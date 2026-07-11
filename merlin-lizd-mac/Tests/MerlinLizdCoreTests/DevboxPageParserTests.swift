@@ -35,12 +35,28 @@ struct DevboxPageParserTests {
         #expect(page.devboxes.count == 1)
         #expect(page.devboxes[0].sid == "dbx_135679")
         #expect(page.devboxes[0].name == "wt_hl")
-        #expect(page.devboxes[0].status == "future_state")
+        #expect(page.devboxes[0].status.rawValue == "future_state")
         #expect(page.devboxes[0].cpuCores == 8)
         #expect(page.devboxes[0].memoryBytes == 34_359_738_368)
         #expect(page.devboxes[0].diskBytes == 137_438_953_472)
         #expect(page.devboxes[0].workerCount == 4)
         #expect(page.devboxes[0].accessRole == "OWNER")
         #expect(page.nextPageToken == "opaque-next")
+    }
+
+    @Test("normalizes lifecycle casing at the decode boundary")
+    func normalizesLifecycleCasing() throws {
+        let json = """
+        {
+          "ResponseBase": {"code": 0, "message": "success"},
+          "data": [{"sid": "dbx_1", "name": "one", "status": " RUNNING "}],
+          "pagination": {"page_size": 100}
+        }
+        """
+
+        let devbox = try #require(DevboxPageParser.parse(json).devboxes.first)
+
+        #expect(devbox.status == .running)
+        #expect(devbox.status.isRunning)
     }
 }

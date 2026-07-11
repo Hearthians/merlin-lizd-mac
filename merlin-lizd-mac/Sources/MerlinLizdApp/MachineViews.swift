@@ -9,6 +9,9 @@ struct OverviewView: View {
 
     private var devboxes: [DevboxInventory] { snapshot?.devboxes ?? [] }
     private var workers: [WorkerInventoryRecord] { devboxes.flatMap(\.workers) }
+    private var hasPendingWorkerInventory: Bool {
+        devboxes.contains(where: workerInventoryIsPending)
+    }
 
     var body: some View {
         ScrollView {
@@ -31,21 +34,25 @@ struct OverviewView: View {
                     SummaryTile(
                         title: "开发机",
                         value: "\(devboxes.count)",
-                        detail: "\(devboxes.filter { $0.devbox.status == "running" }.count) 台运行中",
+                        detail: "\(devboxes.filter { $0.devbox.status.isRunning }.count) 台运行中",
                         symbol: "server.rack",
                         tint: .blue
                     )
                     SummaryTile(
                         title: "工作机",
-                        value: "\(workers.count)",
-                        detail: "跨开发机汇总",
+                        value: hasPendingWorkerInventory
+                            ? (workers.isEmpty ? "…" : "\(workers.count)+")
+                            : "\(workers.count)",
+                        detail: hasPendingWorkerInventory ? "后台更新中" : "跨开发机汇总",
                         symbol: "cpu",
                         tint: .purple
                     )
                     SummaryTile(
                         title: "GPU",
-                        value: "\(workers.reduce(0) { $0 + $1.gpuCount })",
-                        detail: "当前已列出的卡数",
+                        value: hasPendingWorkerInventory
+                            ? "…"
+                            : "\(workers.reduce(0) { $0 + $1.gpuCount })",
+                        detail: hasPendingWorkerInventory ? "后台更新中" : "当前已列出的卡数",
                         symbol: "square.stack.3d.up.fill",
                         tint: .green
                     )
@@ -136,7 +143,7 @@ struct DevboxCard: View {
                 if let memory = machine.devbox.memoryBytes {
                     MetricPill(symbol: "memorychip", value: formatGiB(memory))
                 }
-                MetricPill(symbol: "shippingbox", value: "\(machine.workers.count) Workers")
+                MetricPill(symbol: "shippingbox", value: workerCountLabel(machine))
             }
 
             HStack {
@@ -146,7 +153,7 @@ struct DevboxCard: View {
                 Spacer()
                 Button("连接", systemImage: "terminal", action: onConnect)
                     .buttonStyle(.bordered)
-                    .disabled(machine.devbox.status != "running" || machine.sshAlias == nil)
+                    .disabled(!machine.devbox.status.isRunning || machine.sshAlias == nil)
             }
         }
     }
@@ -160,6 +167,8 @@ struct DevboxDetailView: View {
     let onConnectWorker: (WorkerInventoryRecord) -> Void
 
     var body: some View {
+        let workerStatus = workerStatusPresentation(machine)
+
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 HStack(alignment: .top) {
@@ -175,14 +184,14 @@ struct DevboxDetailView: View {
                 }
 
                 HStack(spacing: 8) {
-                    if machine.devbox.status == "running" {
+                    if machine.devbox.status.isRunning {
                         Button("打开终端", systemImage: "terminal", action: onConnect)
                             .buttonStyle(.borderedProminent)
                             .disabled(machine.sshAlias == nil)
                         Button("tmux 会话", systemImage: "rectangle.stack", action: onBrowseSessions)
                             .buttonStyle(.bordered)
                             .disabled(machine.sshAlias == nil)
-                    } else if machine.devbox.status == "stopped" {
+                    } else if machine.devbox.status.isStopped {
                         Button("启动开发机", systemImage: "play.fill", action: onStart)
                             .buttonStyle(.borderedProminent)
                     }
@@ -209,20 +218,28 @@ struct DevboxDetailView: View {
                     Text("工作机")
                         .font(.title2.bold())
                     Spacer()
-                    Text(workerStatusText(machine.workerStatus))
+                    Text(workerStatus.summary)
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(workerStatus.isFailure ? .red : .secondary)
+                }
+
+                if let detail = workerStatus.detail {
+                    MessageBanner(text: detail, kind: .error)
                 }
 
                 if machine.workers.isEmpty {
                     SurfaceCard {
-                        Text("当前没有可显示的工作机")
+                        Text(emptyWorkerMessage(machine))
                             .foregroundStyle(.secondary)
                     }
                 } else {
                     VStack(spacing: 8) {
                         ForEach(machine.workers) { worker in
-                            WorkerRow(worker: worker) {
+                            WorkerRow(
+                                worker: worker,
+                                isConnectable: machine.devbox.status.isRunning
+                                    && machine.sshAlias != nil
+                            ) {
                                 onConnectWorker(worker)
                             }
                         }
@@ -242,6 +259,14 @@ struct AllWorkersView: View {
         devboxes.flatMap { devbox in devbox.workers.map { (devbox, $0) } }
     }
 
+    private var pendingDevboxCount: Int {
+        devboxes.filter(workerInventoryIsPending).count
+    }
+
+    private var failedDevboxCount: Int {
+        devboxes.filter { workerStatusPresentation($0).isFailure }.count
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
@@ -250,16 +275,43 @@ struct AllWorkersView: View {
                 Text("跨开发机查看 GPU 与资源配置")
                     .foregroundStyle(.secondary)
 
+                if pendingDevboxCount > 0 {
+                    MessageBanner(
+                        text: "还有 \(pendingDevboxCount) 台开发机正在后台查询 Worker；现有结果可先使用。",
+                        kind: .info
+                    )
+                }
+
+                if failedDevboxCount > 0 {
+                    MessageBanner(
+                        text: "\(failedDevboxCount) 台开发机的 Worker 查询失败；其他开发机的结果仍可使用。",
+                        kind: .error
+                    )
+                }
+
                 if rows.isEmpty {
                     ContentUnavailableView(
-                        "暂无工作机",
+                        pendingDevboxCount > 0
+                            ? "正在查询工作机"
+                            : (failedDevboxCount > 0 ? "工作机查询失败" : "暂无工作机"),
                         systemImage: "cpu",
-                        description: Text("运行中的开发机刷新成功后，工作机会显示在这里。")
+                        description: Text(
+                            pendingDevboxCount > 0
+                                ? "开发机已显示，Worker 列表正在后台更新。"
+                                : (failedDevboxCount > 0
+                                    ? "暂时没有可显示的结果；请检查对应开发机的连接状态后刷新。"
+                                    : "运行中的开发机刷新成功后，工作机会显示在这里。")
+                        )
                     )
                     .frame(maxWidth: .infinity, minHeight: 320)
                 } else {
                     ForEach(rows, id: \.1.id) { devbox, worker in
-                        WorkerRow(worker: worker, parentLabel: devbox.sshAlias ?? devbox.devbox.name) {
+                        WorkerRow(
+                            worker: worker,
+                            parentLabel: devbox.sshAlias ?? devbox.devbox.name,
+                            isConnectable: devbox.devbox.status.isRunning
+                                && devbox.sshAlias != nil
+                        ) {
                             onConnect(devbox, worker)
                         }
                     }
@@ -297,11 +349,16 @@ struct WorkerDetailView: View {
                     Button("现有会话", systemImage: "rectangle.stack", action: onBrowseSessions)
                         .buttonStyle(.bordered)
                 }
-                .disabled(machine.sshAlias == nil || machine.devbox.status != "running")
+                .disabled(machine.sshAlias == nil || !machine.devbox.status.isRunning)
 
                 if worker.readiness == .listed {
                     MessageBanner(
-                        text: "Worker 列表不提供就绪状态；真正连接时会由 mlx worker login 验证。",
+                        text: "Worker 列表已显示；就绪状态会在后台探测，不会阻塞机器刷新。",
+                        kind: .info
+                    )
+                } else if worker.readiness == .probing {
+                    MessageBanner(
+                        text: "正在后台验证 Worker 是否可连接；你仍可直接尝试打开终端。",
                         kind: .info
                     )
                 }
@@ -335,6 +392,7 @@ struct WorkerDetailView: View {
 struct WorkerRow: View {
     let worker: WorkerInventoryRecord
     var parentLabel: String?
+    var isConnectable = true
     let onConnect: () -> Void
 
     var body: some View {
@@ -363,6 +421,8 @@ struct WorkerRow: View {
             ReadinessPill(readiness: worker.readiness)
             Button("连接", systemImage: "terminal", action: onConnect)
                 .buttonStyle(.bordered)
+                .disabled(!isConnectable)
+                .help(isConnectable ? "打开 Worker 终端" : "开发机未运行或未匹配 SSH alias")
         }
         .padding(12)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
@@ -374,15 +434,23 @@ struct WorkerRow: View {
 }
 
 struct LifecyclePill: View {
-    let status: String
+    let status: DevboxLifecycle
 
     var body: some View {
-        switch status {
-        case "running": StatusPill(label: "运行中", color: .green)
-        case "stopped": StatusPill(label: "已停止", color: .secondary, symbol: "stop.circle.fill")
-        case "starting": StatusPill(label: "启动中", color: .orange, symbol: "clock.fill")
-        case "stopping": StatusPill(label: "停止中", color: .orange, symbol: "clock.fill")
-        default: StatusPill(label: status, color: .secondary, symbol: "questionmark.circle.fill")
+        if status == .running {
+            StatusPill(label: "运行中", color: .green)
+        } else if status == .stopped {
+            StatusPill(label: "已停止", color: .secondary, symbol: "stop.circle.fill")
+        } else if status == .starting {
+            StatusPill(label: "启动中", color: .orange, symbol: "clock.fill")
+        } else if status == .stopping {
+            StatusPill(label: "停止中", color: .orange, symbol: "clock.fill")
+        } else {
+            StatusPill(
+                label: status.rawValue,
+                color: .secondary,
+                symbol: "questionmark.circle.fill"
+            )
         }
     }
 }
@@ -408,10 +476,75 @@ private func formatGiB(_ bytes: Int64) -> String {
         : String(format: "%.1f GiB", gibibytes)
 }
 
-private func workerStatusText(_ status: WorkerInventoryStatus) -> String {
-    switch status {
-    case .notQueried: "尚未查询"
-    case .loaded: "已刷新"
-    case .failed: "查询失败"
+private struct WorkerStatusPresentation {
+    let summary: String
+    let detail: String?
+    let isFailure: Bool
+}
+
+private func workerStatusPresentation(
+    _ machine: DevboxInventory
+) -> WorkerStatusPresentation {
+    guard machine.devbox.status.isRunning else {
+        return WorkerStatusPresentation(
+            summary: "开发机未运行",
+            detail: nil,
+            isFailure: false
+        )
     }
+    return switch machine.workerStatus {
+    case .notQueried:
+        WorkerStatusPresentation(summary: "后台查询中", detail: nil, isFailure: false)
+    case .loaded:
+        WorkerStatusPresentation(summary: "已刷新", detail: nil, isFailure: false)
+    case .failed(.transport):
+        WorkerStatusPresentation(
+            summary: "SSH 不可达",
+            detail: "无法通过 SSH 查询工作机。请检查开发机是否可连接，以及系统 SSH 登录状态。",
+            isFailure: true
+        )
+    case let .failed(.commandFailed(exitCode)):
+        WorkerStatusPresentation(
+            summary: "命令失败（退出码 \(exitCode)）",
+            detail: "mlx worker list 执行失败（退出码 \(exitCode)）。可先进入开发机检查 mlx 状态。",
+            isFailure: true
+        )
+    case .failed(.malformedOutput):
+        WorkerStatusPresentation(
+            summary: "输出格式异常",
+            detail: "无法识别 mlx worker list 的输出格式；为避免误报，当前未将结果显示为 0 台工作机。",
+            isFailure: true
+        )
+    }
+}
+
+private func workerCountLabel(_ machine: DevboxInventory) -> String {
+    if workerInventoryIsPending(machine) {
+        "Worker 查询中"
+    } else {
+        "\(machine.workers.count) Workers"
+    }
+}
+
+private func emptyWorkerMessage(_ machine: DevboxInventory) -> String {
+    guard machine.devbox.status.isRunning else {
+        return "开发机未运行，无法查询工作机。"
+    }
+    guard machine.sshAlias != nil else {
+        return "未匹配 SSH alias，无法查询工作机。"
+    }
+    return switch machine.workerStatus {
+    case .notQueried:
+        "Worker 列表正在后台查询…"
+    case .loaded:
+        "当前没有工作机"
+    case .failed:
+        "Worker 列表查询失败，暂无可显示结果。"
+    }
+}
+
+private func workerInventoryIsPending(_ machine: DevboxInventory) -> Bool {
+    machine.devbox.status.isRunning
+        && machine.sshAlias != nil
+        && machine.workerStatus == .notQueried
 }

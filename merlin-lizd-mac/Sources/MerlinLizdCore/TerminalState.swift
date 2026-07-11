@@ -15,7 +15,7 @@ public struct TerminalTabRecord: Codable, Equatable, Hashable, Identifiable, Sen
     public let id: String
     public var title: String
     public let target: TerminalTarget
-    public let sessionName: String?
+    public var sessionName: String?
 
     public init(
         id: String,

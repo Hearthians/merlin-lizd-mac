@@ -11,15 +11,44 @@ struct TerminalWorkspaceView: View {
                 let selectedID = terminals.selectedTabID,
                 let session = terminals.session(for: selectedID)
             {
-                TerminalSessionHost(session: session)
+                TerminalSessionContent(session: session) {
+                    terminals.reconnect(selectedID)
+                }
                     .id(session.id)
-                    .background(Color.black)
             } else {
                 ContentUnavailableView(
                     "无法启动终端",
                     systemImage: "terminal.fill",
                     description: Text("目标信息无效，或本地 shell 不可用。")
                 )
+            }
+        }
+    }
+}
+
+private struct TerminalSessionContent: View {
+    @ObservedObject var session: TerminalSession
+    let onReconnect: () -> Void
+
+    var body: some View {
+        ZStack(alignment: .top) {
+            TerminalSessionHost(session: session)
+                .background(Color.black)
+
+            if case let .exited(exitCode) = session.state {
+                HStack(spacing: 10) {
+                    Label(
+                        exitCode.map { "连接已结束（\($0)）" } ?? "连接已结束",
+                        systemImage: "network.slash"
+                    )
+                    Spacer()
+                    Button("重新连接", systemImage: "arrow.clockwise", action: onReconnect)
+                        .buttonStyle(.borderedProminent)
+                }
+                .font(.callout)
+                .padding(10)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
+                .padding(12)
             }
         }
     }
@@ -32,6 +61,9 @@ struct TerminalTabBar: View {
     @State private var pendingCloseID: String?
     @State private var renameID: String?
     @State private var renameText = ""
+    @State private var renameSessionID: String?
+    @State private var renameSessionText = ""
+    @State private var operationErrorMessage: String?
 
     var body: some View {
         HStack(spacing: 0) {
@@ -91,6 +123,39 @@ struct TerminalTabBar: View {
                 renameID = nil
             }
         }
+        .alert("重命名 tmux 会话", isPresented: Binding(
+            get: { renameSessionID != nil },
+            set: { if !$0 { renameSessionID = nil } }
+        )) {
+            TextField("tmux 会话名", text: $renameSessionText)
+            Button("重命名") {
+                guard let id = renameSessionID else { return }
+                let newName = renameSessionText
+                renameSessionID = nil
+                Task {
+                    do {
+                        try await terminals.renameTmuxSession(id, to: newName)
+                    } catch {
+                        operationErrorMessage = operationErrorText(error)
+                    }
+                }
+            }
+            Button("取消", role: .cancel) {
+                renameSessionID = nil
+            }
+        } message: {
+            Text("会直接重命名目标机器上的 tmux 会话，并更新此标签的恢复信息。")
+        }
+        .alert("终端操作失败", isPresented: Binding(
+            get: { operationErrorMessage != nil },
+            set: { if !$0 { operationErrorMessage = nil } }
+        )) {
+            Button("好", role: .cancel) {
+                operationErrorMessage = nil
+            }
+        } message: {
+            Text(operationErrorMessage ?? "未知错误。")
+        }
     }
 
     @ViewBuilder
@@ -134,14 +199,28 @@ struct TerminalTabBar: View {
                 .stroke(selected ? Color.accentColor.opacity(0.3) : Color.clear, lineWidth: 0.5)
         }
         .contextMenu {
-            Button("重命名") {
+            Button("重命名标签") {
                 renameText = tab.title
                 renameID = tab.id
             }
             if let sessionName = tab.sessionName {
+                Button("重命名 tmux 会话") {
+                    renameSessionText = sessionName
+                    renameSessionID = tab.id
+                }
                 Button("复制 tmux 会话名") {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(sessionName, forType: .string)
+                }
+            }
+            Divider()
+            Button("在 Terminal 中打开") {
+                Task {
+                    do {
+                        try await terminals.openInTerminal(tab.id)
+                    } catch {
+                        operationErrorMessage = operationErrorText(error)
+                    }
                 }
             }
             Divider()
@@ -165,7 +244,7 @@ struct TerminalTabBar: View {
                         Button(machine.sshAlias ?? machine.devbox.name) {
                             terminals.openDevbox(machine)
                         }
-                        .disabled(machine.devbox.status != "running" || machine.sshAlias == nil)
+                        .disabled(!machine.devbox.status.isRunning || machine.sshAlias == nil)
                     }
                 }
 
@@ -196,5 +275,18 @@ struct TerminalTabBar: View {
         case .devbox: "server.rack"
         case .worker: "cpu"
         }
+    }
+
+    private func operationErrorText(_ error: Error) -> String {
+        if let operationError = error as? TerminalTabOperationError {
+            return operationError.localizedDescription
+        }
+        if let launcherError = error as? ExternalTerminalLauncherError {
+            switch launcherError {
+            case let .commandFailed(exitCode):
+                return "无法在 Terminal 中打开（退出码 \(exitCode)）。"
+            }
+        }
+        return "操作未完成：\(error.localizedDescription)"
     }
 }

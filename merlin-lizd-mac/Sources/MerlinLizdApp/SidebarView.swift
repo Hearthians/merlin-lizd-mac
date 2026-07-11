@@ -71,7 +71,7 @@ struct SidebarView: View {
                                     )
                                 }
                                 .onTapGesture(count: 2) {
-                                    terminals.openWorker(worker, on: machine)
+                                    openWorkerIfConnectable(worker, on: machine)
                                 }
                         }
                     } label: {
@@ -81,16 +81,14 @@ struct SidebarView: View {
                                 show(.devbox(machine.devbox.sid))
                             }
                             .onTapGesture(count: 2) {
-                                if machine.devbox.status == "running" {
-                                    terminals.openDevbox(machine)
-                                }
+                                openDevboxIfConnectable(machine)
                             }
                     }
                     .contextMenu {
                         Button("查看详情") {
                             show(.devbox(machine.devbox.sid))
                         }
-                        if machine.devbox.status == "running" {
+                        if machine.devbox.status.isRunning {
                             Button("打开终端") {
                                 terminals.openDevbox(machine)
                             }
@@ -103,8 +101,11 @@ struct SidebarView: View {
         .listStyle(.sidebar)
         .navigationTitle("Merlin Lizd")
         .searchable(text: $searchText, placement: .sidebar, prompt: "搜索机器或 GPU")
+        .onKeyPress(.return) {
+            openSelectedTerminal() ? .handled : .ignored
+        }
         .onChange(of: model.snapshot?.refreshedAt) {
-            for machine in model.devboxes where machine.devbox.status == "running" {
+            for machine in model.devboxes where machine.devbox.status.isRunning {
                 expandedDevboxes.insert(machine.devbox.sid)
             }
         }
@@ -124,6 +125,45 @@ struct SidebarView: View {
     private func show(_ selection: SidebarSelection) {
         model.selection = selection
         terminals.selectedTabID = nil
+    }
+
+    @discardableResult
+    private func openSelectedTerminal() -> Bool {
+        switch model.selection {
+        case .local:
+            terminals.openLocal()
+            return true
+        case let .devbox(sid):
+            guard let machine = model.devbox(sid: sid) else { return false }
+            return openDevboxIfConnectable(machine)
+        case let .worker(devboxSID, workerID):
+            guard let (machine, worker) = model.worker(
+                devboxSID: devboxSID,
+                workerID: workerID
+            ) else {
+                return false
+            }
+            return openWorkerIfConnectable(worker, on: machine)
+        case .overview, .allWorkers:
+            return false
+        }
+    }
+
+    @discardableResult
+    private func openDevboxIfConnectable(_ machine: DevboxInventory) -> Bool {
+        guard machine.devbox.status.isRunning, machine.sshAlias != nil else { return false }
+        terminals.openDevbox(machine)
+        return true
+    }
+
+    @discardableResult
+    private func openWorkerIfConnectable(
+        _ worker: WorkerInventoryRecord,
+        on machine: DevboxInventory
+    ) -> Bool {
+        guard machine.devbox.status.isRunning, machine.sshAlias != nil else { return false }
+        terminals.openWorker(worker, on: machine)
+        return true
     }
 
     private func expandedBinding(for sid: String) -> Binding<Bool> {
@@ -146,7 +186,7 @@ private struct SidebarDevboxLabel: View {
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: "server.rack")
-                .foregroundStyle(machine.devbox.status == "running" ? .green : .secondary)
+                .foregroundStyle(machine.devbox.status.isRunning ? .green : .secondary)
             VStack(alignment: .leading, spacing: 1) {
                 Text(machine.sshAlias ?? machine.devbox.name)
                     .lineLimit(1)

@@ -30,6 +30,7 @@ The primary mental model is **machines**. A future **tasks** workspace may add f
 - Discover all CPU Devboxes from the current `merlin-cli` account, not only aliases already present in SSH config.
 - Match a Devbox SID/name to a safe local SSH alias when possible. Never display or persist ProxyCommand contents.
 - For every running, routable Devbox, list Workers with `NO_COLOR=1 TERM=dumb mlx worker list` through SSH. Worker list requests may run concurrently with a bounded limit.
+- Render the last safe snapshot immediately, then refresh Devboxes, Worker lists, and Worker readiness in separate stages. A slow `mlx worker list/login` must not block or clear the machine tree.
 - Refresh immediately on launch, manually on request, and every 15 seconds while the app is active. Pause foreground polling when inactive.
 - Show lifecycle/connectivity, CPU, memory, GPU type/count, Worker readiness, last refresh time, and actionable errors. Real-time utilization charts are not part of v1.
 - A Worker appearing in a list is not proof that it is ready. Connection failures and the text `worker has not been ready yet` must remain visible as readiness/transport errors.
@@ -37,6 +38,7 @@ The primary mental model is **machines**. A future **tasks** workspace may add f
 ## Authentication and safety
 
 - Reuse the installed `merlin-cli` login, system SSH config, and SSH Agent. The app stores no password, private key, JWT, or raw ProxyCommand.
+- A last-known inventory snapshot may be cached locally, but only from the safe projection: never Pod IPs, ports, webshell URLs, raw command output, or credentials.
 - Read-only discovery may run automatically. Starting a Devbox requires a user confirmation. No other resource mutation is exposed in v1.
 - Use argument arrays when spawning local processes. Do not build a user-controlled shell command string.
 - Remote tmux session names are sanitized to a conservative character set.

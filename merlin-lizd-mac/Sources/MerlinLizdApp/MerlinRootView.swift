@@ -35,9 +35,19 @@ struct MerlinRootView: View {
         }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
-                if model.isRefreshing || model.isStartingDevbox {
+                if model.isRefreshing
+                    || model.isStartingDevbox
+                    || model.isRefreshingWorkers
+                    || model.isProbingWorkers
+                {
                     ProgressView()
                         .controlSize(.small)
+                }
+                if model.isRefreshingWorkers || model.isProbingWorkers {
+                    Text(model.isRefreshingWorkers ? "同步 Worker" : "探测就绪")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .help("开发机列表已可使用，Worker 信息正在后台更新")
                 }
                 if let refreshedAt = model.snapshot?.refreshedAt {
                     Text(refreshedAt, style: .time)
@@ -46,7 +56,7 @@ struct MerlinRootView: View {
                         .help("最近刷新时间")
                 }
                 Button {
-                    Task { await model.refresh() }
+                    Task { await model.refresh(forceReadinessProbe: true) }
                 } label: {
                     Label("刷新", systemImage: "arrow.clockwise")
                 }
@@ -101,7 +111,9 @@ struct MerlinRootView: View {
             OverviewView(
                 snapshot: model.snapshot,
                 isRefreshing: model.isRefreshing,
-                onRefresh: { Task { await model.refresh() } },
+                onRefresh: {
+                    Task { await model.refresh(forceReadinessProbe: true) }
+                },
                 onConnectDevbox: terminals.openDevbox
             )
         case .allWorkers:

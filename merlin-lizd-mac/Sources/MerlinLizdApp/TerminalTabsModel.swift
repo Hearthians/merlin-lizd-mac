@@ -11,6 +11,9 @@ final class TerminalTabsModel: ObservableObject {
 
     private var sessions: [String: TerminalSession] = [:]
     private let defaults: UserDefaults
+    let tmuxSessionDiscovery = TmuxSessionDiscovery()
+    private let tmuxSessionController = TmuxSessionController()
+    private let externalTerminalLauncher = ExternalTerminalLauncher()
     private let persistenceKey = "terminal-state-v1"
 
     init(defaults: UserDefaults = .standard) {
@@ -87,10 +90,42 @@ final class TerminalTabsModel: ObservableObject {
         )
     }
 
+    func knownTmuxSessions(for target: TerminalTarget) -> [TmuxSessionRecord] {
+        var seen: Set<String> = []
+        return tabs.compactMap { tab in
+            guard
+                tab.target == target,
+                let sessionName = tab.sessionName,
+                TmuxSessionParser.isAttachable(sessionName),
+                seen.insert(sessionName).inserted
+            else {
+                return nil
+            }
+            return TmuxSessionRecord(name: sessionName)
+        }
+    }
+
     func select(_ id: String) {
         guard tabs.contains(where: { $0.id == id }) else { return }
         selectedTabID = id
+        if let existing = sessions[id] {
+            switch existing.state {
+            case .exited, .closed:
+                reconnect(id)
+            case .idle, .running:
+                break
+            }
+        } else {
+            _ = session(for: id)
+        }
+    }
+
+    func reconnect(_ id: String) {
+        guard tabs.contains(where: { $0.id == id }) else { return }
+        sessions.removeValue(forKey: id)?.close()
         _ = session(for: id)
+        selectedTabID = id
+        objectWillChange.send()
     }
 
     func session(for id: String) -> TerminalSession? {
@@ -141,6 +176,61 @@ final class TerminalTabsModel: ObservableObject {
         persist()
     }
 
+    func renameTmuxSession(_ id: String, to proposedName: String) async throws {
+        let newName = proposedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard TmuxSessionParser.isAttachable(newName) else {
+            throw TerminalTabOperationError.invalidSessionName
+        }
+        guard
+            let tab = tabs.first(where: { $0.id == id }),
+            let currentName = tab.sessionName
+        else {
+            throw TerminalTabOperationError.sessionUnavailable
+        }
+        guard currentName != newName else { return }
+
+        do {
+            try await tmuxSessionController.rename(
+                target: tab.target,
+                from: currentName,
+                to: newName
+            )
+        } catch let error as TmuxSessionMutationError {
+            switch error {
+            case .localTmuxNotFound:
+                throw TerminalTabOperationError.localTmuxNotFound
+            case .workerNotReady:
+                throw TerminalTabOperationError.workerNotReady
+            case let .commandFailed(exitCode):
+                throw TerminalTabOperationError.commandFailed(exitCode: exitCode)
+            }
+        }
+
+        await tmuxSessionDiscovery.recordRename(
+            target: tab.target,
+            from: currentName,
+            to: newName
+        )
+
+        // The remote operation is authoritative. Persist its new identity only
+        // if this tab still describes the session that was renamed.
+        guard
+            let currentIndex = tabs.firstIndex(where: { $0.id == id }),
+            tabs[currentIndex].sessionName == currentName
+        else {
+            return
+        }
+        tabs[currentIndex].sessionName = newName
+        persist()
+    }
+
+    func openInTerminal(_ id: String) async throws {
+        guard let tab = tabs.first(where: { $0.id == id }) else {
+            throw TerminalTabOperationError.sessionUnavailable
+        }
+        try await externalTerminalLauncher.open(command(for: tab))
+    }
+
     private func open(title: String, target: TerminalTarget, sessionName: String?) {
         let id = UUID().uuidString
         let record = TerminalTabRecord(
@@ -159,12 +249,7 @@ final class TerminalTabsModel: ObservableObject {
         switch tab.target {
         case .local:
             if let sessionName = tab.sessionName {
-                let candidates = [
-                    "/opt/homebrew/bin/tmux",
-                    "/usr/local/bin/tmux",
-                    "/usr/bin/tmux",
-                ]
-                guard let tmux = candidates.first(where: FileManager.default.isExecutableFile(atPath:)) else {
+                guard let tmux = resolvedLocalTmuxPath() else {
                     throw CommandValidationError.invalidExecutablePath
                 }
                 return CommandSpec(
@@ -201,10 +286,41 @@ final class TerminalTabsModel: ObservableObject {
         return "mlz-\(compactLabel.isEmpty ? "shell" : compactLabel)-\(suffix)"
     }
 
+    private func resolvedLocalTmuxPath() -> String? {
+        [
+            "/opt/homebrew/bin/tmux",
+            "/usr/local/bin/tmux",
+            "/usr/bin/tmux",
+        ].first(where: FileManager.default.isExecutableFile(atPath:))
+    }
+
     private func persist() {
         let state = TerminalState(selectedTabID: selectedTabID, tabs: tabs)
         if let encoded = try? TerminalStateCodec.encode(state) {
             defaults.set(encoded, forKey: persistenceKey)
+        }
+    }
+}
+
+enum TerminalTabOperationError: LocalizedError {
+    case invalidSessionName
+    case sessionUnavailable
+    case localTmuxNotFound
+    case workerNotReady
+    case commandFailed(exitCode: Int32)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidSessionName:
+            "tmux 会话名只能包含字母、数字、点、短横线和下划线，且最长 64 个字符。"
+        case .sessionUnavailable:
+            "这个标签没有可操作的 tmux 会话。"
+        case .localTmuxNotFound:
+            "本机未找到 tmux。"
+        case .workerNotReady:
+            "工作机尚未就绪，暂时无法重命名 tmux 会话。"
+        case let .commandFailed(exitCode):
+            "tmux 操作失败（退出码 \(exitCode)）。"
         }
     }
 }

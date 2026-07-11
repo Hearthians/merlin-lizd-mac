@@ -7,16 +7,27 @@ public enum TmuxSessionDiscoveryError: Error, Equatable, Sendable {
 }
 
 public actor TmuxSessionDiscovery {
+    private struct CacheEntry {
+        let sessions: [TmuxSessionRecord]
+        let fetchedAt: Date
+    }
+
     private let processRunner: any InventoryProcessRunning
     private let localTmuxPath: String?
+    private var cache: [TerminalTarget: CacheEntry] = [:]
 
     public init(maxConcurrentProcesses: Int = 2) {
-        let runner = FoundationInventoryProcessRunner()
+        let runner = TimedInventoryProcessRunner(
+            // `mlx worker login` can take ~25 seconds on a cold Worker even
+            // when it succeeds, so share the inventory command budget.
+            timeout: .seconds(45),
+            underlying: FoundationInventoryProcessRunner()
+        )
         processRunner = BoundedInventoryProcessRunner(
             maxConcurrentProcesses: max(1, maxConcurrentProcesses),
             underlying: runner
         )
-        localTmuxPath = Self.resolveLocalTmux()
+        localTmuxPath = LocalTmuxResolver.resolve()
     }
 
     init(
@@ -55,20 +66,49 @@ public actor TmuxSessionDiscovery {
             if diagnostic.contains("no server running")
                 || diagnostic.contains("no sessions")
             {
+                cache[target] = CacheEntry(sessions: [], fetchedAt: Date())
                 return []
             }
             throw TmuxSessionDiscoveryError.commandFailed(exitCode: output.exitCode)
         }
 
-        return TmuxSessionParser.parse(output.stdout)
+        let sessions = TmuxSessionParser.parse(output.stdout)
+        cache[target] = CacheEntry(sessions: sessions, fetchedAt: Date())
+        return sessions
     }
 
-    private static func resolveLocalTmux() -> String? {
-        let fileManager = FileManager.default
-        return [
-            "/opt/homebrew/bin/tmux",
-            "/usr/local/bin/tmux",
-            "/usr/bin/tmux",
-        ].first(where: fileManager.isExecutableFile(atPath:))
+    public func cached(
+        target: TerminalTarget,
+        maximumAge: TimeInterval = 300
+    ) -> [TmuxSessionRecord]? {
+        guard
+            let entry = cache[target],
+            Date().timeIntervalSince(entry.fetchedAt) <= maximumAge
+        else {
+            return nil
+        }
+        return entry.sessions
+    }
+
+    public func recordRename(
+        target: TerminalTarget,
+        from currentName: String,
+        to newName: String
+    ) {
+        guard let entry = cache[target] else { return }
+        guard entry.sessions.contains(where: { $0.name == currentName }) else {
+            return
+        }
+        let sessions = entry.sessions.map { session in
+            session.name == currentName
+                ? TmuxSessionRecord(name: newName)
+                : session
+        }
+        // Renaming one known session does not prove the rest of the remote
+        // inventory is fresh, so preserve the original expiry time.
+        cache[target] = CacheEntry(
+            sessions: sessions,
+            fetchedAt: entry.fetchedAt
+        )
     }
 }

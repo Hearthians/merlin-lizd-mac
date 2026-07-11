@@ -1,6 +1,6 @@
 import Foundation
 
-public struct InventorySnapshot: Equatable, Sendable {
+public struct InventorySnapshot: Codable, Equatable, Sendable {
     public let devboxes: [DevboxInventory]
     public let refreshedAt: Date
 
@@ -10,7 +10,7 @@ public struct InventorySnapshot: Equatable, Sendable {
     }
 }
 
-public struct DevboxInventory: Identifiable, Equatable, Sendable {
+public struct DevboxInventory: Identifiable, Codable, Equatable, Sendable {
     public var id: String { devbox.sid }
 
     public let devbox: Devbox
@@ -33,7 +33,7 @@ public struct DevboxInventory: Identifiable, Equatable, Sendable {
 
 /// A persistence-safe projection of `Worker`. Network addresses and signed URLs
 /// deliberately never cross the inventory interface.
-public struct WorkerInventoryRecord: Identifiable, Equatable, Sendable {
+public struct WorkerInventoryRecord: Identifiable, Codable, Equatable, Sendable {
     public let id: String
     public let cpuCores: Int
     public let memoryGiB: Int
@@ -51,15 +51,45 @@ public struct WorkerInventoryRecord: Identifiable, Equatable, Sendable {
         self.createdAt = worker.createdAt
         self.readiness = worker.readiness
     }
+
+    public func withReadiness(_ readiness: WorkerReadiness) -> WorkerInventoryRecord {
+        WorkerInventoryRecord(
+            id: id,
+            cpuCores: cpuCores,
+            memoryGiB: memoryGiB,
+            gpuCount: gpuCount,
+            gpuType: gpuType,
+            createdAt: createdAt,
+            readiness: readiness
+        )
+    }
+
+    private init(
+        id: String,
+        cpuCores: Int,
+        memoryGiB: Int,
+        gpuCount: Int,
+        gpuType: String?,
+        createdAt: String,
+        readiness: WorkerReadiness
+    ) {
+        self.id = id
+        self.cpuCores = cpuCores
+        self.memoryGiB = memoryGiB
+        self.gpuCount = gpuCount
+        self.gpuType = gpuType
+        self.createdAt = createdAt
+        self.readiness = readiness
+    }
 }
 
-public enum WorkerInventoryStatus: Equatable, Sendable {
+public enum WorkerInventoryStatus: Codable, Equatable, Sendable {
     case notQueried
     case loaded
     case failed(InventoryFailure)
 }
 
-public enum InventoryFailure: Equatable, Sendable {
+public enum InventoryFailure: Codable, Equatable, Sendable {
     case transport
     case commandFailed(exitCode: Int32)
     case malformedOutput

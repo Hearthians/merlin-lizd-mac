@@ -1,11 +1,39 @@
 import Foundation
 
+public struct DevboxLifecycle: RawRepresentable, Codable, Hashable, Sendable {
+    public static let running = DevboxLifecycle(rawValue: "running")
+    public static let stopped = DevboxLifecycle(rawValue: "stopped")
+    public static let starting = DevboxLifecycle(rawValue: "starting")
+    public static let stopping = DevboxLifecycle(rawValue: "stopping")
+
+    public let rawValue: String
+
+    public init(rawValue: String) {
+        self.rawValue = rawValue
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+    }
+
+    public var isRunning: Bool { self == .running }
+    public var isStopped: Bool { self == .stopped }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        self.init(rawValue: try container.decode(String.self))
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+}
+
 public struct Devbox: Identifiable, Codable, Hashable, Sendable {
     public var id: String { sid }
 
     public let sid: String
     public let name: String
-    public let status: String
+    public let status: DevboxLifecycle
     public let cpuCores: Int?
     public let memoryBytes: Int64?
     public let diskBytes: Int64?
