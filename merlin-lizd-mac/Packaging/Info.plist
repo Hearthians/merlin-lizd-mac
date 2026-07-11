@@ -10,6 +10,8 @@
 	<string>MerlinLizd</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.lizd.merlin-lizd</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon.icns</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
