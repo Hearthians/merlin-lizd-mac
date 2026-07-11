@@ -21,9 +21,10 @@ The primary mental model is **machines**. A future **tasks** workspace may add f
 3. Selecting a node shows current state and allocated resources. Double-click, Return, or the Connect button opens or restores its terminal.
 4. Terminal tabs are independent. More than one tab may target the same machine, and each tab may have its own editable tmux session name.
 5. Closing the app or losing SSH must not terminate remote work. On relaunch, restore tab metadata and reconnect only the selected tab; reconnect other tabs on demand.
-6. Existing tmux sessions created outside the app can be listed and attached.
-7. A stopped existing Devbox can be started after an explicit in-app confirmation. v1 has no stop, delete, Worker create, or Worker terminate actions.
-8. A Local terminal tab is available for Mac commands and manual SSH.
+6. Existing tmux sessions created outside the app can be listed and attached. The session browser supports selecting App-created sessions or arbitrary sessions, then terminating the selection after a destructive confirmation.
+7. Closing a terminal tab leaves its tmux session running by default. The close dialog also offers an explicit “close and terminate tmux” action; terminating a session closes every local tab attached to that same target/session.
+8. A stopped existing Devbox can be started after an explicit in-app confirmation. v1 has no stop, delete, Worker create, or Worker terminate actions.
+9. A Local terminal tab is available for Mac commands and manual SSH.
 
 ## Inventory and refresh
 
@@ -39,7 +40,7 @@ The primary mental model is **machines**. A future **tasks** workspace may add f
 
 - Reuse the installed `merlin-cli` login, system SSH config, and SSH Agent. The app stores no password, private key, JWT, or raw ProxyCommand.
 - A last-known inventory snapshot may be cached locally, but only from the safe projection: never Pod IPs, ports, webshell URLs, raw command output, or credentials.
-- Read-only discovery may run automatically. Starting a Devbox requires a user confirmation. No other resource mutation is exposed in v1.
+- Read-only discovery may run automatically. Starting a Devbox requires confirmation; terminating one or more tmux sessions requires a separate destructive confirmation. No Devbox/Worker stop, delete, or kill mutation is exposed in v1.
 - Use argument arrays when spawning local processes. Do not build a user-controlled shell command string.
 - Remote tmux session names are sanitized to a conservative character set.
 

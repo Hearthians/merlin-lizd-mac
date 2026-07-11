@@ -64,6 +64,7 @@ struct TerminalTabBar: View {
     @State private var renameSessionID: String?
     @State private var renameSessionText = ""
     @State private var operationErrorMessage: String?
+    @State private var terminatingSessionID: String?
 
     var body: some View {
         HStack(spacing: 0) {
@@ -96,17 +97,36 @@ struct TerminalTabBar: View {
             ),
             titleVisibility: .visible
         ) {
-            Button("关闭标签", role: .destructive) {
+            Button(pendingCloseTab?.sessionName == nil ? "关闭标签" : "仅关闭标签") {
                 if let pendingCloseID {
                     terminals.close(pendingCloseID)
                 }
                 pendingCloseID = nil
             }
+            if pendingCloseTab?.sessionName != nil {
+                Button("关闭标签并终止 tmux", role: .destructive) {
+                    guard let id = pendingCloseID else { return }
+                    pendingCloseID = nil
+                    terminatingSessionID = id
+                    Task {
+                        do {
+                            try await terminals.terminateTmuxSessionAndClose(id)
+                        } catch {
+                            operationErrorMessage = operationErrorText(error)
+                        }
+                        terminatingSessionID = nil
+                    }
+                }
+            }
             Button("取消", role: .cancel) {
                 pendingCloseID = nil
             }
         } message: {
-            Text("远端 SSH 会断开，但 tmux 中的任务会继续运行；本机终端进程会结束。")
+            if pendingCloseTab?.sessionName != nil {
+                Text("默认仅关闭标签：SSH 会断开，但 tmux 和其中的任务继续运行。也可以明确终止这个 tmux 会话。")
+            } else {
+                Text("将关闭标签并结束本机终端进程。")
+            }
         }
         .alert("重命名标签", isPresented: Binding(
             get: { renameID != nil },
@@ -178,17 +198,24 @@ struct TerminalTabBar: View {
             }
             .buttonStyle(.plain)
 
-            Button {
-                pendingCloseID = tab.id
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 9, weight: .semibold))
+            if terminatingSessionID == tab.id {
+                ProgressView()
+                    .controlSize(.mini)
                     .frame(width: 18, height: 18)
-                    .contentShape(Rectangle())
+                    .padding(.trailing, 4)
+            } else {
+                Button {
+                    pendingCloseID = tab.id
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .semibold))
+                        .frame(width: 18, height: 18)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .padding(.trailing, 4)
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-            .padding(.trailing, 4)
         }
         .background(
             selected ? Color.accentColor.opacity(0.14) : Color.clear,
@@ -224,7 +251,7 @@ struct TerminalTabBar: View {
                 }
             }
             Divider()
-            Button("关闭", role: .destructive) {
+            Button("关闭…", role: .destructive) {
                 pendingCloseID = tab.id
             }
         }
@@ -267,6 +294,11 @@ struct TerminalTabBar: View {
                 .frame(width: 24, height: 24)
         }
         .help("新建终端")
+    }
+
+    private var pendingCloseTab: TerminalTabRecord? {
+        guard let pendingCloseID else { return nil }
+        return terminals.tabs.first { $0.id == pendingCloseID }
     }
 
     private func tabSymbol(_ target: TerminalTarget) -> String {

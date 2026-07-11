@@ -196,14 +196,7 @@ final class TerminalTabsModel: ObservableObject {
                 to: newName
             )
         } catch let error as TmuxSessionMutationError {
-            switch error {
-            case .localTmuxNotFound:
-                throw TerminalTabOperationError.localTmuxNotFound
-            case .workerNotReady:
-                throw TerminalTabOperationError.workerNotReady
-            case let .commandFailed(exitCode):
-                throw TerminalTabOperationError.commandFailed(exitCode: exitCode)
-            }
+            throw terminalOperationError(error)
         }
 
         await tmuxSessionDiscovery.recordRename(
@@ -222,6 +215,77 @@ final class TerminalTabsModel: ObservableObject {
         }
         tabs[currentIndex].sessionName = newName
         persist()
+    }
+
+    func terminateTmuxSessionAndClose(_ id: String) async throws {
+        guard
+            let tab = tabs.first(where: { $0.id == id }),
+            let sessionName = tab.sessionName
+        else {
+            throw TerminalTabOperationError.sessionUnavailable
+        }
+
+        do {
+            try await tmuxSessionController.terminate(
+                target: tab.target,
+                sessionName: sessionName
+            )
+        } catch let error as TmuxSessionMutationError {
+            throw terminalOperationError(error)
+        }
+
+        await tmuxSessionDiscovery.recordTermination(
+            target: tab.target,
+            sessionNames: [sessionName]
+        )
+        closeTabs(target: tab.target, sessionNames: [sessionName])
+    }
+
+    func terminateTmuxSessions(
+        _ sessionNames: Set<String>,
+        target: TerminalTarget
+    ) async -> TmuxBatchTerminationResult {
+        let validNames = Set(
+            sessionNames.filter(TmuxSessionParser.isAttachable)
+        )
+        let invalidNames = sessionNames.subtracting(validNames)
+        let controller = tmuxSessionController
+        let results = await withTaskGroup(
+            of: (String, Bool).self
+        ) { group -> [(String, Bool)] in
+            for sessionName in validNames {
+                group.addTask {
+                    do {
+                        try await controller.terminate(
+                            target: target,
+                            sessionName: sessionName
+                        )
+                        return (sessionName, true)
+                    } catch {
+                        return (sessionName, false)
+                    }
+                }
+            }
+
+            var results: [(String, Bool)] = []
+            for await result in group {
+                results.append(result)
+            }
+            return results
+        }
+
+        let succeeded = Set(results.compactMap { $0.1 ? $0.0 : nil })
+        let failed = Set(results.compactMap { $0.1 ? nil : $0.0 })
+            .union(invalidNames)
+        await tmuxSessionDiscovery.recordTermination(
+            target: target,
+            sessionNames: succeeded
+        )
+        closeTabs(target: target, sessionNames: succeeded)
+        return TmuxBatchTerminationResult(
+            succeeded: succeeded,
+            failed: failed
+        )
     }
 
     func openInTerminal(_ id: String) async throws {
@@ -286,6 +350,38 @@ final class TerminalTabsModel: ObservableObject {
         return "mlz-\(compactLabel.isEmpty ? "shell" : compactLabel)-\(suffix)"
     }
 
+    private func closeTabs(
+        target: TerminalTarget,
+        sessionNames: Set<String>
+    ) {
+        let matchingIDs: [String] = tabs.compactMap { tab -> String? in
+            guard
+                tab.target == target,
+                let sessionName = tab.sessionName,
+                sessionNames.contains(sessionName)
+            else {
+                return nil
+            }
+            return tab.id
+        }
+        for id in matchingIDs {
+            close(id)
+        }
+    }
+
+    private func terminalOperationError(
+        _ error: TmuxSessionMutationError
+    ) -> TerminalTabOperationError {
+        switch error {
+        case .localTmuxNotFound:
+            .localTmuxNotFound
+        case .workerNotReady:
+            .workerNotReady
+        case let .commandFailed(exitCode):
+            .commandFailed(exitCode: exitCode)
+        }
+    }
+
     private func resolvedLocalTmuxPath() -> String? {
         [
             "/opt/homebrew/bin/tmux",
@@ -300,6 +396,11 @@ final class TerminalTabsModel: ObservableObject {
             defaults.set(encoded, forKey: persistenceKey)
         }
     }
+}
+
+struct TmuxBatchTerminationResult: Sendable {
+    let succeeded: Set<String>
+    let failed: Set<String>
 }
 
 enum TerminalTabOperationError: LocalizedError {
@@ -318,7 +419,7 @@ enum TerminalTabOperationError: LocalizedError {
         case .localTmuxNotFound:
             "本机未找到 tmux。"
         case .workerNotReady:
-            "工作机尚未就绪，暂时无法重命名 tmux 会话。"
+            "工作机尚未就绪，暂时无法操作 tmux 会话。"
         case let .commandFailed(exitCode):
             "tmux 操作失败（退出码 \(exitCode)）。"
         }

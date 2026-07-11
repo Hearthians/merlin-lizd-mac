@@ -12,7 +12,7 @@ public actor TmuxSessionController {
     private let processRunner: any InventoryProcessRunning
     private let localTmuxPath: String?
 
-    public init(maxConcurrentProcesses: Int = 1) {
+    public init(maxConcurrentProcesses: Int = 4) {
         processRunner = BoundedInventoryProcessRunner(
             maxConcurrentProcesses: max(1, maxConcurrentProcesses),
             underlying: TimedInventoryProcessRunner(
@@ -50,6 +50,37 @@ public actor TmuxSessionController {
             target: target,
             from: currentName,
             to: newName,
+            localTmuxPath: localPath
+        )
+        let output = try await processRunner.run(command)
+        let diagnostic = (output.stdout + "\n" + output.stderr).lowercased()
+        if diagnostic.contains("worker has not been ready")
+            || diagnostic.contains("worker is not ready")
+        {
+            throw TmuxSessionMutationError.workerNotReady
+        }
+        guard output.exitCode == 0 else {
+            throw TmuxSessionMutationError.commandFailed(exitCode: output.exitCode)
+        }
+    }
+
+    public func terminate(
+        target: TerminalTarget,
+        sessionName: String
+    ) async throws {
+        let localPath: String
+        if case .local = target {
+            guard let localTmuxPath else {
+                throw TmuxSessionMutationError.localTmuxNotFound
+            }
+            localPath = localTmuxPath
+        } else {
+            localPath = localTmuxPath ?? "/opt/homebrew/bin/tmux"
+        }
+
+        let command = try MerlinCommands.terminateTmuxSession(
+            target: target,
+            sessionName: sessionName,
             localTmuxPath: localPath
         )
         let output = try await processRunner.run(command)

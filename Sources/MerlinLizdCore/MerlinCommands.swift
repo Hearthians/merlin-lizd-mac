@@ -19,6 +19,45 @@ public enum CommandValidationError: Error, Equatable, Sendable {
 }
 
 public enum MerlinCommands {
+    public static func terminateTmuxSession(
+        target: TerminalTarget,
+        sessionName: String,
+        localTmuxPath: String = "/opt/homebrew/bin/tmux"
+    ) throws -> CommandSpec {
+        try validateSessionName(sessionName)
+
+        let tmuxArguments = ["kill-session", "-t", sessionName]
+        switch target {
+        case .local:
+            guard localTmuxPath.hasPrefix("/") else {
+                throw CommandValidationError.invalidExecutablePath
+            }
+            return CommandSpec(
+                executable: localTmuxPath,
+                arguments: tmuxArguments
+            )
+        case let .devbox(_, _, alias):
+            try validateAlias(alias)
+            return CommandSpec(
+                executable: "/usr/bin/ssh",
+                arguments: nonInteractiveSSHArguments(
+                    alias: alias,
+                    remoteCommand: "tmux kill-session -t \(sessionName)"
+                )
+            )
+        case let .worker(_, _, alias, workerID):
+            try validateAlias(alias)
+            try validateWorkerID(workerID)
+            return CommandSpec(
+                executable: "/usr/bin/ssh",
+                arguments: nonInteractiveSSHArguments(
+                    alias: alias,
+                    remoteCommand: "NO_COLOR=1 TERM=dumb mlx worker login \(workerID) -- tmux kill-session -t \(sessionName)"
+                )
+            )
+        }
+    }
+
     public static func renameTmuxSession(
         target: TerminalTarget,
         from currentName: String,

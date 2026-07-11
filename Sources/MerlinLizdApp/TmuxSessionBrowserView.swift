@@ -42,12 +42,20 @@ final class TmuxSessionBrowserModel: ObservableObject {
             errorMessage = "无法读取 tmux 会话，请检查连接状态。"
         }
     }
+
+    func removeSessions(named names: Set<String>) {
+        sessions.removeAll { names.contains($0.name) }
+    }
 }
 
 struct TmuxSessionBrowserView: View {
     @StateObject private var model: TmuxSessionBrowserModel
     @ObservedObject var terminals: TerminalTabsModel
     @Environment(\.dismiss) private var dismiss
+    @State private var selectedSessionNames: Set<String> = []
+    @State private var pendingTerminationNames: Set<String> = []
+    @State private var isTerminating = false
+    @State private var terminationMessage: String?
 
     init(target: TerminalTarget, terminals: TerminalTabsModel) {
         _model = StateObject(wrappedValue: TmuxSessionBrowserModel(
@@ -74,17 +82,18 @@ struct TmuxSessionBrowserView: View {
                     }
                 }
                 Spacer()
-                if model.isLoading {
+                if model.isLoading || isTerminating {
                     ProgressView()
                         .controlSize(.small)
                 }
                 Button("刷新", systemImage: "arrow.clockwise") {
                     Task { await model.load() }
                 }
-                .disabled(model.isLoading)
+                .disabled(model.isLoading || isTerminating)
                 Button("完成") {
                     dismiss()
                 }
+                .disabled(isTerminating)
                 .keyboardShortcut(.defaultAction)
             }
             .padding(16)
@@ -109,6 +118,24 @@ struct TmuxSessionBrowserView: View {
                     }
                     List(model.sessions) { session in
                         HStack {
+                            Button {
+                                toggleSelection(session.name)
+                            } label: {
+                                Image(systemName: selectedSessionNames.contains(session.name)
+                                    ? "checkmark.circle.fill"
+                                    : "circle")
+                                    .font(.title3)
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(selectedSessionNames.contains(session.name)
+                                ? Color.accentColor
+                                : Color.secondary)
+                            .disabled(isTerminating)
+                            .accessibilityLabel(
+                                selectedSessionNames.contains(session.name)
+                                    ? "取消选择 \(session.name)"
+                                    : "选择 \(session.name)"
+                            )
                             Image(systemName: "rectangle.stack.fill")
                                 .foregroundStyle(.tint)
                             Text(session.name)
@@ -122,16 +149,133 @@ struct TmuxSessionBrowserView: View {
                                 dismiss()
                             }
                             .buttonStyle(.borderedProminent)
+                            .disabled(isTerminating)
                         }
                         .padding(.vertical, 4)
                     }
                     .listStyle(.inset)
+
+                    Divider()
+                    sessionManagementBar
                 }
             }
         }
         .frame(minWidth: 520, minHeight: 380)
         .task {
             await model.load()
+        }
+        .onChange(of: model.sessions) { _, sessions in
+            selectedSessionNames.formIntersection(Set(sessions.map(\.name)))
+        }
+        .confirmationDialog(
+            "终止 \(pendingTerminationNames.count) 个 tmux 会话？",
+            isPresented: Binding(
+                get: { !pendingTerminationNames.isEmpty },
+                set: { if !$0 { pendingTerminationNames = [] } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button(
+                "终止所选会话",
+                role: .destructive,
+                action: terminatePendingSessions
+            )
+            Button("取消", role: .cancel) {
+                pendingTerminationNames = []
+            }
+        } message: {
+            Text("会话内正在运行的任务会停止；引用这些会话的本地标签也会关闭。此操作无法撤销。")
+        }
+        .alert("tmux 批量操作", isPresented: Binding(
+            get: { terminationMessage != nil },
+            set: { if !$0 { terminationMessage = nil } }
+        )) {
+            Button("好", role: .cancel) {
+                terminationMessage = nil
+            }
+        } message: {
+            Text(terminationMessage ?? "操作未完成。")
+        }
+    }
+
+    private var sessionManagementBar: some View {
+        HStack(spacing: 10) {
+            Button("选择 App 会话", systemImage: "wand.and.stars") {
+                selectedSessionNames = managedSessionNames
+            }
+            .disabled(managedSessionNames.isEmpty || isTerminating)
+
+            Button(
+                allSessionsSelected
+                    ? "取消全选"
+                    : "全选",
+                systemImage: allSessionsSelected
+                    ? "circle"
+                    : "checkmark.circle"
+            ) {
+                if allSessionsSelected {
+                    selectedSessionNames = []
+                } else {
+                    selectedSessionNames = Set(model.sessions.map(\.name))
+                }
+            }
+            .disabled(model.sessions.isEmpty || isTerminating)
+
+            Spacer()
+            Text("已选择 \(selectedSessionNames.count) 个")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+
+            Button(role: .destructive) {
+                pendingTerminationNames = selectedSessionNames
+            } label: {
+                Label("终止所选", systemImage: "trash")
+            }
+            .disabled(selectedSessionNames.isEmpty || isTerminating)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.bar)
+    }
+
+    private var managedSessionNames: Set<String> {
+        Set(model.sessions.lazy.filter { $0.name.hasPrefix("mlz-") }.map(\.name))
+    }
+
+    private var allSessionsSelected: Bool {
+        !model.sessions.isEmpty
+            && selectedSessionNames.count == model.sessions.count
+    }
+
+    private func toggleSelection(_ name: String) {
+        if selectedSessionNames.contains(name) {
+            selectedSessionNames.remove(name)
+        } else {
+            selectedSessionNames.insert(name)
+        }
+    }
+
+    private func terminatePendingSessions() {
+        let names = pendingTerminationNames
+        pendingTerminationNames = []
+        guard !names.isEmpty else { return }
+        isTerminating = true
+
+        Task { @MainActor in
+            let result = await terminals.terminateTmuxSessions(
+                names,
+                target: model.target
+            )
+            model.removeSessions(named: result.succeeded)
+            selectedSessionNames.subtract(result.succeeded)
+            isTerminating = false
+
+            if !result.failed.isEmpty {
+                let failedNames = result.failed.sorted().joined(separator: "、")
+                terminationMessage = result.succeeded.isEmpty
+                    ? "未能终止：\(failedNames)。请刷新后重试。"
+                    : "已终止 \(result.succeeded.count) 个；以下会话失败：\(failedNames)。"
+            }
         }
     }
 
