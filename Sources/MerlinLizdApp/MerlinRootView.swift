@@ -10,7 +10,7 @@ struct MerlinRootView: View {
     var body: some View {
         NavigationSplitView {
             SidebarView(model: model, terminals: terminals)
-                .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 340)
+                .navigationSplitViewColumnWidth(min: 245, ideal: 285, max: 360)
         } detail: {
             VStack(spacing: 0) {
                 if !terminals.tabs.isEmpty {
