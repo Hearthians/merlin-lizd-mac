@@ -18,6 +18,20 @@ struct MerlinLizdApplication: App {
                     terminals.openLocal()
                 }
                 .keyboardShortcut("t", modifiers: [.command])
+
+                Divider()
+
+                Button("上一个标签页") {
+                    terminals.selectPreviousTab()
+                }
+                .keyboardShortcut(.leftArrow, modifiers: [.command, .shift])
+                .disabled(terminals.tabs.isEmpty)
+
+                Button("下一个标签页") {
+                    terminals.selectNextTab()
+                }
+                .keyboardShortcut(.rightArrow, modifiers: [.command, .shift])
+                .disabled(terminals.tabs.isEmpty)
             }
         }
     }
