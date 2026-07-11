@@ -8,6 +8,7 @@ struct TmuxSessionParserTests {
         let output = """
         mlz-shell
         external.train
+        wt: 1 windows (created Thu Jul  9 23:55:43 2026)
         warning: terminal database unavailable
         unsafe session
         mlz-shell
@@ -15,6 +16,6 @@ struct TmuxSessionParserTests {
 
         let sessions = TmuxSessionParser.parse(output)
 
-        #expect(sessions.map(\.name) == ["mlz-shell", "external.train"])
+        #expect(sessions.map(\.name) == ["mlz-shell", "external.train", "wt"])
     }
 }

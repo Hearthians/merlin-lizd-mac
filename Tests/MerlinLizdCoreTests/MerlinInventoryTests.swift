@@ -3,6 +3,20 @@ import Testing
 
 @Suite("Merlin inventory refresh")
 struct MerlinInventoryTests {
+    @Test("loads owner and shared Devbox roles concurrently")
+    func loadsDevboxRolesConcurrently() async throws {
+        let runner = RoleConcurrencyTrackingRunner()
+        let inventory = try MerlinInventory(
+            merlinCLIPath: "/Users/test/.merlin-cli/bin/merlin-cli",
+            processRunner: runner,
+            loadDevboxRolesConcurrently: true
+        )
+
+        _ = try await inventory.refresh(sshAliases: [])
+
+        #expect(await runner.maximumConcurrentCount() == 2)
+    }
+
     @Test("bounds concurrent child processes")
     func boundsConcurrentProcesses() async {
         let underlying = ConcurrencyTrackingProcessRunner()
@@ -64,7 +78,22 @@ struct MerlinInventoryTests {
 
         let snapshot = try await inventory.refresh(sshAliases: ["devbox_one", "devbox_two"])
 
-        #expect(snapshot.devboxes.map(\.workerStatus) == [.loaded, .loaded])
+        #expect(snapshot.devboxes.map(\.workerStatus) == [.notQueried, .notQueried])
+        let firstMachine = try #require(snapshot.devboxes.first)
+        let secondMachine = try #require(snapshot.devboxes.dropFirst().first)
+        let firstAlias = try #require(firstMachine.sshAlias)
+        let secondAlias = try #require(secondMachine.sshAlias)
+        async let first = inventory.loadWorkers(
+            for: firstMachine.devbox,
+            sshAlias: firstAlias
+        )
+        async let second = inventory.loadWorkers(
+            for: secondMachine.devbox,
+            sshAlias: secondAlias
+        )
+        let loaded = await [first, second]
+
+        #expect(loaded.map(\.workerStatus) == [.loaded, .loaded])
         #expect(await runner.maximumConcurrentWorkerLists() == 2)
     }
 
@@ -135,6 +164,7 @@ struct MerlinInventoryTests {
             id        cpu    mem    gpu    gpuType     podIP                                   port   createdAt            webshell
             3960209   100    240    0                  fdbd:dc02:2b:84e::37                    9221   2026-07-08T05:20:59  https://secret.invalid/signed-worker-url
             """,
+            "probe-ok",
         ])
         let inventory = try MerlinInventory(
             merlinCLIPath: "/Users/test/.merlin-cli/bin/merlin-cli",
@@ -143,11 +173,27 @@ struct MerlinInventoryTests {
 
         let snapshot = try await inventory.refresh(sshAliases: ["hl_gpu_2"])
 
-        let machine = try #require(snapshot.devboxes.first)
+        let discoveredMachine = try #require(snapshot.devboxes.first)
+        #expect(discoveredMachine.workerStatus == .notQueried)
+        #expect(discoveredMachine.workers.isEmpty)
+        #expect(await runner.recordedCommands().allSatisfy {
+            $0.arguments.last?.contains("mlx worker") != true
+        })
+
+        let machine = await inventory.loadWorkers(
+            for: discoveredMachine.devbox,
+            sshAlias: try #require(discoveredMachine.sshAlias)
+        )
         #expect(machine.sshAlias == "hl_gpu_2")
         #expect(machine.workerStatus == .loaded)
         #expect(machine.workers.map(\.id) == ["3960209"])
-        let persistedDescription = String(reflecting: snapshot)
+        #expect(machine.workers.map(\.readiness) == [.listed])
+        let readiness = await inventory.probeWorker(
+            sshAlias: "hl_gpu_2",
+            workerID: "3960209"
+        )
+        #expect(readiness == .ready)
+        let persistedDescription = String(reflecting: (snapshot, machine))
         #expect(!persistedDescription.contains("secret-proxy"))
         #expect(!persistedDescription.contains("fdbd:dc02:2b:84e::37"))
         #expect(!persistedDescription.contains("signed-worker-url"))
@@ -167,6 +213,11 @@ struct MerlinInventoryTests {
             "hl_gpu_2",
             "NO_COLOR=1 TERM=dumb mlx worker list --limit 100 --offset 0",
         ])
+        let probeCommand = try #require(commands.first {
+            $0.arguments.last?.contains("mlx worker login 3960209 -- true") == true
+        })
+        #expect(probeCommand.arguments.last ==
+            "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- true")
     }
 
     @Test("rejects an unsafe alias before launching ssh")
@@ -208,8 +259,13 @@ struct MerlinInventoryTests {
         )
 
         let snapshot = try await inventory.refresh(sshAliases: ["hl_gpu_2"])
+        let discoveredMachine = try #require(snapshot.devboxes.first)
+        let machine = await inventory.loadWorkers(
+            for: discoveredMachine.devbox,
+            sshAlias: try #require(discoveredMachine.sshAlias)
+        )
 
-        #expect(snapshot.devboxes[0].workers.map(\.id) == ["3960209"])
+        #expect(machine.workers.map(\.id) == ["3960209"])
         let commands = await runner.recordedCommands().filter {
             $0.arguments.last?.contains("mlx worker list") == true
         }
@@ -295,6 +351,33 @@ private actor ConcurrencyTrackingProcessRunner: InventoryProcessRunning {
         try await Task.sleep(nanoseconds: 20_000_000)
         active -= 1
         return InventoryProcessOutput(stdout: "", stderr: "", exitCode: 0)
+    }
+
+    func maximumConcurrentCount() -> Int {
+        maximumActive
+    }
+}
+
+private actor RoleConcurrencyTrackingRunner: InventoryProcessRunning {
+    private var active = 0
+    private var maximumActive = 0
+
+    func run(_ command: CommandSpec) async throws -> InventoryProcessOutput {
+        active += 1
+        maximumActive = max(maximumActive, active)
+        try await Task.sleep(for: .milliseconds(20))
+        active -= 1
+        return InventoryProcessOutput(
+            stdout: """
+            {
+              "ResponseBase": {"code": 0, "message": "success"},
+              "data": [],
+              "pagination": {"page_size": 100}
+            }
+            """,
+            stderr: "",
+            exitCode: 0
+        )
     }
 
     func maximumConcurrentCount() -> Int {

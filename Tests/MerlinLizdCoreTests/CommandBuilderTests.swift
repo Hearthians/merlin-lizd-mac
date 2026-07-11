@@ -3,6 +3,34 @@ import Testing
 
 @Suite("Terminal command routing")
 struct CommandBuilderTests {
+    @Test("renders argv as one shell command without evaluating metacharacters")
+    func safelyRendersArgumentArray() throws {
+        let rendered = try ShellCommandRenderer.render(CommandSpec(
+            executable: "/usr/bin/printf",
+            arguments: ["%s", "it's $(not-a-command); $HOME"]
+        ))
+
+        #expect(rendered ==
+            #"'/usr/bin/printf' '%s' 'it'\''s $(not-a-command); $HOME'"#)
+    }
+
+    @Test("passes the rendered command to osascript as argv")
+    func buildsExternalTerminalLaunchCommand() throws {
+        let launch = try ExternalTerminalLauncher.command(
+            for: CommandSpec(
+                executable: "/usr/bin/ssh",
+                arguments: ["hl_gpu_2", "echo $HOME"]
+            )
+        )
+
+        #expect(launch.executable == "/usr/bin/osascript")
+        #expect(launch.arguments.suffix(2) == [
+            "--",
+            "'/usr/bin/ssh' 'hl_gpu_2' 'echo $HOME'",
+        ])
+        #expect(!launch.arguments.dropLast().contains { $0.contains("hl_gpu_2") })
+    }
+
     @Test("a Worker terminal enters through its parent Devbox and resumes tmux")
     func buildsWorkerTerminalCommand() throws {
         let command = try MerlinCommands.workerTerminal(
@@ -88,7 +116,48 @@ struct CommandBuilderTests {
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=10",
             "hl_gpu_2",
-            "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- tmux list-sessions -F '#{session_name}'"
+            "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- tmux list-sessions -F#{session_name}"
         ])
+    }
+
+    @Test("renames the selected Worker tmux session through its parent Devbox")
+    func buildsWorkerTmuxRenameCommand() throws {
+        let command = try MerlinCommands.renameTmuxSession(
+            target: .worker(
+                devboxSID: "dbx_135679",
+                devboxName: "wt_hl",
+                alias: "hl_gpu_2",
+                workerID: "3960209"
+            ),
+            from: "mlz-old",
+            to: "training-main"
+        )
+
+        #expect(command.arguments.last ==
+            "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- tmux rename-session -t mlz-old training-main")
+    }
+
+    @Test("rejects shell syntax in either tmux rename operand")
+    func rejectsUnsafeTmuxRename() {
+        let target = TerminalTarget.devbox(
+            sid: "dbx_135679",
+            name: "wt_hl",
+            alias: "hl_gpu_2"
+        )
+
+        #expect(throws: CommandValidationError.invalidSessionName) {
+            try MerlinCommands.renameTmuxSession(
+                target: target,
+                from: "mlz-old;id",
+                to: "training-main"
+            )
+        }
+        #expect(throws: CommandValidationError.invalidSessionName) {
+            try MerlinCommands.renameTmuxSession(
+                target: target,
+                from: "mlz-old",
+                to: "$(touch-pwned)"
+            )
+        }
     }
 }

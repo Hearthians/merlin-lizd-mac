@@ -10,8 +10,14 @@ public enum MerlinInventoryError: Error, Equatable, Sendable {
 }
 
 public actor MerlinInventory {
+    private struct InFlightRefresh {
+        let generation: UUID
+        let task: Task<InventorySnapshot, Error>
+    }
+
     private let loader: InventoryLoader
-    private var inFlightRefresh: Task<InventorySnapshot, Error>?
+    private let workerLoader: InventoryLoader
+    private var inFlightRefresh: InFlightRefresh?
 
     public init(maxConcurrentProcesses: Int = 4) throws {
         guard maxConcurrentProcesses > 0 else {
@@ -19,13 +25,31 @@ public actor MerlinInventory {
         }
         let merlinCLIPath = try MerlinCLIResolver.resolve()
         let processRunner = BoundedInventoryProcessRunner(
+            maxConcurrentProcesses: 2,
+            underlying: TimedInventoryProcessRunner(
+                timeout: .seconds(20),
+                underlying: FoundationInventoryProcessRunner()
+            )
+        )
+        let workerProcessRunner = BoundedInventoryProcessRunner(
             maxConcurrentProcesses: maxConcurrentProcesses,
-            underlying: FoundationInventoryProcessRunner()
+            underlying: TimedInventoryProcessRunner(
+                timeout: .seconds(45),
+                underlying: FoundationInventoryProcessRunner()
+            )
         )
         self.loader = InventoryLoader(
             merlinCLIPath: merlinCLIPath,
             processRunner: processRunner,
             workerPageSize: 100,
+            loadDevboxRolesConcurrently: true,
+            now: Date.init
+        )
+        self.workerLoader = InventoryLoader(
+            merlinCLIPath: merlinCLIPath,
+            processRunner: workerProcessRunner,
+            workerPageSize: 100,
+            loadDevboxRolesConcurrently: true,
             now: Date.init
         )
     }
@@ -34,6 +58,7 @@ public actor MerlinInventory {
         merlinCLIPath: String,
         processRunner: any InventoryProcessRunning,
         workerPageSize: Int = 100,
+        loadDevboxRolesConcurrently: Bool = false,
         now: @escaping @Sendable () -> Date = Date.init
     ) throws {
         guard merlinCLIPath.hasPrefix("/") else {
@@ -46,6 +71,14 @@ public actor MerlinInventory {
             merlinCLIPath: merlinCLIPath,
             processRunner: processRunner,
             workerPageSize: workerPageSize,
+            loadDevboxRolesConcurrently: loadDevboxRolesConcurrently,
+            now: now
+        )
+        self.workerLoader = InventoryLoader(
+            merlinCLIPath: merlinCLIPath,
+            processRunner: processRunner,
+            workerPageSize: workerPageSize,
+            loadDevboxRolesConcurrently: loadDevboxRolesConcurrently,
             now: now
         )
     }
@@ -54,23 +87,67 @@ public actor MerlinInventory {
     /// refresh only after the current one has completed.
     public func refresh(sshAliases: [String]) async throws -> InventorySnapshot {
         if let inFlightRefresh {
-            return try await inFlightRefresh.value
+            return try await inFlightRefresh.task.value
         }
 
         let loader = self.loader
+        let generation = UUID()
         let task = Task {
             try await loader.load(sshAliases: sshAliases)
         }
-        inFlightRefresh = task
+        inFlightRefresh = InFlightRefresh(generation: generation, task: task)
 
         do {
             let snapshot = try await task.value
-            inFlightRefresh = nil
+            clearRefresh(generation: generation)
             return snapshot
         } catch {
-            inFlightRefresh = nil
+            clearRefresh(generation: generation)
             throw error
         }
+    }
+
+    /// Readiness is intentionally separate from inventory refresh: entering a
+    /// Worker can spend several seconds in mlx setup, so callers can display
+    /// the machine tree first and merge this result in the background.
+    public func probeWorker(
+        sshAlias: String,
+        workerID: String
+    ) async -> WorkerReadiness {
+        guard
+            MerlinIdentifierValidator.isSSHAlias(sshAlias),
+            MerlinIdentifierValidator.isWorkerID(workerID)
+        else {
+            return .unreachable
+        }
+        return await workerLoader.probeWorkerReadiness(
+            workerID: workerID,
+            alias: sshAlias
+        )
+    }
+
+    /// Worker listing is also isolated from the Devbox inventory so a slow
+    /// SSH/mlx call cannot keep the whole machine tree in a loading state.
+    public func loadWorkers(
+        for devbox: Devbox,
+        sshAlias: String
+    ) async -> DevboxInventory {
+        guard MerlinIdentifierValidator.isSSHAlias(sshAlias) else {
+            return DevboxInventory(devbox: devbox)
+        }
+        guard devbox.status.isRunning else {
+            return DevboxInventory(devbox: devbox, sshAlias: sshAlias)
+        }
+        return await workerLoader.loadWorkers(for: devbox, alias: sshAlias)
+    }
+
+    private func clearRefresh(generation: UUID) {
+        // Keep cleanup tied to the task that installed the slot. This remains
+        // safe if refresh sharing later gains additional cleanup paths.
+        guard inFlightRefresh?.generation == generation else {
+            return
+        }
+        inFlightRefresh = nil
     }
 }
 
@@ -78,35 +155,31 @@ private struct InventoryLoader: Sendable {
     let merlinCLIPath: String
     let processRunner: any InventoryProcessRunning
     let workerPageSize: Int
+    let loadDevboxRolesConcurrently: Bool
     let now: @Sendable () -> Date
 
     func load(sshAliases: [String]) async throws -> InventorySnapshot {
-        var devboxes: [Devbox] = []
-        for role in ["OWNER", "SHARED"] {
-            devboxes.append(contentsOf: try await loadDevboxes(accessRole: role))
+        let devboxes: [Devbox]
+        if loadDevboxRolesConcurrently {
+            async let owner = loadDevboxes(accessRole: "OWNER")
+            async let shared = loadDevboxes(accessRole: "SHARED")
+            devboxes = try await owner + shared
+        } else {
+            var sequential: [Devbox] = []
+            for role in ["OWNER", "SHARED"] {
+                sequential.append(contentsOf: try await loadDevboxes(accessRole: role))
+            }
+            devboxes = sequential
         }
 
         var seen: Set<String> = []
         let unique = devboxes.filter { seen.insert($0.sid).inserted }
-        let aliasesBySID = await resolveAliases(sshAliases)
-        let inventory = await withTaskGroup(
-            of: (Int, DevboxInventory).self,
-            returning: [DevboxInventory].self
-        ) { group in
-            for (index, devbox) in unique.enumerated() {
-                let alias = aliasesBySID[devbox.sid]
-                group.addTask {
-                    guard devbox.status.lowercased() == "running", let alias else {
-                        return (index, DevboxInventory(devbox: devbox, sshAlias: alias))
-                    }
-                    return (index, await loadWorkers(for: devbox, alias: alias))
-                }
-            }
-            var results: [(Int, DevboxInventory)] = []
-            for await result in group {
-                results.append(result)
-            }
-            return results.sorted { $0.0 < $1.0 }.map(\.1)
+        let aliasesBySID = await resolveAliases(sshAliases, devboxes: unique)
+        let inventory = unique.map { devbox in
+            DevboxInventory(
+                devbox: devbox,
+                sshAlias: aliasesBySID[devbox.sid]
+            )
         }
         return InventorySnapshot(
             devboxes: inventory,
@@ -114,29 +187,56 @@ private struct InventoryLoader: Sendable {
         )
     }
 
-    private func resolveAliases(_ aliases: [String]) async -> [String: String] {
+    private func resolveAliases(
+        _ aliases: [String],
+        devboxes: [Devbox]
+    ) async -> [String: String] {
         var result: [String: String] = [:]
-        for alias in aliases where Self.isValidAlias(alias) {
+        let knownSIDs = Set(devboxes.map(\.sid))
+        let devboxesByNormalizedName = Dictionary(
+            grouping: devboxes,
+            by: { $0.name.lowercased() }
+        )
+
+        for alias in aliases where MerlinIdentifierValidator.isSSHAlias(alias) {
             let command = CommandSpec(
                 executable: "/usr/bin/ssh",
                 arguments: ["-G", alias]
             )
             guard
                 let output = try? await processRunner.run(command),
-                output.exitCode == 0,
-                let sid = Self.devboxSID(fromSSHConfiguration: output.stdout),
-                result[sid] == nil
+                output.exitCode == 0
             else {
                 continue
             }
-            result[sid] = alias
+
+            if
+                let sid = Self.devboxSID(fromSSHConfiguration: output.stdout),
+                knownSIDs.contains(sid),
+                result[sid] == nil
+            {
+                result[sid] = alias
+                continue
+            }
+
+            // Some SSH aliases do not encode the Devbox SID in `User`. Fall
+            // back only when the alias exactly names one unique Devbox, so a
+            // broad SSH config entry cannot silently route the wrong machine.
+            let nameMatches = devboxesByNormalizedName[alias.lowercased()] ?? []
+            if
+                nameMatches.count == 1,
+                let sid = nameMatches.first?.sid,
+                result[sid] == nil
+            {
+                result[sid] = alias
+            }
         }
         return result
     }
 
-    private func loadWorkers(for devbox: Devbox, alias: String) async -> DevboxInventory {
+    func loadWorkers(for devbox: Devbox, alias: String) async -> DevboxInventory {
         var offset = 0
-        var workers: [WorkerInventoryRecord] = []
+        var workers: [Worker] = []
 
         while true {
             let command = CommandSpec(
@@ -157,7 +257,7 @@ private struct InventoryLoader: Sendable {
                 return DevboxInventory(
                     devbox: devbox,
                     sshAlias: alias,
-                    workers: workers,
+                    workers: workers.map(WorkerInventoryRecord.init(worker:)),
                     workerStatus: .failed(.transport)
                 )
             }
@@ -165,7 +265,7 @@ private struct InventoryLoader: Sendable {
                 return DevboxInventory(
                     devbox: devbox,
                     sshAlias: alias,
-                    workers: workers,
+                    workers: workers.map(WorkerInventoryRecord.init(worker:)),
                     workerStatus: .failed(.commandFailed(exitCode: output.exitCode))
                 )
             }
@@ -177,11 +277,11 @@ private struct InventoryLoader: Sendable {
                 return DevboxInventory(
                     devbox: devbox,
                     sshAlias: alias,
-                    workers: workers,
+                    workers: workers.map(WorkerInventoryRecord.init(worker:)),
                     workerStatus: .failed(.malformedOutput)
                 )
             }
-            workers.append(contentsOf: page.map(WorkerInventoryRecord.init(worker:)))
+            workers.append(contentsOf: page)
             guard page.count == workerPageSize else { break }
             offset += workerPageSize
         }
@@ -189,9 +289,37 @@ private struct InventoryLoader: Sendable {
         return DevboxInventory(
             devbox: devbox,
             sshAlias: alias,
-            workers: workers,
+            workers: workers.map(WorkerInventoryRecord.init(worker:)),
             workerStatus: .loaded
         )
+    }
+
+    func probeWorkerReadiness(
+        workerID: String,
+        alias: String
+    ) async -> WorkerReadiness {
+        let command = CommandSpec(
+            executable: "/usr/bin/ssh",
+            arguments: [
+                "-nT",
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=10",
+                alias,
+                "NO_COLOR=1 TERM=dumb mlx worker login \(workerID) -- true",
+            ]
+        )
+        do {
+            let output = try await processRunner.run(command)
+            let evidence = (output.stdout + "\n" + output.stderr).lowercased()
+            if evidence.contains("worker has not been ready")
+                || evidence.contains("worker is not ready")
+            {
+                return .notReady
+            }
+            return output.exitCode == 0 ? .ready : .unreachable
+        } catch {
+            return .unreachable
+        }
     }
 
     private func loadDevboxes(accessRole: String) async throws -> [Devbox] {
@@ -238,16 +366,6 @@ private struct InventoryLoader: Sendable {
                 "--json", body,
             ]
         )
-    }
-
-    private static func isValidAlias(_ value: String) -> Bool {
-        guard let match = value.range(
-            of: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"#,
-            options: .regularExpression
-        ) else {
-            return false
-        }
-        return match == value.startIndex..<value.endIndex
     }
 
     private static func devboxSID(fromSSHConfiguration output: String) -> String? {

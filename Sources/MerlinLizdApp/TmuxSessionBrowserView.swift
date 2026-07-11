@@ -8,10 +8,16 @@ final class TmuxSessionBrowserModel: ObservableObject {
     @Published private(set) var errorMessage: String?
 
     let target: TerminalTarget
-    private let discovery = TmuxSessionDiscovery()
+    private let discovery: TmuxSessionDiscovery
 
-    init(target: TerminalTarget) {
+    init(
+        target: TerminalTarget,
+        discovery: TmuxSessionDiscovery,
+        initialSessions: [TmuxSessionRecord]
+    ) {
         self.target = target
+        self.discovery = discovery
+        sessions = initialSessions
     }
 
     func load() async {
@@ -20,6 +26,12 @@ final class TmuxSessionBrowserModel: ObservableObject {
         defer { isLoading = false }
 
         do {
+            if let cached = await discovery.cached(target: target) {
+                var seen: Set<String> = []
+                sessions = (sessions + cached).filter {
+                    seen.insert($0.name).inserted
+                }
+            }
             sessions = try await discovery.list(target: target)
             errorMessage = nil
         } catch TmuxSessionDiscoveryError.workerNotReady {
@@ -38,7 +50,11 @@ struct TmuxSessionBrowserView: View {
     @Environment(\.dismiss) private var dismiss
 
     init(target: TerminalTarget, terminals: TerminalTabsModel) {
-        _model = StateObject(wrappedValue: TmuxSessionBrowserModel(target: target))
+        _model = StateObject(wrappedValue: TmuxSessionBrowserModel(
+            target: target,
+            discovery: terminals.tmuxSessionDiscovery,
+            initialSessions: terminals.knownTmuxSessions(for: target)
+        ))
         self.terminals = terminals
     }
 
@@ -51,6 +67,11 @@ struct TmuxSessionBrowserView: View {
                     Text(targetLabel)
                         .font(.caption.monospaced())
                         .foregroundStyle(.secondary)
+                    if model.isLoading {
+                        Text("正在核对远端；mlx 冷启动最长约 45 秒")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 Spacer()
                 if model.isLoading {
@@ -70,36 +91,42 @@ struct TmuxSessionBrowserView: View {
 
             Divider()
 
-            if let errorMessage = model.errorMessage {
+            if let errorMessage = model.errorMessage, model.sessions.isEmpty {
                 MessageBanner(text: errorMessage, kind: .error)
                     .padding()
             } else if !model.isLoading && model.sessions.isEmpty {
                 ContentUnavailableView(
                     "没有 tmux 会话",
                     systemImage: "rectangle.stack",
-                    description: Text("打开新终端时，App 会自动创建一个可恢复的会话。")
+                    description: Text(emptyStateDescription)
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                List(model.sessions) { session in
-                    HStack {
-                        Image(systemName: "rectangle.stack.fill")
-                            .foregroundStyle(.tint)
-                        Text(session.name)
-                            .font(.body.monospaced())
-                        Spacer()
-                        Button("接入") {
-                            terminals.attachExistingSession(
-                                session.name,
-                                target: model.target
-                            )
-                            dismiss()
-                        }
-                        .buttonStyle(.borderedProminent)
+                VStack(spacing: 0) {
+                    if let errorMessage = model.errorMessage {
+                        MessageBanner(text: errorMessage, kind: .error)
+                            .padding()
                     }
-                    .padding(.vertical, 4)
+                    List(model.sessions) { session in
+                        HStack {
+                            Image(systemName: "rectangle.stack.fill")
+                                .foregroundStyle(.tint)
+                            Text(session.name)
+                                .font(.body.monospaced())
+                            Spacer()
+                            Button("接入") {
+                                terminals.attachExistingSession(
+                                    session.name,
+                                    target: model.target
+                                )
+                                dismiss()
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                        .padding(.vertical, 4)
+                    }
+                    .listStyle(.inset)
                 }
-                .listStyle(.inset)
             }
         }
         .frame(minWidth: 520, minHeight: 380)
@@ -116,6 +143,15 @@ struct TmuxSessionBrowserView: View {
             "\(alias) · \(name)"
         case let .worker(_, _, alias, workerID):
             "\(alias) · Worker \(workerID)"
+        }
+    }
+
+    private var emptyStateDescription: String {
+        switch model.target {
+        case .local:
+            "本机尚无可接入的 tmux 会话；“打开终端”会启动普通登录 shell。"
+        case .devbox, .worker:
+            "打开新终端时，App 会自动创建一个可恢复的会话。"
         }
     }
 }

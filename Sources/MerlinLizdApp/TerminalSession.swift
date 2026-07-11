@@ -1,10 +1,11 @@
 import Darwin
+import Combine
 import Foundation
 import MerlinLizdCore
 @preconcurrency import SwiftTerm
 
 @MainActor
-final class TerminalSession: Identifiable, LocalProcessTerminalViewDelegate {
+final class TerminalSession: ObservableObject, Identifiable, LocalProcessTerminalViewDelegate {
     enum State: Equatable {
         case idle
         case running
@@ -21,7 +22,7 @@ final class TerminalSession: Identifiable, LocalProcessTerminalViewDelegate {
     private let command: CommandSpec
     private let currentDirectory: String?
 
-    private(set) var state: State = .idle
+    @Published private(set) var state: State = .idle
     private(set) var title: String?
     private(set) var hasStarted = false
     private var didReportExit = false

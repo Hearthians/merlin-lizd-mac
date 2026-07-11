@@ -15,9 +15,10 @@ public enum TmuxSessionParser {
         return output
             .split(whereSeparator: \Character.isNewline)
             .compactMap { rawLine -> TmuxSessionRecord? in
-                let name = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+                let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+                let name = sessionName(from: line)
                 guard
-                    isAttachable(name),
+                    let name,
                     seen.insert(name).inserted
                 else {
                     return nil
@@ -27,12 +28,24 @@ public enum TmuxSessionParser {
     }
 
     public static func isAttachable(_ value: String) -> Bool {
-        guard let match = value.range(
-            of: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"#,
-            options: .regularExpression
-        ) else {
-            return false
+        MerlinIdentifierValidator.isTmuxSessionName(value)
+    }
+
+    private static func sessionName(from line: String) -> String? {
+        if isAttachable(line) {
+            return line
         }
-        return match == value.startIndex..<value.endIndex
+
+        // Older mlx Worker login paths can drop tmux's -F option and return
+        // its default `name: N windows (...)` line. Recognize that exact shape
+        // rather than silently reporting an empty server.
+        guard
+            let colon = line.firstIndex(of: ":"),
+            line[line.index(after: colon)...].contains(" window")
+        else {
+            return nil
+        }
+        let candidate = String(line[..<colon])
+        return isAttachable(candidate) ? candidate : nil
     }
 }

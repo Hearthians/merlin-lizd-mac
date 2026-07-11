@@ -19,6 +19,49 @@ public enum CommandValidationError: Error, Equatable, Sendable {
 }
 
 public enum MerlinCommands {
+    public static func renameTmuxSession(
+        target: TerminalTarget,
+        from currentName: String,
+        to newName: String,
+        localTmuxPath: String = "/opt/homebrew/bin/tmux"
+    ) throws -> CommandSpec {
+        try validateSessionName(currentName)
+        try validateSessionName(newName)
+
+        let tmuxArguments = [
+            "rename-session", "-t", currentName, newName,
+        ]
+        switch target {
+        case .local:
+            guard localTmuxPath.hasPrefix("/") else {
+                throw CommandValidationError.invalidExecutablePath
+            }
+            return CommandSpec(
+                executable: localTmuxPath,
+                arguments: tmuxArguments
+            )
+        case let .devbox(_, _, alias):
+            try validateAlias(alias)
+            return CommandSpec(
+                executable: "/usr/bin/ssh",
+                arguments: nonInteractiveSSHArguments(
+                    alias: alias,
+                    remoteCommand: "tmux rename-session -t \(currentName) \(newName)"
+                )
+            )
+        case let .worker(_, _, alias, workerID):
+            try validateAlias(alias)
+            try validateWorkerID(workerID)
+            return CommandSpec(
+                executable: "/usr/bin/ssh",
+                arguments: nonInteractiveSSHArguments(
+                    alias: alias,
+                    remoteCommand: "NO_COLOR=1 TERM=dumb mlx worker login \(workerID) -- tmux rename-session -t \(currentName) \(newName)"
+                )
+            )
+        }
+    }
+
     public static func listTmuxSessions(
         target: TerminalTarget,
         localTmuxPath: String = "/opt/homebrew/bin/tmux"
@@ -36,7 +79,7 @@ public enum MerlinCommands {
                 executable: "/usr/bin/ssh",
                 arguments: nonInteractiveSSHArguments(
                     alias: alias,
-                    remoteCommand: "tmux list-sessions -F '#{session_name}'"
+                    remoteCommand: "tmux list-sessions -F#{session_name}"
                 )
             )
         case let .worker(_, _, alias, workerID):
@@ -46,7 +89,10 @@ public enum MerlinCommands {
                 executable: "/usr/bin/ssh",
                 arguments: nonInteractiveSSHArguments(
                     alias: alias,
-                    remoteCommand: "NO_COLOR=1 TERM=dumb mlx worker login \(workerID) -- tmux list-sessions -F '#{session_name}'"
+                    // mlx reconstructs its remote command without preserving
+                    // quoting. Keeping the format attached to -F prevents the
+                    // leading # from becoming a shell comment.
+                    remoteCommand: "NO_COLOR=1 TERM=dumb mlx worker login \(workerID) -- tmux list-sessions -F#{session_name}"
                 )
             )
         }
@@ -62,7 +108,7 @@ public enum MerlinCommands {
         else {
             throw CommandValidationError.invalidExecutablePath
         }
-        guard matches(sid, pattern: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"#) else {
+        guard MerlinIdentifierValidator.isDevboxSID(sid) else {
             throw CommandValidationError.invalidSID
         }
 
@@ -141,28 +187,21 @@ public enum MerlinCommands {
     }
 
     private static func validateAlias(_ value: String) throws {
-        guard matches(value, pattern: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"#) else {
+        guard MerlinIdentifierValidator.isSSHAlias(value) else {
             throw CommandValidationError.invalidAlias
         }
     }
 
     private static func validateWorkerID(_ value: String) throws {
-        guard matches(value, pattern: #"^[0-9]+$"#) else {
+        guard MerlinIdentifierValidator.isWorkerID(value) else {
             throw CommandValidationError.invalidWorkerID
         }
     }
 
     private static func validateSessionName(_ value: String) throws {
-        guard matches(value, pattern: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"#) else {
+        guard MerlinIdentifierValidator.isTmuxSessionName(value) else {
             throw CommandValidationError.invalidSessionName
         }
-    }
-
-    private static func matches(_ value: String, pattern: String) -> Bool {
-        guard let range = value.range(of: pattern, options: .regularExpression) else {
-            return false
-        }
-        return range == value.startIndex..<value.endIndex
     }
 
     private struct StartPayload: Encodable {

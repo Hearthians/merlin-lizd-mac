@@ -5,6 +5,11 @@ development machines and their workers. It uses the existing Merlin CLI login,
 system SSH configuration, and remote `mlx`/`tmux` tools; it does not store SSH
 passwords or Merlin tokens itself.
 
+Machine data uses stale-while-revalidate behavior: the last safe snapshot is
+shown immediately, while Devboxes, Worker lists, and Worker readiness refresh
+in separate background stages. The snapshot deliberately excludes Pod IPs,
+ports, webshell URLs, ProxyCommand text, raw command output, and credentials.
+
 ## Requirements
 
 - macOS 14 or newer on Apple Silicon
