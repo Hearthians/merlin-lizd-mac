@@ -37,6 +37,9 @@ CONTENTS="$STAGED_APP/Contents"
 /usr/bin/install -m 0644 \
     "$PROJECT_ROOT/Vendor/SwiftTerm/Sources/SwiftTerm/Apple/Metal/Shaders.metal" \
     "$CONTENTS/Resources/Shaders.metal"
+/usr/bin/install -m 0644 \
+    "$PROJECT_ROOT/Assets/AppIcon.icns" \
+    "$CONTENTS/Resources/AppIcon.icns"
 
 # The vendored SwiftTerm build reads its shader from Bundle.main, so the app can
 # use the standard resource layout and receive a valid local ad-hoc signature.
