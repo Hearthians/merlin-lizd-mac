@@ -76,6 +76,33 @@ struct TmuxSessionDiscoveryTests {
                 == ["new-name", "other"]
         )
     }
+
+    @Test("removes terminated sessions without refreshing cache age")
+    func recordsTermination() async throws {
+        let runner = TmuxScriptedRunner(
+            output: InventoryProcessOutput(
+                stdout: "one\ntwo\nthree\n",
+                stderr: "",
+                exitCode: 0
+            )
+        )
+        let discovery = TmuxSessionDiscovery(processRunner: runner)
+        let target = TerminalTarget.devbox(
+            sid: "dbx_135679",
+            name: "wt_hl",
+            alias: "hl_gpu_2"
+        )
+
+        _ = try await discovery.list(target: target)
+        await discovery.recordTermination(
+            target: target,
+            sessionNames: ["one", "three"]
+        )
+
+        #expect(
+            await discovery.cached(target: target)?.map(\.name) == ["two"]
+        )
+    }
 }
 
 private actor TmuxScriptedRunner: InventoryProcessRunning {

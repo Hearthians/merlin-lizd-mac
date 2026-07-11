@@ -49,6 +49,29 @@ struct TmuxSessionControllerTests {
             )
         }
     }
+
+    @Test("terminates through the target-specific safe command")
+    func terminatesWorkerSession() async throws {
+        let runner = MutationRecordingRunner(output: InventoryProcessOutput(
+            stdout: "",
+            stderr: "",
+            exitCode: 0
+        ))
+        let controller = TmuxSessionController(processRunner: runner)
+
+        try await controller.terminate(
+            target: .worker(
+                devboxSID: "dbx_135679",
+                devboxName: "wt_hl",
+                alias: "hl_gpu_2",
+                workerID: "3960209"
+            ),
+            sessionName: "mlz-finished-run"
+        )
+
+        #expect(await runner.lastCommand()?.arguments.last ==
+            "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- tmux kill-session -t mlz-finished-run")
+    }
 }
 
 private actor MutationRecordingRunner: InventoryProcessRunning {

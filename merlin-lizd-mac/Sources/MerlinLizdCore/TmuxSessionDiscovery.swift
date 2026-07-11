@@ -111,4 +111,17 @@ public actor TmuxSessionDiscovery {
             fetchedAt: entry.fetchedAt
         )
     }
+
+    public func recordTermination(
+        target: TerminalTarget,
+        sessionNames: Set<String>
+    ) {
+        guard !sessionNames.isEmpty, let entry = cache[target] else { return }
+        cache[target] = CacheEntry(
+            sessions: entry.sessions.filter {
+                !sessionNames.contains($0.name)
+            },
+            fetchedAt: entry.fetchedAt
+        )
+    }
 }

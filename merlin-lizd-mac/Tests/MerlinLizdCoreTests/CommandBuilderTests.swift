@@ -137,6 +137,36 @@ struct CommandBuilderTests {
             "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- tmux rename-session -t mlz-old training-main")
     }
 
+    @Test("terminates one Worker tmux session through its parent Devbox")
+    func buildsWorkerTmuxTerminationCommand() throws {
+        let command = try MerlinCommands.terminateTmuxSession(
+            target: .worker(
+                devboxSID: "dbx_135679",
+                devboxName: "wt_hl",
+                alias: "hl_gpu_2",
+                workerID: "3960209"
+            ),
+            sessionName: "mlz-finished-run"
+        )
+
+        #expect(command.arguments.last ==
+            "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- tmux kill-session -t mlz-finished-run")
+    }
+
+    @Test("rejects shell syntax in a tmux termination target")
+    func rejectsUnsafeTmuxTermination() {
+        #expect(throws: CommandValidationError.invalidSessionName) {
+            try MerlinCommands.terminateTmuxSession(
+                target: .devbox(
+                    sid: "dbx_135679",
+                    name: "wt_hl",
+                    alias: "hl_gpu_2"
+                ),
+                sessionName: "mlz-old;rm"
+            )
+        }
+    }
+
     @Test("rejects shell syntax in either tmux rename operand")
     func rejectsUnsafeTmuxRename() {
         let target = TerminalTarget.devbox(
