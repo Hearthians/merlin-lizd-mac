@@ -190,4 +190,119 @@ struct CommandBuilderTests {
             )
         }
     }
+
+    @Test("samples Worker metrics through the alias and mlx route only")
+    func buildsWorkerMetricsCommand() throws {
+        let command = try MerlinCommands.sampleWorkerMetrics(
+            target: .worker(
+                devboxSID: "dbx_135679",
+                devboxName: "wt_hl",
+                alias: "hl_gpu_2",
+                workerID: "3966762"
+            )
+        )
+
+        #expect(command.executable == "/usr/bin/ssh")
+        #expect(command.arguments.dropLast() == [
+            "-nT",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=10",
+            "hl_gpu_2",
+        ])
+        let remoteCommand = try #require(command.arguments.last)
+        #expect(remoteCommand.hasPrefix(
+            "NO_COLOR=1 TERM=dumb mlx worker login 3966762 -- export LC_ALL=C \\;"
+        ))
+        #expect(remoteCommand.contains("head -n 1 /proc/stat"))
+        #expect(remoteCommand.contains("cat /proc/meminfo"))
+        #expect(remoteCommand.contains("/sys/fs/cgroup/cpu,cpuacct/cpuacct.usage"))
+        #expect(remoteCommand.contains("/sys/fs/cgroup/memory/memory.usage_in_bytes"))
+        #expect(remoteCommand.contains("/sys/fs/cgroup/cpu.stat"))
+        #expect(remoteCommand.contains("/sys/fs/cgroup/memory.current"))
+        #expect(remoteCommand.contains("nvidia-smi --query-gpu="))
+        #expect(remoteCommand.contains("__MERLIN_LIZD_METRICS_V1_END__"))
+        #expect(!remoteCommand.contains("podIP"))
+        #expect(!remoteCommand.contains("ProxyCommand"))
+        #expect(!remoteCommand.contains("9221"))
+    }
+
+    @Test("metrics sampling rejects non-Worker and unsafe Worker targets")
+    func rejectsUnsafeMetricsTargets() {
+        #expect(throws: CommandValidationError.workerTargetRequired) {
+            try MerlinCommands.sampleWorkerMetrics(target: .local)
+        }
+        #expect(throws: CommandValidationError.invalidAlias) {
+            try MerlinCommands.sampleWorkerMetrics(
+                target: .worker(
+                    devboxSID: "dbx_135679",
+                    devboxName: "wt_hl",
+                    alias: "hl_gpu_2;id",
+                    workerID: "3966762"
+                )
+            )
+        }
+        #expect(throws: CommandValidationError.invalidWorkerID) {
+            try MerlinCommands.sampleWorkerMetrics(
+                target: .worker(
+                    devboxSID: "dbx_135679",
+                    devboxName: "wt_hl",
+                    alias: "hl_gpu_2",
+                    workerID: "3966762;id"
+                )
+            )
+        }
+    }
+
+    @Test("builds a persistent metrics loop with keepalives and complete envelopes")
+    func buildsWorkerMetricsStreamCommand() throws {
+        let command = try MerlinCommands.streamWorkerMetrics(
+            target: .worker(
+                devboxSID: "dbx_135679",
+                devboxName: "wt_hl",
+                alias: "hl_gpu_2",
+                workerID: "3966762"
+            ),
+            intervalSeconds: 15
+        )
+
+        #expect(command.executable == "/usr/bin/ssh")
+        #expect(command.arguments.dropLast() == [
+            "-nT",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=10",
+            "-o", "ServerAliveCountMax=3",
+            "hl_gpu_2",
+        ])
+        let remoteCommand = try #require(command.arguments.last)
+        #expect(remoteCommand.hasPrefix(
+            "NO_COLOR=1 TERM=dumb mlx worker login 3966762 -- export LC_ALL=C \\; while true \\; do "
+        ))
+        #expect(remoteCommand.contains(
+            "__MERLIN_LIZD_METRICS_V1_END__ \\; sleep 15 \\; done"
+        ))
+        #expect(remoteCommand.contains("__MERLIN_LIZD_METRICS_V1_BEGIN__"))
+    }
+
+    @Test("rejects unsafe metrics stream intervals before command construction")
+    func rejectsInvalidMetricsStreamIntervals() {
+        let target = TerminalTarget.worker(
+            devboxSID: "dbx_135679",
+            devboxName: "wt_hl",
+            alias: "hl_gpu_2",
+            workerID: "3966762"
+        )
+        #expect(throws: CommandValidationError.invalidMetricsInterval) {
+            try MerlinCommands.streamWorkerMetrics(
+                target: target,
+                intervalSeconds: 0
+            )
+        }
+        #expect(throws: CommandValidationError.invalidMetricsInterval) {
+            try MerlinCommands.streamWorkerMetrics(
+                target: target,
+                intervalSeconds: 3_601
+            )
+        }
+    }
 }

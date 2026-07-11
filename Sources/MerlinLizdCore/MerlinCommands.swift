@@ -16,9 +16,59 @@ public enum CommandValidationError: Error, Equatable, Sendable {
     case invalidSessionName
     case invalidExecutablePath
     case invalidSID
+    case workerTargetRequired
+    case invalidMetricsInterval
 }
 
 public enum MerlinCommands {
+    /// Captures one machine-readable, read-only metrics snapshot inside a
+    /// Worker. Shell separators are escaped at the Devbox hop so `mlx` receives
+    /// them as arguments and reconstructs them only inside the Worker shell.
+    /// No Worker network coordinates or SSH configuration are embedded here.
+    public static func sampleWorkerMetrics(
+        target: TerminalTarget
+    ) throws -> CommandSpec {
+        let (alias, workerID) = try validatedWorkerRoute(target)
+        let separator = #"\;"#
+        let commands = [
+            "export LC_ALL=C",
+            workerMetricsSnapshotCommands(separator: separator),
+        ].joined(separator: " \(separator) ")
+
+        return workerCommand(
+            alias: alias,
+            workerID: workerID,
+            remoteCommands: commands
+        )
+    }
+
+    /// Builds one persistent Worker-side loop. Each iteration emits a complete
+    /// independently parseable envelope. The fixed integer interval is the
+    /// only varying shell token and is range-checked before interpolation.
+    public static func streamWorkerMetrics(
+        target: TerminalTarget,
+        intervalSeconds: Int
+    ) throws -> CommandSpec {
+        guard (1 ... 3_600).contains(intervalSeconds) else {
+            throw CommandValidationError.invalidMetricsInterval
+        }
+        let (alias, workerID) = try validatedWorkerRoute(target)
+        let separator = #"\;"#
+        let snapshot = workerMetricsSnapshotCommands(separator: separator)
+        let commands = [
+            "export LC_ALL=C",
+            "while true",
+            "do \(snapshot) \(separator) sleep \(intervalSeconds)",
+            "done",
+        ].joined(separator: " \(separator) ")
+
+        return streamingWorkerCommand(
+            alias: alias,
+            workerID: workerID,
+            remoteCommands: commands
+        )
+    }
+
     public static func terminateTmuxSession(
         target: TerminalTarget,
         sessionName: String,
@@ -223,6 +273,98 @@ public enum MerlinCommands {
             alias,
             remoteCommand,
         ]
+    }
+
+    private static func validatedWorkerRoute(
+        _ target: TerminalTarget
+    ) throws -> (alias: String, workerID: String) {
+        guard case let .worker(_, _, alias, workerID) = target else {
+            throw CommandValidationError.workerTargetRequired
+        }
+        try validateAlias(alias)
+        try validateWorkerID(workerID)
+        return (alias, workerID)
+    }
+
+    private static func workerCommand(
+        alias: String,
+        workerID: String,
+        remoteCommands: String
+    ) -> CommandSpec {
+        CommandSpec(
+            executable: "/usr/bin/ssh",
+            arguments: nonInteractiveSSHArguments(
+                alias: alias,
+                remoteCommand: "NO_COLOR=1 TERM=dumb mlx worker login \(workerID) -- \(remoteCommands)"
+            )
+        )
+    }
+
+    private static func streamingWorkerCommand(
+        alias: String,
+        workerID: String,
+        remoteCommands: String
+    ) -> CommandSpec {
+        CommandSpec(
+            executable: "/usr/bin/ssh",
+            arguments: [
+                "-nT",
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=10",
+                "-o", "ServerAliveInterval=10",
+                "-o", "ServerAliveCountMax=3",
+                alias,
+                "NO_COLOR=1 TERM=dumb mlx worker login \(workerID) -- \(remoteCommands)",
+            ]
+        )
+    }
+
+    private static func workerMetricsSnapshotCommands(
+        separator: String
+    ) -> String {
+        func readableFile(_ path: String) -> String {
+            "if test -r \(path) \(separator) then cat \(path) \(separator) fi"
+        }
+
+        return [
+            "echo \(WorkerMetricsWireFormat.beginMarker)",
+            "echo \(WorkerMetricsWireFormat.uptimeBeforeMarker)",
+            "cat /proc/uptime",
+            "echo \(WorkerMetricsWireFormat.cgroupV1CPUBeforeMarker)",
+            readableFile("/sys/fs/cgroup/cpu,cpuacct/cpuacct.usage"),
+            "echo \(WorkerMetricsWireFormat.cgroupV2CPUBeforeMarker)",
+            readableFile("/sys/fs/cgroup/cpu.stat"),
+            "echo \(WorkerMetricsWireFormat.cpuBeforeMarker)",
+            "head -n 1 /proc/stat",
+            "sleep 0.2",
+            "echo \(WorkerMetricsWireFormat.uptimeAfterMarker)",
+            "cat /proc/uptime",
+            "echo \(WorkerMetricsWireFormat.cgroupV1CPUAfterMarker)",
+            readableFile("/sys/fs/cgroup/cpu,cpuacct/cpuacct.usage"),
+            "echo \(WorkerMetricsWireFormat.cgroupV2CPUAfterMarker)",
+            readableFile("/sys/fs/cgroup/cpu.stat"),
+            "echo \(WorkerMetricsWireFormat.cpuAfterMarker)",
+            "head -n 1 /proc/stat",
+            "echo \(WorkerMetricsWireFormat.cgroupV1CPUQuotaMarker)",
+            readableFile("/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_quota_us"),
+            "echo \(WorkerMetricsWireFormat.cgroupV1CPUPeriodMarker)",
+            readableFile("/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_period_us"),
+            "echo \(WorkerMetricsWireFormat.cgroupV2CPUMaxMarker)",
+            readableFile("/sys/fs/cgroup/cpu.max"),
+            "echo \(WorkerMetricsWireFormat.cgroupV1MemoryUsageMarker)",
+            readableFile("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+            "echo \(WorkerMetricsWireFormat.cgroupV1MemoryLimitMarker)",
+            readableFile("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+            "echo \(WorkerMetricsWireFormat.cgroupV2MemoryUsageMarker)",
+            readableFile("/sys/fs/cgroup/memory.current"),
+            "echo \(WorkerMetricsWireFormat.cgroupV2MemoryLimitMarker)",
+            readableFile("/sys/fs/cgroup/memory.max"),
+            "echo \(WorkerMetricsWireFormat.memoryMarker)",
+            "cat /proc/meminfo",
+            "echo \(WorkerMetricsWireFormat.gpuMarker)",
+            "nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit --format=csv,noheader,nounits",
+            "echo \(WorkerMetricsWireFormat.endMarker)",
+        ].joined(separator: " \(separator) ")
     }
 
     private static func validateAlias(_ value: String) throws {

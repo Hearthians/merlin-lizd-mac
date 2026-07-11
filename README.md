@@ -10,6 +10,11 @@ shown immediately, while Devboxes, Worker lists, and Worker readiness refresh
 in separate background stages. The snapshot deliberately excludes Pod IPs,
 ports, webshell URLs, ProxyCommand text, raw command output, and credentials.
 
+Selecting a reachable Worker starts one read-only streaming monitor connection.
+The detail page keeps a five-minute in-memory history for CPU, memory, GPU,
+VRAM, temperature, and power. Leaving the page cancels and reaps that SSH
+connection; telemetry is never persisted.
+
 ## Requirements
 
 - macOS 14 or newer on Apple Silicon
@@ -17,6 +22,8 @@ ports, webshell URLs, ProxyCommand text, raw command output, and credentials.
 - `merlin-cli` installed and logged in
 - working SSH aliases for development machines
 - `mlx` and `tmux` on the corresponding remote machines
+- `nvidia-smi` inside GPU Workers for GPU telemetry (CPU and memory remain
+  available when it is unsupported)
 
 The app is intentionally not sandboxed because it must invoke system SSH and
 read the user's existing SSH and Merlin CLI state.
