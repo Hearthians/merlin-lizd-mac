@@ -42,6 +42,39 @@ public struct TerminalState: Codable, Equatable, Sendable {
     }
 }
 
+public enum TerminalTabSelection {
+    public static func previous(
+        in tabIDs: [String],
+        from selectedTabID: String?
+    ) -> String? {
+        selection(in: tabIDs, from: selectedTabID, offset: -1)
+    }
+
+    public static func next(
+        in tabIDs: [String],
+        from selectedTabID: String?
+    ) -> String? {
+        selection(in: tabIDs, from: selectedTabID, offset: 1)
+    }
+
+    private static func selection(
+        in tabIDs: [String],
+        from selectedTabID: String?,
+        offset: Int
+    ) -> String? {
+        guard !tabIDs.isEmpty else { return nil }
+        guard
+            let selectedTabID,
+            let selectedIndex = tabIDs.firstIndex(of: selectedTabID)
+        else {
+            return offset < 0 ? tabIDs.last : tabIDs.first
+        }
+
+        let nextIndex = (selectedIndex + offset + tabIDs.count) % tabIDs.count
+        return tabIDs[nextIndex]
+    }
+}
+
 public enum TerminalStateCodecError: Error, Equatable, Sendable {
     case invalidEncoding
 }

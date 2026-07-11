@@ -3,6 +3,26 @@ import Testing
 
 @Suite("Terminal tab persistence")
 struct TerminalStateCodecTests {
+    @Test("cycles terminal tabs in both directions")
+    func cyclesTerminalTabs() {
+        let ids = ["first", "second", "third"]
+
+        #expect(TerminalTabSelection.next(in: ids, from: "first") == "second")
+        #expect(TerminalTabSelection.next(in: ids, from: "third") == "first")
+        #expect(TerminalTabSelection.previous(in: ids, from: "third") == "second")
+        #expect(TerminalTabSelection.previous(in: ids, from: "first") == "third")
+    }
+
+    @Test("selects a deterministic edge when no terminal tab is active")
+    func selectsEdgeWithoutActiveTab() {
+        let ids = ["first", "second", "third"]
+
+        #expect(TerminalTabSelection.next(in: ids, from: nil) == "first")
+        #expect(TerminalTabSelection.previous(in: ids, from: nil) == "third")
+        #expect(TerminalTabSelection.next(in: [], from: nil) == nil)
+        #expect(TerminalTabSelection.previous(in: [], from: nil) == nil)
+    }
+
     @Test("persists a renamed tmux session for later reconnection")
     func persistsRenamedSession() throws {
         var tab = TerminalTabRecord(

@@ -120,6 +120,22 @@ final class TerminalTabsModel: ObservableObject {
         }
     }
 
+    func selectPreviousTab() {
+        guard let id = TerminalTabSelection.previous(
+            in: tabs.map(\.id),
+            from: selectedTabID
+        ) else { return }
+        select(id)
+    }
+
+    func selectNextTab() {
+        guard let id = TerminalTabSelection.next(
+            in: tabs.map(\.id),
+            from: selectedTabID
+        ) else { return }
+        select(id)
+    }
+
     func reconnect(_ id: String) {
         guard tabs.contains(where: { $0.id == id }) else { return }
         sessions.removeValue(forKey: id)?.close()
