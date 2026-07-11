@@ -1,7 +1,11 @@
+import AppKit
+import MerlinLizdCore
 import SwiftUI
 
 @main
 struct MerlinLizdApplication: App {
+    @NSApplicationDelegateAdaptor(MerlinLizdApplicationDelegate.self)
+    private var appDelegate
     @StateObject private var model = AppModel()
     @StateObject private var terminals = TerminalTabsModel()
 
@@ -34,5 +38,23 @@ struct MerlinLizdApplication: App {
                 .disabled(terminals.tabs.isEmpty)
             }
         }
+    }
+}
+
+@MainActor
+private final class MerlinLizdApplicationDelegate: NSObject, NSApplicationDelegate {
+    private var isFinishingTermination = false
+
+    func applicationShouldTerminate(
+        _ sender: NSApplication
+    ) -> NSApplication.TerminateReply {
+        guard !isFinishingTermination else { return .terminateLater }
+        isFinishingTermination = true
+
+        Task {
+            await WorkerMetricsStreamer.shutdownAll()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 }

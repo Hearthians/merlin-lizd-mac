@@ -377,15 +377,47 @@ struct WorkerDetailView: View {
                     }
                 }
 
-                SurfaceCard("会话行为") {
-                    Label("每个标签对应一个独立 tmux 会话", systemImage: "rectangle.stack")
-                    Label("关闭 App 或 SSH 断开后，远端任务继续运行", systemImage: "arrow.trianglehead.2.clockwise.rotate.90")
-                    Label("重新打开标签时会恢复原会话", systemImage: "clock.arrow.circlepath")
-                }
-                .foregroundStyle(.secondary)
+                WorkerMonitoringContainer(
+                    target: monitoringTarget,
+                    expectsGPU: worker.gpuCount > 0,
+                    unavailableMessage: monitoringUnavailableMessage
+                )
             }
             .padding(24)
         }
+    }
+
+    private var monitoringTarget: TerminalTarget? {
+        guard
+            machine.devbox.status.isRunning,
+            let alias = machine.sshAlias,
+            worker.readiness != .notReady,
+            worker.readiness != .unreachable
+        else {
+            return nil
+        }
+        return .worker(
+            devboxSID: machine.devbox.sid,
+            devboxName: machine.devbox.name,
+            alias: alias,
+            workerID: worker.id
+        )
+    }
+
+    private var monitoringUnavailableMessage: String {
+        if !machine.devbox.status.isRunning {
+            return "开发机未运行，无法读取 Worker 指标。"
+        }
+        if machine.sshAlias == nil {
+            return "未匹配 SSH alias，无法建立监控连接。"
+        }
+        if worker.readiness == .notReady {
+            return "Worker 尚未就绪，暂时无法读取指标。"
+        }
+        if worker.readiness == .unreachable {
+            return "Worker 当前不可达，请刷新状态后重试。"
+        }
+        return "暂时无法读取 Worker 指标。"
     }
 }
 

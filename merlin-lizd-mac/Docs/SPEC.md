@@ -25,6 +25,7 @@ The primary mental model is **machines**. A future **tasks** workspace may add f
 7. Closing a terminal tab leaves its tmux session running by default. The close dialog also offers an explicit “close and terminate tmux” action; terminating a session closes every local tab attached to that same target/session.
 8. A stopped existing Devbox can be started after an explicit in-app confirmation. v1 has no stop, delete, Worker create, or Worker terminate actions.
 9. A Local terminal tab is available for Mac commands and manual SSH.
+10. Selecting a reachable Worker shows live utilization cards and five-minute curves for CPU, memory, GPU, and VRAM. GPU temperature and power remain visible with the latest sample.
 
 ## Inventory and refresh
 
@@ -33,7 +34,8 @@ The primary mental model is **machines**. A future **tasks** workspace may add f
 - For every running, routable Devbox, list Workers with `NO_COLOR=1 TERM=dumb mlx worker list` through SSH. Worker list requests may run concurrently with a bounded limit.
 - Render the last safe snapshot immediately, then refresh Devboxes, Worker lists, and Worker readiness in separate stages. A slow `mlx worker list/login` must not block or clear the machine tree.
 - Refresh immediately on launch, manually on request, and every 15 seconds while the app is active. Pause foreground polling when inactive.
-- Show lifecycle/connectivity, CPU, memory, GPU type/count, Worker readiness, last refresh time, and actionable errors. Real-time utilization charts are not part of v1.
+- Show lifecycle/connectivity, CPU, memory, GPU type/count, Worker readiness, last refresh time, and actionable errors.
+- While a Worker detail page is visible, use one cancellation-aware SSH/`mlx worker login` stream for read-only telemetry. Prefer cgroup CPU/memory data over host `/proc` values, retain only five minutes in memory, and stop the stream when the page leaves the view.
 - A Worker appearing in a list is not proof that it is ready. Connection failures and the text `worker has not been ready yet` must remain visible as readiness/transport errors.
 
 ## Authentication and safety
@@ -55,7 +57,7 @@ The primary mental model is **machines**. A future **tasks** workspace may add f
 
 - Cross-machine batch commands or task fan-out.
 - Resource creation, deletion, stopping, Worker launch, or Worker kill.
-- File browser, editor, upload/download workflow, IDE features, or monitoring charts.
+- File browser, editor, upload/download workflow, or IDE features.
 - Multi-user onboarding, credential management, Windows, or Linux support.
 
 ## Delivery sequence

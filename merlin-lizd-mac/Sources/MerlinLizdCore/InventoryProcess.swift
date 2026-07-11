@@ -1,6 +1,8 @@
 import Darwin
 import Foundation
 
+private let inventoryProcessIOChunkBytes = 16 * 1_024
+
 struct InventoryProcessOutput: Equatable, Sendable {
     let stdout: String
     let stderr: String
@@ -9,6 +11,45 @@ struct InventoryProcessOutput: Equatable, Sendable {
 
 protocol InventoryProcessRunning: Sendable {
     func run(_ command: CommandSpec) async throws -> InventoryProcessOutput
+}
+
+protocol InventoryProcessOutputStreaming: Sendable {
+    /// Starts one process and forwards its standard output as it arrives.
+    /// Cancelling iteration cancels the producer task, which in turn
+    /// terminates and reaps the process group through `RunningProcessBox`.
+    func streamStandardOutput(
+        _ command: CommandSpec
+    ) -> InventoryProcessOutputStream
+}
+
+enum InventoryProcessStreamError: Error, Equatable, Sendable {
+    case commandFailed(exitCode: Int32, stderrTail: String)
+    case stdoutBufferOverflow(maxBufferedBytes: Int)
+}
+
+struct InventoryProcessOutputStream: Sendable {
+    let chunks: AsyncThrowingStream<Data, Error>
+    private let producer: Task<Void, Never>
+
+    init(
+        chunks: AsyncThrowingStream<Data, Error>,
+        producer: Task<Void, Never>
+    ) {
+        self.chunks = chunks
+        self.producer = producer
+    }
+
+    /// Waits until the process group has completed output draining and reaping.
+    func waitForTermination() async {
+        await producer.value
+    }
+
+    /// Cancellation is intentionally awaitable so a replacement connection
+    /// cannot launch during the TERM/KILL cleanup window.
+    func cancelAndWait() async {
+        producer.cancel()
+        await producer.value
+    }
 }
 
 enum InventoryProcessTimeoutError: Error, Equatable, Sendable {
@@ -143,6 +184,243 @@ final class FoundationInventoryProcessRunner: InventoryProcessRunning, @unchecke
             stderr.requestClose()
         }
     }
+}
+
+/// A streaming counterpart to `FoundationInventoryProcessRunner` backed by
+/// the same `posix_spawn` process-group lifecycle. It intentionally retains
+/// only a bounded tail of stderr while continuously draining the pipe.
+final class POSIXInventoryProcessStreamer: InventoryProcessOutputStreaming, @unchecked Sendable {
+    private static let defaultStdoutBufferBytes = 512 * 1_024
+
+    private let stderrTailByteLimit: Int
+    private let stdoutBufferChunkLimit: Int
+    private let stdoutBufferByteLimit: Int
+
+    init(
+        stderrTailByteLimit: Int = 64 * 1_024,
+        maximumBufferedStdoutBytes: Int = defaultStdoutBufferBytes
+    ) {
+        precondition(maximumBufferedStdoutBytes >= inventoryProcessIOChunkBytes)
+        self.stderrTailByteLimit = max(0, stderrTailByteLimit)
+        stdoutBufferChunkLimit = maximumBufferedStdoutBytes
+            / inventoryProcessIOChunkBytes
+        stdoutBufferByteLimit = stdoutBufferChunkLimit
+            * inventoryProcessIOChunkBytes
+    }
+
+    func streamStandardOutput(
+        _ command: CommandSpec
+    ) -> InventoryProcessOutputStream {
+        let (chunks, continuation) = AsyncThrowingStream<Data, Error>.makeStream(
+            bufferingPolicy: .bufferingOldest(stdoutBufferChunkLimit)
+        )
+        let lifecycle = ActiveStreamingProcessLifecycle()
+        let registry = InventoryStreamingProcessRegistry.shared
+        let producer = Task {
+            defer {
+                lifecycle.markFinished()
+                registry.unregister(id: lifecycle.id)
+            }
+            do {
+                try await pump(
+                    command,
+                    stderrTailByteLimit: stderrTailByteLimit,
+                    stdoutBufferByteLimit: stdoutBufferByteLimit
+                ) { data in
+                    continuation.yield(data)
+                }
+                continuation.finish()
+            } catch {
+                continuation.finish(throwing: error)
+            }
+        }
+        registry.register(lifecycle: lifecycle, producer: producer)
+        continuation.onTermination = { @Sendable termination in
+            if case .cancelled = termination {
+                producer.cancel()
+            }
+        }
+        return InventoryProcessOutputStream(chunks: chunks, producer: producer)
+    }
+
+    private func pump(
+        _ command: CommandSpec,
+        stderrTailByteLimit: Int,
+        stdoutBufferByteLimit: Int,
+        consume: @escaping @Sendable (Data) ->
+            AsyncThrowingStream<Data, Error>.Continuation.YieldResult
+    ) async throws {
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        let processBox = RunningProcessBox(
+            command: command,
+            standardOutput: stdoutPipe.fileHandleForWriting.fileDescriptor,
+            standardError: stderrPipe.fileHandleForWriting.fileDescriptor,
+            childDescriptorsToClose: [
+                stdoutPipe.fileHandleForReading.fileDescriptor,
+                stderrPipe.fileHandleForReading.fileDescriptor,
+            ]
+        )
+        let stdout = FileHandleBox(stdoutPipe.fileHandleForReading)
+        let stderr = FileHandleBox(stderrPipe.fileHandleForReading)
+        let overflow = StreamingOutputOverflowState()
+
+        try await withTaskCancellationHandler {
+            do {
+                try processBox.start()
+            } catch {
+                try? stdoutPipe.fileHandleForWriting.close()
+                try? stderrPipe.fileHandleForWriting.close()
+                throw error
+            }
+            try? stdoutPipe.fileHandleForWriting.close()
+            try? stderrPipe.fileHandleForWriting.close()
+
+            async let stdoutRead: Void = Task.detached {
+                stdout.readChunks { data in
+                    guard case .dropped = consume(data) else { return }
+                    guard overflow.markOverflowed() else { return }
+                    processBox.cancel()
+                    stdout.requestClose()
+                    stderr.requestClose()
+                }
+            }.value
+            async let stderrTail: Data = Task.detached {
+                stderr.readToEnd(retainingLast: stderrTailByteLimit)
+            }.value
+
+            let exitCode = await processBox.waitForExit()
+            await stdoutRead
+            let diagnosticTail = await stderrTail
+            await processBox.reap()
+            if overflow.isOverflowed {
+                throw InventoryProcessStreamError.stdoutBufferOverflow(
+                    maxBufferedBytes: stdoutBufferByteLimit
+                )
+            }
+            try Task.checkCancellation()
+
+            guard exitCode == 0 else {
+                throw InventoryProcessStreamError.commandFailed(
+                    exitCode: exitCode,
+                    stderrTail: String(decoding: diagnosticTail, as: UTF8.self)
+                )
+            }
+        } onCancel: {
+            processBox.cancel()
+            stdout.requestClose()
+            stderr.requestClose()
+        }
+    }
+}
+
+private final class StreamingOutputOverflowState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var overflowed = false
+
+    var isOverflowed: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return overflowed
+    }
+
+    /// Returns true only for the first overflow signal.
+    func markOverflowed() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !overflowed else { return false }
+        overflowed = true
+        return true
+    }
+}
+
+private final class ActiveStreamingProcessLifecycle: @unchecked Sendable {
+    let id = UUID()
+
+    private let lock = NSLock()
+    private var finished = false
+
+    var isFinished: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return finished
+    }
+
+    func markFinished() {
+        lock.lock()
+        finished = true
+        lock.unlock()
+    }
+}
+
+/// Tracks every active POSIX streaming child, independently of stream iterator
+/// lifetime, so application shutdown can cancel and await process-group reap.
+private final class InventoryStreamingProcessRegistry: @unchecked Sendable {
+    private struct Entry {
+        let lifecycle: ActiveStreamingProcessLifecycle
+        let producer: Task<Void, Never>
+    }
+
+    static let shared = InventoryStreamingProcessRegistry()
+
+    private let lock = NSLock()
+    private var entries: [UUID: Entry] = [:]
+    private var isShuttingDown = false
+
+    func register(
+        lifecycle: ActiveStreamingProcessLifecycle,
+        producer: Task<Void, Never>
+    ) {
+        var shouldCancel = false
+        lock.lock()
+        if !lifecycle.isFinished {
+            entries[lifecycle.id] = Entry(
+                lifecycle: lifecycle,
+                producer: producer
+            )
+            shouldCancel = isShuttingDown
+        }
+        lock.unlock()
+
+        if shouldCancel {
+            producer.cancel()
+        }
+    }
+
+    func unregister(id: UUID) {
+        lock.lock()
+        entries[id] = nil
+        lock.unlock()
+    }
+
+    func shutdownAll() async {
+        while true {
+            let producers: [Task<Void, Never>] = lock.withLock {
+                isShuttingDown = true
+                let activeProducers = entries.values.map(\.producer)
+                if activeProducers.isEmpty {
+                    isShuttingDown = false
+                }
+                return activeProducers
+            }
+            guard !producers.isEmpty else { return }
+
+            for producer in producers {
+                producer.cancel()
+            }
+            await withTaskGroup(of: Void.self) { group in
+                for producer in producers {
+                    group.addTask {
+                        await producer.value
+                    }
+                }
+            }
+        }
+    }
+}
+
+func shutdownAllInventoryStreamingProcesses() async {
+    await InventoryStreamingProcessRegistry.shared.shutdownAll()
 }
 
 private final class RunningProcessBox: @unchecked Sendable {
@@ -436,11 +714,28 @@ private final class FileHandleBox: @unchecked Sendable {
     }
 
     func readToEnd() -> Data {
+        readToEnd(retainingLast: nil)
+    }
+
+    /// Drains the descriptor to EOF while retaining either all bytes or only
+    /// the newest `byteLimit` bytes. The latter keeps noisy SSH diagnostics
+    /// from growing memory for the lifetime of a metrics stream.
+    func readToEnd(retainingLast byteLimit: Int?) -> Data {
+        var output = Data()
+        readChunks { data in
+            guard byteLimit != 0 else { return }
+            output.append(data)
+            guard let byteLimit, output.count > byteLimit else { return }
+            output.removeFirst(output.count - byteLimit)
+        }
+        return output
+    }
+
+    func readChunks(_ consume: (Data) -> Void) {
         let descriptor = handle.fileDescriptor
-        guard descriptor >= 0 else { return Data() }
+        guard descriptor >= 0 else { return }
         defer { try? handle.close() }
 
-        var output = Data()
         var buffer = [UInt8](repeating: 0, count: 16 * 1024)
 
         while !shouldClose {
@@ -464,7 +759,7 @@ private final class FileHandleBox: @unchecked Sendable {
 
             let byteCount = Darwin.read(descriptor, &buffer, buffer.count)
             if byteCount > 0 {
-                output.append(contentsOf: buffer.prefix(Int(byteCount)))
+                consume(Data(buffer.prefix(Int(byteCount))))
             } else if byteCount == 0 {
                 break
             } else if errno != EINTR && errno != EAGAIN {
@@ -472,7 +767,6 @@ private final class FileHandleBox: @unchecked Sendable {
             }
         }
 
-        return output
     }
 
     func requestClose() {
