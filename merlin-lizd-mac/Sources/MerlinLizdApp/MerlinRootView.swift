@@ -39,13 +39,12 @@ struct MerlinRootView: View {
                 if model.isRefreshing
                     || model.isStartingDevbox
                     || model.isRefreshingWorkers
-                    || model.isProbingWorkers
                 {
                     ProgressView()
                         .controlSize(.small)
                 }
-                if model.isRefreshingWorkers || model.isProbingWorkers {
-                    Text(model.isRefreshingWorkers ? "同步 Worker" : "探测就绪")
+                if model.isRefreshingWorkers {
+                    Text("同步 Worker")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .help("开发机列表已可使用，Worker 信息正在后台更新")
@@ -70,6 +69,11 @@ struct MerlinRootView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task { await model.refresh() }
+        }
+        .onChange(of: sessionBrowserTarget) { _, target in
+            if let target {
+                terminals.prioritize(target)
+            }
         }
         .confirmationDialog(
             "启动开发机？",

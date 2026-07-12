@@ -8,24 +8,16 @@ struct MerlinLizdApplication: App {
     private var appDelegate
     @StateObject private var model: AppModel
     @StateObject private var terminals: TerminalTabsModel
-    private let sshMasterPool: SSHMasterPool
-    private let metricsStreamer: WorkerMetricsStreamer
+    private let runtime: MerlinRemoteRuntime
 
     init() {
-        let pool = SSHMasterPool(maxConcurrentPreparations: 4)
-        let discovery = TmuxSessionDiscovery(sshMasterPool: pool)
-        let controller = TmuxSessionController(sshMasterPool: pool)
-        sshMasterPool = pool
-        metricsStreamer = WorkerMetricsStreamer(sshMasterPool: pool)
+        let runtime = MerlinRemoteRuntime()
+        self.runtime = runtime
         _model = StateObject(
-            wrappedValue: AppModel(sshMasterPool: pool)
+            wrappedValue: AppModel(runtime: runtime)
         )
         _terminals = StateObject(
-            wrappedValue: TerminalTabsModel(
-                sshMasterPool: pool,
-                tmuxSessionDiscovery: discovery,
-                tmuxSessionController: controller
-            )
+            wrappedValue: TerminalTabsModel(runtime: runtime)
         )
     }
 
@@ -34,11 +26,11 @@ struct MerlinLizdApplication: App {
             MerlinRootView(
                 model: model,
                 terminals: terminals,
-                metricsStreamer: metricsStreamer
+                metricsStreamer: runtime.metricsStreamer
             )
                 .frame(minWidth: 960, minHeight: 640)
                 .onAppear {
-                    appDelegate.configure(sshMasterPool: sshMasterPool)
+                    appDelegate.configure(runtime: runtime)
                 }
         }
         .defaultSize(width: 1180, height: 760)
@@ -71,10 +63,10 @@ struct MerlinLizdApplication: App {
 @MainActor
 private final class MerlinLizdApplicationDelegate: NSObject, NSApplicationDelegate {
     private var isFinishingTermination = false
-    private var sshMasterPool: SSHMasterPool?
+    private var runtime: MerlinRemoteRuntime?
 
-    func configure(sshMasterPool: SSHMasterPool) {
-        self.sshMasterPool = sshMasterPool
+    func configure(runtime: MerlinRemoteRuntime) {
+        self.runtime = runtime
     }
 
     func applicationShouldTerminate(
@@ -84,8 +76,7 @@ private final class MerlinLizdApplicationDelegate: NSObject, NSApplicationDelega
         isFinishingTermination = true
 
         Task {
-            await WorkerMetricsStreamer.shutdownAll()
-            await sshMasterPool?.shutdown()
+            await runtime?.shutdown()
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater

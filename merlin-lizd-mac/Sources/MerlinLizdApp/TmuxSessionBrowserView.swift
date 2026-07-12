@@ -4,11 +4,16 @@ import SwiftUI
 @MainActor
 final class TmuxSessionBrowserModel: ObservableObject {
     @Published private(set) var sessions: [TmuxSessionRecord] = []
-    @Published private(set) var isLoading = false
+    @Published private(set) var fetchedAt: Date?
+    @Published private(set) var isStale = true
+    @Published private(set) var isVerifying = false
+    @Published private(set) var hasKnownEvidence = false
     @Published private(set) var errorMessage: String?
 
     let target: TerminalTarget
     private let discovery: TmuxSessionDiscovery
+    private let restoredSessions: [TmuxSessionRecord]
+    private var refreshTask: Task<Void, Never>?
 
     init(
         target: TerminalTarget,
@@ -17,34 +22,92 @@ final class TmuxSessionBrowserModel: ObservableObject {
     ) {
         self.target = target
         self.discovery = discovery
+        restoredSessions = initialSessions
         sessions = initialSessions
+        hasKnownEvidence = !initialSessions.isEmpty
     }
 
-    func load() async {
-        guard !isLoading else { return }
-        isLoading = true
-        defer { isLoading = false }
-
-        do {
-            if let cached = await discovery.cached(target: target) {
-                var seen: Set<String> = []
-                sessions = (sessions + cached).filter {
-                    seen.insert($0.name).inserted
-                }
-            }
-            sessions = try await discovery.list(target: target)
-            errorMessage = nil
-        } catch TmuxSessionDiscoveryError.workerNotReady {
-            errorMessage = "Worker 尚未就绪。"
-        } catch TmuxSessionDiscoveryError.localTmuxNotFound {
-            errorMessage = "本机未找到 tmux。"
-        } catch {
-            errorMessage = "无法读取 tmux 会话，请检查连接状态。"
+    func load(force: Bool = false) async {
+        let snapshot = await discovery.snapshot(target: target)
+        publish(snapshot)
+        if !force, let snapshot, snapshot.isFresh(at: Date()) {
+            return
         }
+        startRefresh()
     }
 
     func removeSessions(named names: Set<String>) {
         sessions.removeAll { names.contains($0.name) }
+    }
+
+    private func startRefresh() {
+        guard refreshTask == nil else { return }
+        isVerifying = true
+        let discovery = discovery
+        let target = target
+        refreshTask = Task { [weak self] in
+            let snapshot = await discovery.refresh(target: target)
+            guard !Task.isCancelled else { return }
+            self?.publishRefresh(snapshot)
+            self?.refreshTask = nil
+        }
+    }
+
+    private func publish(_ snapshot: TmuxSessionSnapshot?) {
+        guard let snapshot else {
+            hasKnownEvidence = !restoredSessions.isEmpty
+            isStale = true
+            isVerifying = false
+            errorMessage = nil
+            return
+        }
+        hasKnownEvidence = true
+        sessions = merged(snapshot.sessions, restoredSessions)
+        fetchedAt = snapshot.fetchedAt
+        isStale = !snapshot.isFresh(at: Date())
+        isVerifying = snapshot.verification == .verifying
+        errorMessage = Self.message(for: snapshot.lastError)
+    }
+
+    private func publishRefresh(_ snapshot: TmuxSessionSnapshot) {
+        let previousFetchedAt = fetchedAt
+        fetchedAt = snapshot.fetchedAt
+        hasKnownEvidence = true
+        isStale = !snapshot.isFresh(at: Date())
+        isVerifying = snapshot.verification == .verifying
+        errorMessage = Self.message(for: snapshot.lastError)
+        if
+            snapshot.readiness == .ready,
+            snapshot.lastError == nil,
+            previousFetchedAt == nil || snapshot.fetchedAt > previousFetchedAt!
+        {
+            sessions = snapshot.sessions
+        }
+    }
+
+    private func merged(
+        _ snapshotSessions: [TmuxSessionRecord],
+        _ knownSessions: [TmuxSessionRecord]
+    ) -> [TmuxSessionRecord] {
+        var seen: Set<String> = []
+        return (snapshotSessions + knownSessions).filter {
+            seen.insert($0.name).inserted
+        }
+    }
+
+    private static func message(
+        for error: TmuxSessionDiscoveryError?
+    ) -> String? {
+        switch error {
+        case .workerNotReady:
+            "Worker 尚未就绪。"
+        case .localTmuxNotFound:
+            "本机未找到 tmux。"
+        case .commandFailed, .transport:
+            "无法读取 tmux 会话，请检查连接状态。"
+        case nil:
+            nil
+        }
     }
 }
 
@@ -75,21 +138,17 @@ struct TmuxSessionBrowserView: View {
                     Text(targetLabel)
                         .font(.caption.monospaced())
                         .foregroundStyle(.secondary)
-                    if model.isLoading {
-                        Text("正在核对远端；mlx 冷启动最长约 45 秒")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
+                    verificationStatus
                 }
                 Spacer()
-                if model.isLoading || isTerminating {
+                if model.isVerifying || isTerminating {
                     ProgressView()
                         .controlSize(.small)
                 }
                 Button("刷新", systemImage: "arrow.clockwise") {
-                    Task { await model.load() }
+                    Task { await model.load(force: true) }
                 }
-                .disabled(model.isLoading || isTerminating)
+                .disabled(model.isVerifying || isTerminating)
                 Button("完成") {
                     dismiss()
                 }
@@ -100,20 +159,31 @@ struct TmuxSessionBrowserView: View {
 
             Divider()
 
-            if let errorMessage = model.errorMessage, model.sessions.isEmpty {
+            if let errorMessage = model.errorMessage,
+                model.sessions.isEmpty,
+                !model.hasKnownEvidence
+            {
                 MessageBanner(text: errorMessage, kind: .error)
                     .padding()
-            } else if !model.isLoading && model.sessions.isEmpty {
-                ContentUnavailableView(
-                    "没有 tmux 会话",
-                    systemImage: "rectangle.stack",
-                    description: Text(emptyStateDescription)
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if model.sessions.isEmpty {
+                VStack(spacing: 0) {
+                    if let errorMessage = model.errorMessage {
+                        MessageBanner(text: errorMessage, kind: .warning)
+                            .padding()
+                    }
+                    if !model.isVerifying {
+                        ContentUnavailableView(
+                            "没有 tmux 会话",
+                            systemImage: "rectangle.stack",
+                            description: Text(emptyStateDescription)
+                        )
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                }
             } else {
                 VStack(spacing: 0) {
                     if let errorMessage = model.errorMessage {
-                        MessageBanner(text: errorMessage, kind: .error)
+                        MessageBanner(text: errorMessage, kind: .warning)
                             .padding()
                     }
                     List(model.sessions) { session in
@@ -162,7 +232,7 @@ struct TmuxSessionBrowserView: View {
         }
         .frame(minWidth: 520, minHeight: 380)
         .task {
-            await model.load()
+            await model.load(force: false)
         }
         .onChange(of: model.sessions) { _, sessions in
             selectedSessionNames.formIntersection(Set(sessions.map(\.name)))
@@ -195,6 +265,28 @@ struct TmuxSessionBrowserView: View {
             }
         } message: {
             Text(terminationMessage ?? "操作未完成。")
+        }
+    }
+
+    @ViewBuilder
+    private var verificationStatus: some View {
+        if model.isVerifying {
+            Text("后台核对中")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        } else if let fetchedAt = model.fetchedAt {
+            if model.isStale {
+                HStack(spacing: 2) {
+                    Text("缓存 ·")
+                    Text(fetchedAt, style: .time)
+                }
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+            } else {
+                Text("刚刚更新")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 

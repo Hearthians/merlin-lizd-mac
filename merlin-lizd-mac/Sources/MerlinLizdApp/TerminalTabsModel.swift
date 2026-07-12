@@ -6,28 +6,32 @@ import SwiftUI
 final class TerminalTabsModel: ObservableObject {
     @Published private(set) var tabs: [TerminalTabRecord]
     @Published var selectedTabID: String? {
-        didSet { persist() }
+        didSet {
+            persist()
+            guard let selectedTab else { return }
+            prioritize(selectedTab.target)
+        }
     }
 
     private var sessions: [String: TerminalSession] = [:]
     private let defaults: UserDefaults
     private let managedTerminalCommands: ManagedTerminalCommandBuilder
+    private let warmupCoordinator: TargetWarmupCoordinator
     let tmuxSessionDiscovery: TmuxSessionDiscovery
     private let tmuxSessionController: TmuxSessionController
     private let externalTerminalLauncher = ExternalTerminalLauncher()
     private let persistenceKey = "terminal-state-v1"
 
     init(
-        sshMasterPool: SSHMasterPool,
-        tmuxSessionDiscovery: TmuxSessionDiscovery,
-        tmuxSessionController: TmuxSessionController,
+        runtime: MerlinRemoteRuntime,
         defaults: UserDefaults = .standard
     ) {
         managedTerminalCommands = ManagedTerminalCommandBuilder(
-            sshMasterPool: sshMasterPool
+            sshMasterPool: runtime.sshMasterPool
         )
-        self.tmuxSessionDiscovery = tmuxSessionDiscovery
-        self.tmuxSessionController = tmuxSessionController
+        warmupCoordinator = runtime.warmupCoordinator
+        tmuxSessionDiscovery = runtime.tmuxDiscovery
+        tmuxSessionController = runtime.tmuxController
         self.defaults = defaults
         if
             let encoded = defaults.string(forKey: persistenceKey),
@@ -41,6 +45,7 @@ final class TerminalTabsModel: ObservableObject {
             tabs = []
             selectedTabID = nil
         }
+        seedWarmupPriorities()
     }
 
     var selectedTab: TerminalTabRecord? {
@@ -114,6 +119,11 @@ final class TerminalTabsModel: ObservableObject {
             }
             return TmuxSessionRecord(name: sessionName)
         }
+    }
+
+    func prioritize(_ target: TerminalTarget) {
+        let coordinator = warmupCoordinator
+        Task { await coordinator.prioritize(target) }
     }
 
     func select(_ id: String) {
@@ -445,6 +455,24 @@ final class TerminalTabsModel: ObservableObject {
         let state = TerminalState(selectedTabID: selectedTabID, tabs: tabs)
         if let encoded = try? TerminalStateCodec.encode(state) {
             defaults.set(encoded, forKey: persistenceKey)
+        }
+    }
+
+    private func seedWarmupPriorities() {
+        var desiredTargets: [TerminalTarget] = []
+        if let selectedTab {
+            desiredTargets.append(selectedTab.target)
+        }
+        for tab in tabs.reversed()
+        where !desiredTargets.contains(tab.target)
+        {
+            desiredTargets.append(tab.target)
+        }
+        let coordinator = warmupCoordinator
+        Task {
+            for target in desiredTargets.reversed() {
+                await coordinator.prioritize(target)
+            }
         }
     }
 }
