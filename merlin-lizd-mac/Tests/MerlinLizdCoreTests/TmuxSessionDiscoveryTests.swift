@@ -1,8 +1,178 @@
 import Testing
+import os
 @testable import MerlinLizdCore
 
 @Suite("tmux session inventory")
 struct TmuxSessionDiscoveryTests {
+    @Test("returns a 59-second snapshot without starting another process")
+    func returnsFreshSnapshotWithoutRefresh() async {
+        let clock = TmuxTestClock()
+        let runner = TmuxSnapshotRunner(steps: [
+            .output(.init(stdout: "one\n", stderr: "", exitCode: 0))
+        ])
+        let discovery = TmuxSessionDiscovery(
+            processRunner: runner,
+            now: { clock.now }
+        )
+        let target = tmuxTestTarget
+
+        let first = await discovery.refresh(target: target)
+        clock.advance(by: 59)
+        let cached = await discovery.snapshot(target: target)
+
+        #expect(cached?.sessions == first.sessions)
+        #expect(cached?.isFresh(at: clock.now) == true)
+        #expect(await runner.runCount == 1)
+    }
+
+    @Test("returns stale evidence while sharing one background refresh")
+    func staleSnapshotStartsSingleFlightRefresh() async {
+        let clock = TmuxTestClock()
+        let runner = TmuxSnapshotRunner(steps: [
+            .output(.init(stdout: "old\n", stderr: "", exitCode: 0)),
+            .gated(.init(stdout: "new\n", stderr: "", exitCode: 0))
+        ])
+        let discovery = TmuxSessionDiscovery(
+            processRunner: runner,
+            now: { clock.now }
+        )
+
+        let first = await discovery.refresh(target: tmuxTestTarget)
+        clock.advance(by: 61)
+        let stale = await discovery.snapshot(target: tmuxTestTarget)
+        let sameStale = await discovery.snapshot(target: tmuxTestTarget)
+        await runner.waitUntilRunCount(2)
+
+        #expect(stale?.sessions == first.sessions)
+        #expect(stale?.verification == .verifying)
+        #expect(stale?.isFresh(at: clock.now) == false)
+        #expect(sameStale == stale)
+        #expect(await runner.runCount == 2)
+
+        await runner.releaseGate()
+        let refreshed = await discovery.refresh(target: tmuxTestTarget)
+        #expect(refreshed.sessions.map(\.name) == ["new"])
+        #expect(await runner.runCount == 2)
+    }
+
+    @Test("failed refresh retains authoritative sessions and timestamp")
+    func failedRefreshRetainsEvidence() async {
+        let clock = TmuxTestClock()
+        let runner = TmuxSnapshotRunner(steps: [
+            .output(.init(stdout: "known\n", stderr: "", exitCode: 0)),
+            .failure
+        ])
+        let discovery = TmuxSessionDiscovery(
+            processRunner: runner,
+            now: { clock.now }
+        )
+
+        let first = await discovery.refresh(target: tmuxTestTarget)
+        clock.advance(by: 61)
+        let failed = await discovery.refresh(target: tmuxTestTarget)
+
+        #expect(failed.sessions == first.sessions)
+        #expect(failed.fetchedAt == first.fetchedAt)
+        #expect(failed.readiness == .ready)
+        #expect(failed.verification == .idle)
+        #expect(failed.lastError == .transport)
+    }
+
+    @Test(
+        "empty tmux diagnostics replace inventory with authoritative evidence",
+        arguments: [
+            "no server running on /tmp/tmux/default",
+            "no sessions"
+        ]
+    )
+    func emptyTmuxIsAuthoritative(_ diagnostic: String) async {
+        let clock = TmuxTestClock()
+        let runner = TmuxSnapshotRunner(steps: [
+            .output(.init(stdout: "old\n", stderr: "", exitCode: 0)),
+            .output(.init(
+                stdout: "",
+                stderr: diagnostic,
+                exitCode: 1
+            ))
+        ])
+        let discovery = TmuxSessionDiscovery(
+            processRunner: runner,
+            now: { clock.now }
+        )
+
+        _ = await discovery.refresh(target: tmuxTestTarget)
+        clock.advance(by: 10)
+        let empty = await discovery.refresh(target: tmuxTestTarget)
+
+        #expect(empty.sessions.isEmpty)
+        #expect(empty.readiness == .ready)
+        #expect(empty.fetchedAt == clock.now)
+        #expect(empty.lastError == nil)
+    }
+
+    @Test("Worker-not-ready evidence does not replace authoritative sessions")
+    func workerNotReadyRetainsSessions() async {
+        let clock = TmuxTestClock()
+        let runner = TmuxSnapshotRunner(steps: [
+            .output(.init(stdout: "known\n", stderr: "", exitCode: 0)),
+            .output(.init(
+                stdout: "",
+                stderr: "worker has not been ready yet",
+                exitCode: 1
+            ))
+        ])
+        let discovery = TmuxSessionDiscovery(
+            processRunner: runner,
+            now: { clock.now }
+        )
+        let target = TerminalTarget.worker(
+            devboxSID: "dbx_135679",
+            devboxName: "wt_hl",
+            alias: "hl_gpu_2",
+            workerID: "3966773"
+        )
+
+        let first = await discovery.refresh(target: target)
+        clock.advance(by: 10)
+        let notReady = await discovery.refresh(target: target)
+
+        #expect(notReady.sessions == first.sessions)
+        #expect(notReady.fetchedAt == first.fetchedAt)
+        #expect(notReady.readiness == .workerNotReady)
+        #expect(notReady.lastError == .workerNotReady)
+    }
+
+    @Test("rename and termination preserve the authoritative timestamp")
+    func mutationsPreserveTimestamp() async {
+        let clock = TmuxTestClock()
+        let runner = TmuxSnapshotRunner(steps: [
+            .output(.init(stdout: "one\ntwo\n", stderr: "", exitCode: 0))
+        ])
+        let discovery = TmuxSessionDiscovery(
+            processRunner: runner,
+            now: { clock.now }
+        )
+
+        let first = await discovery.refresh(target: tmuxTestTarget)
+        clock.advance(by: 10)
+        await discovery.recordRename(
+            target: tmuxTestTarget,
+            from: "one",
+            to: "renamed"
+        )
+        let renamed = await discovery.snapshot(target: tmuxTestTarget)
+        await discovery.recordTermination(
+            target: tmuxTestTarget,
+            sessionNames: ["two"]
+        )
+        let terminated = await discovery.snapshot(target: tmuxTestTarget)
+
+        #expect(renamed?.sessions.map(\.name) == ["renamed", "two"])
+        #expect(renamed?.fetchedAt == first.fetchedAt)
+        #expect(terminated?.sessions.map(\.name) == ["renamed"])
+        #expect(terminated?.fetchedAt == first.fetchedAt)
+    }
+
     @Test("discovers sessions through the safe target command")
     func discoversSessions() async throws {
         let runner = TmuxScriptedRunner(
@@ -22,6 +192,7 @@ struct TmuxSessionDiscoveryTests {
         let sessions = try await discovery.list(target: target)
 
         #expect(sessions.map(\.name) == ["mlz-shell", "external.train"])
+        #expect(await discovery.snapshot(target: target)?.sessions == sessions)
         #expect(await discovery.cached(target: target) == sessions)
         let command = await runner.recordedCommand()
         #expect(command?.executable == "/usr/bin/ssh")
@@ -70,7 +241,7 @@ struct TmuxSessionDiscoveryTests {
         )
 
         #expect(try await discovery.list(target: target).isEmpty)
-        #expect(await discovery.cached(target: target) == [])
+        #expect(await discovery.snapshot(target: target)?.sessions == [])
     }
 
     @Test("pooled discovery caches authoritative no-server output")
@@ -94,7 +265,7 @@ struct TmuxSessionDiscoveryTests {
         )
 
         #expect(try await discovery.list(target: target).isEmpty)
-        #expect(await discovery.cached(target: target) == [])
+        #expect(await discovery.snapshot(target: target)?.sessions == [])
     }
 
     @Test("pooled discovery preserves Worker not-ready diagnostics")
@@ -144,7 +315,7 @@ struct TmuxSessionDiscoveryTests {
         )
 
         #expect(
-            await discovery.cached(target: target)?.map(\.name)
+            await discovery.snapshot(target: target)?.sessions.map(\.name)
                 == ["new-name", "other"]
         )
     }
@@ -172,8 +343,70 @@ struct TmuxSessionDiscoveryTests {
         )
 
         #expect(
-            await discovery.cached(target: target)?.map(\.name) == ["two"]
+            await discovery.snapshot(target: target)?.sessions.map(\.name)
+                == ["two"]
         )
+    }
+}
+
+private let tmuxTestTarget = TerminalTarget.devbox(
+    sid: "dbx_135679",
+    name: "wt_hl",
+    alias: "hl_gpu_2"
+)
+
+private final class TmuxTestClock: @unchecked Sendable {
+    private let value = OSAllocatedUnfairLock(
+        initialState: TmuxSnapshotDate(timeIntervalSince1970: 1_000)
+    )
+
+    var now: TmuxSnapshotDate { value.withLock { $0 } }
+
+    func advance(by interval: Double) {
+        value.withLock { $0 = $0.addingTimeInterval(interval) }
+    }
+}
+
+private enum TmuxSnapshotRunnerError: Error {
+    case failed
+}
+
+private actor TmuxSnapshotRunner: InventoryProcessRunning {
+    enum Step: Sendable {
+        case output(InventoryProcessOutput)
+        case failure
+        case gated(InventoryProcessOutput)
+    }
+
+    private var steps: [Step]
+    private var gate: CheckedContinuation<Void, Never>?
+    private(set) var runCount = 0
+
+    init(steps: [Step]) {
+        self.steps = steps
+    }
+
+    func run(_ command: CommandSpec) async throws -> InventoryProcessOutput {
+        runCount += 1
+        let step = steps.removeFirst()
+        switch step {
+        case let .output(output):
+            return output
+        case .failure:
+            throw TmuxSnapshotRunnerError.failed
+        case let .gated(output):
+            await withCheckedContinuation { gate = $0 }
+            return output
+        }
+    }
+
+    func waitUntilRunCount(_ expected: Int) async {
+        while runCount < expected { await Task.yield() }
+    }
+
+    func releaseGate() {
+        gate?.resume()
+        gate = nil
     }
 }
 
