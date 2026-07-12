@@ -141,7 +141,13 @@ struct WorkerMetricsStreamerTests {
             Array(bytes[..<midpoint]),
             Array(bytes[midpoint...]),
         ])
-        let streamer = WorkerMetricsStreamer(processStreamer: processStreamer)
+        let directory = temporarySSHDirectory()
+        let poolRunner = SSHMasterScriptedRunner(actions: [.exit(255), .succeed])
+        let pool = SSHMasterPool(testDirectory: directory, runner: poolRunner)
+        let streamer = WorkerMetricsStreamer(
+            sshMasterPool: pool,
+            processStreamer: processStreamer
+        )
         let target = TerminalTarget.worker(
             devboxSID: "dbx_135679",
             devboxName: "wt_hl",
@@ -157,6 +163,10 @@ struct WorkerMetricsStreamerTests {
         let second = try await iterator.next()
         #expect(first?.memoryTotalBytes == 102_400)
         #expect(second?.memoryTotalBytes == 204_800)
+        let command = try #require(processStreamer.recordedCommand())
+        let expectedPath = try SSHMasterCommands(directory: directory)
+            .socketPath(alias: "hl_gpu_2")
+        #expect(command.arguments.contains("ControlPath=\(expectedPath)"))
         do {
             _ = try await iterator.next()
             Issue.record("Expected an ended persistent connection")

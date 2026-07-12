@@ -22,6 +22,15 @@ public enum CommandValidationError: Error, Equatable, Sendable {
 }
 
 public enum MerlinCommands {
+    public static func sshAlias(for target: TerminalTarget) -> String? {
+        switch target {
+        case .local:
+            nil
+        case let .devbox(_, _, alias), let .worker(_, _, alias, _):
+            alias
+        }
+    }
+
     /// Captures one machine-readable, read-only metrics snapshot inside a
     /// Worker. Shell separators are escaped at the Devbox hop so `mlx` receives
     /// them as arguments and reconstructs them only inside the Worker shell.

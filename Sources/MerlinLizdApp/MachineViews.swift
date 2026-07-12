@@ -327,6 +327,7 @@ struct WorkerDetailView: View {
     let worker: WorkerInventoryRecord
     let onConnect: () -> Void
     let onBrowseSessions: () -> Void
+    let metricsStreamer: WorkerMetricsStreamer
 
     var body: some View {
         ScrollView {
@@ -388,6 +389,7 @@ struct WorkerDetailView: View {
                 }
 
                 WorkerMonitoringContainer(
+                    streamer: metricsStreamer,
                     platformTarget: platformMonitoringTarget,
                     directTarget: directMonitoringTarget,
                     expectsGPU: worker.gpuCount > 0,

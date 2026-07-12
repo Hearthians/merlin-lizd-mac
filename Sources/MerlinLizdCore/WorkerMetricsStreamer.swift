@@ -14,12 +14,14 @@ public final class WorkerMetricsStreamer: @unchecked Sendable {
     typealias Parser = @Sendable (String, Date) throws -> WorkerMetricsSample
 
     private let processStreamer: any InventoryProcessOutputStreaming
+    private let sshMasterPool: SSHMasterPool?
     private let now: @Sendable () -> Date
     private let parser: Parser
     private let lease = WorkerMetricsStreamLease()
 
-    public init() {
+    public init(sshMasterPool: SSHMasterPool) {
         processStreamer = POSIXInventoryProcessStreamer()
+        self.sshMasterPool = sshMasterPool
         now = Date.init
         parser = { output, timestamp in
             try WorkerMetricsParser.parse(output, timestamp: timestamp)
@@ -40,12 +42,14 @@ public final class WorkerMetricsStreamer: @unchecked Sendable {
     }
 
     init(
+        sshMasterPool: SSHMasterPool? = nil,
         processStreamer: any InventoryProcessOutputStreaming,
         now: @escaping @Sendable () -> Date = Date.init,
         parser: @escaping Parser = { output, timestamp in
             try WorkerMetricsParser.parse(output, timestamp: timestamp)
         }
     ) {
+        self.sshMasterPool = sshMasterPool
         self.processStreamer = processStreamer
         self.now = now
         self.parser = parser
@@ -57,15 +61,30 @@ public final class WorkerMetricsStreamer: @unchecked Sendable {
     ) -> AsyncThrowingStream<WorkerMetricsSample, Error> {
         return AsyncThrowingStream { continuation in
             guard let producer = WorkerMetricsProducerRegistry.shared.start({
-                [processStreamer, now, parser, lease] in
+                [processStreamer, sshMasterPool, now, parser, lease] in
                 do {
                     let leaseID = try await lease.acquire()
                     do {
                         try Task.checkCancellation()
-                        let command = try MerlinCommands.streamWorkerMetrics(
+                        var command = try MerlinCommands.streamWorkerMetrics(
                             target: target,
                             intervalSeconds: intervalSeconds
                         )
+                        if
+                            let alias = MerlinCommands.sshAlias(for: target),
+                            let sshMasterPool
+                        {
+                            guard await sshMasterPool.prepare(
+                                alias: alias,
+                                priority: .foreground
+                            ) == .ready else {
+                                throw WorkerMetricsStreamingError.connectionEnded
+                            }
+                            command = try sshMasterPool.managedCommand(
+                                command,
+                                alias: alias
+                            )
+                        }
                         var framer = WorkerMetricsEnvelopeFramer()
                         let output = processStreamer.streamStandardOutput(command)
 

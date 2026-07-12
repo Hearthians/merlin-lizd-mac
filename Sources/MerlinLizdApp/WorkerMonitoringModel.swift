@@ -23,8 +23,8 @@ final class WorkerMonitoringModel: ObservableObject {
     private var directErrorMessage: String?
     private let retentionWindow: TimeInterval = 5 * 60
 
-    init() {
-        streamer = WorkerMetricsStreamer()
+    init(streamer: WorkerMetricsStreamer) {
+        self.streamer = streamer
         platformProvider = try? MerlinPlatformMetricsProvider()
     }
 
@@ -449,8 +449,24 @@ struct WorkerMonitoringContainer: View {
     let expectsGPU: Bool
     let unavailableMessage: String
 
-    @StateObject private var model = WorkerMonitoringModel()
+    @StateObject private var model: WorkerMonitoringModel
     @State private var retryGeneration = 0
+
+    init(
+        streamer: WorkerMetricsStreamer,
+        platformTarget: MerlinPlatformMetricsTarget?,
+        directTarget: TerminalTarget?,
+        expectsGPU: Bool,
+        unavailableMessage: String
+    ) {
+        _model = StateObject(
+            wrappedValue: WorkerMonitoringModel(streamer: streamer)
+        )
+        self.platformTarget = platformTarget
+        self.directTarget = directTarget
+        self.expectsGPU = expectsGPU
+        self.unavailableMessage = unavailableMessage
+    }
 
     private var requestID: RequestID {
         RequestID(

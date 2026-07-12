@@ -14,17 +14,45 @@ struct TmuxSessionControllerTests {
 
         try await controller.rename(
             target: .worker(
-                devboxSID: "dbx_135679",
-                devboxName: "wt_hl",
-                alias: "hl_gpu_2",
-                workerID: "3960209"
+                devboxSID: "dbx_135679", devboxName: "wt_hl",
+                alias: "hl_gpu_2", workerID: "3960209"
             ),
-            from: "mlz-old",
-            to: "training-main"
+            from: "mlz-old", to: "training-main"
         )
 
         #expect(await runner.lastCommand()?.arguments.last ==
             "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- tmux rename-session -t mlz-old training-main")
+    }
+
+    @Test("routes a mutation through the shared path without replay")
+    func mutationUsesSharedControlPathWithoutReplay() async throws {
+        let directRunner = MutationRecordingRunner(output: InventoryProcessOutput(
+            stdout: "", stderr: "", exitCode: 0
+        ))
+        let directory = temporarySSHDirectory()
+        let poolRunner = SSHMasterScriptedRunner(actions: [
+            .exit(255), .succeed, .exit(255),
+        ])
+        let pool = SSHMasterPool(testDirectory: directory, runner: poolRunner)
+        let controller = TmuxSessionController(
+            sshMasterPool: pool, processRunner: directRunner
+        )
+
+        await #expect(throws: TmuxSessionMutationError.commandFailed(exitCode: 255)) {
+            try await controller.rename(
+                target: .devbox(
+                    sid: "dbx_135679", name: "wt_hl", alias: "hl_gpu_2"
+                ),
+                from: "mlz-old", to: "training-main"
+            )
+        }
+
+        let commands = await poolRunner.commands()
+        let expectedPath = try SSHMasterCommands(directory: directory)
+            .socketPath(alias: "hl_gpu_2")
+        #expect(commands.last?.arguments.contains("ControlPath=\(expectedPath)") == true)
+        #expect(await poolRunner.childCommandCount(alias: "hl_gpu_2") == 1)
+        #expect(await directRunner.lastCommand() == nil)
     }
 
     @Test("surfaces a Worker not-ready diagnostic")

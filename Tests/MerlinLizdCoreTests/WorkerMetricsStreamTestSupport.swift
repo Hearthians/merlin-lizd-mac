@@ -1,12 +1,19 @@
 import Foundation
 @testable import MerlinLizdCore
 
-struct ChunkedInventoryProcessStreamer: InventoryProcessOutputStreaming {
+final class ChunkedInventoryProcessStreamer: InventoryProcessOutputStreaming,
+    @unchecked Sendable
+{
     let chunks: [[UInt8]]
+    private let lock = NSLock()
+    private var command: CommandSpec?
+
+    init(chunks: [[UInt8]]) { self.chunks = chunks }
 
     func streamStandardOutput(
         _ command: CommandSpec
     ) -> InventoryProcessOutputStream {
+        lock.withLock { self.command = command }
         let (stream, continuation) = AsyncThrowingStream<Data, Error>.makeStream()
         let producer = Task {
             for chunk in chunks {
@@ -16,6 +23,8 @@ struct ChunkedInventoryProcessStreamer: InventoryProcessOutputStreaming {
         }
         return InventoryProcessOutputStream(chunks: stream, producer: producer)
     }
+
+    func recordedCommand() -> CommandSpec? { lock.withLock { command } }
 }
 
 final class BlockingInventoryProcessStreamer: InventoryProcessOutputStreaming,

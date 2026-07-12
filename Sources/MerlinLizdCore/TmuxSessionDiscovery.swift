@@ -13,10 +13,14 @@ public actor TmuxSessionDiscovery {
     }
 
     private let processRunner: any InventoryProcessRunning
+    private let sshMasterPool: SSHMasterPool?
     private let localTmuxPath: String?
     private var cache: [TerminalTarget: CacheEntry] = [:]
 
-    public init(maxConcurrentProcesses: Int = 2) {
+    public init(
+        sshMasterPool: SSHMasterPool,
+        maxConcurrentProcesses: Int = 2
+    ) {
         let runner = TimedInventoryProcessRunner(
             // `mlx worker login` can take ~25 seconds on a cold Worker even
             // when it succeeds, so share the inventory command budget.
@@ -27,13 +31,16 @@ public actor TmuxSessionDiscovery {
             maxConcurrentProcesses: max(1, maxConcurrentProcesses),
             underlying: runner
         )
+        self.sshMasterPool = sshMasterPool
         localTmuxPath = LocalTmuxResolver.resolve()
     }
 
     init(
+        sshMasterPool: SSHMasterPool? = nil,
         processRunner: any InventoryProcessRunning,
         localTmuxPath: String? = "/opt/homebrew/bin/tmux"
     ) {
+        self.sshMasterPool = sshMasterPool
         self.processRunner = processRunner
         self.localTmuxPath = localTmuxPath
     }
@@ -53,7 +60,20 @@ public actor TmuxSessionDiscovery {
             target: target,
             localTmuxPath: localPath
         )
-        let output = try await processRunner.run(command)
+        let output: InventoryProcessOutput
+        if let alias = MerlinCommands.sshAlias(for: target), let sshMasterPool {
+            do {
+                output = try await sshMasterPool.run(
+                    command,
+                    alias: alias,
+                    replay: .readOnly
+                )
+            } catch let SSHMasterPoolError.commandFailed(exitCode) {
+                throw TmuxSessionDiscoveryError.commandFailed(exitCode: exitCode)
+            }
+        } else {
+            output = try await processRunner.run(command)
+        }
         let diagnostic = (output.stdout + "\n" + output.stderr).lowercased()
 
         if diagnostic.contains("worker has not been ready")
