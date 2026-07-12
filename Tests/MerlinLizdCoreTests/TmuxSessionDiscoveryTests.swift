@@ -76,6 +76,72 @@ struct TmuxSessionDiscoveryTests {
         #expect(failed.readiness == .ready)
         #expect(failed.verification == .idle)
         #expect(failed.lastError == .transport)
+        #expect(await discovery.cached(target: tmuxTestTarget) == first.sessions)
+    }
+
+    @Test("in-flight transport failure preserves an authoritative rename")
+    func failedRefreshPreservesConcurrentRename() async {
+        let clock = TmuxTestClock()
+        let runner = TmuxSnapshotRunner(steps: [
+            .output(.init(stdout: "old\nother\n", stderr: "", exitCode: 0)),
+            .gatedFailure
+        ])
+        let discovery = TmuxSessionDiscovery(
+            processRunner: runner,
+            now: { clock.now }
+        )
+
+        let first = await discovery.refresh(target: tmuxTestTarget)
+        let refresh = Task {
+            await discovery.refresh(target: tmuxTestTarget)
+        }
+        await runner.waitUntilRunCount(2)
+        await discovery.recordRename(
+            target: tmuxTestTarget,
+            from: "old",
+            to: "renamed"
+        )
+        await runner.releaseGate()
+        let failed = await refresh.value
+
+        #expect(failed.sessions.map(\.name) == ["renamed", "other"])
+        #expect(failed.fetchedAt == first.fetchedAt)
+        #expect(failed.readiness == .ready)
+        #expect(failed.lastError == .transport)
+    }
+
+    @Test("in-flight Worker-not-ready result preserves an authoritative termination")
+    func workerNotReadyPreservesConcurrentTermination() async {
+        let clock = TmuxTestClock()
+        let runner = TmuxSnapshotRunner(steps: [
+            .output(.init(stdout: "one\ntwo\n", stderr: "", exitCode: 0)),
+            .gated(.init(
+                stdout: "",
+                stderr: "worker is not ready",
+                exitCode: 1
+            ))
+        ])
+        let discovery = TmuxSessionDiscovery(
+            processRunner: runner,
+            now: { clock.now }
+        )
+
+        let first = await discovery.refresh(target: tmuxTestTarget)
+        let refresh = Task {
+            await discovery.refresh(target: tmuxTestTarget)
+        }
+        await runner.waitUntilRunCount(2)
+        await discovery.recordTermination(
+            target: tmuxTestTarget,
+            sessionNames: ["one"]
+        )
+        await runner.releaseGate()
+        let notReady = await refresh.value
+
+        #expect(notReady.sessions.map(\.name) == ["two"])
+        #expect(notReady.fetchedAt == first.fetchedAt)
+        #expect(notReady.readiness == .workerNotReady)
+        #expect(notReady.lastError == .workerNotReady)
     }
 
     @Test(
@@ -376,6 +442,7 @@ private actor TmuxSnapshotRunner: InventoryProcessRunning {
         case output(InventoryProcessOutput)
         case failure
         case gated(InventoryProcessOutput)
+        case gatedFailure
     }
 
     private var steps: [Step]
@@ -397,6 +464,9 @@ private actor TmuxSnapshotRunner: InventoryProcessRunning {
         case let .gated(output):
             await withCheckedContinuation { gate = $0 }
             return output
+        case .gatedFailure:
+            await withCheckedContinuation { gate = $0 }
+            throw TmuxSnapshotRunnerError.failed
         }
     }
 

@@ -102,7 +102,7 @@ public actor TmuxSessionDiscovery {
     ) -> [TmuxSessionRecord]? {
         guard
             let snapshot = snapshots[target],
-            snapshot.isFresh(at: now(), maximumAge: maximumAge)
+            now().timeIntervalSince(snapshot.fetchedAt) <= maximumAge
         else { return nil }
         return snapshot.sessions
     }
@@ -173,12 +173,11 @@ public actor TmuxSessionDiscovery {
                 localTmuxPath: localTmuxPath,
                 now: now
             )
-            self.completeRefresh(
+            return self.completeRefresh(
                 result,
                 target: target,
                 generation: generation
             )
-            return result
         }
         refreshes[target] = task
         return task
@@ -188,10 +187,26 @@ public actor TmuxSessionDiscovery {
         _ snapshot: TmuxSessionSnapshot,
         target: TerminalTarget,
         generation: UInt64
-    ) {
-        guard refreshGenerations[target] == generation else { return }
-        snapshots[target] = snapshot
+    ) -> TmuxSessionSnapshot {
+        guard refreshGenerations[target] == generation else {
+            return snapshots[target] ?? snapshot
+        }
+        let committed: TmuxSessionSnapshot
+        if snapshot.lastError != nil, let latest = snapshots[target] {
+            committed = TmuxSessionSnapshot(
+                target: latest.target,
+                sessions: latest.sessions,
+                readiness: snapshot.readiness,
+                fetchedAt: latest.fetchedAt,
+                verification: .idle,
+                lastError: snapshot.lastError
+            )
+        } else {
+            committed = snapshot
+        }
+        snapshots[target] = committed
         refreshes[target] = nil
+        return committed
     }
 
     private func replacingSessions(
