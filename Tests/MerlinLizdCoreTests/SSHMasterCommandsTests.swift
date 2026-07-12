@@ -20,13 +20,30 @@ struct SSHMasterCommandsTests {
         let commands = SSHMasterCommands(
             directory: .init(fileURLWithPath: "/tmp/mlz-tests")
         )
-        let prepare = try commands.prepare(alias: "hl_gpu_2")
-        #expect(prepare.executable == "/usr/bin/ssh")
-        #expect(prepare.arguments.contains("ControlMaster=yes"))
-        #expect(prepare.arguments.contains("ControlPersist=600"))
-        #expect(prepare.arguments.suffix(1) == ["hl_gpu_2"])
-        #expect(try commands.check(alias: "hl_gpu_2").arguments.contains("check"))
-        #expect(try commands.stop(alias: "hl_gpu_2").arguments.contains("stop"))
+        let socketPath = "/tmp/mlz-tests/m-cac93519225495d659065a87"
+
+        #expect(try commands.prepare(alias: "hl_gpu_2") == CommandSpec(
+            executable: "/usr/bin/ssh",
+            arguments: [
+                "-MNf", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                "-o", "ControlMaster=yes", "-o", "ControlPath=\(socketPath)",
+                "-o", "ControlPersist=600", "hl_gpu_2",
+            ]
+        ))
+        #expect(try commands.check(alias: "hl_gpu_2") == CommandSpec(
+            executable: "/usr/bin/ssh",
+            arguments: [
+                "-O", "check", "-o", "BatchMode=yes",
+                "-o", "ControlPath=\(socketPath)", "hl_gpu_2",
+            ]
+        ))
+        #expect(try commands.stop(alias: "hl_gpu_2") == CommandSpec(
+            executable: "/usr/bin/ssh",
+            arguments: [
+                "-O", "stop", "-o", "BatchMode=yes",
+                "-o", "ControlPath=\(socketPath)", "hl_gpu_2",
+            ]
+        ))
     }
 
     @Test("inserts multiplexing options before the validated destination")
@@ -39,9 +56,111 @@ struct SSHMasterCommandsTests {
             arguments: ["-nT", "hl_gpu_2", "tmux list-sessions"]
         )
         let managed = try commands.managed(child, alias: "hl_gpu_2")
-        let aliasIndex = try #require(managed.arguments.firstIndex(of: "hl_gpu_2"))
-        #expect(managed.arguments[..<aliasIndex].contains("ControlMaster=auto"))
-        #expect(managed.arguments[..<aliasIndex].contains("ControlPersist=600"))
-        #expect(managed.arguments.last == "tmux list-sessions")
+        #expect(managed == CommandSpec(
+            executable: "/usr/bin/ssh",
+            arguments: [
+                "-nT",
+                "-o", "ControlMaster=auto",
+                "-o", "ControlPath=/tmp/mlz-tests/m-cac93519225495d659065a87",
+                "-o", "ControlPersist=600",
+                "hl_gpu_2", "tmux list-sessions",
+            ]
+        ))
+    }
+
+    @Test("finds the destination after options and an option terminator")
+    func parsesDestination() throws {
+        let commands = SSHMasterCommands(
+            directory: .init(fileURLWithPath: "/tmp/mlz-tests")
+        )
+        let child = CommandSpec(
+            executable: "/usr/bin/ssh",
+            arguments: ["-v", "-p", "22", "--", "hl_gpu_2", "true"]
+        )
+
+        let managed = try commands.managed(child, alias: "hl_gpu_2")
+
+        #expect(managed.arguments == [
+            "-v", "-p", "22",
+            "-o", "ControlMaster=auto",
+            "-o", "ControlPath=/tmp/mlz-tests/m-cac93519225495d659065a87",
+            "-o", "ControlPersist=600",
+            "--", "hl_gpu_2", "true",
+        ])
+    }
+
+    @Test("rejects an invalid alias")
+    func rejectsInvalidAlias() {
+        let commands = SSHMasterCommands(
+            directory: .init(fileURLWithPath: "/tmp/mlz-tests")
+        )
+        let child = CommandSpec(
+            executable: "/usr/bin/ssh",
+            arguments: ["hl_gpu_2;id"]
+        )
+
+        #expect(throws: SSHMasterCommandError.invalidAlias) {
+            try commands.managed(child, alias: "hl_gpu_2;id")
+        }
+    }
+
+    @Test("rejects a non-SSH executable")
+    func rejectsNonSSHExecutable() {
+        let commands = SSHMasterCommands(
+            directory: .init(fileURLWithPath: "/tmp/mlz-tests")
+        )
+        let child = CommandSpec(
+            executable: "/usr/bin/env",
+            arguments: ["hl_gpu_2"]
+        )
+
+        #expect(throws: SSHMasterCommandError.invalidSSHCommand) {
+            try commands.managed(child, alias: "hl_gpu_2")
+        }
+    }
+
+    @Test("rejects an SSH command without a destination")
+    func rejectsMissingDestination() {
+        let commands = SSHMasterCommands(
+            directory: .init(fileURLWithPath: "/tmp/mlz-tests")
+        )
+        let child = CommandSpec(
+            executable: "/usr/bin/ssh",
+            arguments: ["-nT", "-o", "BatchMode=yes"]
+        )
+
+        #expect(throws: SSHMasterCommandError.invalidSSHCommand) {
+            try commands.managed(child, alias: "hl_gpu_2")
+        }
+    }
+
+    @Test("rejects the alias when it appears only in the remote command")
+    func rejectsAliasInRemoteCommand() {
+        let commands = SSHMasterCommands(
+            directory: .init(fileURLWithPath: "/tmp/mlz-tests")
+        )
+        let child = CommandSpec(
+            executable: "/usr/bin/ssh",
+            arguments: ["other-host", "echo", "hl_gpu_2"]
+        )
+
+        #expect(throws: SSHMasterCommandError.invalidSSHCommand) {
+            try commands.managed(child, alias: "hl_gpu_2")
+        }
+    }
+
+    @Test("rejects the alias when it appears only as an option value")
+    func rejectsAliasAsOptionValue() {
+        let commands = SSHMasterCommands(
+            directory: .init(fileURLWithPath: "/tmp/mlz-tests")
+        )
+        let child = CommandSpec(
+            executable: "/usr/bin/ssh",
+            arguments: ["-o", "hl_gpu_2", "other-host"]
+        )
+
+        #expect(throws: SSHMasterCommandError.invalidSSHCommand) {
+            try commands.managed(child, alias: "hl_gpu_2")
+        }
     }
 }
