@@ -15,38 +15,33 @@ enum SidebarSelection: Hashable {
 final class AppModel: ObservableObject {
     private static let inventoryCacheKey = "safe-inventory-snapshot-v1"
 
-    @Published var selection: SidebarSelection = .overview
+    @Published var selection: SidebarSelection = .overview {
+        didSet { prioritizeSelection() }
+    }
     @Published private(set) var snapshot: InventorySnapshot?
     @Published private(set) var isRefreshing = false
     @Published private(set) var isRefreshingWorkers = false
-    @Published private(set) var isProbingWorkers = false
     @Published private(set) var isStartingDevbox = false
     @Published var pendingStartDevbox: DevboxInventory?
     @Published var message: AppMessage?
 
     private let inventory: MerlinInventory?
     private let devboxLifecycle: MerlinDevboxLifecycle?
+    private let warmupCoordinator: TargetWarmupCoordinator
     private let sshAliases: [String]
     private var workerInventoryTask: Task<Void, Never>?
     private var workerInventoryGeneration: UUID?
     private var workerInventoryRescanPending = false
     private var pendingWorkerInventoryForce = false
-    private var forceReadinessAfterWorkerRefresh = false
     private var workerInventoryCache: [String: CachedWorkerInventory] = [:]
     private let workerInventoryCacheLifetime: TimeInterval = 60
     private let failedWorkerRetryDelay: TimeInterval = 15
-    private var workerProbeTask: Task<Void, Never>?
-    private var workerProbeGeneration: UUID?
-    private var readinessRescanPending = false
-    private var pendingReadinessForce = false
-    private var readinessCache: [WorkerProbeKey: CachedWorkerReadiness] = [:]
-    private let readinessCacheLifetime: TimeInterval = 60
-
-    init(sshMasterPool: SSHMasterPool) {
+    init(runtime: MerlinRemoteRuntime) {
+        warmupCoordinator = runtime.warmupCoordinator
         sshAliases = SSHConfigCandidates.load()
         do {
             let inventory = try MerlinInventory(
-                sshMasterPool: sshMasterPool,
+                sshMasterPool: runtime.sshMasterPool,
                 maxConcurrentProcesses: 4
             )
             let devboxLifecycle = try MerlinDevboxLifecycle()
@@ -63,6 +58,9 @@ final class AppModel: ObservableObject {
         if let cached = Self.loadCachedInventory() {
             snapshot = cached.snapshot
             seedCaches(from: cached)
+        }
+        if let snapshot {
+            scheduleWarmup(for: snapshot, reason: .appLaunch)
         }
     }
 
@@ -111,19 +109,16 @@ final class AppModel: ObservableObject {
         do {
             let loaded = try await inventory.refresh(sshAliases: sshAliases)
             let withWorkers = applyingCachedWorkerInventory(to: loaded)
-            let merged = applyingCachedReadiness(to: withWorkers)
-            snapshot = merged
+            snapshot = withWorkers
             persistSnapshot()
-            let isRefreshingWorkers = scheduleWorkerInventoryRefreshes(
-                for: merged,
+            scheduleWarmup(
+                for: withWorkers,
+                reason: forceReadinessProbe ? .manualRefresh : .inventoryChange
+            )
+            _ = scheduleWorkerInventoryRefreshes(
+                for: withWorkers,
                 force: forceReadinessProbe
             )
-            if !isRefreshingWorkers {
-                scheduleReadinessProbes(
-                    for: merged,
-                    force: forceReadinessProbe
-                )
-            }
             if message?.kind == .error {
                 message = nil
             }
@@ -187,7 +182,6 @@ final class AppModel: ObservableObject {
         if workerInventoryTask != nil {
             workerInventoryRescanPending = true
             pendingWorkerInventoryForce = pendingWorkerInventoryForce || force
-            forceReadinessAfterWorkerRefresh = forceReadinessAfterWorkerRefresh || force
             return true
         }
         guard let inventory else { return false }
@@ -224,7 +218,6 @@ final class AppModel: ObservableObject {
         let generation = UUID()
         workerInventoryGeneration = generation
         isRefreshingWorkers = true
-        forceReadinessAfterWorkerRefresh = forceReadinessAfterWorkerRefresh || force
         workerInventoryTask = Task { [weak self, inventory] in
             await withTaskGroup(
                 of: (WorkerInventoryTarget, DevboxInventory).self
@@ -309,15 +302,10 @@ final class AppModel: ObservableObject {
 
         let devboxes = current.devboxes.map { machine in
             guard machine.devbox.sid == sid else { return machine }
-            let workers = effectiveWorkers.map { worker in
-                let key = WorkerProbeKey(devboxSID: sid, workerID: worker.id)
-                guard let cached = readinessCache[key] else { return worker }
-                return worker.withReadiness(cached.readiness)
-            }
             return DevboxInventory(
                 devbox: machine.devbox,
                 sshAlias: machine.sshAlias,
-                workers: workers,
+                workers: effectiveWorkers,
                 workerStatus: result.workerStatus
             )
         }
@@ -325,10 +313,9 @@ final class AppModel: ObservableObject {
             devboxes: devboxes,
             refreshedAt: current.refreshedAt
         )
-        pruneReadinessCache(to: devboxes)
         persistSnapshot()
-        if let snapshot {
-            scheduleReadinessProbes(for: snapshot, force: false)
+        if result.workerStatus == .loaded, let snapshot {
+            scheduleWarmup(for: snapshot, reason: .inventoryChange)
         }
     }
 
@@ -340,10 +327,8 @@ final class AppModel: ObservableObject {
 
         let shouldRescan = workerInventoryRescanPending
         let nextForce = pendingWorkerInventoryForce
-        let readinessForce = forceReadinessAfterWorkerRefresh
         workerInventoryRescanPending = false
         pendingWorkerInventoryForce = false
-        forceReadinessAfterWorkerRefresh = false
 
         guard let current = snapshot else { return }
         if shouldRescan {
@@ -351,212 +336,109 @@ final class AppModel: ObservableObject {
                 for: current,
                 force: nextForce
             )
-            if started {
-                forceReadinessAfterWorkerRefresh =
-                    forceReadinessAfterWorkerRefresh || readinessForce
-                return
-            }
+            if started { return }
         }
-        scheduleReadinessProbes(
+        scheduleWarmup(
             for: current,
-            force: nextForce || readinessForce
+            reason: nextForce ? .manualRefresh : .inventoryChange
         )
     }
 
-    private func applyingCachedReadiness(
-        to incoming: InventorySnapshot
-    ) -> InventorySnapshot {
-        let currentKeys = Set(incoming.devboxes.flatMap { machine in
-            machine.workers.map {
-                WorkerProbeKey(devboxSID: machine.devbox.sid, workerID: $0.id)
-            }
-        })
-        readinessCache = readinessCache.filter { currentKeys.contains($0.key) }
-
-        let devboxes = incoming.devboxes.map { machine in
-            let workers = machine.workers.map { worker in
-                let key = WorkerProbeKey(
-                    devboxSID: machine.devbox.sid,
-                    workerID: worker.id
-                )
-                guard let cached = readinessCache[key] else { return worker }
-                return worker.withReadiness(cached.readiness)
-            }
-            return DevboxInventory(
-                devbox: machine.devbox,
-                sshAlias: machine.sshAlias,
-                workers: workers,
-                workerStatus: machine.workerStatus
-            )
-        }
-        return InventorySnapshot(
-            devboxes: devboxes,
-            refreshedAt: incoming.refreshedAt
-        )
-    }
-
-    private func pruneReadinessCache(to devboxes: [DevboxInventory]) {
-        let currentKeys = Set(devboxes.flatMap { machine in
-            machine.workers.map {
-                WorkerProbeKey(
-                    devboxSID: machine.devbox.sid,
-                    workerID: $0.id
-                )
-            }
-        })
-        readinessCache = readinessCache.filter { currentKeys.contains($0.key) }
-    }
-
-    private func scheduleReadinessProbes(
+    private func scheduleWarmup(
         for snapshot: InventorySnapshot,
-        force: Bool
+        reason: WarmupReason
     ) {
-        if workerProbeTask != nil {
-            readinessRescanPending = true
-            pendingReadinessForce = pendingReadinessForce || force
-            return
-        }
-
-        let now = Date()
-        let targets = snapshot.devboxes.flatMap { machine -> [WorkerProbeTarget] in
-            guard machine.devbox.status.isRunning, let alias = machine.sshAlias else {
-                return []
+        let inventory = Self.warmupInventory(from: snapshot)
+        let coordinator = warmupCoordinator
+        let updateModel = self
+        Task {
+            await coordinator.reconcile(inventory, reason: reason) { update in
+                Task { @MainActor in
+                    updateModel.applyWarmupUpdate(update)
+                }
             }
-            return machine.workers.compactMap { worker in
-                let key = WorkerProbeKey(
-                    devboxSID: machine.devbox.sid,
-                    workerID: worker.id
-                )
-                if
-                    !force,
-                    let cached = readinessCache[key],
-                    now.timeIntervalSince(cached.probedAt) < readinessCacheLifetime
-                {
+        }
+    }
+
+    private static func warmupInventory(
+        from snapshot: InventorySnapshot
+    ) -> TargetWarmupInventory {
+        var aliases: [String] = []
+        var seenAliases: Set<String> = []
+        var workerTargets: [TerminalTarget] = []
+        for machine in snapshot.devboxes {
+            guard
+                machine.devbox.status.isRunning,
+                let alias = machine.sshAlias,
+                MerlinIdentifierValidator.isSSHAlias(alias),
+                MerlinIdentifierValidator.isDevboxSID(machine.devbox.sid)
+            else {
+                continue
+            }
+            if seenAliases.insert(alias).inserted {
+                aliases.append(alias)
+            }
+            workerTargets.append(contentsOf: machine.workers.compactMap { worker in
+                guard MerlinIdentifierValidator.isWorkerID(worker.id) else {
                     return nil
                 }
-                return WorkerProbeTarget(
-                    key: key,
-                    sshAlias: alias,
-                    workerID: worker.id
-                )
-            }
-        }
-        guard !targets.isEmpty, let inventory else {
-            workerProbeGeneration = nil
-            workerProbeTask = nil
-            isProbingWorkers = false
-            return
-        }
-
-        let generation = UUID()
-        workerProbeGeneration = generation
-        isProbingWorkers = true
-        markListedWorkersAsProbing(targets.map(\.key))
-        workerProbeTask = Task { [weak self, inventory] in
-            let results = await withTaskGroup(
-                of: (WorkerProbeKey, WorkerReadiness).self
-            ) { group -> [WorkerProbeKey: WorkerReadiness] in
-                for target in targets {
-                    group.addTask {
-                        let readiness = await inventory.probeWorker(
-                            sshAlias: target.sshAlias,
-                            workerID: target.workerID
-                        )
-                        return (target.key, readiness)
-                    }
-                }
-                var results: [WorkerProbeKey: WorkerReadiness] = [:]
-                for await (key, readiness) in group {
-                    guard !Task.isCancelled else { return [:] }
-                    results[key] = readiness
-                }
-                return results
-            }
-            if !Task.isCancelled {
-                self?.applyReadinessResults(results, generation: generation)
-            }
-            self?.finishReadinessProbes(generation: generation)
-        }
-    }
-
-    private func markListedWorkersAsProbing(_ keys: [WorkerProbeKey]) {
-        guard let current = snapshot else { return }
-        let keySet = Set(keys)
-        let devboxes = current.devboxes.map { machine in
-            let workers = machine.workers.map { worker in
-                let key = WorkerProbeKey(
+                return .worker(
                     devboxSID: machine.devbox.sid,
+                    devboxName: machine.devbox.name,
+                    alias: alias,
                     workerID: worker.id
                 )
-                return keySet.contains(key) && worker.readiness == .listed
-                    ? worker.withReadiness(.probing)
-                    : worker
-            }
-            return DevboxInventory(
-                devbox: machine.devbox,
-                sshAlias: machine.sshAlias,
-                workers: workers,
-                workerStatus: machine.workerStatus
-            )
+            })
         }
-        snapshot = InventorySnapshot(
-            devboxes: devboxes,
-            refreshedAt: current.refreshedAt
+        return TargetWarmupInventory(
+            runningDevboxAliases: aliases,
+            workerTargets: workerTargets
         )
     }
 
-    private func finishReadinessProbes(generation: UUID) {
-        guard workerProbeGeneration == generation else { return }
-        workerProbeGeneration = nil
-        workerProbeTask = nil
-        isProbingWorkers = false
-
-        let shouldRescan = readinessRescanPending
-        let force = pendingReadinessForce
-        readinessRescanPending = false
-        pendingReadinessForce = false
-        if shouldRescan, let current = snapshot {
-            scheduleReadinessProbes(for: current, force: force)
-        }
-    }
-
-    private func applyReadinessResults(
-        _ results: [WorkerProbeKey: WorkerReadiness],
-        generation: UUID
-    ) {
-        guard workerProbeGeneration == generation, let current = snapshot else {
+    private func applyWarmupUpdate(_ update: TargetWarmupUpdate) {
+        guard
+            case let .worker(devboxSID, _, alias, workerID) = update.target,
+            let current = snapshot,
+            let currentMachine = current.devboxes.first(where: {
+                $0.devbox.sid == devboxSID
+            }),
+            currentMachine.devbox.status.isRunning,
+            currentMachine.sshAlias == alias,
+            currentMachine.workers.contains(where: { $0.id == workerID })
+        else {
             return
         }
-        let probedAt = Date()
-        let currentKeys = Set(current.devboxes.flatMap { machine in
-            guard machine.devbox.status.isRunning else { return [WorkerProbeKey]() }
-            return machine.workers.map {
-                WorkerProbeKey(
-                    devboxSID: machine.devbox.sid,
-                    workerID: $0.id
-                )
+
+        let readiness: WorkerReadiness
+        if let error = update.snapshot.lastError {
+            readiness = error == .workerNotReady ? .notReady : .unreachable
+        } else {
+            switch update.snapshot.readiness {
+            case .ready:
+                readiness = .ready
+            case .workerNotReady:
+                readiness = .notReady
+            case .unknown:
+                readiness = .unreachable
             }
-        })
-        for (key, readiness) in results {
-            guard currentKeys.contains(key) else { continue }
-            readinessCache[key] = CachedWorkerReadiness(
-                readiness: readiness,
-                probedAt: probedAt
-            )
         }
+
         let devboxes = current.devboxes.map { machine in
-            let workers = machine.workers.map { worker in
-                let key = WorkerProbeKey(
-                    devboxSID: machine.devbox.sid,
-                    workerID: worker.id
-                )
-                guard let readiness = results[key] else { return worker }
-                return worker.withReadiness(readiness)
+            guard
+                machine.devbox.sid == devboxSID,
+                machine.sshAlias == alias
+            else {
+                return machine
             }
             return DevboxInventory(
                 devbox: machine.devbox,
                 sshAlias: machine.sshAlias,
-                workers: workers,
+                workers: machine.workers.map { worker in
+                    worker.id == workerID
+                        ? worker.withReadiness(readiness)
+                        : worker
+                },
                 workerStatus: machine.workerStatus
             )
         }
@@ -565,6 +447,44 @@ final class AppModel: ObservableObject {
             refreshedAt: current.refreshedAt
         )
         persistSnapshot()
+    }
+
+    private func prioritizeSelection() {
+        let target: TerminalTarget?
+        switch selection {
+        case .overview, .allWorkers:
+            target = nil
+        case .local:
+            target = .local
+        case let .devbox(sid):
+            guard
+                let machine = devbox(sid: sid),
+                let alias = machine.sshAlias
+            else {
+                return
+            }
+            target = .devbox(
+                sid: sid,
+                name: machine.devbox.name,
+                alias: alias
+            )
+        case let .worker(devboxSID, workerID):
+            guard let (machine, _) = worker(
+                devboxSID: devboxSID,
+                workerID: workerID
+            ), let alias = machine.sshAlias else {
+                return
+            }
+            target = .worker(
+                devboxSID: devboxSID,
+                devboxName: machine.devbox.name,
+                alias: alias,
+                workerID: workerID
+            )
+        }
+        guard let target else { return }
+        let coordinator = warmupCoordinator
+        Task { await coordinator.prioritize(target) }
     }
 
     private func seedCaches(from cached: PersistedInventoryCache) {
@@ -578,19 +498,6 @@ final class AppModel: ObservableObject {
                         machine.devbox.sid
                     ] ?? .distantPast,
                     attemptedAt: .distantPast
-                )
-            }
-            for worker in machine.workers {
-                guard worker.readiness != .listed, worker.readiness != .probing else {
-                    continue
-                }
-                let key = WorkerProbeKey(
-                    devboxSID: machine.devbox.sid,
-                    workerID: worker.id
-                )
-                readinessCache[key] = CachedWorkerReadiness(
-                    readiness: worker.readiness,
-                    probedAt: cached.readinessProbedAtByKey[key] ?? .distantPast
                 )
             }
         }
@@ -626,7 +533,7 @@ final class AppModel: ObservableObject {
         let persisted = PersistedInventoryCache(
             snapshot: snapshot,
             workerFetchedAtBySID: workerInventoryCache.mapValues(\.fetchedAt),
-            readinessProbedAtByKey: readinessCache.mapValues(\.probedAt)
+            readinessProbedAtByKey: [:]
         )
         guard let data = try? JSONEncoder().encode(persisted) else {
             return
@@ -707,17 +614,6 @@ private struct CachedWorkerInventory: Sendable {
             attemptedAt: .distantPast
         )
     }
-}
-
-private struct WorkerProbeTarget: Sendable {
-    let key: WorkerProbeKey
-    let sshAlias: String
-    let workerID: String
-}
-
-private struct CachedWorkerReadiness: Sendable {
-    let readiness: WorkerReadiness
-    let probedAt: Date
 }
 
 private struct PersistedInventoryCache: Codable {
