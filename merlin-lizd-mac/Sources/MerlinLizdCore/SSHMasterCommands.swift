@@ -59,7 +59,8 @@ struct SSHMasterCommands: Sendable {
         }
         guard
             command.executable == "/usr/bin/ssh",
-            let destinationIndex = command.arguments.firstIndex(of: alias)
+            let parsed = sshDestination(in: command.arguments),
+            command.arguments[parsed.destinationIndex] == alias
         else {
             throw SSHMasterCommandError.invalidSSHCommand
         }
@@ -70,8 +71,45 @@ struct SSHMasterCommands: Sendable {
             "-o", "ControlMaster=auto",
             "-o", "ControlPath=\(path)",
             "-o", "ControlPersist=600",
-        ], at: destinationIndex)
+        ], at: parsed.insertionIndex)
         return CommandSpec(executable: command.executable, arguments: arguments)
+    }
+
+    private func sshDestination(
+        in arguments: [String]
+    ) -> (destinationIndex: Int, insertionIndex: Int)? {
+        var index = arguments.startIndex
+        while index < arguments.endIndex {
+            let argument = arguments[index]
+            if argument == "--" {
+                let destinationIndex = arguments.index(after: index)
+                guard destinationIndex < arguments.endIndex else {
+                    return nil
+                }
+                return (destinationIndex, index)
+            }
+            if argument == "-" || !argument.hasPrefix("-") {
+                return (index, index)
+            }
+
+            index = arguments.index(after: index)
+            if optionConsumesFollowingArgument(argument) {
+                guard index < arguments.endIndex else {
+                    return nil
+                }
+                index = arguments.index(after: index)
+            }
+        }
+        return nil
+    }
+
+    private func optionConsumesFollowingArgument(_ argument: String) -> Bool {
+        let valueOptions = Set("BbcDEeFIiJLlmOoPpQRSWw")
+        let options = argument.dropFirst()
+        for (offset, option) in options.enumerated() where valueOptions.contains(option) {
+            return offset == options.count - 1
+        }
+        return false
     }
 
     private func operation(_ operation: String, alias: String) throws -> CommandSpec {
