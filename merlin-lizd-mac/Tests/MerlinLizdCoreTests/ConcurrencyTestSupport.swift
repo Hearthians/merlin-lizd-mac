@@ -2,6 +2,33 @@ import Darwin
 import Foundation
 @testable import MerlinLizdCore
 
+func temporarySSHDirectory() -> URL {
+    URL(
+        fileURLWithPath: "/tmp/mlz-\(UUID().uuidString.prefix(12))",
+        isDirectory: true
+    )
+}
+
+func createEmptyFile(atPath path: String) throws {
+    try Data().write(to: URL(fileURLWithPath: path), options: .withoutOverwriting)
+}
+
+func createDirectory(at directory: URL) throws {
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: false
+    )
+}
+
+func fileExists(atPath path: String) -> Bool {
+    FileManager.default.fileExists(atPath: path)
+}
+
+func posixMode(of directory: URL) throws -> Int {
+    let attributes = try FileManager.default.attributesOfItem(atPath: directory.path)
+    return attributes[.posixPermissions] as? Int ?? -1
+}
+
 struct TemporaryMarkerFile: Sendable {
     private let url = FileManager.default.temporaryDirectory
         .appendingPathComponent("merlin-lizd-cancel-\(UUID().uuidString)")
@@ -97,6 +124,139 @@ actor AsyncStartGate {
         isOpen = true
         openWaiters.forEach { $0.resume() }
         openWaiters.removeAll()
+    }
+}
+
+enum SSHMasterTestError: Error, Equatable, Sendable {
+    case transport
+}
+
+actor SSHMasterScriptedRunner: InventoryProcessRunning {
+    indirect enum Action: Sendable {
+        case succeed
+        case exit(Int32)
+        case fail(SSHMasterTestError)
+        case wait(AsyncStartGate, then: Action)
+    }
+
+    private var actions: [Action]
+    private var recordedCommands: [CommandSpec] = []
+
+    init(actions: [Action] = []) {
+        self.actions = actions
+    }
+
+    init(prepareExitCodes: [Int32]) {
+        actions = prepareExitCodes.flatMap { [.exit(255), .exit($0)] }
+    }
+
+    func enqueue(_ action: Action) {
+        actions.append(action)
+    }
+
+    func run(_ command: CommandSpec) async throws -> InventoryProcessOutput {
+        recordedCommands.append(command)
+        let action = actions.isEmpty ? .succeed : actions.removeFirst()
+        return try await perform(action)
+    }
+
+    func commands() -> [CommandSpec] {
+        recordedCommands
+    }
+
+    func count(argumentsContaining substring: String) -> Int {
+        recordedCommands.filter { command in
+            command.arguments.contains { $0.contains(substring) }
+        }.count
+    }
+
+    func masterStartAliases() -> [String] {
+        recordedCommands.compactMap { command in
+            guard
+                command.executable == "/usr/bin/ssh",
+                command.arguments.first == "-MNf",
+                let alias = command.arguments.last
+            else { return nil }
+            return alias
+        }
+    }
+
+    func childCommandCount(alias: String) -> Int {
+        recordedCommands.filter { command in
+            guard
+                command.executable == "/usr/bin/ssh",
+                command.arguments.first != "-MNf",
+                command.arguments.first != "-O",
+                let destinationIndex = sshDestinationIndex(in: command.arguments)
+            else { return false }
+            return command.arguments[destinationIndex] == alias
+        }.count
+    }
+
+    private func perform(_ action: Action) async throws -> InventoryProcessOutput {
+        switch action {
+        case .succeed:
+            return output(exitCode: 0)
+        case let .exit(exitCode):
+            return output(exitCode: exitCode)
+        case let .fail(error):
+            throw error
+        case let .wait(gate, then: next):
+            await gate.wait()
+            return try await perform(next)
+        }
+    }
+
+    private func output(exitCode: Int32) -> InventoryProcessOutput {
+        InventoryProcessOutput(stdout: "", stderr: "", exitCode: exitCode)
+    }
+
+    private func sshDestinationIndex(in arguments: [String]) -> Int? {
+        var index = arguments.startIndex
+        while index < arguments.endIndex {
+            let argument = arguments[index]
+            if argument == "--" {
+                let destination = arguments.index(after: index)
+                return destination < arguments.endIndex ? destination : nil
+            }
+            if argument == "-" || !argument.hasPrefix("-") {
+                return index
+            }
+            index = arguments.index(after: index)
+            if optionConsumesFollowingArgument(argument) {
+                guard index < arguments.endIndex else { return nil }
+                index = arguments.index(after: index)
+            }
+        }
+        return nil
+    }
+
+    private func optionConsumesFollowingArgument(_ argument: String) -> Bool {
+        let valueOptions = Set("BbcDEeFIiJLlmOoPpQRSWw")
+        let options = argument.dropFirst()
+        return options.enumerated().contains { offset, option in
+            valueOptions.contains(option) && offset == options.count - 1
+        }
+    }
+}
+
+actor SSHMasterCancellationRunner: InventoryProcessRunning {
+    private var callCount = 0
+    private var childCount = 0
+
+    func run(_ command: CommandSpec) async throws -> InventoryProcessOutput {
+        callCount += 1
+        if command.arguments.first != "-O", command.arguments.first != "-MNf" {
+            childCount += 1
+        }
+        if callCount == 3 {
+            throw CancellationError()
+        }
+        return InventoryProcessOutput(stdout: "", stderr: "", exitCode: callCount == 1 ? 255 : 0)
+    }
+
+    func childCommandCount() -> Int {
+        childCount
     }
 }
 
