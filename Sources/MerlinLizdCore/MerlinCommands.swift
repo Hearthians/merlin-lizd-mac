@@ -197,6 +197,16 @@ public enum MerlinCommands {
         }
     }
 
+    public static func warmWorker(target: TerminalTarget) throws -> CommandSpec {
+        let (alias, workerID) = try validatedWorkerRoute(target)
+        let fixedBody = #"printf '__MLZ_READY__\n'; tmux list-sessions -F#{session_name}"#
+        return workerCommand(
+            alias: alias,
+            workerID: workerID,
+            remoteCommands: #"sh -lc "\#(fixedBody)""#
+        )
+    }
+
     public static func startDevbox(
         merlinCLIPath: String,
         sid: String

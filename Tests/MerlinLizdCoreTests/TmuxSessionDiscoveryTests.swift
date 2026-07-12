@@ -264,6 +264,29 @@ struct TmuxSessionDiscoveryTests {
         #expect(command?.executable == "/usr/bin/ssh")
     }
 
+    @Test("Worker tmux warmup parses readiness before session names")
+    func workerWarmupParsesReadinessMarker() async throws {
+        let runner = TmuxScriptedRunner(output: InventoryProcessOutput(
+            stdout: "connecting to Worker\n__MLZ_READY__\none\ntwo\n",
+            stderr: "",
+            exitCode: 0
+        ))
+        let discovery = TmuxSessionDiscovery(processRunner: runner)
+        let target = TerminalTarget.worker(
+            devboxSID: "dbx_135679",
+            devboxName: "wt_hl",
+            alias: "hl_gpu_2",
+            workerID: "3966762"
+        )
+
+        let sessions = try await discovery.list(target: target)
+
+        #expect(sessions.map(\.name) == ["one", "two"])
+        let remote = await runner.recordedCommand()?.arguments.last
+        #expect(remote?.components(separatedBy: "mlx worker login").count == 2)
+        #expect(remote?.contains("printf '__MLZ_READY__\\n'") == true)
+    }
+
     @Test("routes remote discovery through the shared SSH control path")
     func usesSharedControlPath() async throws {
         let directory = temporarySSHDirectory()
@@ -293,7 +316,7 @@ struct TmuxSessionDiscoveryTests {
     func cachesNoServerResult() async throws {
         let runner = TmuxScriptedRunner(
             output: InventoryProcessOutput(
-                stdout: "",
+                stdout: "__MLZ_READY__\n",
                 stderr: "no server running on /tmp/tmux-1000/default",
                 exitCode: 1
             )
