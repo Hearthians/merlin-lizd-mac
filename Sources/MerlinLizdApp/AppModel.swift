@@ -37,6 +37,7 @@ final class AppModel: ObservableObject {
     private let workerInventoryCacheLifetime: TimeInterval = 60
     private let failedWorkerRetryDelay: TimeInterval = 15
     private lazy var warmupUpdateRelay = WarmupUpdateRelay(model: self)
+    private var hasStarted = false
     init(runtime: MerlinRemoteRuntime) {
         self.runtime = runtime
         sshAliases = SSHConfigCandidates.load()
@@ -60,6 +61,11 @@ final class AppModel: ObservableObject {
             snapshot = cached.snapshot
             seedCaches(from: cached)
         }
+    }
+
+    func start() {
+        guard !hasStarted else { return }
+        hasStarted = true
         if let snapshot {
             scheduleWarmup(for: snapshot, reason: .appLaunch)
         }

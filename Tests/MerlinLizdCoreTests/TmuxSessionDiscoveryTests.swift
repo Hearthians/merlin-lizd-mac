@@ -89,6 +89,37 @@ struct TmuxSessionDiscoveryTests {
         #expect(await runner.runCount == 2)
     }
 
+    @Test("stale request rechecks freshness after an existing refresh finishes")
+    func refreshIfStaleAvoidsCompletedRefreshDuplicate() async {
+        let clock = TmuxTestClock()
+        let runner = TmuxSnapshotRunner(steps: [
+            .output(.init(stdout: "cached\n", stderr: "", exitCode: 0)),
+            .gated(.init(stdout: "fresh\n", stderr: "", exitCode: 0)),
+        ])
+        let discovery = TmuxSessionDiscovery(
+            processRunner: runner,
+            now: { clock.now }
+        )
+
+        _ = await discovery.refresh(target: tmuxTestTarget)
+        clock.advance(by: 61)
+        let existingRefresh = Task {
+            await discovery.refresh(target: tmuxTestTarget)
+        }
+        await runner.waitUntilRunCount(2)
+        let cached = await discovery.peekSnapshot(target: tmuxTestTarget)
+        #expect(cached?.sessions.map(\.name) == ["cached"])
+        #expect(cached?.verification == .verifying)
+
+        await runner.releaseGate()
+        #expect(await existingRefresh.value.sessions.map(\.name) == ["fresh"])
+
+        let rechecked = await discovery.refreshIfStale(target: tmuxTestTarget)
+        #expect(rechecked.sessions.map(\.name) == ["fresh"])
+        #expect(rechecked.isFresh(at: clock.now))
+        #expect(await runner.runCount == 2)
+    }
+
     @Test("failed refresh retains authoritative sessions and timestamp")
     func failedRefreshRetainsEvidence() async {
         let clock = TmuxTestClock()

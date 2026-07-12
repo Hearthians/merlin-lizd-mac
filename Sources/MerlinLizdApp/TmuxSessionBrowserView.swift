@@ -33,20 +33,24 @@ final class TmuxSessionBrowserModel: ObservableObject {
         if !force, let snapshot, snapshot.isFresh(at: Date()) {
             return
         }
-        startRefresh()
+        startRefresh(force: force)
     }
 
     func removeSessions(named names: Set<String>) {
         sessions.removeAll { names.contains($0.name) }
     }
 
-    private func startRefresh() {
+    private func startRefresh(force: Bool) {
         guard refreshTask == nil else { return }
         isVerifying = true
         let discovery = discovery
         let target = target
         refreshTask = Task { [weak self] in
-            let snapshot = await discovery.refresh(target: target)
+            let snapshot = if force {
+                await discovery.refresh(target: target)
+            } else {
+                await discovery.refreshIfStale(target: target)
+            }
             guard !Task.isCancelled else { return }
             self?.publishRefresh(snapshot)
             self?.refreshTask = nil

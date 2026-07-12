@@ -13,12 +13,15 @@ struct MerlinLizdApplication: App {
     init() {
         let runtime = MerlinRemoteRuntime()
         self.runtime = runtime
+        let model = AppModel(runtime: runtime)
+        let terminals = TerminalTabsModel(runtime: runtime)
         _model = StateObject(
-            wrappedValue: AppModel(runtime: runtime)
+            wrappedValue: model
         )
         _terminals = StateObject(
-            wrappedValue: TerminalTabsModel(runtime: runtime)
+            wrappedValue: terminals
         )
+        model.start()
     }
 
     var body: some Scene {
