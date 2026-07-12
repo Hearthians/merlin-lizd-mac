@@ -91,6 +91,13 @@ public actor TmuxSessionDiscovery {
         return snapshots[target]
     }
 
+    /// Returns current evidence without starting or joining remote work.
+    public func peekSnapshot(
+        target: TerminalTarget
+    ) -> TmuxSessionSnapshot? {
+        snapshots[target]
+    }
+
     public func refresh(target: TerminalTarget) async -> TmuxSessionSnapshot {
         let task = refreshes[target] ?? startRefresh(target: target)
         return await task.value

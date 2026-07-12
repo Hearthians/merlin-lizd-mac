@@ -7,6 +7,8 @@ final class MerlinRemoteRuntime {
     let tmuxController: TmuxSessionController
     let metricsStreamer: WorkerMetricsStreamer
     let warmupCoordinator: TargetWarmupCoordinator
+    private let submissions = OrderedAsyncSubmissionQueue()
+    private var isShuttingDown = false
 
     init() {
         let pool = SSHMasterPool(maxConcurrentPreparations: 4)
@@ -24,7 +26,33 @@ final class MerlinRemoteRuntime {
         )
     }
 
+    func reconcile(
+        _ inventory: TargetWarmupInventory,
+        reason: WarmupReason,
+        onUpdate: @escaping @Sendable (TargetWarmupUpdate) -> Void
+    ) {
+        guard !isShuttingDown else { return }
+        let coordinator = warmupCoordinator
+        submissions.submit {
+            await coordinator.reconcile(
+                inventory,
+                reason: reason,
+                onUpdate: onUpdate
+            )
+        }
+    }
+
+    func prioritize(_ target: TerminalTarget) {
+        guard !isShuttingDown else { return }
+        let coordinator = warmupCoordinator
+        submissions.submit {
+            await coordinator.prioritize(target)
+        }
+    }
+
     func shutdown() async {
+        isShuttingDown = true
+        await submissions.cancelPendingAndFinish()
         await warmupCoordinator.shutdown()
         await WorkerMetricsStreamer.shutdownAll()
         await sshMasterPool.shutdown()
