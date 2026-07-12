@@ -250,6 +250,75 @@ struct TmuxSessionDiscoveryTests {
         #expect(await refresh.value.sessions.map(\.name) == ["two"])
     }
 
+    @Test("first successful refresh preserves a concurrent rename")
+    func firstRefreshPreservesConcurrentRename() async {
+        let runner = TmuxSnapshotRunner(steps: [
+            .gated(.init(stdout: "old\nother\n", stderr: "", exitCode: 0)),
+        ])
+        let discovery = TmuxSessionDiscovery(processRunner: runner)
+
+        let refresh = Task { await discovery.refresh(target: tmuxTestTarget) }
+        await runner.waitUntilRunCount(1)
+        await discovery.recordRename(
+            target: tmuxTestTarget,
+            from: "old",
+            to: "renamed"
+        )
+        await runner.releaseGate()
+
+        #expect(await refresh.value.sessions.map(\.name) == ["renamed", "other"])
+    }
+
+    @Test("first successful refresh preserves a concurrent termination")
+    func firstRefreshPreservesConcurrentTermination() async {
+        let runner = TmuxSnapshotRunner(steps: [
+            .gated(.init(stdout: "one\ntwo\n", stderr: "", exitCode: 0)),
+        ])
+        let discovery = TmuxSessionDiscovery(processRunner: runner)
+
+        let refresh = Task { await discovery.refresh(target: tmuxTestTarget) }
+        await runner.waitUntilRunCount(1)
+        await discovery.recordTermination(
+            target: tmuxTestTarget,
+            sessionNames: ["one"]
+        )
+        await runner.releaseGate()
+
+        #expect(await refresh.value.sessions.map(\.name) == ["two"])
+    }
+
+    @Test("mutations outside refresh advance revision without accumulating journal")
+    func idleMutationsDoNotAccumulateJournal() async {
+        let discovery = TmuxSessionDiscovery(processRunner: TmuxSnapshotRunner(
+            steps: [.output(.init(
+                stdout: "one\ntwo\n",
+                stderr: "",
+                exitCode: 0
+            ))]
+        ))
+        _ = await discovery.refresh(target: tmuxTestTarget)
+
+        await discovery.recordRename(
+            target: tmuxTestTarget,
+            from: "one",
+            to: "renamed"
+        )
+        await discovery.recordTermination(
+            target: tmuxTestTarget,
+            sessionNames: ["two"]
+        )
+
+        let state = await discovery.mutationStateForTesting(
+            target: tmuxTestTarget
+        )
+        #expect(state.revision == 2)
+        #expect(state.journalCount == 0)
+        #expect(
+            await discovery.peekSnapshot(target: tmuxTestTarget)?
+                .sessions.map(\.name) == ["renamed"]
+        )
+    }
+
     @Test(
         "empty tmux diagnostics replace inventory with authoritative evidence",
         arguments: [
