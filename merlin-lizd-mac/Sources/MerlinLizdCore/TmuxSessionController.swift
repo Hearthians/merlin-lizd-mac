@@ -11,12 +11,17 @@ public enum TmuxSessionMutationError: Error, Equatable, Sendable {
 public actor TmuxSessionController {
     private let processRunner: any InventoryProcessRunning
     private let sshMasterPool: SSHMasterPool?
+    private let pooledExecutionPolicy: BoundedAsyncOperationRunner?
     private let localTmuxPath: String?
 
     public init(
         sshMasterPool: SSHMasterPool,
         maxConcurrentProcesses: Int = 4
     ) {
+        pooledExecutionPolicy = BoundedAsyncOperationRunner(
+            maxConcurrentOperations: max(1, maxConcurrentProcesses),
+            timeout: .seconds(45)
+        )
         processRunner = BoundedInventoryProcessRunner(
             maxConcurrentProcesses: max(1, maxConcurrentProcesses),
             underlying: TimedInventoryProcessRunner(
@@ -35,6 +40,7 @@ public actor TmuxSessionController {
     ) {
         self.sshMasterPool = sshMasterPool
         self.processRunner = processRunner
+        pooledExecutionPolicy = nil
         self.localTmuxPath = localTmuxPath
     }
 
@@ -113,6 +119,15 @@ public actor TmuxSessionController {
             return try await processRunner.run(command)
         }
         do {
+            if let pooledExecutionPolicy {
+                return try await pooledExecutionPolicy.run {
+                    try await sshMasterPool.run(
+                        command,
+                        alias: alias,
+                        replay: .never
+                    )
+                }
+            }
             return try await sshMasterPool.run(
                 command,
                 alias: alias,

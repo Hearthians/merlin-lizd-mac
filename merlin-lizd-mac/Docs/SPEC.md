@@ -45,7 +45,7 @@ The primary mental model is **machines**. A future **tasks** workspace may add f
 
 - Start prewarming from the restored safe inventory without delaying the first App frame, then reconcile against authoritative inventory updates.
 - Own at most one OpenSSH control socket per running Devbox. Store sockets in an App-owned owner-only temporary directory under hashed alias names. Pass `ControlMaster=auto`, that `ControlPath`, and `ControlPersist=600` explicitly to App SSH children; never modify the user's SSH configuration.
-- Prewarm all current Workers with selected/open/recent targets first and no more than two concurrent `mlx worker login` operations. Warmup commands are fixed, read-only readiness and `tmux list-sessions` probes.
+- Prewarm all current Workers with selected/open/recent targets first. Prewarming and browser refreshes share a total limit of two concurrent `mlx worker login` operations. Warmup commands are fixed, read-only readiness and `tmux list-sessions` probes.
 - Treat a tmux snapshot as fresh for 60 seconds and schedule current targets for refresh every five minutes. Fresh sheets make no remote request. Stale rows remain visible during background verification and after transport or Worker-not-ready failures.
 - A warmed Devbox operation avoids the measured SSH handshake, and a warmed Worker session sheet renders cached rows immediately. The first interactive Worker terminal may still incur `mlx worker login` latency. A long-lived Worker `agent --stdio` transport is deferred for a later phase if terminal-first-byte latency remains unacceptable.
 

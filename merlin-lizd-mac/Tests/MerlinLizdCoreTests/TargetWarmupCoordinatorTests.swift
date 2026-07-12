@@ -154,6 +154,44 @@ struct TargetWarmupCoordinatorTests {
         await coordinator.shutdown()
     }
 
+    @Test("replacing both active Workers immediately admits new Workers")
+    func workerReplacementCancelsActiveWarmups() async {
+        let runner = CancellationAwareWarmupRunner()
+        let coordinator = TargetWarmupCoordinator(
+            sshMasterPool: SSHMasterPool(
+                testDirectory: temporarySSHDirectory(),
+                runner: WarmupPoolRunner()
+            ),
+            discovery: TmuxSessionDiscovery(processRunner: runner),
+            maxConcurrentWorkerWarmups: 2
+        )
+        await coordinator.reconcile(
+            .init(
+                runningDevboxAliases: [],
+                workerTargets: [warmupWorker("4100001"), warmupWorker("4100002")]
+            ),
+            reason: .inventoryChange,
+            onUpdate: { _ in }
+        )
+        await runner.waitForStarts(2)
+
+        await coordinator.reconcile(
+            .init(
+                runningDevboxAliases: [],
+                workerTargets: [warmupWorker("4100003"), warmupWorker("4100004")]
+            ),
+            reason: .inventoryChange,
+            onUpdate: { _ in }
+        )
+        await runner.waitForStarts(4)
+        await runner.waitForCancellations(2)
+
+        #expect(Set(await runner.startedWorkerIDs().suffix(2)) == ["4100003", "4100004"])
+        #expect(await runner.cancelledWorkerIDs() == ["4100001", "4100002"])
+        await runner.releaseAll()
+        await coordinator.shutdown()
+    }
+
     @Test("five-minute cache expiry re-enqueues current targets")
     func periodicRefreshReenqueuesCurrentTargets() async {
         let runner = WarmupDiscoveryRunner()
@@ -457,6 +495,52 @@ private actor WarmupDiscoveryRunner: InventoryProcessRunning {
     func releaseAll() {
         gated = false
         let pending = gates
+        gates.removeAll()
+        for gate in pending { gate.resume() }
+    }
+}
+
+private actor CancellationAwareWarmupRunner: InventoryProcessRunning {
+    private var started: [String] = []
+    private var cancelled: Set<String> = []
+    private var gates: [String: CheckedContinuation<Void, Never>] = [:]
+
+    func run(_ command: CommandSpec) async throws -> InventoryProcessOutput {
+        let remote = command.arguments.last ?? ""
+        let suffix = remote.components(separatedBy: "mlx worker login ").last ?? ""
+        let workerID = String(suffix.split(separator: " ").first ?? "")
+        started.append(workerID)
+        do {
+            try await withTaskCancellationHandler {
+                await withCheckedContinuation { gates[workerID] = $0 }
+                try Task.checkCancellation()
+            } onCancel: {
+                Task { await self.cancel(workerID) }
+            }
+        } catch {
+            cancelled.insert(workerID)
+            throw error
+        }
+        return .init(stdout: "__MLZ_READY__\n", stderr: "", exitCode: 0)
+    }
+
+    private func cancel(_ workerID: String) {
+        gates.removeValue(forKey: workerID)?.resume()
+    }
+
+    func waitForStarts(_ count: Int) async {
+        while started.count < count { await Task.yield() }
+    }
+
+    func startedWorkerIDs() -> [String] { started }
+    func cancelledWorkerIDs() -> Set<String> { cancelled }
+
+    func waitForCancellations(_ count: Int) async {
+        while cancelled.count < count { await Task.yield() }
+    }
+
+    func releaseAll() {
+        let pending = Array(gates.values)
         gates.removeAll()
         for gate in pending { gate.resume() }
     }

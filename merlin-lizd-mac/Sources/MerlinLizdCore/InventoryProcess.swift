@@ -56,6 +56,85 @@ enum InventoryProcessTimeoutError: Error, Equatable, Sendable {
     case timedOut
 }
 
+/// Applies one shared concurrency and timeout budget around a complete async
+/// operation. The slot is held until cancellation has propagated through the
+/// child operation, so process-backed work is terminated and reaped before a
+/// replacement operation can start.
+actor BoundedAsyncOperationRunner {
+    private struct Waiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
+    private let maximumConcurrentOperations: Int
+    private let timeout: Duration
+    private var activeOperations = 0
+    private var waiters: [Waiter] = []
+
+    init(maxConcurrentOperations: Int, timeout: Duration) {
+        precondition(maxConcurrentOperations > 0)
+        maximumConcurrentOperations = maxConcurrentOperations
+        self.timeout = timeout
+    }
+
+    func run<Value: Sendable>(
+        _ operation: @escaping @Sendable () async throws -> Value
+    ) async throws -> Value {
+        try await acquireSlot()
+        defer { releaseSlot() }
+        try Task.checkCancellation()
+        return try await withThrowingTaskGroup(of: Value.self) { group in
+            group.addTask { try await operation() }
+            group.addTask { [timeout] in
+                try await Task.sleep(for: timeout)
+                throw InventoryProcessTimeoutError.timedOut
+            }
+            defer { group.cancelAll() }
+            guard let first = try await group.next() else {
+                throw CancellationError()
+            }
+            return first
+        }
+    }
+
+    private func acquireSlot() async throws {
+        let waiterID = UUID()
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            try await withCheckedThrowingContinuation { continuation in
+                if activeOperations < maximumConcurrentOperations {
+                    activeOperations += 1
+                    continuation.resume()
+                } else {
+                    waiters.append(.init(
+                        id: waiterID,
+                        continuation: continuation
+                    ))
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelWaiter(id: waiterID) }
+        }
+    }
+
+    private func releaseSlot() {
+        if waiters.isEmpty {
+            activeOperations -= 1
+        } else {
+            waiters.removeFirst().continuation.resume()
+        }
+    }
+
+    private func cancelWaiter(id: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        waiters.remove(at: index).continuation.resume(
+            throwing: CancellationError()
+        )
+    }
+}
+
 struct TimedInventoryProcessRunner: InventoryProcessRunning {
     let timeout: Duration
     let underlying: any InventoryProcessRunning

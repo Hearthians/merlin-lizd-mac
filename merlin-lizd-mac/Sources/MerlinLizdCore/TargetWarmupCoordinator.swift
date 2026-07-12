@@ -91,7 +91,7 @@ public actor TargetWarmupCoordinator {
         _ inventory: TargetWarmupInventory,
         reason: WarmupReason,
         onUpdate: @escaping @Sendable (TargetWarmupUpdate) -> Void
-    ) {
+    ) async {
         guard !isShuttingDown else { return }
         generation &+= 1
         latestInventory = inventory
@@ -110,6 +110,15 @@ public actor TargetWarmupCoordinator {
 
         let currentTargets = Set(inventory.workerTargets)
         queue.removeAll { !currentTargets.contains($0.target) }
+        let obsoleteTargets = inFlightTargets.keys.filter {
+            !currentTargets.contains($0)
+        }
+        for target in obsoleteTargets {
+            guard let obsolete = inFlightTargets.removeValue(forKey: target)
+            else { continue }
+            obsolete.task.cancel()
+            await discovery.cancelRefresh(target: target)
+        }
         if case .cacheExpiry = reason {
             // Keep active work distinct so it gets one follow-up, while
             // queued work is adopted by this expiry generation.
@@ -281,9 +290,9 @@ public actor TargetWarmupCoordinator {
         }
     }
 
-    private func periodicRefresh() {
+    private func periodicRefresh() async {
         guard let latestInventory, let latestUpdate else { return }
-        reconcile(
+        await reconcile(
             latestInventory,
             reason: .cacheExpiry,
             onUpdate: latestUpdate
