@@ -21,6 +21,9 @@
 - Do not modify Devbox/Worker lifecycle or mounts.
 - Never run the full bootstrap on an existing migration target; deploy only the
   reviewed Codex helper and managed shell block.
+- Treat the Devbox master and every currently attached Worker as shared-rootfs
+  consumers. Refresh the full inventory before TERM and again before
+  quarantine; any new, missing, or unreachable consumer is a hard stop.
 - Keep every secret out of manifests, command lines, tmux names, and displayed logs.
 - Stage and commit only files named by the current task; preserve all unrelated dirty-worktree state.
 
@@ -92,6 +95,12 @@ Add fail-closed cases that require:
 - an inherited shared `CODEX_HOME` to be overridden, and any initializer
   failure to leave both `CODEX_HOME` and `CODEX_SQLITE_HOME` set to
   `/dev/null`.
+- both zsh and bash to source the real managed block successfully and to keep
+  the shell alive with both Codex roots at `/dev/null` on helper failure;
+- the narrow installer to leave Claude, history, NVM, packages, and unrelated
+  shell blocks unchanged;
+- a template containing `sqlite_home` to fail closed without writing a local
+  config.
 
 - [ ] **Step 2: Run the test in isolated Linux temp space and verify RED**
 
@@ -198,7 +207,11 @@ Expected: FAIL because the controller does not exist.
 
 - [ ] **Step 3: Implement guarded phases**
 
-Use strict mode, fixed target arrays, `0700` directories, `0600` manifests, and marker files written via temporary file plus atomic rename. Every Worker action emits and the controller validates:
+Use strict mode, fixed target arrays, `0700` directories, `0600` manifests,
+and marker files written via temporary file plus atomic rename and fsynced with
+their parent directories. Crash/retry tests must reject a marker whose durable
+prerequisites are missing. Every Worker action emits and the controller
+validates:
 
 ```text
 LIZD_CODEX_MIGRATION_V1 phase=preflight worker_id=3966762 status=ok
@@ -208,12 +221,18 @@ LIZD_CODEX_MIGRATION_V1 phase=preflight worker_id=3966762 status=ok
 cwd, open JSONL paths, and filesystem evidence without prompt content or
 persisted arguments. `freeze` revalidates PID identity, sends TERM, waits 20
 seconds, and fails if a process remains; two complete no-process/no-old-FD
-scans two seconds apart are required. `quarantine` then immediately performs a
-same-filesystem atomic rename and installs a `0555` guard with a `0444` README.
+scans two seconds apart are required. Before freeze, `preflight` prepares and
+validates a root-owned `0555` guard with a `0444` README and proves disposable
+`renameat2(RENAME_EXCHANGE)` support. `quarantine` refreshes the full
+master/Worker inventory and then atomically exchanges that ready guard with the
+old runtime, eliminating the writable gap.
 `preserve` copies from quarantine into
 `/home/tiger/.codex-migrations/<run-id>` after capacity checks. `merge` uses two
 identical manifests five seconds apart, validates every JSONL and session UUID,
-and performs fsync-backed no-overwrite copies under a NAS migration lock.
+and publishes through no-clobber `link(2)` under a NAS migration lock after
+fsyncing the temporary file. It fsyncs directories, `added-files.tsv`,
+manifests, markers, and parent directories;
+crash/rerun and concurrent-destination fixture tests must remain safe.
 `deploy` installs only the reviewed Codex helper/shell block, initializes each
 Worker `/tmp`, and reloads a pane only after exact pane/shell/idle checks.
 `verify` checks mounts, paths, links, counts, inodes, open FDs, tmux survival,
@@ -258,7 +277,9 @@ git commit -m "feat: add guarded Codex runtime migration"
 
 - [ ] **Step 1: Refresh official inventory and probe exact targets**
 
-Use `merlin-cli cpu-devbox instances list`, `cpu-devbox workers list`, and the `merlin-lizd` controller probe. Never silently substitute a Worker ID.
+Use `merlin-cli cpu-devbox instances list`, `cpu-devbox workers list`, and the
+`merlin-lizd` controller probe. Include `hl_gpu_2` master plus every attached
+Worker; never silently substitute a Worker ID.
 
 - [ ] **Step 2: Run controller preflight only**
 
@@ -268,7 +289,11 @@ Expected baseline: four Codex parents, 121 canonical sessions, 25 legacy session
 
 - [ ] **Step 3: Enforce go/no-go gates**
 
-Stop before mutation if a target is unreachable, PID identity is ambiguous, a source session changes, counts drift without explanation, a destination conflict exists, or `/tmp` is not local ext4.
+Stop before mutation if a rootfs consumer is unaccounted or unreachable, PID
+identity is ambiguous, the master/Worker inventory changes, a source session
+changes, counts drift without explanation, a destination conflict exists,
+`renameat2(RENAME_EXCHANGE)` is unavailable, the ready guard is invalid, or
+`/tmp` is not local ext4.
 
 ---
 
@@ -284,18 +309,21 @@ Stop before mutation if a target is unreachable, PID identity is ambiguous, a so
 - [ ] **Step 1: Run guarded freeze**
 
 Revalidate each exact PID start time and executable, send TERM only to those
-four parents, and wait for exit. Scan all four namespaces twice, two seconds
-apart, and require no Codex parent/child and no old SQLite/WAL/SHM FD. All tmux
+four parents, refresh the complete inventory, and wait for exit. Scan the
+master and all four Worker namespaces twice, two seconds apart, and require no
+Codex parent/child and no old SQLite/WAL/SHM FD. All tmux
 sessions and non-Codex panes must survive. If anything remains, stop for new
 approval; do not quarantine or escalate the signal.
 
 - [ ] **Step 2: Immediately quarantine the old shared runtime**
 
-Before any other work can restart Codex, verify the path is a non-symlink
-directory, not a mount point, shares a filesystem with its parent, the target
-is absent, and no `/proc/*/{fd,cwd,root}` references it. Atomically rename it
-to `/home/tiger/.codex.quarantine-<run-id>`, then create the root-owned `0555`
-guard and `0444` README at `/home/tiger/.codex`. Recheck no quarantine users.
+Before any other work can restart Codex, refresh the complete inventory and
+verify the path is a non-symlink directory, not a mount point, the target is
+absent, no `/proc/*/{fd,cwd,root}` references it, and the pre-created sibling
+guard still has the required owner/modes/content. Atomically exchange the guard
+and runtime with `renameat2(RENAME_EXCHANGE)`, then rename the displaced runtime
+to `/home/tiger/.codex.quarantine-<run-id>`. Recheck no quarantine users. If
+exchange fails, require the original `.codex` to remain unchanged.
 
 - [ ] **Step 3: Preserve old runtime**
 
@@ -310,8 +338,10 @@ quarantine unchanged.
 Acquire a NAS migration lock. Require two full source/destination SHA-256
 manifests five seconds apart to match. Validate every JSONL line and initial
 `session_meta` UUID; stop on malformed/truncated input or a UUID/hash/path/name
-conflict. Copy with destination-local temp files, fsync file, verify, rename
-without overwrite, fsync directory, and append `added-files.tsv`. Expected:
+conflict. Copy with destination-local temp files, fsync file, verify, publish
+with no-clobber `link(2)`, unlink the temp name, fsync the directory, and durably append
+`added-files.tsv`; durably publish manifests/markers only after prerequisites.
+Fixture-test a crash/rerun and concurrent destination creation. Expected:
 25 verified atomic copies, no overwrite, 146 validated canonical sessions,
 source count still 25, and matching post-merge manifest.
 

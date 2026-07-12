@@ -107,7 +107,8 @@ remain unchanged after the shell environment has loaded.
 ### 1. Preflight and freeze
 
 - Refresh the Devbox and Worker inventory and verify the four approved Worker
-  IDs are still present and reachable.
+  IDs are still present and reachable. Include the Devbox master and reject
+  any newly attached or otherwise unaccounted rootfs consumer.
 - Record every active Codex PID, `/proc/<pid>/stat` start time, executable,
   Worker target, tmux pane and pane-shell PID, cwd, and open session JSONL
   paths without reading prompt contents or persisting command arguments.
@@ -117,22 +118,26 @@ remain unchanged after the shell environment has loaded.
   tmux servers, shells, `code-mode-host`, training commands, or unrelated
   panes.
 - Immediately before sending `SIGTERM`, re-read and match PID start time and
-  executable. Wait for clean exit, then scan every reachable Worker twice,
+  executable and refresh the complete master/Worker inventory. Wait for clean
+  exit, then scan every reachable rootfs consumer twice,
   two seconds apart, for Codex processes and open Codex SQLite/WAL/SHM file
   descriptors. If a Codex parent or descendant survives, stop the migration
   and request separate approval before any `SIGKILL`.
 
 ### 2. Quarantine shared mutable state
 
-- Immediately after the second clean scan, verify `/home/tiger/.codex` is a
-  real directory, not a symlink or mount point, the quarantine destination is
-  absent, and no process has an fd, cwd, or root beneath it.
-- Atomically rename it on the same filesystem to
-  `/home/tiger/.codex.quarantine-<run-id>` before any backup, merge, or
-  deployment work can reopen the old runtime.
-- Replace the old path with a root-owned, mode `0555` guard directory and a
-  mode `0444` diagnostic README. An invocation that unsets the managed
-  environment must be unable to recreate or write the default runtime.
+- Before freeze, pre-create and validate a root-owned, mode `0555` guard
+  sibling with a mode `0444` diagnostic README, and prove on disposable
+  siblings that the host supports Linux `renameat2(RENAME_EXCHANGE)`.
+- Immediately after the second clean scan, refresh the complete inventory and
+  verify `/home/tiger/.codex` is a real directory, not a symlink or mount
+  point, the quarantine destination is absent, and no process has an fd, cwd,
+  or root beneath it.
+- Use `renameat2(RENAME_EXCHANGE)` to atomically swap the ready guard into
+  `/home/tiger/.codex`. The old runtime lands at the guard sibling and is then
+  renamed to `/home/tiger/.codex.quarantine-<run-id>`. If the exchange fails,
+  stop with the original path unchanged; there is no writable gap in which a
+  new Codex can recreate the shared runtime.
 - Recheck that no process uses the quarantine after every later phase.
 
 ### 3. Preserve the old runtime
@@ -156,9 +161,13 @@ remain unchanged after the shell environment has loaded.
   Malformed or truncated JSONL, duplicate UUIDs with different hashes, or any
   destination conflict is a hard stop.
 - Copy, never move, into a temporary file in the final destination directory;
-  fsync the file, verify size and SHA-256, atomically rename without overwrite,
-  and fsync the destination directory. Preserve relative date paths and record
-  each new file in `added-files.tsv`.
+  fsync the file, verify size and SHA-256, publish with `link(2)` as an atomic
+  no-overwrite primitive, unlink the temporary name, and fsync the destination
+  directory. Preserve relative date paths
+  and record each new file in a recoverable `added-files.tsv` journal.
+- Fsync the journal, manifests, every phase marker, and their parent
+  directories in dependency order. A crash/retry must reconstruct state from
+  content and never trust a marker whose durable prerequisites are absent.
 - Generate a stable post-merge manifest. The expected result for the confirmed
   snapshot is 146 validated sessions. Retain the complete legacy directory as
   rollback evidence.
