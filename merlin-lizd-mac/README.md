@@ -18,6 +18,30 @@ read-only Worker stream. The UI always identifies the active data source and
 marks direct-only data as degraded. Leaving the page cancels and reaps active
 processes; telemetry and signed monitoring URLs are never persisted.
 
+## SSH reuse and session prewarming
+
+At launch, the app prepares one App-owned OpenSSH control socket for each
+running Devbox and prewarms read-only tmux snapshots for current Workers, with
+at most two Worker logins in flight. Socket names use hashed aliases in a
+private temporary directory. The app does not edit the user's SSH
+configuration; child SSH commands continue to use that configuration and the
+SSH Agent while explicitly opting into the App-owned socket.
+
+Tmux snapshots are fresh for 60 seconds and are refreshed every five minutes.
+A stale snapshot remains visible while verification runs and also remains the
+last-known result if verification fails or a Worker is temporarily not ready.
+Closing a terminal tab or quitting the app stops only local channels and the
+App-owned SSH masters; it preserves remote tmux sessions and their processes.
+The confirmed **terminate session** action is the only app path that kills a
+tmux session.
+
+Connection reuse removes the Devbox SSH handshake from warmed operations, and
+a warmed Worker session sheet can render its cached rows immediately. Opening
+the first interactive Worker terminal can still pay `mlx worker login` startup
+latency. If that terminal-first-byte boundary remains unacceptable, a future
+phase may evaluate a long-lived Worker `agent --stdio` transport; it is not
+part of v1.
+
 ## Requirements
 
 - macOS 14 or newer on Apple Silicon

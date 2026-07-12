@@ -41,11 +41,20 @@ The primary mental model is **machines**. A future **tasks** workspace may add f
 - Prefer cgroup CPU/memory data over host `/proc` values only on the direct fallback path. Retain all telemetry for at most five minutes in memory, persist none of it, and stop every process when the page leaves the view.
 - A Worker appearing in a list is not proof that it is ready. Connection failures and the text `worker has not been ready yet` must remain visible as readiness/transport errors.
 
+### SSH prewarming and tmux snapshot cache
+
+- Start prewarming from the restored safe inventory without delaying the first App frame, then reconcile against authoritative inventory updates.
+- Own at most one OpenSSH control socket per running Devbox. Store sockets in an App-owned owner-only temporary directory under hashed alias names. Pass `ControlMaster=auto`, that `ControlPath`, and `ControlPersist=600` explicitly to App SSH children; never modify the user's SSH configuration.
+- Prewarm all current Workers with selected/open/recent targets first and no more than two concurrent `mlx worker login` operations. Warmup commands are fixed, read-only readiness and `tmux list-sessions` probes.
+- Treat a tmux snapshot as fresh for 60 seconds and schedule current targets for refresh every five minutes. Fresh sheets make no remote request. Stale rows remain visible during background verification and after transport or Worker-not-ready failures.
+- A warmed Devbox operation avoids the measured SSH handshake, and a warmed Worker session sheet renders cached rows immediately. The first interactive Worker terminal may still incur `mlx worker login` latency. A long-lived Worker `agent --stdio` transport is deferred for a later phase if terminal-first-byte latency remains unacceptable.
+
 ## Authentication and safety
 
 - Reuse the installed `merlin-cli` login, system SSH config, and SSH Agent. The app stores no password, private key, JWT, or raw ProxyCommand.
 - A last-known inventory snapshot may be cached locally, but only from the safe projection: never Pod IPs, ports, webshell URLs, raw command output, or credentials.
 - Read-only discovery may run automatically. Starting a Devbox requires confirmation; terminating one or more tmux sessions requires a separate destructive confirmation. No Devbox/Worker stop, delete, or kill mutation is exposed in v1.
+- Closing a terminal tab or the App preserves every remote tmux session. Graceful App shutdown stops only App-owned OpenSSH masters after local channels drain. The explicitly confirmed terminate-session action is the only tmux-killing path.
 - Use argument arrays when spawning local processes. Do not build a user-controlled shell command string.
 - Remote tmux session names are sanitized to a conservative character set.
 

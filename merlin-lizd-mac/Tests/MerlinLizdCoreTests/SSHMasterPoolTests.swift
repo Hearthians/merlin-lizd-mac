@@ -216,6 +216,14 @@ struct SSHMasterPoolTests {
         #expect(await active.value == .ready)
         await shutdown.value
         #expect(await runner.count(argumentsContaining: "ControlMaster=yes") == 1)
+        #expect(await runner.count(argumentsContaining: "stop") <= 1)
+        let argv = await runner.commands().flatMap(\.arguments).joined(separator: " ")
+        for forbidden in [
+            "tmux kill", "kill-session", "rename-session",
+            "worker stop", "worker delete",
+        ] {
+            #expect(!argv.contains(forbidden))
+        }
     }
 
     @Test("shutdown waits for an admitted child before stopping its master")
