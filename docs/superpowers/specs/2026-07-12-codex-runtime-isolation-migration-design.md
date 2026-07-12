@@ -35,10 +35,12 @@ still be active elsewhere.
 
 ## Target Layout
 
-Each shell computes the following paths at runtime:
+Each shell computes the following paths at runtime. Production defaults to
+`/tmp`; tests may inject a different parent explicitly:
 
 ```text
-LIZD_AGENT_RUNTIME_ROOT=/tmp/lizd-agent-runtime-${USER}
+LIZD_AGENT_RUNTIME_PARENT=/tmp
+LIZD_AGENT_RUNTIME_ROOT=$LIZD_AGENT_RUNTIME_PARENT/lizd-agent-runtime-${USER}
 CODEX_HOME=$LIZD_AGENT_RUNTIME_ROOT/codex
 CODEX_SQLITE_HOME=$LIZD_AGENT_RUNTIME_ROOT/codex-sqlite
 XDG_CACHE_HOME=$LIZD_AGENT_RUNTIME_ROOT/cache
@@ -58,8 +60,9 @@ $CODEX_HOME/sessions  -> $SHARED_CODEX_HOME/sessions
 $CODEX_HOME/skills    -> $SHARED_CODEX_HOME/skills
 ```
 
-`config.toml` is copied from a shared template into the local runtime. It is
-not symlinked, because concurrent config writes must not become another shared
+`config.toml` is copied from
+`$SHARED_CODEX_HOME/config.toml.template` into the local runtime. It is not
+symlinked, because concurrent config writes must not become another shared
 mutable-state channel. `CODEX_SQLITE_HOME` supplies the machine-local database
 location, so the shared template must not contain a `sqlite_home` value.
 
@@ -83,12 +86,18 @@ Devbox. It will install an idempotent managed shell block in `.zshenv` and
 4. copies the shared config template only when the local config is absent;
 5. writes a local schema/version marker after successful initialization.
 
+The script also exposes `--install-codex-runtime-only`, which installs only
+this helper and managed block. The live migration uses that entry point; it
+does not run the full bootstrap path that configures other agents, history,
+packages, or ownership.
+
 The initializer must be safe when two shells start concurrently. Directory
 creation and symlink replacement are idempotent. A local initialization lock
 under the same `/tmp` runtime prevents two shells from copying the config at
-the same time. Failure to create or verify any required symlink fails closed
-with a concise diagnostic rather than silently falling back to
-`/home/tiger/.codex`.
+the same time. Failure to create or verify any required path fails closed with
+a concise diagnostic. The managed shell block then exports both `CODEX_HOME`
+and `CODEX_SQLITE_HOME` as `/dev/null`, so an inherited or default
+`/home/tiger/.codex` can never become an accidental fallback.
 
 No command wrapper is introduced. Existing Codex CLI behavior and arguments
 remain unchanged after the shell environment has loaded.
@@ -99,62 +108,75 @@ remain unchanged after the shell environment has loaded.
 
 - Refresh the Devbox and Worker inventory and verify the four approved Worker
   IDs are still present and reachable.
-- Record every active Codex PID, process start time, Worker target, tmux pane,
-  cwd, and visible session evidence without reading prompt contents.
+- Record every active Codex PID, `/proc/<pid>/stat` start time, executable,
+  Worker target, tmux pane and pane-shell PID, cwd, and open session JSONL
+  paths without reading prompt contents or persisting command arguments.
 - Verify the canonical and legacy session counts and capture path, size,
   mtime, and SHA-256 manifests.
 - Send `SIGTERM` only to the four recorded Codex parent processes. Do not kill
   tmux servers, shells, `code-mode-host`, training commands, or unrelated
   panes.
-- Wait for clean exit and verify that no process on any reachable Worker still
-  has a Codex SQLite/WAL/SHM file open. If a Codex parent does not exit, stop
-  the migration and request separate approval before any `SIGKILL`.
+- Immediately before sending `SIGTERM`, re-read and match PID start time and
+  executable. Wait for clean exit, then scan every reachable Worker twice,
+  two seconds apart, for Codex processes and open Codex SQLite/WAL/SHM file
+  descriptors. If a Codex parent or descendant survives, stop the migration
+  and request separate approval before any `SIGKILL`.
 
-### 2. Preserve the old runtime
+### 2. Quarantine shared mutable state
 
-- Create a timestamped migration directory with mode `0700` under the shared
-  Devbox rootfs.
-- Copy the old `/home/tiger/.codex` metadata and every SQLite/WAL/SHM file into
-  that directory without modifying the originals.
-- Save file manifests and integrity results beside the copy.
-- Keep the old runtime available for forensic recovery; do not use a damaged
-  database as the source for a new runtime.
+- Immediately after the second clean scan, verify `/home/tiger/.codex` is a
+  real directory, not a symlink or mount point, the quarantine destination is
+  absent, and no process has an fd, cwd, or root beneath it.
+- Atomically rename it on the same filesystem to
+  `/home/tiger/.codex.quarantine-<run-id>` before any backup, merge, or
+  deployment work can reopen the old runtime.
+- Replace the old path with a root-owned, mode `0555` guard directory and a
+  mode `0444` diagnostic README. An invocation that unsets the managed
+  environment must be unable to recreate or write the default runtime.
+- Recheck that no process uses the quarantine after every later phase.
 
-### 3. Consolidate sessions
+### 3. Preserve the old runtime
+
+- Create `/home/tiger/.codex-migrations/<run-id>` with mode `0700`, outside
+  both the guard and quarantine, after an explicit free-space gate.
+- Copy from the quarantine with metadata preservation, no reflinks, sparse
+  file handling, and no ignored errors. Save a full inventory, metadata,
+  SHA-256 hashes for every SQLite/WAL/SHM file, and `PRAGMA quick_check` output
+  from backup copies only.
+- Keep the quarantine and verified backup available for forensic recovery;
+  never use a damaged database as the source for a new runtime.
+
+### 4. Consolidate sessions
 
 - Treat `.agent-shared/codex/sessions` as the canonical destination.
-- Copy, never move, each legacy JSONL whose basename is absent from the
-  canonical tree.
-- Before copying a source file, require its size and mtime to remain unchanged
-  across a stability interval. Copy into a temporary destination file, verify
-  SHA-256 and size, then atomically rename it into place.
-- Never overwrite an existing canonical filename. A same-name/different-hash
-  file is a hard conflict and stops the merge.
-- Generate a post-merge manifest. The expected result for the confirmed
-  snapshot is 146 unique session JSONL files. Retain the complete legacy
-  directory as rollback evidence.
+- Acquire a migration lock on NAS, then capture two complete SHA-256 manifests
+  five seconds apart. They must be identical before copying begins.
+- Parse every JSONL line and require a valid first `session_meta` record with a
+  session UUID. Deduplicate by UUID, basename, relative path, and SHA-256.
+  Malformed or truncated JSONL, duplicate UUIDs with different hashes, or any
+  destination conflict is a hard stop.
+- Copy, never move, into a temporary file in the final destination directory;
+  fsync the file, verify size and SHA-256, atomically rename without overwrite,
+  and fsync the destination directory. Preserve relative date paths and record
+  each new file in `added-files.tsv`.
+- Generate a stable post-merge manifest. The expected result for the confirmed
+  snapshot is 146 validated sessions. Retain the complete legacy directory as
+  rollback evidence.
 
-### 4. Deploy isolated runtime configuration
+### 5. Deploy isolated runtime configuration
 
-- Save the current Codex config as the shared template after removing only the
-  obsolete `sqlite_home` entry.
+- Save the current Codex config as `config.toml.template` after removing only
+  the obsolete `sqlite_home` entry, using a temporary file and atomic rename.
 - Update and test `startup-minimal-nas-agents.sh`.
-- Install the managed shell blocks on `hl_gpu_2`.
+- Install only the reviewed Codex runtime helper and managed shell blocks on
+  `hl_gpu_2`. Do not run the full bootstrap on existing machines: it also
+  changes Claude, history, ownership, packages, and Node tooling.
 - Run the runtime initializer separately inside each reachable Worker, so its
   `/tmp` receives local directories and symlinks.
-- Reload the shell environment only in the tmux panes whose Codex process was
-  stopped. Do not inject commands into unrelated panes.
-
-### 5. Quarantine shared mutable state
-
-After all reachable targets pass the isolated-runtime checks, rename the old
-shared `.codex` directory to a timestamped quarantine name and replace the old
-path with a non-writable guard directory containing a diagnostic README. This
-prevents a shell that failed to load the managed environment from silently
-recreating and writing shared SQLite files.
-
-The quarantine step occurs last. Any preflight, merge, deployment, or
-verification failure leaves the original path unchanged.
+- Reload only a recorded tmux pane whose pane ID and shell PID still match,
+  whose foreground command has returned to `zsh` or `bash`, that has no child
+  process, and that is not in copy mode. Otherwise leave the pane untouched;
+  never send keys blindly.
 
 ## Validation
 
@@ -166,13 +188,16 @@ The migration succeeds only when all of these checks pass:
 - the four runtime directories and any generated SQLite files do not resolve
   to the shared rootfs and do not share device/inode identity;
 - the three allowed links resolve to the expected canonical NAS paths;
-- every Worker sees exactly the same 146 canonical session files and manifest;
+- every Worker sees exactly the same 146 validated canonical sessions and
+  manifest;
 - no Worker opens a SQLite/WAL/SHM file beneath the quarantined shared runtime;
 - `codex --version` succeeds without the stale shared `arg0` cleanup warning;
 - starting a disposable new Codex session creates mutable files only inside
   that Worker's local runtime, and the session JSONL appears in the canonical
   NAS directory;
-- existing tmux sessions and all non-Codex panes remain present.
+- existing tmux sessions and all non-Codex panes remain present;
+- `env -u CODEX_HOME -u CODEX_SQLITE_HOME codex --version` cannot write or
+  recreate `/home/tiger/.codex` because the guard remains non-writable.
 
 Validation must not resume the user's four previous sessions automatically.
 Their panes return to a shell with the new environment loaded; Lizd chooses
@@ -180,15 +205,18 @@ which session to resume or fork.
 
 ## Rollback
 
-- Before quarantine, rollback means restoring the previous shell files and
-  leaving `/home/tiger/.codex` untouched.
-- After quarantine, rollback restores the previous shell files and atomically
-  restores the quarantined directory name.
+- Before quarantine, rollback may restore the previous shell files and leaves
+  `/home/tiger/.codex` untouched.
+- After quarantine, automated rollback never reactivates the damaged shared
+  runtime. It keeps the guard and quarantine in place, may restore only a
+  known-safe shell/config backup, and otherwise leaves Codex disabled while
+  the migration is repaired and rolled forward.
 - Session consolidation is not reversed because it is copy-only and never
   overwrites canonical files. Both source directories and pre/post manifests
   remain available for audit.
-- Damaged SQLite files are never deleted by rollback or automatically restored
-  into an active runtime.
+- Damaged SQLite files are never deleted or automatically restored into an
+  active runtime. Reactivating the quarantined directory requires a new,
+  explicit user approval.
 
 ## Accepted Operating Risk
 
