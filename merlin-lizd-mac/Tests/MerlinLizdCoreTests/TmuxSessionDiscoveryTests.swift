@@ -27,6 +27,31 @@ struct TmuxSessionDiscoveryTests {
         #expect(command?.executable == "/usr/bin/ssh")
     }
 
+    @Test("routes remote discovery through the shared SSH control path")
+    func usesSharedControlPath() async throws {
+        let directory = temporarySSHDirectory()
+        let poolRunner = TmuxPoolRunner()
+        let pool = SSHMasterPool(testDirectory: directory, runner: poolRunner)
+        let directRunner = TmuxScriptedRunner(output: InventoryProcessOutput(
+            stdout: "must-not-run", stderr: "", exitCode: 0
+        ))
+        let discovery = TmuxSessionDiscovery(
+            sshMasterPool: pool,
+            processRunner: directRunner
+        )
+
+        let sessions = try await discovery.list(target: .devbox(
+            sid: "dbx_135679", name: "wt_hl", alias: "hl_gpu_2"
+        ))
+
+        #expect(sessions.map(\.name) == ["pool-session"])
+        let commands = await poolRunner.commands()
+        let expectedPath = try SSHMasterCommands(directory: directory)
+            .socketPath(alias: "hl_gpu_2")
+        #expect(commands.last?.arguments.contains("ControlPath=\(expectedPath)") == true)
+        #expect(await directRunner.recordedCommand() == nil)
+    }
+
     @Test("caches an empty result when tmux has no server")
     func cachesNoServerResult() async throws {
         let runner = TmuxScriptedRunner(
@@ -103,6 +128,25 @@ struct TmuxSessionDiscoveryTests {
             await discovery.cached(target: target)?.map(\.name) == ["two"]
         )
     }
+}
+
+private actor TmuxPoolRunner: InventoryProcessRunning {
+    private var recorded: [CommandSpec] = []
+
+    func run(_ command: CommandSpec) async throws -> InventoryProcessOutput {
+        recorded.append(command)
+        if command.arguments.starts(with: ["-O", "check"]) {
+            return InventoryProcessOutput(stdout: "", stderr: "", exitCode: 255)
+        }
+        if command.arguments.first == "-MNf" {
+            return InventoryProcessOutput(stdout: "", stderr: "", exitCode: 0)
+        }
+        return InventoryProcessOutput(
+            stdout: "pool-session\n", stderr: "", exitCode: 0
+        )
+    }
+
+    func commands() -> [CommandSpec] { recorded }
 }
 
 private actor TmuxScriptedRunner: InventoryProcessRunning {

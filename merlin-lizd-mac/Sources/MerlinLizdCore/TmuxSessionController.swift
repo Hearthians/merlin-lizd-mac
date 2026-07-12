@@ -10,9 +10,13 @@ public enum TmuxSessionMutationError: Error, Equatable, Sendable {
 /// process infrastructure used by inventory and Devbox lifecycle commands.
 public actor TmuxSessionController {
     private let processRunner: any InventoryProcessRunning
+    private let sshMasterPool: SSHMasterPool?
     private let localTmuxPath: String?
 
-    public init(maxConcurrentProcesses: Int = 4) {
+    public init(
+        sshMasterPool: SSHMasterPool,
+        maxConcurrentProcesses: Int = 4
+    ) {
         processRunner = BoundedInventoryProcessRunner(
             maxConcurrentProcesses: max(1, maxConcurrentProcesses),
             underlying: TimedInventoryProcessRunner(
@@ -20,13 +24,16 @@ public actor TmuxSessionController {
                 underlying: FoundationInventoryProcessRunner()
             )
         )
+        self.sshMasterPool = sshMasterPool
         localTmuxPath = LocalTmuxResolver.resolve()
     }
 
     init(
+        sshMasterPool: SSHMasterPool? = nil,
         processRunner: any InventoryProcessRunning,
         localTmuxPath: String? = "/opt/homebrew/bin/tmux"
     ) {
+        self.sshMasterPool = sshMasterPool
         self.processRunner = processRunner
         self.localTmuxPath = localTmuxPath
     }
@@ -52,7 +59,7 @@ public actor TmuxSessionController {
             to: newName,
             localTmuxPath: localPath
         )
-        let output = try await processRunner.run(command)
+        let output = try await run(command, target: target)
         let diagnostic = (output.stdout + "\n" + output.stderr).lowercased()
         if diagnostic.contains("worker has not been ready")
             || diagnostic.contains("worker is not ready")
@@ -83,7 +90,7 @@ public actor TmuxSessionController {
             sessionName: sessionName,
             localTmuxPath: localPath
         )
-        let output = try await processRunner.run(command)
+        let output = try await run(command, target: target)
         let diagnostic = (output.stdout + "\n" + output.stderr).lowercased()
         if diagnostic.contains("worker has not been ready")
             || diagnostic.contains("worker is not ready")
@@ -92,6 +99,27 @@ public actor TmuxSessionController {
         }
         guard output.exitCode == 0 else {
             throw TmuxSessionMutationError.commandFailed(exitCode: output.exitCode)
+        }
+    }
+
+    private func run(
+        _ command: CommandSpec,
+        target: TerminalTarget
+    ) async throws -> InventoryProcessOutput {
+        guard
+            let alias = MerlinCommands.sshAlias(for: target),
+            let sshMasterPool
+        else {
+            return try await processRunner.run(command)
+        }
+        do {
+            return try await sshMasterPool.run(
+                command,
+                alias: alias,
+                replay: .never
+            )
+        } catch let SSHMasterPoolError.commandFailed(exitCode) {
+            throw TmuxSessionMutationError.commandFailed(exitCode: exitCode)
         }
     }
 }

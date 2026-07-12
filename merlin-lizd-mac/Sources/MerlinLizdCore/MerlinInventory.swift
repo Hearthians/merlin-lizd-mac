@@ -19,7 +19,10 @@ public actor MerlinInventory {
     private let workerLoader: InventoryLoader
     private var inFlightRefresh: InFlightRefresh?
 
-    public init(maxConcurrentProcesses: Int = 4) throws {
+    public init(
+        sshMasterPool: SSHMasterPool,
+        maxConcurrentProcesses: Int = 4
+    ) throws {
         guard maxConcurrentProcesses > 0 else {
             throw MerlinInventoryError.invalidConcurrencyLimit
         }
@@ -43,18 +46,21 @@ public actor MerlinInventory {
             processRunner: processRunner,
             workerPageSize: 100,
             loadDevboxRolesConcurrently: true,
-            now: Date.init
+            now: Date.init,
+            sshMasterPool: sshMasterPool
         )
         self.workerLoader = InventoryLoader(
             merlinCLIPath: merlinCLIPath,
             processRunner: workerProcessRunner,
             workerPageSize: 100,
             loadDevboxRolesConcurrently: true,
-            now: Date.init
+            now: Date.init,
+            sshMasterPool: sshMasterPool
         )
     }
 
     init(
+        sshMasterPool: SSHMasterPool? = nil,
         merlinCLIPath: String,
         processRunner: any InventoryProcessRunning,
         workerPageSize: Int = 100,
@@ -72,14 +78,16 @@ public actor MerlinInventory {
             processRunner: processRunner,
             workerPageSize: workerPageSize,
             loadDevboxRolesConcurrently: loadDevboxRolesConcurrently,
-            now: now
+            now: now,
+            sshMasterPool: sshMasterPool
         )
         self.workerLoader = InventoryLoader(
             merlinCLIPath: merlinCLIPath,
             processRunner: processRunner,
             workerPageSize: workerPageSize,
             loadDevboxRolesConcurrently: loadDevboxRolesConcurrently,
-            now: now
+            now: now,
+            sshMasterPool: sshMasterPool
         )
     }
 
@@ -175,6 +183,7 @@ private struct InventoryLoader: Sendable {
     let workerPageSize: Int
     let loadDevboxRolesConcurrently: Bool
     let now: @Sendable () -> Date
+    let sshMasterPool: SSHMasterPool?
 
     func load(sshAliases: [String]) async throws -> InventorySnapshot {
         let devboxes: [Devbox]
@@ -351,7 +360,15 @@ private struct InventoryLoader: Sendable {
 
             let output: InventoryProcessOutput
             do {
-                output = try await processRunner.run(command)
+                if let sshMasterPool {
+                    output = try await sshMasterPool.run(
+                        command,
+                        alias: alias,
+                        replay: .readOnly
+                    )
+                } else {
+                    output = try await processRunner.run(command)
+                }
             } catch {
                 return DevboxInventory(
                     devbox: devbox,
@@ -408,7 +425,16 @@ private struct InventoryLoader: Sendable {
             ]
         )
         do {
-            let output = try await processRunner.run(command)
+            let output: InventoryProcessOutput
+            if let sshMasterPool {
+                output = try await sshMasterPool.run(
+                    command,
+                    alias: alias,
+                    replay: .readOnly
+                )
+            } else {
+                output = try await processRunner.run(command)
+            }
             let evidence = (output.stdout + "\n" + output.stderr).lowercased()
             if evidence.contains("worker has not been ready")
                 || evidence.contains("worker is not ready")

@@ -11,12 +11,21 @@ final class TerminalTabsModel: ObservableObject {
 
     private var sessions: [String: TerminalSession] = [:]
     private let defaults: UserDefaults
-    let tmuxSessionDiscovery = TmuxSessionDiscovery()
-    private let tmuxSessionController = TmuxSessionController()
+    private let sshMasterPool: SSHMasterPool
+    let tmuxSessionDiscovery: TmuxSessionDiscovery
+    private let tmuxSessionController: TmuxSessionController
     private let externalTerminalLauncher = ExternalTerminalLauncher()
     private let persistenceKey = "terminal-state-v1"
 
-    init(defaults: UserDefaults = .standard) {
+    init(
+        sshMasterPool: SSHMasterPool,
+        tmuxSessionDiscovery: TmuxSessionDiscovery,
+        tmuxSessionController: TmuxSessionController,
+        defaults: UserDefaults = .standard
+    ) {
+        self.sshMasterPool = sshMasterPool
+        self.tmuxSessionDiscovery = tmuxSessionDiscovery
+        self.tmuxSessionController = tmuxSessionController
         self.defaults = defaults
         if
             let encoded = defaults.string(forKey: persistenceKey),
@@ -344,15 +353,24 @@ final class TerminalTabsModel: ObservableObject {
             guard let sessionName = tab.sessionName else {
                 throw CommandValidationError.invalidSessionName
             }
-            return try MerlinCommands.devboxTerminal(alias: alias, sessionName: sessionName)
+            return try sshMasterPool.managedCommand(
+                MerlinCommands.devboxTerminal(
+                    alias: alias,
+                    sessionName: sessionName
+                ),
+                alias: alias
+            )
         case let .worker(_, _, alias, workerID):
             guard let sessionName = tab.sessionName else {
                 throw CommandValidationError.invalidSessionName
             }
-            return try MerlinCommands.workerTerminal(
-                alias: alias,
-                workerID: workerID,
-                sessionName: sessionName
+            return try sshMasterPool.managedCommand(
+                MerlinCommands.workerTerminal(
+                    alias: alias,
+                    workerID: workerID,
+                    sessionName: sessionName
+                ),
+                alias: alias
             )
         }
     }

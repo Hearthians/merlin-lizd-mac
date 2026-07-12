@@ -310,16 +310,15 @@ struct MerlinInventoryTests {
                 stderr: "unsupported command",
                 exitCode: 64
             ),
-            InventoryProcessOutput(
-                stdout: """
-                id        cpu    mem    gpu    gpuType     podIP                                   port   createdAt            webshell
-                3966762   20     225    1      NVIDIA-H20                                          9000   2026-07-09T04:49:39  https://secret.invalid/worker
-                """,
-                stderr: "",
-                exitCode: 0
-            ),
         ])
+        let directory = temporarySSHDirectory()
+        let poolRunner = InventorySSHMasterRunner(workerList: """
+            id        cpu    mem    gpu    gpuType     podIP                                   port   createdAt            webshell
+            3966762   20     225    1      NVIDIA-H20                                          9000   2026-07-09T04:49:39  https://secret.invalid/worker
+            """)
+        let pool = SSHMasterPool(testDirectory: directory, runner: poolRunner)
         let inventory = try MerlinInventory(
+            sshMasterPool: pool,
             merlinCLIPath: "/Users/test/.merlin-cli/bin/merlin-cli",
             processRunner: runner
         )
@@ -339,8 +338,36 @@ struct MerlinInventoryTests {
             $0.arguments.starts(with: ["cpu-devbox", "workers", "list"])
         })
         #expect(commands.contains {
-            $0.arguments.last?.contains("mlx worker list --limit 100 --offset 0") == true
+            $0.arguments == ["-G", "hl_gpu_2"]
         })
+        #expect(!commands.first(where: { $0.arguments == ["-G", "hl_gpu_2"] })!
+            .arguments.contains(where: { $0.contains("ControlMaster") }))
+        let remoteCommands = await poolRunner.commands()
+        let expectedPath = try SSHMasterCommands(directory: directory)
+            .socketPath(alias: "hl_gpu_2")
+        #expect(remoteCommands.last?.arguments.contains("ControlPath=\(expectedPath)") == true)
+    }
+
+    @Test("probes Worker readiness through the shared SSH control path")
+    func probesWorkerReadinessThroughPool() async throws {
+        let directory = temporarySSHDirectory()
+        let poolRunner = InventorySSHMasterRunner(workerList: "")
+        let pool = SSHMasterPool(testDirectory: directory, runner: poolRunner)
+        let inventory = try MerlinInventory(
+            sshMasterPool: pool,
+            merlinCLIPath: "/Users/test/.merlin-cli/bin/merlin-cli",
+            processRunner: ScriptedInventoryProcessRunner(stdout: [])
+        )
+
+        let readiness = await inventory.probeWorker(
+            sshAlias: "hl_gpu_2", workerID: "3966762"
+        )
+
+        #expect(readiness == .ready)
+        let expectedPath = try SSHMasterCommands(directory: directory)
+            .socketPath(alias: "hl_gpu_2")
+        #expect(await poolRunner.commands().last?.arguments
+            .contains("ControlPath=\(expectedPath)") == true)
     }
 
     @Test("loads platform Workers without an SSH alias")
@@ -523,6 +550,26 @@ private actor ScriptedInventoryProcessRunner: InventoryProcessRunning {
 
 private enum ScriptedRunnerError: Error {
     case missingOutput
+}
+
+private actor InventorySSHMasterRunner: InventoryProcessRunning {
+    let workerList: String
+    private var recorded: [CommandSpec] = []
+
+    init(workerList: String) { self.workerList = workerList }
+
+    func run(_ command: CommandSpec) async throws -> InventoryProcessOutput {
+        recorded.append(command)
+        if command.arguments.starts(with: ["-O", "check"]) {
+            return InventoryProcessOutput(stdout: "", stderr: "", exitCode: 255)
+        }
+        if command.arguments.first == "-MNf" {
+            return InventoryProcessOutput(stdout: "", stderr: "", exitCode: 0)
+        }
+        return InventoryProcessOutput(stdout: workerList, stderr: "", exitCode: 0)
+    }
+
+    func commands() -> [CommandSpec] { recorded }
 }
 
 private actor ConcurrencyTrackingProcessRunner: InventoryProcessRunning {

@@ -6,13 +6,40 @@ import SwiftUI
 struct MerlinLizdApplication: App {
     @NSApplicationDelegateAdaptor(MerlinLizdApplicationDelegate.self)
     private var appDelegate
-    @StateObject private var model = AppModel()
-    @StateObject private var terminals = TerminalTabsModel()
+    @StateObject private var model: AppModel
+    @StateObject private var terminals: TerminalTabsModel
+    private let sshMasterPool: SSHMasterPool
+    private let metricsStreamer: WorkerMetricsStreamer
+
+    init() {
+        let pool = SSHMasterPool(maxConcurrentPreparations: 4)
+        let discovery = TmuxSessionDiscovery(sshMasterPool: pool)
+        let controller = TmuxSessionController(sshMasterPool: pool)
+        sshMasterPool = pool
+        metricsStreamer = WorkerMetricsStreamer(sshMasterPool: pool)
+        _model = StateObject(
+            wrappedValue: AppModel(sshMasterPool: pool)
+        )
+        _terminals = StateObject(
+            wrappedValue: TerminalTabsModel(
+                sshMasterPool: pool,
+                tmuxSessionDiscovery: discovery,
+                tmuxSessionController: controller
+            )
+        )
+    }
 
     var body: some Scene {
         WindowGroup("Merlin Lizd") {
-            MerlinRootView(model: model, terminals: terminals)
+            MerlinRootView(
+                model: model,
+                terminals: terminals,
+                metricsStreamer: metricsStreamer
+            )
                 .frame(minWidth: 960, minHeight: 640)
+                .onAppear {
+                    appDelegate.configure(sshMasterPool: sshMasterPool)
+                }
         }
         .defaultSize(width: 1180, height: 760)
         .windowToolbarStyle(.unifiedCompact)
@@ -44,6 +71,11 @@ struct MerlinLizdApplication: App {
 @MainActor
 private final class MerlinLizdApplicationDelegate: NSObject, NSApplicationDelegate {
     private var isFinishingTermination = false
+    private var sshMasterPool: SSHMasterPool?
+
+    func configure(sshMasterPool: SSHMasterPool) {
+        self.sshMasterPool = sshMasterPool
+    }
 
     func applicationShouldTerminate(
         _ sender: NSApplication
@@ -53,6 +85,7 @@ private final class MerlinLizdApplicationDelegate: NSObject, NSApplicationDelega
 
         Task {
             await WorkerMetricsStreamer.shutdownAll()
+            await sshMasterPool?.shutdown()
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater

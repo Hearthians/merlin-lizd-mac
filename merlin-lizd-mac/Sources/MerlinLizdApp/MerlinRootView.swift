@@ -5,6 +5,7 @@ import SwiftUI
 struct MerlinRootView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var terminals: TerminalTabsModel
+    let metricsStreamer: WorkerMetricsStreamer
     @State private var sessionBrowserTarget: TerminalTarget?
 
     var body: some View {
@@ -158,7 +159,8 @@ struct MerlinRootView: View {
                             alias: alias,
                             workerID: worker.id
                         )
-                    }
+                    },
+                    metricsStreamer: metricsStreamer
                 )
             } else {
                 MissingSelectionView()

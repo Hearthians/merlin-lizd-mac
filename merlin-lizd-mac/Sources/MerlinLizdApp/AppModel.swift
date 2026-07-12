@@ -42,10 +42,13 @@ final class AppModel: ObservableObject {
     private var readinessCache: [WorkerProbeKey: CachedWorkerReadiness] = [:]
     private let readinessCacheLifetime: TimeInterval = 60
 
-    init() {
+    init(sshMasterPool: SSHMasterPool) {
         sshAliases = SSHConfigCandidates.load()
         do {
-            let inventory = try MerlinInventory(maxConcurrentProcesses: 4)
+            let inventory = try MerlinInventory(
+                sshMasterPool: sshMasterPool,
+                maxConcurrentProcesses: 4
+            )
             let devboxLifecycle = try MerlinDevboxLifecycle()
             self.inventory = inventory
             self.devboxLifecycle = devboxLifecycle
