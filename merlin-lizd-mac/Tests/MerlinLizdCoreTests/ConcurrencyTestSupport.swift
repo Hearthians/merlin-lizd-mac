@@ -127,6 +127,18 @@ actor AsyncStartGate {
     }
 }
 
+actor AsyncCompletionProbe {
+    private var completionCount = 0
+
+    func complete() {
+        completionCount += 1
+    }
+
+    func count() -> Int {
+        completionCount
+    }
+}
+
 enum SSHMasterTestError: Error, Equatable, Sendable {
     case transport
 }
