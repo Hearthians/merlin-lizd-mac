@@ -103,6 +103,20 @@ public actor TmuxSessionDiscovery {
         return await task.value
     }
 
+    /// Atomically joins current verification, returns fresh evidence, or starts
+    /// one refresh after rechecking state inside the discovery actor.
+    public func refreshIfStale(
+        target: TerminalTarget,
+        maximumAge: TimeInterval = 60
+    ) async -> TmuxSessionSnapshot {
+        if let snapshot = snapshots[target],
+            snapshot.isFresh(at: now(), maximumAge: maximumAge)
+        {
+            return snapshot
+        }
+        return await refresh(target: target)
+    }
+
     func cancelRefresh(target: TerminalTarget) {
         refreshes[target]?.cancel()
     }
