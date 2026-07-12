@@ -539,13 +539,12 @@ declare -F print_fixed_targets >/dev/null || die "print_fixed_targets library fu
 print_fixed_targets >"$tmp/fixed-targets"
 printf '%s\n' \
   'hl_gpu_2' \
-  'hl_gpu_2@3960209' \
   'hl_gpu_2@3959909' \
   'hl_gpu_2@3966773' \
   'hl_gpu_2@3966762' \
   >"$tmp/expected-fixed-targets"
 cmp "$tmp/expected-fixed-targets" "$tmp/fixed-targets" >/dev/null || \
-  die "migration target inventory is not the fixed approved master and four Workers"
+  die "migration target inventory is not the fixed approved master and three Workers"
 
 declare -F validate_worker_phase_line >/dev/null || \
   die "validate_worker_phase_line library function is missing"

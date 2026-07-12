@@ -4,7 +4,9 @@ umask 077
 
 MIGRATION_CONTROLLER_SOURCE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 MIGRATION_MASTER_TARGET='hl_gpu_2'
-MIGRATION_WORKER_IDS=(3960209 3959909 3966773 3966762)
+# Frozen for the active migration run. CPU Worker 3960209 was reclaimed by
+# Merlin before freeze and is recorded as skipped; never silently re-add it.
+MIGRATION_WORKER_IDS=(3959909 3966773 3966762)
 readonly MIGRATION_MASTER_TARGET
 readonly -a MIGRATION_WORKER_IDS
 

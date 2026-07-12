@@ -41,7 +41,17 @@ else
   LOCAL_STATE_ROOT="${LOCAL_STATE_ROOT:-$TARGET_HOME/.agent-local}"
 fi
 
-LIZD_AGENT_RUNTIME_PARENT="${LIZD_AGENT_RUNTIME_PARENT:-/tmp}"
+LOCAL_MACHINE_RUNTIME_PARENT="/mnt/local/localcache00/${TARGET_USER}-agent-local"
+if [[ -n "${LIZD_AGENT_RUNTIME_PARENT:-}" ]]; then
+  LIZD_AGENT_RUNTIME_PARENT="$LIZD_AGENT_RUNTIME_PARENT"
+elif [[ -d "$LOCAL_MACHINE_RUNTIME_PARENT" && ! -L "$LOCAL_MACHINE_RUNTIME_PARENT" && \
+  -w "$LOCAL_MACHINE_RUNTIME_PARENT" ]]; then
+  # Codex refuses to create helper aliases under a temporary directory.
+  # Workspace mounts this as a per-machine local disk on both masters/workers.
+  LIZD_AGENT_RUNTIME_PARENT="$LOCAL_MACHINE_RUNTIME_PARENT"
+else
+  LIZD_AGENT_RUNTIME_PARENT=/tmp
+fi
 CODEX_RUNTIME_DIRNAME="${CODEX_RUNTIME_DIRNAME:-lizd-agent-runtime-${TARGET_USER}}"
 LIZD_AGENT_RUNTIME_ROOT="${LIZD_AGENT_RUNTIME_ROOT:-$LIZD_AGENT_RUNTIME_PARENT/$CODEX_RUNTIME_DIRNAME}"
 LOCAL_CODEX_HOME="${LOCAL_CODEX_HOME:-$LIZD_AGENT_RUNTIME_ROOT/codex}"
@@ -482,7 +492,14 @@ LIZD_CODEX_RUNTIME_INIT
 install_codex_runtime_shell_blocks() {
   local body
   body="$(cat <<EOF
-export LIZD_AGENT_RUNTIME_PARENT="\${LIZD_AGENT_RUNTIME_PARENT:-/tmp}"
+if [[ -z "\${LIZD_AGENT_RUNTIME_PARENT:-}" ]]; then
+  local_runtime_parent="/mnt/local/localcache00/\${USER:-tiger}-agent-local"
+  if [[ -d "\$local_runtime_parent" && ! -L "\$local_runtime_parent" && -w "\$local_runtime_parent" ]]; then
+    export LIZD_AGENT_RUNTIME_PARENT="\$local_runtime_parent"
+  else
+    export LIZD_AGENT_RUNTIME_PARENT=/tmp
+  fi
+fi
 export LIZD_AGENT_RUNTIME_ROOT="\$LIZD_AGENT_RUNTIME_PARENT/lizd-agent-runtime-\${USER:-tiger}"
 export CODEX_HOME="\$LIZD_AGENT_RUNTIME_ROOT/codex"
 export CODEX_SQLITE_HOME="\$LIZD_AGENT_RUNTIME_ROOT/codex-sqlite"

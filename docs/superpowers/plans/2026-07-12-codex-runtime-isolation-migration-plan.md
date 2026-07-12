@@ -4,7 +4,7 @@
 
 **Goal:** Move every current and future Merlin Codex runtime off the shared Devbox rootfs onto each target's local `/tmp` NVMe while retaining one verified NAS session pool.
 
-**Architecture:** `startup-minimal-nas-agents.sh` installs a small idempotent shell-time initializer. Shells export a local `CODEX_HOME` and `CODEX_SQLITE_HOME`; the initializer creates local mutable state and links only auth, sessions, and skills to NAS. A separate auditable migration controller freezes the four current Codex writers, immediately quarantines the shared runtime behind a read-only guard, preserves forensic evidence, performs a copy-only session merge, and deploys the shell configuration.
+**Architecture:** `startup-minimal-nas-agents.sh` installs a small idempotent shell-time initializer. Shells export a local `CODEX_HOME` and `CODEX_SQLITE_HOME`; the initializer creates local mutable state and links only auth, sessions, and skills to NAS. A separate auditable migration controller freezes the three current Codex writers, immediately quarantines the shared runtime behind a read-only guard, preserves forensic evidence, performs a copy-only session merge, and deploys the shell configuration. CPU Worker `3960209` was reclaimed before this run.
 
 **Tech Stack:** Bash/GNU coreutils on Merlin Linux, zsh/bash managed shell blocks, SSH + `mlx worker login`, NFS JSONL session storage, SHA-256 manifests, tmux metadata.
 
@@ -178,7 +178,7 @@ git commit -m "fix: isolate Codex runtime per Merlin target"
 - Create: `tests/test-migrate-codex-runtime-isolation.sh`
 
 **Interfaces:**
-- Consumes: exact targets `hl_gpu_2@3960209`, `hl_gpu_2@3959909`, `hl_gpu_2@3966773`, `hl_gpu_2@3966762`; canonical and legacy session roots; the reviewed startup script.
+- Consumes: exact targets `hl_gpu_2@3959909`, `hl_gpu_2@3966773`, `hl_gpu_2@3966762`; canonical and legacy session roots; the reviewed startup script. CPU Worker `3960209` was reclaimed before the approved freeze and is recorded as skipped, not retried.
 - Produces: phases `preflight`, `freeze`, `quarantine`, `preserve`, `merge`, `deploy`, `verify`, and `rollback`, plus atomic per-phase markers in a timestamped manifest directory.
 
 - [ ] **Step 1: Write failing fixture tests**
@@ -416,7 +416,7 @@ git diff --check
 
 Run `tests/test-startup-minimal-nas-agents.sh` again in a fresh isolated Linux
 directory on `hl_gpu_2`, then re-run the controller's read-only verify phase
-against all four Workers.
+against the three active Workers.
 
 - [ ] **Step 3: Commit only the runbook and verified corrections**
 

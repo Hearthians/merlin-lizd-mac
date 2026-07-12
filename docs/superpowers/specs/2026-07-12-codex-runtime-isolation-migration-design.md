@@ -15,39 +15,43 @@ still be active elsewhere.
 
 ## Confirmed Current State
 
-- `hl_gpu_2` is the active Devbox for Workers `3960209`, `3959909`, `3966773`,
-  and `3966762`.
-- All four Workers run Codex `0.144.1` from the same Devbox rootfs.
-- The Devbox sees `/home/tiger/.codex` on its ext4 root disk; all four Workers
+- `hl_gpu_2` is the active Devbox for Workers `3959909`, `3966773`, and
+  `3966762`. CPU Worker `3960209` was reclaimed before the approved migration
+  freeze and is deliberately excluded from this run.
+- The three active Workers run Codex `0.144.1` from the same Devbox rootfs.
+- The Devbox sees `/home/tiger/.codex` on its ext4 root disk; all three Workers
   mount that same rootfs through NFS. The Codex database files have identical
   inodes across the Workers.
-- Four Codex processes are active, one on each Worker.
+- Three Codex processes are active, one on each active Worker.
 - The canonical session directory is
   `/mnt/bn/vai3d-hl-1/Users/lizd/.agent-shared/codex/sessions`, containing 121
   JSONL files.
 - The legacy directory
   `/mnt/bn/vai3d-hl-1/Users/lizd/.codex/sessions` contains 25 additional JSONL
   files. Basename comparison found no overlap with the canonical 121 files.
-- All four Workers have a separate ext4 NVMe mounted at `/tmp`.
+- All three Workers have a separate ext4 NVMe local disk mounted at
+  `/mnt/local/localcache00`.
 - The shared mutable runtime is unhealthy: `state_5.sqlite` and
   `goals_1.sqlite` are not valid stock SQLite files, `logs_2.sqlite` fails
   `PRAGMA quick_check`, and only `memories_1.sqlite` passes.
 
 ## Target Layout
 
-Each shell computes the following paths at runtime. Production defaults to
-`/tmp`; tests may inject a different parent explicitly:
+Each shell computes the following paths at runtime. Production uses the
+user-writable directory on the per-machine local disk when provisioned,
+falling back to `/tmp`; tests may inject a different parent explicitly:
 
 ```text
-LIZD_AGENT_RUNTIME_PARENT=/tmp
+LIZD_AGENT_RUNTIME_PARENT=/mnt/local/localcache00/${USER}-agent-local
 LIZD_AGENT_RUNTIME_ROOT=$LIZD_AGENT_RUNTIME_PARENT/lizd-agent-runtime-${USER}
 CODEX_HOME=$LIZD_AGENT_RUNTIME_ROOT/codex
 CODEX_SQLITE_HOME=$LIZD_AGENT_RUNTIME_ROOT/codex-sqlite
 XDG_CACHE_HOME=$LIZD_AGENT_RUNTIME_ROOT/cache
 ```
 
-`/tmp` is intentionally used because it is a separate local NVMe mount inside
-each current Worker. The mutable runtime may be recreated after a Worker is
+The local disk is intentionally used because Codex refuses to create PATH
+helper aliases directly below a temporary directory. The mutable runtime may
+be recreated after a Worker is
 recycled; the canonical JSONL sessions remain on NAS and Codex can rebuild its
 local session index.
 
@@ -106,7 +110,7 @@ remain unchanged after the shell environment has loaded.
 
 ### 1. Preflight and freeze
 
-- Refresh the Devbox and Worker inventory and verify the four approved Worker
+- Refresh the Devbox and Worker inventory and verify the three approved Worker
   IDs are still present and reachable. Include the Devbox master and reject
   any newly attached or otherwise unaccounted rootfs consumer.
 - Record every active Codex PID, `/proc/<pid>/stat` start time, executable,
@@ -114,7 +118,7 @@ remain unchanged after the shell environment has loaded.
   paths without reading prompt contents or persisting command arguments.
 - Verify the canonical and legacy session counts and capture path, size,
   mtime, and SHA-256 manifests.
-- Send `SIGTERM` only to the four recorded Codex parent processes. Do not kill
+- Send `SIGTERM` only to the three recorded Codex parent processes. Do not kill
   tmux servers, shells, `code-mode-host`, training commands, or unrelated
   panes.
 - Immediately before sending `SIGTERM`, re-read and match PID start time and
@@ -181,7 +185,7 @@ remain unchanged after the shell environment has loaded.
   `hl_gpu_2`. Do not run the full bootstrap on existing machines: it also
   changes Claude, history, ownership, packages, and Node tooling.
 - Run the runtime initializer separately inside each reachable Worker, so its
-  `/tmp` receives local directories and symlinks.
+  local disk receives local directories and symlinks.
 - Reload only a recorded tmux pane whose pane ID and shell PID still match,
   whose foreground command has returned to `zsh` or `bash`, that has no child
   process, and that is not in copy mode. Otherwise leave the pane untouched;
@@ -191,14 +195,15 @@ remain unchanged after the shell environment has loaded.
 
 The migration succeeds only when all of these checks pass:
 
-- all four current Workers report `CODEX_HOME` and `CODEX_SQLITE_HOME` under
-  their own `/tmp` mount;
-- `/tmp` resolves to the expected local ext4 NVMe on every Worker;
-- the four runtime directories and any generated SQLite files do not resolve
+- all three current Workers report `CODEX_HOME` and `CODEX_SQLITE_HOME` under
+  their own local-disk mount;
+- the local runtime parent resolves to local ext4 on every Worker;
+- the three runtime directories and any generated SQLite files do not resolve
   to the shared rootfs and do not share device/inode identity;
 - the three allowed links resolve to the expected canonical NAS paths;
-- every Worker sees exactly the same 146 validated canonical sessions and
-  manifest;
+- every Worker sees the same canonical NAS session directory; the separately
+  tracked malformed historical JSONL must be repaired before asserting the
+  planned 146 validated sessions;
 - no Worker opens a SQLite/WAL/SHM file beneath the quarantined shared runtime;
 - `codex --version` succeeds without the stale shared `arg0` cleanup warning;
 - starting a disposable new Codex session creates mutable files only inside
@@ -245,5 +250,5 @@ Concurrent Codex processes working in different sessions remain supported.
   configuration;
 - distributed session locks, wrappers, owner metadata, and takeover flows;
 - Devbox or Worker creation, deletion, restart, or mount changes;
-- automatic restart or resume of the four stopped Codex sessions;
+- automatic restart or resume of the three stopped Codex sessions;
 - repair of the damaged SQLite databases beyond preservation and quarantine.
