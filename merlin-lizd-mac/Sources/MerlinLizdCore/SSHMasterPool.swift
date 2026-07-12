@@ -26,6 +26,7 @@ public final class SSHMasterPool: @unchecked Sendable {
     private let runner: any InventoryProcessRunning
     private let state: SSHMasterPoolState
     private let shutdownCoordinator = SSHMasterShutdownCoordinator()
+    private let managedOwnership: SSHManagedOwnershipRegistry
     private let retryBoundaryHook: (@Sendable () async -> Void)?
     private let retryInvalidationHook: (@Sendable () async -> Void)?
 
@@ -66,6 +67,7 @@ public final class SSHMasterPool: @unchecked Sendable {
     ) {
         precondition(maxConcurrentPreparations > 0)
         commands = SSHMasterCommands(directory: directory)
+        managedOwnership = SSHManagedOwnershipRegistry(directory: directory)
         self.runner = runner
         self.retryBoundaryHook = retryBoundaryHook
         self.retryInvalidationHook = retryInvalidationHook
@@ -91,7 +93,9 @@ public final class SSHMasterPool: @unchecked Sendable {
         _ command: CommandSpec,
         alias: String
     ) throws -> CommandSpec {
-        try commands.managed(command, alias: alias)
+        let managed = try commands.managed(command, alias: alias)
+        try managedOwnership.register(alias: alias)
+        return managed
     }
 
     func run(
@@ -125,7 +129,7 @@ public final class SSHMasterPool: @unchecked Sendable {
             return output
         }
         if let output, output.exitCode != 255 {
-            throw SSHMasterPoolError.commandFailed(exitCode: output.exitCode)
+            return output
         }
         guard replay == .readOnly else {
             throw SSHMasterPoolError.commandFailed(exitCode: 255)
@@ -153,13 +157,14 @@ public final class SSHMasterPool: @unchecked Sendable {
 
         try Task.checkCancellation()
         let replayed = try await runAdmitted(managedCommand(command, alias: alias))
-        guard replayed.exitCode == 0 else {
+        guard replayed.exitCode != 255 else {
             throw SSHMasterPoolError.commandFailed(exitCode: replayed.exitCode)
         }
         return replayed
     }
 
     public func shutdown() async {
+        managedOwnership.beginShutdown()
         let task = await shutdownCoordinator.task { [weak self] in
             await self?.performShutdown()
         }
@@ -171,7 +176,8 @@ public final class SSHMasterPool: @unchecked Sendable {
         for task in tasks {
             _ = await task.value
         }
-        let aliases = await state.ownedAliasesForShutdown()
+        let aliases = Set(await state.ownedAliasesForShutdown())
+            .union(managedOwnership.aliasesForShutdown())
         for alias in aliases {
             guard let stop = try? commands.stop(alias: alias) else { continue }
             _ = try? await runner.run(stop)
@@ -224,6 +230,75 @@ public final class SSHMasterPool: @unchecked Sendable {
             await state.releaseCommandLease()
             throw error
         }
+    }
+}
+
+private final class SSHManagedOwnershipRegistry: @unchecked Sendable {
+    private let lock = NSLock()
+    private let directory: URL
+    private var aliases: Set<String> = []
+    private var isShuttingDown = false
+    private var directoryIsReady = false
+
+    init(directory: URL) {
+        self.directory = directory
+    }
+
+    func register(alias: String) throws {
+        try lock.withLock {
+            guard !isShuttingDown else {
+                throw SSHMasterPoolError.shuttingDown
+            }
+            guard ensureDirectory() else {
+                throw SSHMasterPoolError.commandFailed(exitCode: 255)
+            }
+            aliases.insert(alias)
+        }
+    }
+
+    func beginShutdown() {
+        lock.withLock { isShuttingDown = true }
+    }
+
+    func aliasesForShutdown() -> Set<String> {
+        lock.withLock {
+            let owned = aliases
+            aliases.removeAll()
+            return owned
+        }
+    }
+
+    private func ensureDirectory() -> Bool {
+        if directoryIsReady { return true }
+
+        do {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: false
+            )
+        } catch CocoaError.fileWriteFileExists {
+            // Validate the existing path below.
+        } catch {
+            return false
+        }
+
+        let descriptor = open(
+            directory.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard descriptor >= 0 else { return false }
+        defer { close(descriptor) }
+
+        var information = stat()
+        guard
+            fstat(descriptor, &information) == 0,
+            (information.st_mode & S_IFMT) == S_IFDIR,
+            information.st_uid == getuid(),
+            fchmod(descriptor, S_IRWXU) == 0
+        else { return false }
+
+        directoryIsReady = true
+        return true
     }
 }
 

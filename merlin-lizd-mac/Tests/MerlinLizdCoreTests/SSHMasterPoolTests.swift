@@ -66,18 +66,63 @@ struct SSHMasterPoolTests {
         #expect(await runner.childCommandCount(alias: "hl_gpu_2") == 1)
     }
 
-    @Test("read-only command does not replay a remote command failure")
-    func doesNotReplayRemoteFailure() async {
-        let runner = SSHMasterScriptedRunner(actions: [.exit(255), .succeed, .exit(1)])
+    @Test("read-only command returns a remote command failure unchanged")
+    func doesNotReplayRemoteFailure() async throws {
+        let runner = SSHMasterDiagnosticRunner(childOutput: InventoryProcessOutput(
+            stdout: "remote stdout",
+            stderr: "worker is not ready",
+            exitCode: 1
+        ))
         let pool = SSHMasterPool(testDirectory: temporarySSHDirectory(), runner: runner)
         let command = CommandSpec(
             executable: "/usr/bin/ssh",
             arguments: ["-nT", "hl_gpu_2", "false"]
         )
-        await #expect(throws: SSHMasterPoolError.commandFailed(exitCode: 1)) {
-            try await pool.run(command, alias: "hl_gpu_2", replay: .readOnly)
+        let output = try await pool.run(
+            command, alias: "hl_gpu_2", replay: .readOnly
+        )
+        #expect(output == InventoryProcessOutput(
+            stdout: "remote stdout",
+            stderr: "worker is not ready",
+            exitCode: 1
+        ))
+        #expect(await runner.childCommands() == 1)
+    }
+
+    @Test("terminal-first managed alias is owned and stopped once")
+    func terminalFirstAliasIsStopped() async throws {
+        let directory = temporarySSHDirectory()
+        let runner = SSHMasterScriptedRunner(actions: [.succeed, .exit(255)])
+        let pool = SSHMasterPool(
+            testDirectory: directory, runner: runner
+        )
+        let terminal = try MerlinCommands.devboxTerminal(
+            alias: "hl_gpu_2", sessionName: "mlz-shell"
+        )
+
+        _ = try pool.managedCommand(terminal, alias: "hl_gpu_2")
+        #expect(fileExists(atPath: directory.path))
+        #expect(try posixMode(of: directory) == 0o700)
+        await pool.shutdown()
+
+        #expect(await runner.count(argumentsContaining: "stop") == 1)
+        #expect(await runner.count(argumentsContaining: "ControlMaster=yes") == 0)
+    }
+
+    @Test("managed command construction is rejected after shutdown begins")
+    func rejectsManagedCommandAfterShutdown() async throws {
+        let runner = SSHMasterScriptedRunner()
+        let pool = SSHMasterPool(
+            testDirectory: temporarySSHDirectory(), runner: runner
+        )
+        await pool.shutdown()
+        let terminal = try MerlinCommands.devboxTerminal(
+            alias: "hl_gpu_2", sessionName: "mlz-shell"
+        )
+
+        #expect(throws: SSHMasterPoolError.shuttingDown) {
+            try pool.managedCommand(terminal, alias: "hl_gpu_2")
         }
-        #expect(await runner.childCommandCount(alias: "hl_gpu_2") == 1)
     }
 
     @Test("read-only command propagates cancellation without rebuilding")
@@ -325,4 +370,26 @@ struct SSHMasterPoolTests {
         await pool.shutdown()
         #expect(await runner.count(argumentsContaining: "stop") == 1)
     }
+}
+
+private actor SSHMasterDiagnosticRunner: InventoryProcessRunning {
+    private let childOutput: InventoryProcessOutput
+    private var childCount = 0
+
+    init(childOutput: InventoryProcessOutput) {
+        self.childOutput = childOutput
+    }
+
+    func run(_ command: CommandSpec) async throws -> InventoryProcessOutput {
+        if command.arguments.starts(with: ["-O", "check"]) {
+            return InventoryProcessOutput(stdout: "", stderr: "", exitCode: 255)
+        }
+        if command.arguments.first == "-MNf" {
+            return InventoryProcessOutput(stdout: "", stderr: "", exitCode: 0)
+        }
+        childCount += 1
+        return childOutput
+    }
+
+    func childCommands() -> Int { childCount }
 }

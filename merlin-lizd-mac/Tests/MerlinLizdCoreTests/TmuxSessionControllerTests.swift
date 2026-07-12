@@ -78,6 +78,33 @@ struct TmuxSessionControllerTests {
         }
     }
 
+    @Test("pooled mutation preserves Worker not-ready diagnostics")
+    func pooledMutationSurfacesWorkerNotReady() async {
+        let runner = MutationPoolRunner(childOutput: InventoryProcessOutput(
+            stdout: "", stderr: "worker is not ready", exitCode: 1
+        ))
+        let pool = SSHMasterPool(
+            testDirectory: temporarySSHDirectory(), runner: runner
+        )
+        let controller = TmuxSessionController(
+            sshMasterPool: pool,
+            processRunner: MutationRecordingRunner(output: InventoryProcessOutput(
+                stdout: "must-not-run", stderr: "", exitCode: 0
+            ))
+        )
+
+        await #expect(throws: TmuxSessionMutationError.workerNotReady) {
+            try await controller.terminate(
+                target: .worker(
+                    devboxSID: "dbx_135679", devboxName: "wt_hl",
+                    alias: "hl_gpu_2", workerID: "3960209"
+                ),
+                sessionName: "mlz-finished-run"
+            )
+        }
+        #expect(await runner.childCommands() == 1)
+    }
+
     @Test("terminates through the target-specific safe command")
     func terminatesWorkerSession() async throws {
         let runner = MutationRecordingRunner(output: InventoryProcessOutput(
@@ -100,6 +127,28 @@ struct TmuxSessionControllerTests {
         #expect(await runner.lastCommand()?.arguments.last ==
             "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- tmux kill-session -t mlz-finished-run")
     }
+}
+
+private actor MutationPoolRunner: InventoryProcessRunning {
+    private let childOutput: InventoryProcessOutput
+    private var childCount = 0
+
+    init(childOutput: InventoryProcessOutput) {
+        self.childOutput = childOutput
+    }
+
+    func run(_ command: CommandSpec) async throws -> InventoryProcessOutput {
+        if command.arguments.starts(with: ["-O", "check"]) {
+            return InventoryProcessOutput(stdout: "", stderr: "", exitCode: 255)
+        }
+        if command.arguments.first == "-MNf" {
+            return InventoryProcessOutput(stdout: "", stderr: "", exitCode: 0)
+        }
+        childCount += 1
+        return childOutput
+    }
+
+    func childCommands() -> Int { childCount }
 }
 
 private actor MutationRecordingRunner: InventoryProcessRunning {
