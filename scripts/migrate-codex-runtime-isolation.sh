@@ -261,15 +261,78 @@ except Exception:
 PY
 }
 
+validate_run_id() {
+  local run_id="${1:-}"
+
+  if [[ ! "$run_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+    printf 'unsafe migration run_id: %s\n' "$run_id" >&2
+    return 1
+  fi
+}
+
+sha256_file() {
+  python3 - "$1" <<'PY'
+import hashlib
+from pathlib import Path
+import stat
+import sys
+
+path = Path(sys.argv[1])
+status = path.lstat()
+if path.is_symlink() or not stat.S_ISREG(status.st_mode):
+    raise SystemExit(f"cannot hash unsafe prerequisite: {path}")
+digest = hashlib.sha256()
+with path.open("rb") as stream:
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
+print(digest.hexdigest())
+PY
+}
+
+write_merge_marker() {
+  local manifest_dir="$1"
+  local run_id="$2"
+  local prerequisite_manifest="$manifest_dir/merge.prerequisites.sha256"
+  local temporary_path prerequisite_path prerequisite_digest
+
+  validate_run_id "$run_id" || return 1
+  temporary_path="$(mktemp "$manifest_dir/.merge.prerequisites.sha256.tmp.XXXXXX")" || return 1
+  {
+    printf 'LIZD_CODEX_PREREQUISITES_V1\tphase=merge\trun_id=%s\n' "$run_id"
+    for prerequisite_path in \
+      "$manifest_dir/sessions.before-1.tsv" \
+      "$manifest_dir/sessions.before-2.tsv" \
+      "$manifest_dir/sessions.after.tsv" \
+      "$manifest_dir/added-files.tsv"; do
+      printf '%s\t%s\n' "$(sha256_file "$prerequisite_path")" \
+        "$(basename "$prerequisite_path")"
+    done
+  } >"$temporary_path" || {
+    rm -f "$temporary_path"
+    return 1
+  }
+  durable_replace_file "$temporary_path" "$prerequisite_manifest" || {
+    rm -f "$temporary_path"
+    return 1
+  }
+  prerequisite_digest="$(sha256_file "$prerequisite_manifest")" || return 1
+  write_atomic_text_file "$manifest_dir/merge.ok" \
+    "LIZD_CODEX_MIGRATION_V1 phase=merge run_id=$run_id status=ok prerequisites_sha256=$prerequisite_digest
+" || return 1
+}
+
 capture_durable_session_manifest() {
   local legacy_root="$1"
   local canonical_root="$2"
   local output_path="$3"
+  local run_id="${4:-${MIGRATION_RUN_ID:-}}"
   local temporary_path
 
+  validate_run_id "$run_id" || return 1
   temporary_path="$(mktemp "$(dirname "$output_path")/.$(basename "$output_path").tmp.XXXXXX")" || \
     return 1
-  if ! capture_session_manifest "$legacy_root" "$canonical_root" "$temporary_path"; then
+  if ! capture_session_manifest "$legacy_root" "$canonical_root" "$temporary_path" \
+    "$run_id" "$(basename "$output_path" .tsv)"; then
     rm -f "$temporary_path"
     return 1
   fi
@@ -283,8 +346,17 @@ publish_session_no_clobber() {
   local source_path="$1"
   local destination_path="$2"
   local journal_path="$3"
+  local expected_device="${4:-}"
+  local expected_inode="${5:-}"
+  local expected_size="${6:-}"
+  local expected_mtime_ns="${7:-}"
+  local expected_hash="${8:-}"
+  local legacy_root="${9:-}"
+  local canonical_root="${10:-}"
 
-  python3 - "$source_path" "$destination_path" "$journal_path" <<'PY'
+  python3 - "$source_path" "$destination_path" "$journal_path" \
+    "$expected_device" "$expected_inode" "$expected_size" "$expected_mtime_ns" \
+    "$expected_hash" "$legacy_root" "$canonical_root" <<'PY'
 import errno
 import fcntl
 import hashlib
@@ -298,6 +370,9 @@ import tempfile
 source = Path(sys.argv[1])
 destination = Path(sys.argv[2])
 journal = Path(sys.argv[3])
+expected_fields = sys.argv[4:9]
+legacy_root_arg = sys.argv[9]
+canonical_root_arg = sys.argv[10]
 
 
 def digest_file(path):
@@ -325,7 +400,55 @@ def fsync_directory(path):
         os.close(descriptor)
 
 
-destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+def require_real_root(root, label):
+    status = root.lstat()
+    if root.is_symlink() or not stat.S_ISDIR(status.st_mode):
+        raise RuntimeError(f"unsafe {label} session root: {root}")
+
+
+def require_beneath_real_parents(path, root, create_parents=False):
+    require_real_root(root, "publish")
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        raise RuntimeError(f"session path is outside its approved root: {path}")
+    if not relative.parts or any(part in ("", ".", "..") for part in relative.parts):
+        raise RuntimeError(f"unsafe relative session path: {path}")
+    current = root
+    for part in relative.parts[:-1]:
+        current = current / part
+        try:
+            current_status = current.lstat()
+        except FileNotFoundError:
+            if not create_parents:
+                raise RuntimeError(f"missing session source parent: {current}")
+            current.mkdir(mode=0o700)
+            current_status = current.lstat()
+        if current.is_symlink() or not stat.S_ISDIR(current_status.st_mode):
+            raise RuntimeError(f"symlinked or unsafe session parent: {current}")
+
+
+if any(expected_fields):
+    if not all(expected_fields):
+        raise SystemExit("incomplete snapshot-two source identity")
+    expected_identity = tuple(map(int, expected_fields[:4]))
+    expected_snapshot_hash = expected_fields[4]
+    if len(expected_snapshot_hash) != 64 or any(
+        character not in "0123456789abcdef" for character in expected_snapshot_hash
+    ):
+        raise SystemExit("invalid snapshot-two source hash")
+else:
+    if os.environ.get("MIGRATION_LIBRARY_ONLY") != "1":
+        raise SystemExit("production publish requires snapshot-two source identity")
+    expected_identity = None
+    expected_snapshot_hash = None
+
+if legacy_root_arg:
+    require_beneath_real_parents(source, Path(legacy_root_arg))
+if canonical_root_arg:
+    require_beneath_real_parents(destination, Path(canonical_root_arg), create_parents=True)
+else:
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
 journal.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
 temporary_path = None
 linked_by_this_attempt = False
@@ -337,6 +460,15 @@ try:
         before = os.fstat(source_fd)
         if not stat.S_ISREG(before.st_mode):
             raise RuntimeError(f"session source is not a regular file: {source}")
+        if expected_identity is not None:
+            actual_identity = (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+            )
+            if actual_identity != expected_identity:
+                raise RuntimeError(f"session source changed after snapshot two: {source}")
         temporary_fd, temporary_name = tempfile.mkstemp(
             prefix=f".{destination.name}.tmp.", dir=destination.parent
         )
@@ -365,6 +497,8 @@ try:
         raise RuntimeError(f"session source changed while copying: {source}")
 
     expected_hash = digest.hexdigest()
+    if expected_snapshot_hash is not None and expected_hash != expected_snapshot_hash:
+        raise RuntimeError(f"session source hash changed after snapshot two: {source}")
     temporary_hash, temporary_size = digest_file(temporary_path)
     if (temporary_hash, temporary_size) != (expected_hash, size):
         raise RuntimeError(f"temporary session verification failed: {source}")
@@ -439,20 +573,43 @@ PY
 
 emit_session_publish_plan() {
   local manifest_path="$1"
+  local run_id="${2:-${MIGRATION_RUN_ID:-}}"
 
-  python3 - "$manifest_path" <<'PY'
+  validate_run_id "$run_id" || return 1
+  python3 - "$manifest_path" "$run_id" <<'PY'
 from pathlib import Path
 import sys
 
 manifest = Path(sys.argv[1])
+run_id = sys.argv[2]
 canonical_uuids = set()
 legacy_rows = []
 with manifest.open("r", encoding="utf-8") as stream:
     for line_number, line in enumerate(stream, 1):
+        if line_number == 1:
+            fields = line.rstrip("\n").split(" ")
+            if (
+                len(fields) != 3
+                or fields[0] != "LIZD_CODEX_ARTIFACT_V1"
+                or not fields[1].startswith("type=sessions.")
+                or fields[2] != f"run_id={run_id}"
+            ):
+                raise SystemExit(f"invalid session manifest run_id header: {manifest}")
+            continue
         fields = line.rstrip("\n").split("\t")
-        if len(fields) != 7:
+        if len(fields) != 9:
             raise SystemExit(f"invalid session manifest row: {manifest}:{line_number}")
-        root_name, relative_path, basename, session_id, size, mtime_ns, digest = fields
+        (
+            root_name,
+            relative_path,
+            basename,
+            session_id,
+            device,
+            inode,
+            size,
+            mtime_ns,
+            digest,
+        ) = fields
         if root_name == "canonical":
             canonical_uuids.add(session_id)
         elif root_name == "legacy":
@@ -462,7 +619,11 @@ with manifest.open("r", encoding="utf-8") as stream:
 
 for relative_path, session_id in legacy_rows:
     if session_id not in canonical_uuids:
-        sys.stdout.buffer.write(relative_path.encode("utf-8") + b"\0")
+        for line in manifest.read_text(encoding="utf-8").splitlines()[1:]:
+            fields = line.split("\t")
+            if len(fields) == 9 and fields[0] == "legacy" and fields[1] == relative_path:
+                sys.stdout.buffer.write(line.encode("utf-8") + b"\0")
+                break
 PY
 }
 
@@ -470,21 +631,91 @@ capture_session_manifest() {
   local legacy_root="$1"
   local canonical_root="$2"
   local output_path="$3"
+  local run_id="${4:-${MIGRATION_RUN_ID:-}}"
+  local artifact_type="${5:-sessions}"
 
-  python3 - "$legacy_root" "$canonical_root" >"$output_path" <<'PY'
+  validate_run_id "$run_id" || return 1
+  python3 - "$legacy_root" "$canonical_root" "$run_id" "$artifact_type" \
+    >"$output_path" <<'PY'
 import hashlib
 import json
+import os
 from pathlib import Path
+import stat
 import sys
 import uuid
 
 legacy_root = Path(sys.argv[1])
 canonical_root = Path(sys.argv[2])
+run_id = sys.argv[3]
+artifact_type = sys.argv[4]
+
+
+def validate_root(root, label):
+    try:
+        status = root.lstat()
+    except FileNotFoundError:
+        raise SystemExit(f"missing {label} session root: {root}")
+    if root.is_symlink() or not stat.S_ISDIR(status.st_mode):
+        raise SystemExit(f"unsafe {label} session root: {root}")
+    return root.resolve(strict=True)
+
+
+def iter_jsonl(root):
+    root_resolved = root.resolve(strict=True)
+    for current, directory_names, file_names in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        for directory_name in directory_names:
+            directory = current_path / directory_name
+            if directory.is_symlink():
+                raise SystemExit(f"symlinked session directory is forbidden: {directory}")
+        for file_name in file_names:
+            if not file_name.endswith(".jsonl"):
+                continue
+            path = current_path / file_name
+            status = path.lstat()
+            if path.is_symlink() or not stat.S_ISREG(status.st_mode):
+                raise SystemExit(f"unsafe JSONL entry: {path}")
+            try:
+                path.resolve(strict=True).relative_to(root_resolved)
+            except (OSError, ValueError):
+                raise SystemExit(f"JSONL escapes its session root: {path}")
+            yield path
 
 
 def inspect(path):
     try:
-        data = path.read_bytes()
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise SystemExit(f"unsafe JSONL entry: {path}")
+            chunks = []
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        identity_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        )
+        identity_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        )
+        if identity_before != identity_after:
+            raise SystemExit(f"JSONL changed while capturing manifest: {path}")
+        data = b"".join(chunks)
+        if len(data) != before.st_size:
+            raise SystemExit(f"JSONL size changed while capturing manifest: {path}")
         text = data.decode("utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise SystemExit(f"invalid JSONL: {path}: {exc.__class__.__name__}")
@@ -511,14 +742,21 @@ def inspect(path):
                 uuid.UUID(session_id)
             except (AttributeError, TypeError, ValueError):
                 raise SystemExit(f"invalid JSONL: {path}: session_meta payload.id is not a UUID")
-    return session_id, hashlib.sha256(data).hexdigest()
+    return session_id, hashlib.sha256(data).hexdigest(), before
 
 
 seen_uuids = {}
 seen_basenames = {}
+validate_root(canonical_root, "canonical")
+validate_root(legacy_root, "legacy")
+print(
+    "LIZD_CODEX_ARTIFACT_V1",
+    f"type={artifact_type}",
+    f"run_id={run_id}",
+)
 for root_name, root in (("canonical", canonical_root), ("legacy", legacy_root)):
-    for path in sorted(root.rglob("*.jsonl")):
-        session_id, digest = inspect(path)
+    for path in sorted(iter_jsonl(root)):
+        session_id, digest, status = inspect(path)
         previous = seen_uuids.get(session_id)
         if previous is not None and previous != digest:
             raise SystemExit(f"session UUID has conflicting content: {session_id}")
@@ -530,14 +768,15 @@ for root_name, root in (("canonical", canonical_root), ("legacy", legacy_root)):
         relative_path = path.relative_to(root).as_posix()
         if any(character in relative_path for character in ("\t", "\n", "\r")):
             raise SystemExit(f"unsupported session path: {path}")
-        stat = path.stat()
         print(
             root_name,
             relative_path,
             path.name,
             session_id,
-            stat.st_size,
-            stat.st_mtime_ns,
+            status.st_dev,
+            status.st_ino,
+            status.st_size,
+            status.st_mtime_ns,
             digest,
             sep="\t",
         )
@@ -546,13 +785,19 @@ PY
 
 validate_completed_merge() {
   local manifest_dir="$1"
-  local required_path
+  local run_id="$2"
+  local required_path prerequisite_manifest prerequisite_digest marker_content
+  local recorded_digest recorded_name actual_digest seen_prerequisites='' prerequisite_count=0
+
+  validate_run_id "$run_id" || return 1
 
   for required_path in \
     "$manifest_dir/sessions.before-1.tsv" \
     "$manifest_dir/sessions.before-2.tsv" \
     "$manifest_dir/sessions.after.tsv" \
-    "$manifest_dir/added-files.tsv"; do
+    "$manifest_dir/added-files.tsv" \
+    "$manifest_dir/merge.prerequisites.sha256" \
+    "$manifest_dir/merge.ok"; do
     if [[ ! -f "$required_path" || -L "$required_path" ]]; then
       printf 'merge marker prerequisite is missing or unsafe: %s\n' "$required_path" >&2
       return 1
@@ -562,11 +807,45 @@ validate_completed_merge() {
     printf 'merge marker stability manifests differ\n' >&2
     return 1
   fi
-  grep -Fx 'LIZD_CODEX_MIGRATION_V1 phase=merge status=ok' \
-    "$manifest_dir/merge.ok" >/dev/null || {
-      printf 'merge marker content is invalid\n' >&2
+  prerequisite_manifest="$manifest_dir/merge.prerequisites.sha256"
+  if ! IFS= read -r marker_content <"$prerequisite_manifest" || \
+    [[ "$marker_content" != "LIZD_CODEX_PREREQUISITES_V1"$'\t'"phase=merge"$'\t'"run_id=$run_id" ]]; then
+    printf 'merge prerequisite manifest run_id is invalid\n' >&2
+    return 1
+  fi
+  while IFS=$'\t' read -r recorded_digest recorded_name; do
+    [[ -n "$recorded_digest" || -n "$recorded_name" ]] || continue
+    case "$recorded_name" in
+      sessions.before-1.tsv|sessions.before-2.tsv|sessions.after.tsv|added-files.tsv) ;;
+      *)
+        printf 'merge prerequisite digest row is invalid\n' >&2
+        return 1
+        ;;
+    esac
+    if [[ "$seen_prerequisites" == *"|$recorded_name|"* || \
+      ! "$recorded_digest" =~ ^[0-9a-f]{64}$ ]]; then
+      printf 'merge prerequisite digest row is invalid\n' >&2
       return 1
-    }
+    fi
+    actual_digest="$(sha256_file "$manifest_dir/$recorded_name")" || return 1
+    if [[ "$actual_digest" != "$recorded_digest" ]]; then
+      printf 'merge prerequisite digest changed: %s\n' "$recorded_name" >&2
+      return 1
+    fi
+    seen_prerequisites+="|$recorded_name|"
+    prerequisite_count=$((prerequisite_count + 1))
+  done < <(tail -n +2 "$prerequisite_manifest")
+  if [[ "$prerequisite_count" -ne 4 ]]; then
+    printf 'merge prerequisite digest set is incomplete\n' >&2
+    return 1
+  fi
+  prerequisite_digest="$(sha256_file "$prerequisite_manifest")" || return 1
+  marker_content="$(<"$manifest_dir/merge.ok")"
+  if [[ "$marker_content" != \
+    "LIZD_CODEX_MIGRATION_V1 phase=merge run_id=$run_id status=ok prerequisites_sha256=$prerequisite_digest" ]]; then
+    printf 'merge marker content or run_id is invalid\n' >&2
+    return 1
+  fi
 }
 
 guard_expected_ids() {
@@ -948,7 +1227,10 @@ _merge_sessions_locked() {
   local legacy_root="$1"
   local canonical_root="$2"
   local manifest_dir="$3"
-  local source_path relative_path destination_path
+  local run_id="$4"
+  local source_path destination_path publish_row
+  local root_name relative_path basename session_id source_device source_inode
+  local source_size source_mtime_ns source_hash
   local first_manifest="$manifest_dir/sessions.before-1.tsv"
   local second_manifest="$manifest_dir/sessions.before-2.tsv"
   local post_manifest="$manifest_dir/sessions.after.tsv"
@@ -956,45 +1238,85 @@ _merge_sessions_locked() {
 
   ensure_secure_directory "$manifest_dir" || return 1
   if [[ -e "$manifest_dir/merge.ok" ]]; then
-    validate_completed_merge "$manifest_dir" || return 1
+    validate_completed_merge "$manifest_dir" "$run_id" || return 1
+    return 0
   fi
-  capture_durable_session_manifest "$legacy_root" "$canonical_root" "$first_manifest" || return 1
+  capture_durable_session_manifest "$legacy_root" "$canonical_root" "$first_manifest" \
+    "$run_id" || return 1
   sleep "${MIGRATION_SETTLE_SECONDS:-5}" || return 1
-  capture_durable_session_manifest "$legacy_root" "$canonical_root" "$second_manifest" || return 1
-  if ! cmp -s "$first_manifest" "$second_manifest"; then
+  capture_durable_session_manifest "$legacy_root" "$canonical_root" "$second_manifest" \
+    "$run_id" || return 1
+  # The first line identifies each artifact (before-1 vs before-2); compare
+  # only the durable session rows for stability.
+  if ! diff -q <(tail -n +2 "$first_manifest") \
+    <(tail -n +2 "$second_manifest") >/dev/null; then
     printf 'session sources changed during stability window\n' >&2
     return 1
   fi
+  if [[ -n "${MIGRATION_TEST_AFTER_SNAPSHOT2_HOOK:-}" ]]; then
+    if [[ "${MIGRATION_LIBRARY_ONLY:-0}" != 1 ]]; then
+      printf 'snapshot-two test hook is forbidden in production\n' >&2
+      return 1
+    fi
+    "$MIGRATION_TEST_AFTER_SNAPSHOT2_HOOK" "$legacy_root" "$canonical_root" \
+      "$manifest_dir" || return 1
+  fi
   if [[ ! -e "$journal_path" ]]; then
-    write_atomic_text_file "$journal_path" '' || return 1
+    write_atomic_text_file "$journal_path" \
+      "LIZD_CODEX_ARTIFACT_V1 type=added-files run_id=$run_id
+" || return 1
   elif [[ ! -f "$journal_path" || -L "$journal_path" ]]; then
     printf 'unsafe added-files journal: %s\n' "$journal_path" >&2
     return 1
   fi
-  while IFS= read -r -d '' relative_path; do
+  while IFS= read -r -d '' publish_row; do
+    IFS=$'\t' read -r root_name relative_path basename session_id source_device \
+      source_inode source_size source_mtime_ns source_hash <<<"$publish_row"
+    if [[ "$root_name" != legacy || -z "$source_hash" ]]; then
+      printf 'invalid legacy publish plan row\n' >&2
+      return 1
+    fi
     source_path="$legacy_root/$relative_path"
     destination_path="$canonical_root/$relative_path"
-    mkdir -p "$(dirname "$destination_path")"
     publish_session_no_clobber "$source_path" "$destination_path" \
-      "$journal_path" || return 1
-  done < <(emit_session_publish_plan "$first_manifest")
-  capture_durable_session_manifest "$legacy_root" "$canonical_root" "$post_manifest" || return 1
-  write_atomic_text_file "$manifest_dir/merge.ok" \
-    'LIZD_CODEX_MIGRATION_V1 phase=merge status=ok
-' || return 1
+      "$journal_path" "$source_device" "$source_inode" "$source_size" \
+      "$source_mtime_ns" "$source_hash" "$legacy_root" "$canonical_root" || return 1
+  done < <(emit_session_publish_plan "$second_manifest" "$run_id")
+  capture_durable_session_manifest "$legacy_root" "$canonical_root" "$post_manifest" \
+    "$run_id" || return 1
+  write_merge_marker "$manifest_dir" "$run_id" || return 1
 }
 
 merge_sessions() {
   local legacy_root="$1"
   local canonical_root="$2"
   local manifest_dir="$3"
+  local run_id="${4:-${MIGRATION_RUN_ID:-}}"
   local lock_path="${MIGRATION_NAS_LOCK_PATH:-$canonical_root/.lizd-codex-migration.lock}"
+
+  validate_run_id "$run_id" || return 1
+  python3 - "$legacy_root" "$canonical_root" <<'PY' || return 1
+from pathlib import Path
+import stat
+import sys
+
+for label, raw_path in (("legacy", sys.argv[1]), ("canonical", sys.argv[2])):
+    path = Path(raw_path)
+    try:
+        status = path.lstat()
+    except FileNotFoundError:
+        raise SystemExit(f"missing {label} session root: {path}")
+    if path.is_symlink() or not stat.S_ISDIR(status.st_mode):
+        raise SystemExit(f"unsafe {label} session root: {path}")
+PY
 
   with_nas_lock "$lock_path" /bin/bash -c '
     export MIGRATION_LIBRARY_ONLY=1
+    export MIGRATION_RUN_ID="$5"
     source "$1"
-    _merge_sessions_locked "$2" "$3" "$4"
-  ' lizd-merge "$MIGRATION_CONTROLLER_SOURCE" "$legacy_root" "$canonical_root" "$manifest_dir"
+    _merge_sessions_locked "$2" "$3" "$4" "$5"
+  ' lizd-merge "$MIGRATION_CONTROLLER_SOURCE" "$legacy_root" "$canonical_root" "$manifest_dir" \
+    "$run_id"
 }
 
 usage() {

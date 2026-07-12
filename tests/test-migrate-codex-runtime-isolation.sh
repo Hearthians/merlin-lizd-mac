@@ -45,6 +45,7 @@ legacy_hash="$(hash_file "$legacy/2026/07/01/legacy-a.jsonl")"
 
 export MIGRATION_LIBRARY_ONLY=1
 export MIGRATION_SETTLE_SECONDS=0
+export MIGRATION_RUN_ID=run-fixture-20260713T000000Z
 test -r "$sut" || die "migration controller does not exist: $sut"
 source "$sut" || die "migration controller could not be loaded"
 merge_sessions "$legacy" "$canonical" "$manifest"
@@ -159,6 +160,62 @@ MIGRATION_SETTLE_SECONDS=0
 test "$changing_was_accepted" = 0 || die "a changing session source was accepted"
 test ! -e "$changing_canonical/2026/07/07/changing.jsonl" || \
   die "a changing session source was published"
+
+post_snapshot_legacy="$tmp/post-snapshot-legacy"
+post_snapshot_canonical="$tmp/post-snapshot-canonical"
+post_snapshot_manifest="$tmp/post-snapshot-manifest"
+post_snapshot_hook="$tmp/change-after-snapshot-two"
+mkdir -p "$post_snapshot_legacy/2026/07/07" "$post_snapshot_canonical" \
+  "$post_snapshot_manifest"
+printf '%s\n' \
+  '{"type":"session_meta","payload":{"id":"70707070-7070-4070-8070-707070707070"}}' \
+  >"$post_snapshot_legacy/2026/07/07/post-snapshot.jsonl"
+printf '%s\n' '#!/usr/bin/env bash' \
+  'printf '\''%s\n'\'' '\''{"type":"response_item","payload":{"value":"changed-after-snapshot-two"}}'\'' >>"$1/2026/07/07/post-snapshot.jsonl"' \
+  >"$post_snapshot_hook"
+chmod 700 "$post_snapshot_hook"
+export MIGRATION_TEST_AFTER_SNAPSHOT2_HOOK="$post_snapshot_hook"
+if merge_sessions "$post_snapshot_legacy" "$post_snapshot_canonical" \
+  "$post_snapshot_manifest" >"$tmp/post-snapshot.out" 2>"$tmp/post-snapshot.err"; then
+  die "a source changed after snapshot two was accepted"
+fi
+unset MIGRATION_TEST_AFTER_SNAPSHOT2_HOOK
+test ! -e "$post_snapshot_canonical/2026/07/07/post-snapshot.jsonl" || \
+  die "a source changed after snapshot two was published"
+
+symlink_source_real="$tmp/symlink-source-real"
+symlink_source_root="$tmp/symlink-source-root"
+symlink_source_canonical="$tmp/symlink-source-canonical"
+symlink_source_manifest="$tmp/symlink-source-manifest"
+mkdir -p "$symlink_source_real/2026/07/07" "$symlink_source_canonical" \
+  "$symlink_source_manifest"
+printf '%s\n' \
+  '{"type":"session_meta","payload":{"id":"71717171-7171-4171-8171-717171717171"}}' \
+  >"$symlink_source_real/2026/07/07/symlink-source.jsonl"
+ln -s "$symlink_source_real" "$symlink_source_root"
+if merge_sessions "$symlink_source_root" "$symlink_source_canonical" \
+  "$symlink_source_manifest" >"$tmp/symlink-source.out" 2>"$tmp/symlink-source.err"; then
+  die "a symlinked legacy session root was accepted"
+fi
+test ! -e "$symlink_source_canonical/2026/07/07/symlink-source.jsonl" || \
+  die "a session beneath a symlinked legacy root was published"
+
+parent_escape_legacy="$tmp/parent-escape-legacy"
+parent_escape_canonical="$tmp/parent-escape-canonical"
+parent_escape_outside="$tmp/parent-escape-outside"
+parent_escape_manifest="$tmp/parent-escape-manifest"
+mkdir -p "$parent_escape_legacy/2026/07/07" "$parent_escape_canonical" \
+  "$parent_escape_outside" "$parent_escape_manifest"
+printf '%s\n' \
+  '{"type":"session_meta","payload":{"id":"72727272-7272-4272-8272-727272727272"}}' \
+  >"$parent_escape_legacy/2026/07/07/parent-escape.jsonl"
+ln -s "$parent_escape_outside" "$parent_escape_canonical/2026"
+if merge_sessions "$parent_escape_legacy" "$parent_escape_canonical" \
+  "$parent_escape_manifest" >"$tmp/parent-escape.out" 2>"$tmp/parent-escape.err"; then
+  die "a symlinked canonical parent escape was accepted"
+fi
+test ! -e "$parent_escape_outside/07/07/parent-escape.jsonl" || \
+  die "canonical publish escaped through a symlinked parent"
 
 quarantine_runtime_root="$tmp/quarantine-runtime"
 quarantine_guard="$tmp/quarantine-runtime.guard-ready"
@@ -300,10 +357,24 @@ for durable_merge_file in sessions.before-1.tsv sessions.before-2.tsv \
   test "$(mode_of "$manifest/$durable_merge_file")" = 600 || \
     die "durable merge artifact is not mode 0600: $durable_merge_file"
 done
-grep -Fx 'LIZD_CODEX_MIGRATION_V1 phase=merge status=ok' "$manifest/merge.ok" >/dev/null || \
-  die "merge marker content is invalid"
+grep -E '^LIZD_CODEX_MIGRATION_V1 phase=merge run_id=run-fixture-20260713T000000Z status=ok prerequisites_sha256=[0-9a-f]{64}$' \
+  "$manifest/merge.ok" >/dev/null || die "merge marker is not bound to run_id and prerequisites"
+test -s "$manifest/merge.prerequisites.sha256" || \
+  die "merge prerequisite digest manifest is missing"
+for run_bound_manifest in sessions.before-1.tsv sessions.before-2.tsv \
+  sessions.after.tsv added-files.tsv; do
+  head -n 1 "$manifest/$run_bound_manifest" | \
+    grep -Fx "LIZD_CODEX_ARTIFACT_V1 type=${run_bound_manifest%.tsv} run_id=$MIGRATION_RUN_ID" \
+    >/dev/null || die "durable merge artifact is not bound to run_id: $run_bound_manifest"
+done
 if find "$manifest" -maxdepth 1 -name '.merge.ok.tmp.*' -print | grep -q .; then
   die "merge left a temporary marker"
+fi
+
+printf '%s\n' '# tampered after completion' >>"$manifest/sessions.after.tsv"
+if merge_sessions "$legacy" "$canonical" "$manifest" \
+  >"$tmp/tampered-completed.out" 2>"$tmp/tampered-completed.err"; then
+  die "completed merge marker trusted a tampered cryptographic prerequisite"
 fi
 
 dedupe_legacy="$tmp/dedupe-legacy"
@@ -319,7 +390,7 @@ cp "$dedupe_canonical/2026/06/28/canonical-copy.jsonl" \
 merge_sessions "$dedupe_legacy" "$dedupe_canonical" "$dedupe_manifest"
 test ! -e "$dedupe_canonical/2026/07/10/legacy-copy.jsonl" || \
   die "same UUID and hash was duplicated into canonical sessions"
-test ! -s "$dedupe_manifest/added-files.tsv" || \
+test -z "$(tail -n +2 "$dedupe_manifest/added-files.tsv")" || \
   die "deduplicated session was recorded as an added file"
 
 locked_legacy="$tmp/locked-legacy"
