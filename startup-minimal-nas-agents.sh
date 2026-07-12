@@ -53,6 +53,7 @@ SHARED_CODEX_HOME="${SHARED_CODEX_HOME:-$SHARED_AGENT_HOME/codex}"
 SHARED_CODEX_CONFIG_TEMPLATE="${SHARED_CODEX_CONFIG_TEMPLATE:-$SHARED_CODEX_HOME/config.toml.template}"
 SHARED_CLAUDE_HOME="${SHARED_CLAUDE_HOME:-$SHARED_AGENT_HOME/claude}"
 SHARED_ZSH_HISTORY="${SHARED_ZSH_HISTORY:-$SHARED_HOME/.zsh_history}"
+SQLITE_HOME_TOML_KEY_RE="^[[:space:]]*(sqlite_home|\"sqlite_home\"|'sqlite_home')[[:space:]]*="
 
 log() {
   printf '\n\033[1;34m==> %s\033[0m\n' "$*"
@@ -103,7 +104,7 @@ verify_shared_codex_inputs() {
     die "Missing shared Codex skills directory: $SHARED_CODEX_HOME/skills"
   [[ -f "$SHARED_CODEX_CONFIG_TEMPLATE" ]] || \
     die "Missing shared Codex config template: $SHARED_CODEX_CONFIG_TEMPLATE"
-  if grep -Eq '^[[:space:]]*sqlite_home[[:space:]]*=' "$SHARED_CODEX_CONFIG_TEMPLATE"; then
+  if grep -Eq "$SQLITE_HOME_TOML_KEY_RE" "$SHARED_CODEX_CONFIG_TEMPLATE"; then
     die "Shared Codex config template must not set sqlite_home"
   fi
 }
@@ -153,6 +154,19 @@ chown_to_target() {
   fi
 }
 
+chown_to_target_strict() {
+  local chown_command="${LIZD_CHOWN_COMMAND:-chown}"
+  local group
+
+  if [[ "$(id -u)" -ne 0 && -z "${LIZD_CHOWN_COMMAND:-}" ]]; then
+    return 0
+  fi
+  id "$TARGET_USER" >/dev/null 2>&1 || die "Target user does not exist: $TARGET_USER"
+  group="$(id -gn "$TARGET_USER")" || die "Could not determine target group: $TARGET_USER"
+  "$chown_command" "$TARGET_USER:$group" "$@" || \
+    die "Could not set target ownership for: $*"
+}
+
 link_shared_file() {
   local local_path="$1"
   local shared_path="$2"
@@ -194,7 +208,14 @@ install_managed_block_atomic() {
   local file="$1"
   local name="$2"
   local body="$3"
+  local placement="${4:-append}"
+  local clean_legacy_codex_exports="${5:-0}"
   local dir tmp
+
+  case "$placement" in
+    append | prepend) ;;
+    *) die "Unknown managed block placement: $placement" ;;
+  esac
 
   dir="$(dirname "$file")"
   mkdir -p "$dir"
@@ -203,27 +224,45 @@ install_managed_block_atomic() {
   fi
 
   tmp="$(mktemp "$dir/.lizd-shell-block.XXXXXX")" || die "Could not create shell config temporary file"
+  : >"$tmp"
+  if [[ "$placement" == "prepend" ]]; then
+    if ! {
+      printf '# >>> %s\n' "$name"
+      printf '%s\n' "$body"
+      printf '# <<< %s\n\n' "$name"
+    } >>"$tmp"; then
+      rm -f "$tmp"
+      die "Could not write managed block for $file"
+    fi
+  fi
+
   if [[ -f "$file" ]]; then
-    if ! awk -v start="# >>> $name" -v finish="# <<< $name" '
+    if ! awk -v start="# >>> $name" -v finish="# <<< $name" \
+      -v clean_legacy="$clean_legacy_codex_exports" '
       $0 == start { managed = 1; next }
       managed && $0 == finish { managed = 0; next }
-      !managed { print }
-      END { if (managed) exit 42 }
-    ' "$file" >"$tmp"; then
+      managed { next }
+      clean_legacy && $0 == "# >>> minimal-nas-agents" { legacy = 1; print; next }
+      clean_legacy && legacy && $0 == "# <<< minimal-nas-agents" { legacy = 0; print; next }
+      clean_legacy && legacy && \
+        $0 ~ /^[[:space:]]*export[[:space:]]+(CODEX_HOME|CODEX_SQLITE_HOME|XDG_CACHE_HOME)[[:space:]]*=/ { next }
+      { print }
+      END { if (managed || (clean_legacy && legacy)) exit 42 }
+    ' "$file" >>"$tmp"; then
       rm -f "$tmp"
       die "Could not rewrite managed block in $file"
     fi
-  else
-    : >"$tmp"
   fi
 
-  if ! {
-    printf '\n# >>> %s\n' "$name"
-    printf '%s\n' "$body"
-    printf '# <<< %s\n' "$name"
-  } >>"$tmp"; then
-    rm -f "$tmp"
-    die "Could not write managed block for $file"
+  if [[ "$placement" == "append" ]]; then
+    if ! {
+      printf '\n# >>> %s\n' "$name"
+      printf '%s\n' "$body"
+      printf '# <<< %s\n' "$name"
+    } >>"$tmp"; then
+      rm -f "$tmp"
+      die "Could not write managed block for $file"
+    fi
   fi
 
   if ! mv "$tmp" "$file"; then
@@ -249,6 +288,8 @@ fail() {
   printf 'lizd-codex-runtime-init: %s\n' "$*" >&2
   exit 1
 }
+
+sqlite_home_toml_key_re="^[[:space:]]*(sqlite_home|\"sqlite_home\"|'sqlite_home')[[:space:]]*="
 
 [[ -n "${HOME:-}" ]] || fail "HOME is required"
 [[ -n "${SHARED_HOME:-}" ]] || fail "SHARED_HOME is required"
@@ -298,31 +339,74 @@ fi
   fail "missing shared skills: $SHARED_CODEX_HOME/skills"
 [[ -f "$SHARED_CODEX_CONFIG_TEMPLATE" ]] || \
   fail "missing shared config template: $SHARED_CODEX_CONFIG_TEMPLATE"
-if grep -Eq '^[[:space:]]*sqlite_home[[:space:]]*=' "$SHARED_CODEX_CONFIG_TEMPLATE"; then
+if grep -Eq "$sqlite_home_toml_key_re" "$SHARED_CODEX_CONFIG_TEMPLATE"; then
   fail "shared config template must not set sqlite_home"
 fi
 
-mkdir -p "$LIZD_AGENT_RUNTIME_ROOT" || fail "could not create local runtime root"
-lock_dir="$LIZD_AGENT_RUNTIME_ROOT/.lizd-codex-runtime-init.lock"
-lock_attempt=0
-until mkdir "$lock_dir" 2>/dev/null; do
-  lock_attempt=$((lock_attempt + 1))
-  [[ "$lock_attempt" -lt 200 ]] || fail "timed out waiting for runtime initialization lock"
-  sleep 0.05
+runtime_uid="$(id -u)" || fail "could not determine runtime owner"
+
+path_owner_uid() {
+  stat -c '%u' "$1" 2>/dev/null || stat -f '%u' "$1" 2>/dev/null
+}
+
+validate_private_dir_slot() {
+  local path="$1"
+  local owner_uid
+
+  [[ ! -L "$path" ]] || fail "refusing runtime directory symlink: $path"
+  if [[ -e "$path" ]]; then
+    [[ -d "$path" ]] || fail "runtime path is not a directory: $path"
+    owner_uid="$(path_owner_uid "$path")" || fail "could not determine owner: $path"
+    [[ "$owner_uid" == "$runtime_uid" ]] || fail "runtime directory has wrong owner: $path"
+  fi
+}
+
+prepare_private_dir() {
+  local path="$1"
+
+  if [[ ! -e "$path" ]]; then
+    mkdir -p "$path" || fail "could not create local runtime directory: $path"
+  fi
+  validate_private_dir_slot "$path"
+  chmod 700 "$path" || fail "could not secure local runtime directory: $path"
+}
+
+for private_dir in "$LIZD_AGENT_RUNTIME_ROOT" "$CODEX_HOME" \
+  "$CODEX_SQLITE_HOME" "$XDG_CACHE_HOME"; do
+  validate_private_dir_slot "$private_dir"
 done
+for private_dir in "$LIZD_AGENT_RUNTIME_ROOT" "$CODEX_HOME" \
+  "$CODEX_SQLITE_HOME" "$XDG_CACHE_HOME"; do
+  prepare_private_dir "$private_dir"
+done
+
+lock_dir=""
+if command -v flock >/dev/null 2>&1; then
+  if ! exec 9<"$LIZD_AGENT_RUNTIME_ROOT"; then
+    fail "could not open local runtime directory for locking"
+  fi
+  flock -x -w 10 9 || fail "timed out waiting for runtime initialization lock"
+elif [[ "${LIZD_ALLOW_NON_NFS_SHARED_HOME:-0}" == "1" ]]; then
+  lock_dir="$LIZD_AGENT_RUNTIME_ROOT/.lizd-codex-runtime-init.lock"
+  lock_attempt=0
+  until mkdir "$lock_dir" 2>/dev/null; do
+    lock_attempt=$((lock_attempt + 1))
+    [[ "$lock_attempt" -lt 200 ]] || fail "timed out waiting for synthetic runtime initialization lock"
+    sleep 0.05
+  done
+else
+  fail "flock is required for production runtime initialization"
+fi
 
 config_tmp=""
 marker_tmp=""
 cleanup() {
   [[ -z "$config_tmp" ]] || rm -f "$config_tmp"
   [[ -z "$marker_tmp" ]] || rm -f "$marker_tmp"
-  rmdir "$lock_dir" 2>/dev/null || true
+  [[ -z "$lock_dir" ]] || rmdir "$lock_dir" 2>/dev/null || true
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
-
-mkdir -p "$CODEX_HOME" "$CODEX_SQLITE_HOME" "$XDG_CACHE_HOME" || \
-  fail "could not create local Codex runtime directories"
 
 verify_link_slot() {
   local local_path="$1"
@@ -351,7 +435,7 @@ verify_link_slot "$CODEX_HOME/skills" "$SHARED_CODEX_HOME/skills"
 if [[ -e "$CODEX_HOME/config.toml" || -L "$CODEX_HOME/config.toml" ]]; then
   [[ -f "$CODEX_HOME/config.toml" && ! -L "$CODEX_HOME/config.toml" ]] || \
     fail "refusing local config conflict: $CODEX_HOME/config.toml"
-  if grep -Eq '^[[:space:]]*sqlite_home[[:space:]]*=' "$CODEX_HOME/config.toml"; then
+  if grep -Eq "$sqlite_home_toml_key_re" "$CODEX_HOME/config.toml"; then
     fail "local config.toml must not set sqlite_home"
   fi
 else
@@ -392,7 +476,7 @@ LIZD_CODEX_RUNTIME_INIT
     rm -f "$helper_tmp"
     die "Could not atomically install runtime initializer"
   fi
-  chown_to_target "$helper"
+  chown_to_target_strict "$helper"
 }
 
 install_codex_runtime_shell_blocks() {
@@ -414,10 +498,10 @@ EOF
 )"
 
   install_managed_block_atomic "$TARGET_HOME/.zshenv" \
-    "minimal-nas-agents-codex-runtime" "$body"
+    "minimal-nas-agents-codex-runtime" "$body" append 1
   install_managed_block_atomic "$TARGET_HOME/.bashrc" \
-    "minimal-nas-agents-codex-runtime" "$body"
-  chown_to_target "$TARGET_HOME/.zshenv" "$TARGET_HOME/.bashrc"
+    "minimal-nas-agents-codex-runtime" "$body" prepend 1
+  chown_to_target_strict "$TARGET_HOME/.zshenv" "$TARGET_HOME/.bashrc"
 }
 
 install_codex_runtime() {
