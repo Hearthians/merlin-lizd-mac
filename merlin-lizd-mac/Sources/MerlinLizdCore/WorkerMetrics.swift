@@ -131,6 +131,52 @@ public struct WorkerMetricsSample: Codable, Equatable, Hashable, Sendable {
         let sum = values.compactMap { $0 }.reduce(0, +)
         return sum.isFinite ? sum : nil
     }
+
+    /// Combines two projections of the same instant. Values already present
+    /// on the receiver win (for example a direct Worker observation), while
+    /// the other sample fills fields supplied later by an incremental Merlin
+    /// panel retry. GPU fields are merged independently by device ID.
+    public func fillingMissingValues(
+        from other: WorkerMetricsSample
+    ) -> WorkerMetricsSample {
+        guard timestamp == other.timestamp else { return self }
+        let ownGPUs = Dictionary(uniqueKeysWithValues: gpus.map { ($0.index, $0) })
+        let otherGPUs = Dictionary(
+            uniqueKeysWithValues: other.gpus.map { ($0.index, $0) }
+        )
+        let gpuIDs = Set(ownGPUs.keys).union(otherGPUs.keys)
+        let mergedGPUs = gpuIDs.sorted().compactMap { id -> WorkerGPUMetrics? in
+            switch (ownGPUs[id], otherGPUs[id]) {
+            case let (own?, supplement?):
+                WorkerGPUMetrics(
+                    index: id,
+                    utilization: own.utilization ?? supplement.utilization,
+                    memoryUsedBytes: own.memoryUsedBytes
+                        ?? supplement.memoryUsedBytes,
+                    memoryTotalBytes: own.memoryTotalBytes
+                        ?? supplement.memoryTotalBytes,
+                    temperatureCelsius: own.temperatureCelsius
+                        ?? supplement.temperatureCelsius,
+                    powerWatts: own.powerWatts ?? supplement.powerWatts,
+                    powerLimitWatts: own.powerLimitWatts
+                        ?? supplement.powerLimitWatts
+                )
+            case let (own?, nil):
+                own
+            case let (nil, supplement?):
+                supplement
+            case (nil, nil):
+                nil
+            }
+        }
+        return WorkerMetricsSample(
+            timestamp: timestamp,
+            cpuUtilization: cpuUtilization ?? other.cpuUtilization,
+            memoryUsedBytes: memoryUsedBytes ?? other.memoryUsedBytes,
+            memoryTotalBytes: memoryTotalBytes ?? other.memoryTotalBytes,
+            gpus: mergedGPUs
+        )
+    }
 }
 
 enum WorkerMetricsWireFormat {

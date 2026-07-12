@@ -42,4 +42,19 @@ struct InventorySnapshotPersistenceFixture {
             encoded: String(decoding: data, as: UTF8.self)
         )
     }
+
+    static func decodeLegacyWorkerRecord() throws -> WorkerInventoryRecord {
+        let data = Data("""
+        {
+          "id": "123",
+          "cpuCores": 8,
+          "memoryGiB": 32,
+          "gpuCount": 1,
+          "gpuType": "GPU",
+          "createdAt": "now",
+          "readiness": "listed"
+        }
+        """.utf8)
+        return try JSONDecoder().decode(WorkerInventoryRecord.self, from: data)
+    }
 }

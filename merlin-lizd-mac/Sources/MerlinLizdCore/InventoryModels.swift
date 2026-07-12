@@ -39,6 +39,7 @@ public struct WorkerInventoryRecord: Identifiable, Codable, Equatable, Sendable 
     public let memoryGiB: Int
     public let gpuCount: Int
     public let gpuType: String?
+    public let platformStatus: String?
     public let createdAt: String
     public let readiness: WorkerReadiness
 
@@ -48,6 +49,7 @@ public struct WorkerInventoryRecord: Identifiable, Codable, Equatable, Sendable 
         self.memoryGiB = worker.memoryGiB
         self.gpuCount = worker.gpuCount
         self.gpuType = worker.gpuType
+        self.platformStatus = worker.platformStatus
         self.createdAt = worker.createdAt
         self.readiness = worker.readiness
     }
@@ -59,6 +61,23 @@ public struct WorkerInventoryRecord: Identifiable, Codable, Equatable, Sendable 
             memoryGiB: memoryGiB,
             gpuCount: gpuCount,
             gpuType: gpuType,
+            platformStatus: platformStatus,
+            createdAt: createdAt,
+            readiness: readiness
+        )
+    }
+
+    /// The platform Worker API currently omits the GPU model. Callers can carry
+    /// forward a previously observed safe display label without reintroducing
+    /// network metadata from `mlx worker list`.
+    public func withGPUType(_ gpuType: String?) -> WorkerInventoryRecord {
+        WorkerInventoryRecord(
+            id: id,
+            cpuCores: cpuCores,
+            memoryGiB: memoryGiB,
+            gpuCount: gpuCount,
+            gpuType: gpuType,
+            platformStatus: platformStatus,
             createdAt: createdAt,
             readiness: readiness
         )
@@ -70,6 +89,7 @@ public struct WorkerInventoryRecord: Identifiable, Codable, Equatable, Sendable 
         memoryGiB: Int,
         gpuCount: Int,
         gpuType: String?,
+        platformStatus: String?,
         createdAt: String,
         readiness: WorkerReadiness
     ) {
@@ -78,6 +98,7 @@ public struct WorkerInventoryRecord: Identifiable, Codable, Equatable, Sendable 
         self.memoryGiB = memoryGiB
         self.gpuCount = gpuCount
         self.gpuType = gpuType
+        self.platformStatus = platformStatus
         self.createdAt = createdAt
         self.readiness = readiness
     }

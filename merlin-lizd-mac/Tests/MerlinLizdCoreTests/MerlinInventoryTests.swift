@@ -160,10 +160,13 @@ struct MerlinInventoryTests {
             proxycommand secret-proxy --credential must-not-escape
             identityfile /secret/private/key
             """,
-            """
-            id        cpu    mem    gpu    gpuType     podIP                                   port   createdAt            webshell
-            3960209   100    240    0                  fdbd:dc02:2b:84e::37                    9221   2026-07-08T05:20:59  https://secret.invalid/signed-worker-url
-            """,
+            workerPage(
+                sid: "wkr_3960209",
+                status: "running",
+                cpuCores: 100,
+                memoryBytes: 257_698_037_760,
+                gpuCount: 0
+            ),
             "probe-ok",
         ])
         let inventory = try MerlinInventory(
@@ -182,11 +185,12 @@ struct MerlinInventoryTests {
 
         let machine = await inventory.loadWorkers(
             for: discoveredMachine.devbox,
-            sshAlias: try #require(discoveredMachine.sshAlias)
+            sshAlias: discoveredMachine.sshAlias
         )
         #expect(machine.sshAlias == "hl_gpu_2")
         #expect(machine.workerStatus == .loaded)
         #expect(machine.workers.map(\.id) == ["3960209"])
+        #expect(machine.workers.map(\.platformStatus) == ["running"])
         #expect(machine.workers.map(\.readiness) == [.listed])
         let readiness = await inventory.probeWorker(
             sshAlias: "hl_gpu_2",
@@ -203,16 +207,17 @@ struct MerlinInventoryTests {
         #expect(aliasCommand.executable == "/usr/bin/ssh")
         #expect(aliasCommand.arguments == ["-G", "hl_gpu_2"])
         let workerCommand = try #require(commands.first {
+            $0.arguments.starts(with: ["cpu-devbox", "workers", "list"])
+        })
+        #expect(workerCommand.executable == "/Users/test/.merlin-cli/bin/merlin-cli")
+        #expect(workerCommand.arguments == [
+            "cpu-devbox", "workers", "list",
+            "--control-plane", "cn",
+            "--json", #"{"filter":{"instance_sid":"dbx_135679"},"page_size":100}"#,
+        ])
+        #expect(!commands.contains {
             $0.arguments.last?.contains("mlx worker list") == true
         })
-        #expect(workerCommand.executable == "/usr/bin/ssh")
-        #expect(workerCommand.arguments == [
-            "-nT",
-            "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=10",
-            "hl_gpu_2",
-            "NO_COLOR=1 TERM=dumb mlx worker list --limit 100 --offset 0",
-        ])
         let probeCommand = try #require(commands.first {
             $0.arguments.last?.contains("mlx worker login 3960209 -- true") == true
         })
@@ -239,18 +244,21 @@ struct MerlinInventoryTests {
         #expect(commands.allSatisfy { $0.executable != "/usr/bin/ssh" })
     }
 
-    @Test("continues Worker inventory with offset pagination")
-    func paginatesWorkersByOffset() async throws {
-        let header = "id        cpu    mem    gpu    gpuType     podIP                                   port   createdAt            webshell"
+    @Test("continues platform Worker inventory with cursor pagination")
+    func paginatesWorkersByCursor() async throws {
         let runner = ScriptedInventoryProcessRunner(stdout: [
             devboxPage(sid: "dbx_135679", role: "OWNER", status: "running"),
             emptyDevboxPage(),
             "user 135679.some-account.cn",
-            """
-            \(header)
-            3960209   100    240    0                  fdbd:dc02:2b:84e::37                    9221   2026-07-08T05:20:59  https://secret.invalid/worker
-            """,
-            header,
+            workerPage(
+                sid: "wkr_3960209",
+                status: "running",
+                cpuCores: 100,
+                memoryBytes: 257_698_037_760,
+                gpuCount: 0,
+                nextPageToken: "opaque-worker-cursor"
+            ),
+            emptyWorkerPage(),
         ])
         let inventory = try MerlinInventory(
             merlinCLIPath: "/Users/test/.merlin-cli/bin/merlin-cli",
@@ -262,17 +270,149 @@ struct MerlinInventoryTests {
         let discoveredMachine = try #require(snapshot.devboxes.first)
         let machine = await inventory.loadWorkers(
             for: discoveredMachine.devbox,
-            sshAlias: try #require(discoveredMachine.sshAlias)
+            sshAlias: discoveredMachine.sshAlias
         )
 
         #expect(machine.workers.map(\.id) == ["3960209"])
         let commands = await runner.recordedCommands().filter {
-            $0.arguments.last?.contains("mlx worker list") == true
+            $0.arguments.starts(with: ["cpu-devbox", "workers", "list"])
         }
-        #expect(commands.map(\.arguments.last) == [
-            "NO_COLOR=1 TERM=dumb mlx worker list --limit 1 --offset 0",
-            "NO_COLOR=1 TERM=dumb mlx worker list --limit 1 --offset 1",
+        #expect(try commands.map { try requestBody(in: $0) } == [
+            #"{"filter":{"instance_sid":"dbx_135679"},"page_size":1}"#,
+            #"{"filter":{"instance_sid":"dbx_135679"},"page_size":1,"page_token":"opaque-worker-cursor"}"#,
         ])
+    }
+
+    @Test("falls back to SSH mlx only when the platform Worker command fails")
+    func fallsBackToMLXWorkerList() async throws {
+        let runner = ScriptedInventoryProcessRunner(outputs: [
+            InventoryProcessOutput(
+                stdout: devboxPage(
+                    sid: "dbx_135679",
+                    role: "OWNER",
+                    status: "running"
+                ),
+                stderr: "",
+                exitCode: 0
+            ),
+            InventoryProcessOutput(
+                stdout: emptyDevboxPage(),
+                stderr: "",
+                exitCode: 0
+            ),
+            InventoryProcessOutput(
+                stdout: "user 135679.some-account.cn",
+                stderr: "",
+                exitCode: 0
+            ),
+            InventoryProcessOutput(
+                stdout: "",
+                stderr: "unsupported command",
+                exitCode: 64
+            ),
+            InventoryProcessOutput(
+                stdout: """
+                id        cpu    mem    gpu    gpuType     podIP                                   port   createdAt            webshell
+                3966762   20     225    1      NVIDIA-H20                                          9000   2026-07-09T04:49:39  https://secret.invalid/worker
+                """,
+                stderr: "",
+                exitCode: 0
+            ),
+        ])
+        let inventory = try MerlinInventory(
+            merlinCLIPath: "/Users/test/.merlin-cli/bin/merlin-cli",
+            processRunner: runner
+        )
+
+        let snapshot = try await inventory.refresh(sshAliases: ["hl_gpu_2"])
+        let discoveredMachine = try #require(snapshot.devboxes.first)
+        let loaded = await inventory.loadWorkers(
+            for: discoveredMachine.devbox,
+            sshAlias: discoveredMachine.sshAlias
+        )
+
+        #expect(loaded.workerStatus == .loaded)
+        #expect(loaded.workers.map(\.id) == ["3966762"])
+        #expect(loaded.workers.first?.platformStatus == nil)
+        let commands = await runner.recordedCommands()
+        #expect(commands.contains {
+            $0.arguments.starts(with: ["cpu-devbox", "workers", "list"])
+        })
+        #expect(commands.contains {
+            $0.arguments.last?.contains("mlx worker list --limit 100 --offset 0") == true
+        })
+    }
+
+    @Test("loads platform Workers without an SSH alias")
+    func loadsPlatformWorkersWithoutAlias() async throws {
+        let runner = ScriptedInventoryProcessRunner(stdout: [
+            devboxPage(sid: "dbx_135679", role: "OWNER", status: "running"),
+            emptyDevboxPage(),
+            workerPage(
+                sid: "wkr_3966773",
+                status: "running",
+                cpuCores: 22,
+                memoryBytes: 123_480_309_760,
+                gpuCount: 1
+            ),
+        ])
+        let inventory = try MerlinInventory(
+            merlinCLIPath: "/Users/test/.merlin-cli/bin/merlin-cli",
+            processRunner: runner
+        )
+
+        let snapshot = try await inventory.refresh(sshAliases: [])
+        let discoveredMachine = try #require(snapshot.devboxes.first)
+        let loaded = await inventory.loadWorkers(
+            for: discoveredMachine.devbox,
+            sshAlias: nil
+        )
+
+        #expect(loaded.sshAlias == nil)
+        #expect(loaded.workerStatus == .loaded)
+        #expect(loaded.workers.map(\.id) == ["3966773"])
+        #expect(await runner.recordedCommands().allSatisfy {
+            $0.executable != "/usr/bin/ssh"
+        })
+    }
+
+    @Test("reports a platform failure when no SSH fallback route exists")
+    func reportsWorkerFailureWithoutAlias() async throws {
+        let runner = ScriptedInventoryProcessRunner(outputs: [
+            InventoryProcessOutput(
+                stdout: devboxPage(
+                    sid: "dbx_135679",
+                    role: "OWNER",
+                    status: "running"
+                ),
+                stderr: "",
+                exitCode: 0
+            ),
+            InventoryProcessOutput(
+                stdout: emptyDevboxPage(),
+                stderr: "",
+                exitCode: 0
+            ),
+            InventoryProcessOutput(
+                stdout: "",
+                stderr: "not available",
+                exitCode: 127
+            ),
+        ])
+        let inventory = try MerlinInventory(
+            merlinCLIPath: "/Users/test/.merlin-cli/bin/merlin-cli",
+            processRunner: runner
+        )
+
+        let snapshot = try await inventory.refresh(sshAliases: [])
+        let discoveredMachine = try #require(snapshot.devboxes.first)
+        let loaded = await inventory.loadWorkers(
+            for: discoveredMachine.devbox,
+            sshAlias: nil
+        )
+
+        #expect(loaded.workerStatus == .failed(.commandFailed(exitCode: 127)))
+        #expect(loaded.workers.isEmpty)
     }
 
     private func devboxPage(
@@ -308,6 +448,46 @@ struct MerlinInventoryTests {
         """
     }
 
+    private func workerPage(
+        sid: String,
+        status: String,
+        cpuCores: Int,
+        memoryBytes: UInt64,
+        gpuCount: Int,
+        nextPageToken: String? = nil
+    ) -> String {
+        let token = nextPageToken.map {
+            #", "next_page_token": "\#($0)""#
+        } ?? ""
+        return """
+        {
+          "ResponseBase": {"code": 0, "message": "success"},
+          "data": [{
+            "sid": "\(sid)",
+            "status": "\(status)",
+            "gpu_count": \(gpuCount),
+            "cpu_cores": \(cpuCores),
+            "memory_bytes": \(memoryBytes),
+            "created_at": "2026-07-09T04:50:08Z",
+            "pod_ip": "2605:secret::1",
+            "host_ip": "2605:secret::2",
+            "ssh_proxy_cmd": "must-not-escape",
+            "webshell_url": "https://secret.invalid/signed-worker-url"
+          }],
+          "pagination": {"page_size": 100\(token)}
+        }
+        """
+    }
+
+    private func emptyWorkerPage() -> String {
+        """
+        {
+          "ResponseBase": {"code": 0, "message": "success"},
+          "data": [],
+          "pagination": {"page_size": 100}
+        }
+        """
+    }
     private func requestBody(in command: CommandSpec) throws -> String {
         let jsonIndex = try #require(command.arguments.firstIndex(of: "--json"))
         return command.arguments[jsonIndex + 1]
@@ -322,6 +502,10 @@ private actor ScriptedInventoryProcessRunner: InventoryProcessRunning {
         self.outputs = stdout.map {
             InventoryProcessOutput(stdout: $0, stderr: "", exitCode: 0)
         }
+    }
+
+    init(outputs: [InventoryProcessOutput]) {
+        self.outputs = outputs
     }
 
     func run(_ command: CommandSpec) async throws -> InventoryProcessOutput {
@@ -414,7 +598,7 @@ private actor MultiDevboxInventoryProcessRunner: InventoryProcessRunning {
     private var maximumWorkerLists = 0
 
     func run(_ command: CommandSpec) async throws -> InventoryProcessOutput {
-        if command.arguments.first == "cpu-devbox" {
+        if command.arguments.starts(with: ["cpu-devbox", "instances", "list"]) {
             let body = command.arguments.last ?? ""
             let data: String
             if body.contains(#""access_role":"OWNER""#) {
@@ -434,6 +618,18 @@ private actor MultiDevboxInventoryProcessRunner: InventoryProcessRunning {
             return InventoryProcessOutput(stdout: data, stderr: "", exitCode: 0)
         }
 
+        if command.arguments.starts(with: ["cpu-devbox", "workers", "list"]) {
+            activeWorkerLists += 1
+            maximumWorkerLists = max(maximumWorkerLists, activeWorkerLists)
+            try await Task.sleep(nanoseconds: 30_000_000)
+            activeWorkerLists -= 1
+            return InventoryProcessOutput(
+                stdout: Self.emptyWorkerPage,
+                stderr: "",
+                exitCode: 0
+            )
+        }
+
         if command.arguments.first == "-G" {
             let alias = command.arguments.last
             let user = alias == "devbox_one" ? "1001.user.cn" : "1002.user.cn"
@@ -444,25 +640,22 @@ private actor MultiDevboxInventoryProcessRunner: InventoryProcessRunning {
             )
         }
 
-        activeWorkerLists += 1
-        maximumWorkerLists = max(maximumWorkerLists, activeWorkerLists)
-        try await Task.sleep(nanoseconds: 30_000_000)
-        activeWorkerLists -= 1
-        return InventoryProcessOutput(
-            stdout: Self.workerHeader,
-            stderr: "",
-            exitCode: 0
-        )
+        throw ScriptedRunnerError.missingOutput
     }
 
     func maximumConcurrentWorkerLists() -> Int {
         maximumWorkerLists
     }
 
-    private static let workerHeader =
-        "id        cpu    mem    gpu    gpuType     podIP                                   port   createdAt            webshell"
-
     private static let emptyDevboxPage = """
+        {
+          "ResponseBase": {"code": 0, "message": "success"},
+          "data": [],
+          "pagination": {"page_size": 100}
+        }
+        """
+
+    private static let emptyWorkerPage = """
         {
           "ResponseBase": {"code": 0, "message": "success"},
           "data": [],

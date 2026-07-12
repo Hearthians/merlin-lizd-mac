@@ -18,6 +18,7 @@ public enum CommandValidationError: Error, Equatable, Sendable {
     case invalidSID
     case workerTargetRequired
     case invalidMetricsInterval
+    case invalidWorkerPageSize
 }
 
 public enum MerlinCommands {
@@ -215,6 +216,46 @@ public enum MerlinCommands {
         )
     }
 
+    public static func listWorkers(
+        merlinCLIPath: String,
+        instanceSID: String,
+        pageSize: Int = 100,
+        pageToken: String? = nil
+    ) throws -> CommandSpec {
+        guard
+            merlinCLIPath.hasPrefix("/"),
+            !merlinCLIPath.contains(where: { $0.isNewline || $0 == "\0" })
+        else {
+            throw CommandValidationError.invalidExecutablePath
+        }
+        guard MerlinIdentifierValidator.isDevboxSID(instanceSID) else {
+            throw CommandValidationError.invalidSID
+        }
+        guard (1 ... 100).contains(pageSize) else {
+            throw CommandValidationError.invalidWorkerPageSize
+        }
+
+        let request = WorkerListPayload(
+            filter: .init(instanceSID: instanceSID),
+            pageSize: pageSize,
+            pageToken: pageToken
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let payloadData = try encoder.encode(request)
+        guard let payload = String(data: payloadData, encoding: .utf8) else {
+            throw CommandValidationError.invalidSID
+        }
+        return CommandSpec(
+            executable: merlinCLIPath,
+            arguments: [
+                "cpu-devbox", "workers", "list",
+                "--control-plane", "cn",
+                "--json", payload,
+            ]
+        )
+    }
+
     public static func devboxTerminal(
         alias: String,
         sessionName: String
@@ -387,5 +428,25 @@ public enum MerlinCommands {
 
     private struct StartPayload: Encodable {
         let sid: String
+    }
+
+    private struct WorkerListPayload: Encodable {
+        struct Filter: Encodable {
+            let instanceSID: String
+
+            enum CodingKeys: String, CodingKey {
+                case instanceSID = "instance_sid"
+            }
+        }
+
+        let filter: Filter
+        let pageSize: Int
+        let pageToken: String?
+
+        enum CodingKeys: String, CodingKey {
+            case filter
+            case pageSize = "page_size"
+            case pageToken = "page_token"
+        }
     }
 }

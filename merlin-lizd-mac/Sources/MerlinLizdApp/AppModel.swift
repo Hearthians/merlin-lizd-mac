@@ -157,9 +157,8 @@ final class AppModel: ObservableObject {
         let devboxes = incoming.devboxes.map { machine in
             guard
                 machine.devbox.status.isRunning,
-                let alias = machine.sshAlias,
                 let cached = workerInventoryCache[machine.devbox.sid],
-                cached.sshAlias == alias
+                cached.sshAlias == machine.sshAlias
             else {
                 return machine
             }
@@ -180,8 +179,8 @@ final class AppModel: ObservableObject {
         for snapshot: InventorySnapshot,
         force: Bool
     ) -> Bool {
-        // Do not restart a slow mlx query when a timer tick or repeated click
-        // arrives; its result will be merged when it completes.
+        // Do not restart an in-flight Merlin Worker query when a timer tick or
+        // repeated click arrives; its result will be merged when it completes.
         if workerInventoryTask != nil {
             workerInventoryRescanPending = true
             pendingWorkerInventoryForce = pendingWorkerInventoryForce || force
@@ -192,12 +191,12 @@ final class AppModel: ObservableObject {
 
         let now = Date()
         let targets = snapshot.devboxes.compactMap { machine -> WorkerInventoryTarget? in
-            guard machine.devbox.status.isRunning, let alias = machine.sshAlias else {
+            guard machine.devbox.status.isRunning else {
                 return nil
             }
             if !force,
                let cached = workerInventoryCache[machine.devbox.sid],
-               cached.sshAlias == alias
+               cached.sshAlias == machine.sshAlias
             {
                 switch cached.status {
                 case .loaded
@@ -212,7 +211,10 @@ final class AppModel: ObservableObject {
                     break
                 }
             }
-            return WorkerInventoryTarget(machine: machine, sshAlias: alias)
+            return WorkerInventoryTarget(
+                machine: machine,
+                sshAlias: machine.sshAlias
+            )
         }
         guard !targets.isEmpty else { return false }
 
@@ -272,7 +274,19 @@ final class AppModel: ObservableObject {
         let attemptedAt = Date()
         switch result.workerStatus {
         case .loaded:
-            effectiveWorkers = result.workers
+            var knownGPUTypes: [String: String] = [:]
+            for worker in previous?.workers ?? currentMachine.workers {
+                if let gpuType = worker.gpuType {
+                    knownGPUTypes[worker.id] = gpuType
+                }
+            }
+            // The Merlin Worker API intentionally supplies status/resources
+            // but not every GPU marketing name. Preserve a previously learned
+            // name without making the slow SSH list the primary inventory.
+            effectiveWorkers = result.workers.map { worker in
+                guard worker.gpuType == nil else { return worker }
+                return worker.withGPUType(knownGPUTypes[worker.id])
+            }
             fetchedAt = attemptedAt
         case .failed:
             // A transient SSH/mlx failure must never erase the last useful
@@ -671,7 +685,7 @@ private struct WorkerProbeKey: Codable, Hashable, Sendable {
 
 private struct WorkerInventoryTarget: Sendable {
     let machine: DevboxInventory
-    let sshAlias: String
+    let sshAlias: String?
 }
 
 private struct CachedWorkerInventory: Sendable {

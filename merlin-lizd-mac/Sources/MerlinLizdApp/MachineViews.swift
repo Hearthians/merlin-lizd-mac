@@ -333,14 +333,17 @@ struct WorkerDetailView: View {
             VStack(alignment: .leading, spacing: 18) {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(worker.gpuType ?? "CPU Worker")
+                        Text(workerDisplayName(worker))
                             .font(.largeTitle.bold())
                         Text("\(machine.sshAlias ?? machine.devbox.name) · \(worker.id)")
                             .font(.callout.monospaced())
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
-                    ReadinessPill(readiness: worker.readiness)
+                    HStack(spacing: 7) {
+                        WorkerPlatformStatusPill(status: worker.platformStatus)
+                        ReadinessPill(readiness: worker.readiness)
+                    }
                 }
 
                 HStack {
@@ -350,6 +353,13 @@ struct WorkerDetailView: View {
                         .buttonStyle(.bordered)
                 }
                 .disabled(machine.sshAlias == nil || !machine.devbox.status.isRunning)
+
+                if machine.sshAlias == nil {
+                    MessageBanner(
+                        text: "Merlin 平台状态与监控仍可使用；未匹配 SSH alias，因此终端与 tmux 暂不可用。",
+                        kind: .info
+                    )
+                }
 
                 if worker.readiness == .listed {
                     MessageBanner(
@@ -378,19 +388,30 @@ struct WorkerDetailView: View {
                 }
 
                 WorkerMonitoringContainer(
-                    target: monitoringTarget,
+                    platformTarget: platformMonitoringTarget,
+                    directTarget: directMonitoringTarget,
                     expectsGPU: worker.gpuCount > 0,
                     unavailableMessage: monitoringUnavailableMessage
                 )
+                .id(platformMonitoringTarget)
             }
             .padding(24)
         }
     }
 
-    private var monitoringTarget: TerminalTarget? {
+    private var platformMonitoringTarget: MerlinPlatformMetricsTarget? {
+        guard machine.devbox.status.isRunning else { return nil }
+        return MerlinPlatformMetricsTarget(
+            devboxSID: machine.devbox.sid,
+            workerID: worker.id
+        )
+    }
+
+    private var directMonitoringTarget: TerminalTarget? {
         guard
             machine.devbox.status.isRunning,
             let alias = machine.sshAlias,
+            platformAllowsDirectMonitoring,
             worker.readiness != .notReady,
             worker.readiness != .unreachable
         else {
@@ -404,20 +425,21 @@ struct WorkerDetailView: View {
         )
     }
 
+    private var platformAllowsDirectMonitoring: Bool {
+        guard let status = worker.platformStatus?.lowercased() else {
+            return true
+        }
+        return status == "running" || status == "ready"
+    }
+
     private var monitoringUnavailableMessage: String {
         if !machine.devbox.status.isRunning {
             return "开发机未运行，无法读取 Worker 指标。"
         }
-        if machine.sshAlias == nil {
-            return "未匹配 SSH alias，无法建立监控连接。"
+        if platformMonitoringTarget == nil {
+            return "Worker 标识无效，无法请求 Merlin 平台指标。"
         }
-        if worker.readiness == .notReady {
-            return "Worker 尚未就绪，暂时无法读取指标。"
-        }
-        if worker.readiness == .unreachable {
-            return "Worker 当前不可达，请刷新状态后重试。"
-        }
-        return "暂时无法读取 Worker 指标。"
+        return "Merlin 平台暂时无法读取该 Worker 的指标。"
     }
 }
 
@@ -436,7 +458,7 @@ struct WorkerRow: View {
                 .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(worker.gpuType ?? "CPU Worker")
+                Text(workerDisplayName(worker))
                     .font(.headline)
                 Text([parentLabel, worker.id].compactMap { $0 }.joined(separator: " · "))
                     .font(.caption.monospaced())
@@ -450,6 +472,7 @@ struct WorkerRow: View {
             if worker.gpuCount > 0 {
                 MetricPill(symbol: "square.stack.3d.up", value: "\(worker.gpuCount) GPU", tint: .green)
             }
+            WorkerPlatformStatusPill(status: worker.platformStatus)
             ReadinessPill(readiness: worker.readiness)
             Button("连接", systemImage: "terminal", action: onConnect)
                 .buttonStyle(.bordered)
@@ -501,6 +524,34 @@ struct ReadinessPill: View {
     }
 }
 
+struct WorkerPlatformStatusPill: View {
+    let status: String?
+
+    @ViewBuilder
+    var body: some View {
+        if let status, !status.isEmpty {
+            let normalized = status.lowercased()
+            if normalized == "running" {
+                StatusPill(label: "平台运行中", color: .green)
+            } else if normalized == "pending" || normalized == "starting" {
+                StatusPill(label: "平台准备中", color: .orange, symbol: "clock.fill")
+            } else if normalized == "stopped" || normalized == "terminated" {
+                StatusPill(label: "平台已停止", color: .secondary, symbol: "stop.circle.fill")
+            } else {
+                StatusPill(
+                    label: "平台 \(status)",
+                    color: .secondary,
+                    symbol: "circle.fill"
+                )
+            }
+        }
+    }
+}
+
+private func workerDisplayName(_ worker: WorkerInventoryRecord) -> String {
+    worker.gpuType ?? (worker.gpuCount > 0 ? "GPU Worker" : "CPU Worker")
+}
+
 private func formatGiB(_ bytes: Int64) -> String {
     let gibibytes = Double(bytes) / 1_073_741_824
     return gibibytes.rounded() == gibibytes
@@ -531,20 +582,20 @@ private func workerStatusPresentation(
         WorkerStatusPresentation(summary: "已刷新", detail: nil, isFailure: false)
     case .failed(.transport):
         WorkerStatusPresentation(
-            summary: "SSH 不可达",
-            detail: "无法通过 SSH 查询工作机。请检查开发机是否可连接，以及系统 SSH 登录状态。",
+            summary: "Worker 查询不可用",
+            detail: "Merlin CLI 与可用的 SSH 降级通道均未能刷新工作机；当前保留上次结果。",
             isFailure: true
         )
     case let .failed(.commandFailed(exitCode)):
         WorkerStatusPresentation(
             summary: "命令失败（退出码 \(exitCode)）",
-            detail: "mlx worker list 执行失败（退出码 \(exitCode)）。可先进入开发机检查 mlx 状态。",
+            detail: "Merlin Worker 查询失败（退出码 \(exitCode)）；当前保留上次结果。",
             isFailure: true
         )
     case .failed(.malformedOutput):
         WorkerStatusPresentation(
             summary: "输出格式异常",
-            detail: "无法识别 mlx worker list 的输出格式；为避免误报，当前未将结果显示为 0 台工作机。",
+            detail: "无法识别 Merlin Worker 返回；为避免误报，当前未将结果显示为 0 台工作机。",
             isFailure: true
         )
     }
@@ -562,9 +613,6 @@ private func emptyWorkerMessage(_ machine: DevboxInventory) -> String {
     guard machine.devbox.status.isRunning else {
         return "开发机未运行，无法查询工作机。"
     }
-    guard machine.sshAlias != nil else {
-        return "未匹配 SSH alias，无法查询工作机。"
-    }
     return switch machine.workerStatus {
     case .notQueried:
         "Worker 列表正在后台查询…"
@@ -577,6 +625,5 @@ private func emptyWorkerMessage(_ machine: DevboxInventory) -> String {
 
 private func workerInventoryIsPending(_ machine: DevboxInventory) -> Bool {
     machine.devbox.status.isRunning
-        && machine.sshAlias != nil
         && machine.workerStatus == .notQueried
 }

@@ -377,7 +377,7 @@ private struct SidebarWorkerLabel: View {
                 .frame(width: 25, height: 25)
                 .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
             VStack(alignment: .leading, spacing: 2) {
-                Text(worker.gpuType ?? "CPU Worker")
+                Text(worker.gpuType ?? (worker.gpuCount > 0 ? "GPU Worker" : "CPU Worker"))
                     .font(.callout.weight(selected ? .semibold : .regular))
                     .lineLimit(1)
                 Text(worker.id)

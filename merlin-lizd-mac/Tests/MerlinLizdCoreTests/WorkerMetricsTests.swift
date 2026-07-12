@@ -272,6 +272,52 @@ struct WorkerMetricsTests {
         #expect(sample.memoryUsedBytes == 61_440)
     }
 
+    @Test("incremental platform samples fill fields without erasing existing metrics")
+    func mergesIncrementalMetricFields() throws {
+        let existing = WorkerMetricsSample(
+            timestamp: .distantPast,
+            cpuUtilization: 20,
+            memoryUsedBytes: nil,
+            memoryTotalBytes: nil,
+            gpus: [WorkerGPUMetrics(
+                index: 2,
+                utilization: 50,
+                memoryUsedBytes: nil,
+                memoryTotalBytes: nil,
+                temperatureCelsius: nil,
+                powerWatts: nil,
+                powerLimitWatts: nil
+            )]
+        )
+        let supplement = WorkerMetricsSample(
+            timestamp: .distantPast,
+            cpuUtilization: 99,
+            memoryUsedBytes: 400,
+            memoryTotalBytes: 1_000,
+            gpus: [WorkerGPUMetrics(
+                index: 2,
+                utilization: nil,
+                memoryUsedBytes: 200,
+                memoryTotalBytes: 2_000,
+                temperatureCelsius: 42,
+                powerWatts: nil,
+                powerLimitWatts: nil
+            )]
+        )
+
+        let merged = existing.fillingMissingValues(from: supplement)
+
+        #expect(merged.cpuUtilization == 20)
+        #expect(merged.memoryUsedBytes == 400)
+        #expect(merged.memoryTotalBytes == 1_000)
+        let gpu = try #require(merged.gpus.first)
+        #expect(gpu.index == 2)
+        #expect(gpu.utilization == 50)
+        #expect(gpu.memoryUsedBytes == 200)
+        #expect(gpu.memoryTotalBytes == 2_000)
+        #expect(gpu.temperatureCelsius == 42)
+    }
+
     @Test("sampler routes the safe command and timestamps parsed output")
     func samplerExecutesSafeCommand() async throws {
         let runner = MetricsScriptedRunner(output: InventoryProcessOutput(
