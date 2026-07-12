@@ -11,7 +11,7 @@ final class TerminalTabsModel: ObservableObject {
 
     private var sessions: [String: TerminalSession] = [:]
     private let defaults: UserDefaults
-    private let sshMasterPool: SSHMasterPool
+    private let managedTerminalCommands: ManagedTerminalCommandBuilder
     let tmuxSessionDiscovery: TmuxSessionDiscovery
     private let tmuxSessionController: TmuxSessionController
     private let externalTerminalLauncher = ExternalTerminalLauncher()
@@ -23,7 +23,9 @@ final class TerminalTabsModel: ObservableObject {
         tmuxSessionController: TmuxSessionController,
         defaults: UserDefaults = .standard
     ) {
-        self.sshMasterPool = sshMasterPool
+        managedTerminalCommands = ManagedTerminalCommandBuilder(
+            sshMasterPool: sshMasterPool
+        )
         self.tmuxSessionDiscovery = tmuxSessionDiscovery
         self.tmuxSessionController = tmuxSessionController
         self.defaults = defaults
@@ -162,7 +164,7 @@ final class TerminalTabsModel: ObservableObject {
         }
 
         do {
-            let command = try command(for: tab)
+            let command = try command(for: tab, destination: .swiftTerm)
             let session = TerminalSession(
                 id: UUID(uuidString: tab.id) ?? UUID(),
                 command: command,
@@ -317,7 +319,9 @@ final class TerminalTabsModel: ObservableObject {
         guard let tab = tabs.first(where: { $0.id == id }) else {
             throw TerminalTabOperationError.sessionUnavailable
         }
-        try await externalTerminalLauncher.open(command(for: tab))
+        try await externalTerminalLauncher.open(
+            command(for: tab, destination: .externalTerminal)
+        )
     }
 
     private func open(title: String, target: TerminalTarget, sessionName: String?) {
@@ -334,7 +338,15 @@ final class TerminalTabsModel: ObservableObject {
         persist()
     }
 
-    private func command(for tab: TerminalTabRecord) throws -> CommandSpec {
+    private enum CommandDestination {
+        case swiftTerm
+        case externalTerminal
+    }
+
+    private func command(
+        for tab: TerminalTabRecord,
+        destination: CommandDestination
+    ) throws -> CommandSpec {
         switch tab.target {
         case .local:
             if let sessionName = tab.sessionName {
@@ -349,29 +361,34 @@ final class TerminalTabsModel: ObservableObject {
             let configuredShell = ProcessInfo.processInfo.environment["SHELL"]
             let shell = configuredShell.flatMap { $0.hasPrefix("/") ? $0 : nil } ?? "/bin/zsh"
             return CommandSpec(executable: shell, arguments: ["-l"])
-        case let .devbox(_, _, alias):
+        case .devbox:
             guard let sessionName = tab.sessionName else {
                 throw CommandValidationError.invalidSessionName
             }
-            return try sshMasterPool.managedCommand(
-                MerlinCommands.devboxTerminal(
-                    alias: alias,
-                    sessionName: sessionName
-                ),
-                alias: alias
-            )
-        case let .worker(_, _, alias, workerID):
+            switch destination {
+            case .swiftTerm:
+                return try managedTerminalCommands.swiftTermCommand(
+                    target: tab.target, sessionName: sessionName
+                )
+            case .externalTerminal:
+                return try managedTerminalCommands.externalTerminalCommand(
+                    target: tab.target, sessionName: sessionName
+                )
+            }
+        case .worker:
             guard let sessionName = tab.sessionName else {
                 throw CommandValidationError.invalidSessionName
             }
-            return try sshMasterPool.managedCommand(
-                MerlinCommands.workerTerminal(
-                    alias: alias,
-                    workerID: workerID,
-                    sessionName: sessionName
-                ),
-                alias: alias
-            )
+            switch destination {
+            case .swiftTerm:
+                return try managedTerminalCommands.swiftTermCommand(
+                    target: tab.target, sessionName: sessionName
+                )
+            case .externalTerminal:
+                return try managedTerminalCommands.externalTerminalCommand(
+                    target: tab.target, sessionName: sessionName
+                )
+            }
         }
     }
 

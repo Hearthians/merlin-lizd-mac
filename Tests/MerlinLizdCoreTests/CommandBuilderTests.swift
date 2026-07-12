@@ -3,6 +3,74 @@ import Testing
 
 @Suite("Terminal command routing")
 struct CommandBuilderTests {
+    @Test("SwiftTerm command uses the shared interactive SSH transport")
+    func buildsManagedSwiftTermCommand() throws {
+        let directory = temporarySSHDirectory()
+        let pool = SSHMasterPool(
+            testDirectory: directory, runner: SSHMasterScriptedRunner()
+        )
+        let builder = ManagedTerminalCommandBuilder(sshMasterPool: pool)
+
+        let command = try builder.swiftTermCommand(
+            target: .devbox(
+                sid: "dbx_135679", name: "wt_hl", alias: "hl_gpu_2"
+            ),
+            sessionName: "mlz-shell"
+        )
+        let expectedPath = try SSHMasterCommands(directory: directory)
+            .socketPath(alias: "hl_gpu_2")
+
+        assertManagedInteractiveCommand(
+            command, expectedPath: expectedPath
+        )
+    }
+
+    @Test("external Terminal command uses the same interactive SSH transport")
+    func buildsManagedExternalTerminalCommand() throws {
+        let directory = temporarySSHDirectory()
+        let pool = SSHMasterPool(
+            testDirectory: directory, runner: SSHMasterScriptedRunner()
+        )
+        let builder = ManagedTerminalCommandBuilder(sshMasterPool: pool)
+
+        let target = TerminalTarget.worker(
+            devboxSID: "dbx_135679", devboxName: "wt_hl",
+            alias: "hl_gpu_2", workerID: "3960209"
+        )
+        let command = try builder.externalTerminalCommand(
+            target: target,
+            sessionName: "mlz-train"
+        )
+        let swiftTermCommand = try builder.swiftTermCommand(
+            target: target,
+            sessionName: "mlz-train"
+        )
+        let expectedPath = try SSHMasterCommands(directory: directory)
+            .socketPath(alias: "hl_gpu_2")
+
+        assertManagedInteractiveCommand(
+            command, expectedPath: expectedPath
+        )
+        #expect(controlPaths(in: command) == controlPaths(in: swiftTermCommand))
+        #expect(command.arguments.last?.contains("mlx worker login 3960209") == true)
+    }
+
+    private func assertManagedInteractiveCommand(
+        _ command: CommandSpec,
+        expectedPath: String
+    ) {
+        #expect(command.executable == "/usr/bin/ssh")
+        #expect(command.arguments.contains("-tt"))
+        #expect(command.arguments.contains("ServerAliveInterval=10"))
+        #expect(command.arguments.contains("ServerAliveCountMax=3"))
+        #expect(controlPaths(in: command) == ["ControlPath=\(expectedPath)"])
+        #expect(command.arguments.last?.contains("tmux new-session -A") == true)
+    }
+
+    private func controlPaths(in command: CommandSpec) -> [String] {
+        command.arguments.filter { $0.hasPrefix("ControlPath=") }
+    }
+
     @Test("renders argv as one shell command without evaluating metacharacters")
     func safelyRendersArgumentArray() throws {
         let rendered = try ShellCommandRenderer.render(CommandSpec(

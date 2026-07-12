@@ -73,6 +73,53 @@ struct TmuxSessionDiscoveryTests {
         #expect(await discovery.cached(target: target) == [])
     }
 
+    @Test("pooled discovery caches authoritative no-server output")
+    func pooledDiscoveryCachesNoServer() async throws {
+        let runner = TmuxPoolRunner(childOutput: InventoryProcessOutput(
+            stdout: "",
+            stderr: "no server running on /tmp/tmux-1000/default",
+            exitCode: 1
+        ))
+        let pool = SSHMasterPool(
+            testDirectory: temporarySSHDirectory(), runner: runner
+        )
+        let discovery = TmuxSessionDiscovery(
+            sshMasterPool: pool,
+            processRunner: TmuxScriptedRunner(output: InventoryProcessOutput(
+                stdout: "must-not-run", stderr: "", exitCode: 0
+            ))
+        )
+        let target = TerminalTarget.devbox(
+            sid: "dbx_135679", name: "wt_hl", alias: "hl_gpu_2"
+        )
+
+        #expect(try await discovery.list(target: target).isEmpty)
+        #expect(await discovery.cached(target: target) == [])
+    }
+
+    @Test("pooled discovery preserves Worker not-ready diagnostics")
+    func pooledDiscoverySurfacesWorkerNotReady() async {
+        let runner = TmuxPoolRunner(childOutput: InventoryProcessOutput(
+            stdout: "", stderr: "worker has not been ready yet", exitCode: 1
+        ))
+        let pool = SSHMasterPool(
+            testDirectory: temporarySSHDirectory(), runner: runner
+        )
+        let discovery = TmuxSessionDiscovery(
+            sshMasterPool: pool,
+            processRunner: TmuxScriptedRunner(output: InventoryProcessOutput(
+                stdout: "must-not-run", stderr: "", exitCode: 0
+            ))
+        )
+
+        await #expect(throws: TmuxSessionDiscoveryError.workerNotReady) {
+            try await discovery.list(target: .worker(
+                devboxSID: "dbx_135679", devboxName: "wt_hl",
+                alias: "hl_gpu_2", workerID: "3966773"
+            ))
+        }
+    }
+
     @Test("updates cached inventory after an authoritative rename")
     func recordsRename() async throws {
         let runner = TmuxScriptedRunner(
@@ -131,7 +178,14 @@ struct TmuxSessionDiscoveryTests {
 }
 
 private actor TmuxPoolRunner: InventoryProcessRunning {
+    private let childOutput: InventoryProcessOutput
     private var recorded: [CommandSpec] = []
+
+    init(childOutput: InventoryProcessOutput = InventoryProcessOutput(
+        stdout: "pool-session\n", stderr: "", exitCode: 0
+    )) {
+        self.childOutput = childOutput
+    }
 
     func run(_ command: CommandSpec) async throws -> InventoryProcessOutput {
         recorded.append(command)
@@ -141,9 +195,7 @@ private actor TmuxPoolRunner: InventoryProcessRunning {
         if command.arguments.first == "-MNf" {
             return InventoryProcessOutput(stdout: "", stderr: "", exitCode: 0)
         }
-        return InventoryProcessOutput(
-            stdout: "pool-session\n", stderr: "", exitCode: 0
-        )
+        return childOutput
     }
 
     func commands() -> [CommandSpec] { recorded }
