@@ -13,7 +13,7 @@ struct MerlinInventoryAliasTests {
             )),
             .success(emptyDevboxPage),
             .success("user account-without-numeric-sid"),
-            .success(workerHeader),
+            .success(emptyWorkerPage),
         ])
         let inventory = try MerlinInventory(
             merlinCLIPath: "/Users/test/.merlin-cli/bin/merlin-cli",
@@ -62,10 +62,13 @@ struct MerlinInventoryAliasTests {
             )),
             .success(emptyDevboxPage),
             .success("user 135679.some-account.cn"),
-            .success("""
-                \(workerHeader)
-                3966762   20     225    1      NVIDIA-H20                                          9000   2026-07-09T04:49:39  https://secret.invalid/worker
-                """),
+            .success(workerPage(
+                sid: "wkr_3966762",
+                status: "running",
+                cpuCores: 20,
+                memoryBytes: 241_591_910_400,
+                gpuCount: 1
+            )),
             InventoryProcessOutput(
                 stdout: "",
                 stderr: "worker has not been ready yet",
@@ -118,9 +121,6 @@ private extension InventoryProcessOutput {
     }
 }
 
-private let workerHeader =
-    "id        cpu    mem    gpu    gpuType     podIP                                   port   createdAt            webshell"
-
 private let emptyDevboxPage = """
     {
       "ResponseBase": {"code": 0, "message": "success"},
@@ -128,6 +128,37 @@ private let emptyDevboxPage = """
       "pagination": {"page_size": 100}
     }
     """
+
+private let emptyWorkerPage = """
+    {
+      "ResponseBase": {"code": 0, "message": "success"},
+      "data": [],
+      "pagination": {"page_size": 100}
+    }
+    """
+
+private func workerPage(
+    sid: String,
+    status: String,
+    cpuCores: Int,
+    memoryBytes: UInt64,
+    gpuCount: Int
+) -> String {
+    """
+    {
+      "ResponseBase": {"code": 0, "message": "success"},
+      "data": [{
+        "sid": "\(sid)",
+        "status": "\(status)",
+        "gpu_count": \(gpuCount),
+        "cpu_cores": \(cpuCores),
+        "memory_bytes": \(memoryBytes),
+        "created_at": "2026-07-09T04:49:39Z"
+      }],
+      "pagination": {"page_size": 100}
+    }
+    """
+}
 
 private func devboxPage(
     sid: String,

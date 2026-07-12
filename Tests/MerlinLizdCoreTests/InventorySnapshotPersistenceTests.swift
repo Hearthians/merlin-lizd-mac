@@ -12,4 +12,14 @@ struct InventorySnapshotPersistenceTests {
         #expect(!fixture.encoded.contains("secret.invalid"))
         #expect(!fixture.encoded.contains("9000"))
     }
+
+    @Test("decodes Worker caches written before platform status existed")
+    func decodesLegacyWorkerRecord() throws {
+        let worker = try InventorySnapshotPersistenceFixture
+            .decodeLegacyWorkerRecord()
+
+        #expect(worker.id == "123")
+        #expect(worker.platformStatus == nil)
+        #expect(worker.readiness == .listed)
+    }
 }

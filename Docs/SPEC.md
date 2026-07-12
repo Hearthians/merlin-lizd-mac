@@ -31,11 +31,14 @@ The primary mental model is **machines**. A future **tasks** workspace may add f
 
 - Discover all CPU Devboxes from the current `merlin-cli` account, not only aliases already present in SSH config.
 - Match a Devbox SID/name to a safe local SSH alias when possible. Never display or persist ProxyCommand contents.
-- For every running, routable Devbox, list Workers with `NO_COLOR=1 TERM=dumb mlx worker list` through SSH. Worker list requests may run concurrently with a bounded limit.
-- Render the last safe snapshot immediately, then refresh Devboxes, Worker lists, and Worker readiness in separate stages. A slow `mlx worker list/login` must not block or clear the machine tree.
+- For every running Devbox, list Workers through `merlin-cli cpu-devbox workers list` with `filter.instance_sid`. This platform query does not require a local SSH alias. Use `NO_COLOR=1 TERM=dumb mlx worker list` through SSH only when the platform query fails and a safe alias exists.
+- Keep Merlin's Worker lifecycle status separate from SSH/`mlx worker login` readiness. Platform `running` is not proof that a terminal connection is ready.
+- Render the last safe snapshot immediately, then refresh Devboxes, platform Worker lists, and Worker connection readiness in separate stages. A slow platform query or `mlx worker login` must not block or clear the machine tree.
 - Refresh immediately on launch, manually on request, and every 15 seconds while the app is active. Pause foreground polling when inactive.
 - Show lifecycle/connectivity, CPU, memory, GPU type/count, Worker readiness, last refresh time, and actionable errors.
-- While a Worker detail page is visible, use one cancellation-aware SSH/`mlx worker login` stream for read-only telemetry. Prefer cgroup CPU/memory data over host `/proc` values, retain only five minutes in memory, and stop the stream when the page leaves the view.
+- While a Worker detail page is visible, obtain the official Grafana URL from the Worker **list** response, discover semantic panels with `merlin-cli grafana describe`, and load five-minute CPU, memory, GPU, VRAM, and temperature history with `grafana panel-data`. Do not hardcode panel IDs across dashboards.
+- Grafana panel queries are large and may take tens of seconds, so they run independently from machine refresh and at low frequency. A single cancellation-aware SSH/`mlx worker login` stream may provide the live edge or act as fallback. The UI must label `Merlin 平台`, `Merlin + Worker`, or `Worker 直连` and explain degradation.
+- Prefer cgroup CPU/memory data over host `/proc` values only on the direct fallback path. Retain all telemetry for at most five minutes in memory, persist none of it, and stop every process when the page leaves the view.
 - A Worker appearing in a list is not proof that it is ready. Connection failures and the text `worker has not been ready yet` must remain visible as readiness/transport errors.
 
 ## Authentication and safety

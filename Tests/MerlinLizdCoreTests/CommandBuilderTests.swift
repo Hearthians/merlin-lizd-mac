@@ -99,6 +99,40 @@ struct CommandBuilderTests {
         ])
     }
 
+    @Test("lists platform Workers with an instance filter and cursor pagination")
+    func buildsMerlinWorkerListCommand() throws {
+        let firstPage = try MerlinCommands.listWorkers(
+            merlinCLIPath: "/Users/lizd/.merlin-cli/bin/merlin-cli",
+            instanceSID: "dbx_135679"
+        )
+        let nextPage = try MerlinCommands.listWorkers(
+            merlinCLIPath: "/Users/lizd/.merlin-cli/bin/merlin-cli",
+            instanceSID: "dbx_135679",
+            pageSize: 20,
+            pageToken: "opaque-cursor"
+        )
+
+        #expect(firstPage.executable == "/Users/lizd/.merlin-cli/bin/merlin-cli")
+        #expect(firstPage.arguments == [
+            "cpu-devbox", "workers", "list",
+            "--control-plane", "cn",
+            "--json", #"{"filter":{"instance_sid":"dbx_135679"},"page_size":100}"#,
+        ])
+        #expect(nextPage.arguments.last ==
+            #"{"filter":{"instance_sid":"dbx_135679"},"page_size":20,"page_token":"opaque-cursor"}"#)
+    }
+
+    @Test("rejects an invalid platform Worker page size")
+    func rejectsInvalidWorkerPageSize() {
+        #expect(throws: CommandValidationError.invalidWorkerPageSize) {
+            try MerlinCommands.listWorkers(
+                merlinCLIPath: "/Users/lizd/.merlin-cli/bin/merlin-cli",
+                instanceSID: "dbx_135679",
+                pageSize: 0
+            )
+        }
+    }
+
     @Test("lists tmux sessions inside a Worker without allocating an interactive terminal")
     func buildsWorkerTmuxListCommand() throws {
         let command = try MerlinCommands.listTmuxSessions(

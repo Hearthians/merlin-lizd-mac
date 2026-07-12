@@ -64,7 +64,7 @@ public actor MerlinInventory {
         guard merlinCLIPath.hasPrefix("/") else {
             throw MerlinInventoryError.merlinCLIPathMustBeAbsolute
         }
-        guard workerPageSize > 0 else {
+        guard (1 ... 100).contains(workerPageSize) else {
             throw MerlinInventoryError.invalidWorkerPageSize
         }
         self.loader = InventoryLoader(
@@ -126,19 +126,20 @@ public actor MerlinInventory {
         )
     }
 
-    /// Worker listing is also isolated from the Devbox inventory so a slow
-    /// SSH/mlx call cannot keep the whole machine tree in a loading state.
+    /// Worker listing is isolated from Devbox inventory. Merlin's control plane
+    /// is authoritative; SSH/`mlx` is used only when that command is unavailable
+    /// and a validated alias provides a fallback route.
     public func loadWorkers(
         for devbox: Devbox,
-        sshAlias: String
+        sshAlias: String?
     ) async -> DevboxInventory {
-        guard MerlinIdentifierValidator.isSSHAlias(sshAlias) else {
-            return DevboxInventory(devbox: devbox)
+        let safeAlias = sshAlias.flatMap {
+            MerlinIdentifierValidator.isSSHAlias($0) ? $0 : nil
         }
         guard devbox.status.isRunning else {
-            return DevboxInventory(devbox: devbox, sshAlias: sshAlias)
+            return DevboxInventory(devbox: devbox, sshAlias: safeAlias)
         }
-        return await workerLoader.loadWorkers(for: devbox, alias: sshAlias)
+        return await workerLoader.loadWorkers(for: devbox, alias: safeAlias)
     }
 
     private func clearRefresh(generation: UUID) {
@@ -148,6 +149,23 @@ public actor MerlinInventory {
             return
         }
         inFlightRefresh = nil
+    }
+}
+
+private enum WorkerInventoryLoadError: Error {
+    case transport
+    case commandFailed(exitCode: Int32)
+    case malformedOutput
+
+    var inventoryFailure: InventoryFailure {
+        switch self {
+        case .transport:
+            .transport
+        case let .commandFailed(exitCode):
+            .commandFailed(exitCode: exitCode)
+        case .malformedOutput:
+            .malformedOutput
+        }
     }
 }
 
@@ -234,7 +252,88 @@ private struct InventoryLoader: Sendable {
         return result
     }
 
-    func loadWorkers(for devbox: Devbox, alias: String) async -> DevboxInventory {
+    func loadWorkers(for devbox: Devbox, alias: String?) async -> DevboxInventory {
+        do {
+            let workers = try await loadWorkersFromMerlinCLI(
+                instanceSID: devbox.sid
+            )
+            return DevboxInventory(
+                devbox: devbox,
+                sshAlias: alias,
+                workers: workers.map(WorkerInventoryRecord.init(worker:)),
+                workerStatus: .loaded
+            )
+        } catch let error as WorkerInventoryLoadError {
+            guard let alias else {
+                return DevboxInventory(
+                    devbox: devbox,
+                    workerStatus: .failed(error.inventoryFailure)
+                )
+            }
+            return await loadWorkersThroughSSH(for: devbox, alias: alias)
+        } catch {
+            guard let alias else {
+                return DevboxInventory(
+                    devbox: devbox,
+                    workerStatus: .failed(.transport)
+                )
+            }
+            return await loadWorkersThroughSSH(for: devbox, alias: alias)
+        }
+    }
+
+    private func loadWorkersFromMerlinCLI(
+        instanceSID: String
+    ) async throws -> [Worker] {
+        var pageToken: String?
+        var seenPageTokens: Set<String> = []
+        var workers: [Worker] = []
+
+        repeat {
+            let command: CommandSpec
+            do {
+                command = try MerlinCommands.listWorkers(
+                    merlinCLIPath: merlinCLIPath,
+                    instanceSID: instanceSID,
+                    pageSize: workerPageSize,
+                    pageToken: pageToken
+                )
+            } catch {
+                throw WorkerInventoryLoadError.malformedOutput
+            }
+
+            let output: InventoryProcessOutput
+            do {
+                output = try await processRunner.run(command)
+            } catch {
+                throw WorkerInventoryLoadError.transport
+            }
+            guard output.exitCode == 0 else {
+                throw WorkerInventoryLoadError.commandFailed(
+                    exitCode: output.exitCode
+                )
+            }
+
+            let page: MerlinWorkerPage
+            do {
+                page = try MerlinWorkerPageParser.parse(output.stdout)
+            } catch {
+                throw WorkerInventoryLoadError.malformedOutput
+            }
+            workers.append(contentsOf: page.workers)
+            pageToken = page.nextPageToken
+            if let pageToken, !seenPageTokens.insert(pageToken).inserted {
+                throw WorkerInventoryLoadError.malformedOutput
+            }
+        } while pageToken != nil
+
+        return workers
+    }
+
+    private func loadWorkersThroughSSH(
+        for devbox: Devbox,
+        alias: String
+    ) async -> DevboxInventory {
         var offset = 0
         var workers: [Worker] = []
 

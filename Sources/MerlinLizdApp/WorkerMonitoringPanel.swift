@@ -7,18 +7,50 @@ import SwiftUI
 /// SSH process.
 enum WorkerMonitoringPanelState {
     case unavailable(message: String)
-    case loading(previous: WorkerMonitoringData? = nil)
+    case loading(previous: WorkerMonitoringData? = nil, message: String? = nil)
+    case empty(message: String)
     case loaded(WorkerMonitoringData)
     case failed(message: String, previous: WorkerMonitoringData? = nil)
+}
+
+enum WorkerMonitoringSource: Equatable {
+    case merlinPlatform
+    case merlinPlatformWithDirectTail
+    case directWorker
+
+    var label: String {
+        switch self {
+        case .merlinPlatform:
+            "Merlin 平台"
+        case .merlinPlatformWithDirectTail:
+            "Merlin + Worker"
+        case .directWorker:
+            "Worker 直连"
+        }
+    }
+
+    var isDegraded: Bool { self == .directWorker }
 }
 
 struct WorkerMonitoringData {
     let samples: [WorkerMetricsSample]
     let updatedAt: Date
+    let source: WorkerMonitoringSource
+    let notice: String?
+    let isIncomplete: Bool
 
-    init(samples: [WorkerMetricsSample], updatedAt: Date = .now) {
+    init(
+        samples: [WorkerMetricsSample],
+        updatedAt: Date = .now,
+        source: WorkerMonitoringSource = .directWorker,
+        notice: String? = nil,
+        isIncomplete: Bool = false
+    ) {
         self.samples = samples.sorted { $0.timestamp < $1.timestamp }
         self.updatedAt = updatedAt
+        self.source = source
+        self.notice = notice
+        self.isIncomplete = isIncomplete
     }
 }
 
@@ -35,8 +67,10 @@ struct WorkerMonitoringPanel: View {
         switch state {
         case .unavailable:
             nil
-        case let .loading(previous):
+        case let .loading(previous, _):
             previous
+        case .empty:
+            nil
         case let .loaded(data):
             data
         case let .failed(_, previous):
@@ -46,18 +80,58 @@ struct WorkerMonitoringPanel: View {
 
     private var visibleSamples: [WorkerMetricsSample] {
         guard let data else { return [] }
-        let end = max(data.updatedAt, data.samples.last?.timestamp ?? data.updatedAt)
+        let end = Date.now
         let start = end.addingTimeInterval(-window)
         return data.samples.filter { $0.timestamp >= start && $0.timestamp <= end }
     }
 
     private var latest: WorkerMetricsSample? {
-        visibleSamples.last
+        guard let timestamp = visibleSamples.last?.timestamp else { return nil }
+        let reversed = visibleSamples.reversed()
+        let cpu = reversed.compactMap(\.cpuUtilization).first
+        let memoryUsed = reversed.compactMap(\.memoryUsedBytes).first
+        let memoryTotal = reversed.compactMap(\.memoryTotalBytes).first
+        let gpuIDs = Set(visibleSamples.flatMap { $0.gpus.map(\.index) })
+        let gpus = gpuIDs.sorted().map { gpuID in
+            WorkerGPUMetrics(
+                index: gpuID,
+                utilization: latestGPUValue(gpuID, keyPath: \.utilization),
+                memoryUsedBytes: latestGPUValue(
+                    gpuID,
+                    keyPath: \.memoryUsedBytes
+                ),
+                memoryTotalBytes: latestGPUValue(
+                    gpuID,
+                    keyPath: \.memoryTotalBytes
+                ),
+                temperatureCelsius: latestGPUValue(
+                    gpuID,
+                    keyPath: \.temperatureCelsius
+                ),
+                powerWatts: latestGPUValue(gpuID, keyPath: \.powerWatts),
+                powerLimitWatts: latestGPUValue(
+                    gpuID,
+                    keyPath: \.powerLimitWatts
+                )
+            )
+        }
+        return WorkerMetricsSample(
+            timestamp: timestamp,
+            cpuUtilization: cpu,
+            memoryUsedBytes: memoryUsed,
+            memoryTotalBytes: memoryTotal,
+            gpus: gpus
+        )
     }
 
     private var chartDomain: ClosedRange<Date> {
-        let end = max(data?.updatedAt ?? .now, visibleSamples.last?.timestamp ?? .distantPast)
+        let end = Date.now
         return end.addingTimeInterval(-window)...end
+    }
+
+    private var dataIsStale: Bool {
+        guard let data else { return false }
+        return Date.now.timeIntervalSince(data.updatedAt) > 90
     }
 
     var body: some View {
@@ -66,6 +140,22 @@ struct WorkerMonitoringPanel: View {
 
             if case let .failed(message, _) = state {
                 MessageBanner(text: message, kind: .error)
+            }
+
+            if let data, let notice = data.notice {
+                MessageBanner(
+                    text: notice,
+                    kind: data.source.isDegraded || data.isIncomplete
+                        ? .warning
+                        : .info
+                )
+            }
+
+            if dataIsStale, let data {
+                MessageBanner(
+                    text: "监控数据已超过 90 秒未更新，最后时间为 \(data.updatedAt.formatted(date: .omitted, time: .standard))。",
+                    kind: .warning
+                )
             }
 
             if let data, !data.samples.isEmpty {
@@ -79,7 +169,7 @@ struct WorkerMonitoringPanel: View {
 
     private var header: some View {
         HStack(spacing: 10) {
-            Label("实时监控", systemImage: "chart.xyaxis.line")
+            Label("资源监控", systemImage: "chart.xyaxis.line")
                 .font(.title2.bold())
             Text("最近 5 分钟")
                 .font(.caption.weight(.medium))
@@ -97,21 +187,35 @@ struct WorkerMonitoringPanel: View {
         switch state {
         case .unavailable:
             StatusPill(label: "暂无数据", color: .secondary, symbol: "minus.circle.fill")
-        case .loading:
+        case let .loading(_, message):
             HStack(spacing: 7) {
                 ProgressView()
                     .controlSize(.small)
-                Text("正在采样")
+                Text(message ?? "正在读取 Merlin")
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
             }
+        case .empty:
+            StatusPill(label: "等待指标", color: .secondary, symbol: "clock.fill")
         case let .loaded(data):
             HStack(spacing: 7) {
                 Circle()
-                    .fill(.green)
+                    .fill(
+                        data.source.isDegraded || data.isIncomplete || dataIsStale
+                            ? .orange
+                            : .green
+                    )
                     .frame(width: 7, height: 7)
-                    .shadow(color: .green.opacity(0.35), radius: 3)
-                Text("实时 · \(data.updatedAt.formatted(date: .omitted, time: .standard))")
+                    .shadow(
+                        color: (data.source.isDegraded
+                            || data.isIncomplete
+                            || dataIsStale
+                            ? Color.orange
+                            : Color.green)
+                            .opacity(0.35),
+                        radius: 3
+                    )
+                Text("\(data.source.label) · 截至 \(data.updatedAt.formatted(date: .omitted, time: .standard))")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
@@ -198,7 +302,8 @@ struct WorkerMonitoringPanel: View {
                 )
                 MonitoringMemoryChartCard(
                     samples: visibleSamples,
-                    domain: chartDomain
+                    domain: chartDomain,
+                    showsGPU: expectsGPU
                 )
                 if expectsGPU {
                     MonitoringLineChartCard(
@@ -233,14 +338,33 @@ struct WorkerMonitoringPanel: View {
                 actionTitle: nil,
                 action: nil
             )
-        case .loading, .loaded:
+        case let .loading(_, message):
             MonitoringPlaceholder(
-                title: "正在建立实时监控",
-                description: "首次连接通常需要约 10 秒，建立后会持续更新。",
+                title: "正在读取 Merlin 平台监控",
+                description: message
+                    ?? "平台历史会在后台加载；若平台响应较慢，会先显示 Worker 直连数据。",
                 symbol: "waveform.path.ecg",
                 showsProgress: true,
                 actionTitle: nil,
                 action: nil
+            )
+        case let .empty(message):
+            MonitoringPlaceholder(
+                title: "正在等待平台指标",
+                description: message,
+                symbol: "clock.arrow.circlepath",
+                showsProgress: false,
+                actionTitle: onRetry == nil ? nil : "立即重试",
+                action: onRetry
+            )
+        case .loaded:
+            MonitoringPlaceholder(
+                title: "最近 5 分钟暂无指标",
+                description: "Merlin 平台尚未返回可显示的数据。",
+                symbol: "chart.xyaxis.line",
+                showsProgress: false,
+                actionTitle: onRetry == nil ? nil : "重试",
+                action: onRetry
             )
         case let .failed(message, _):
             MonitoringPlaceholder(
@@ -261,6 +385,21 @@ struct WorkerMonitoringPanel: View {
             guard let value = sample[keyPath: keyPath] else { return nil }
             return MonitoringPoint(timestamp: sample.timestamp, value: clamped(value))
         }
+    }
+
+    private func latestGPUValue<Value>(
+        _ gpuID: Int,
+        keyPath: KeyPath<WorkerGPUMetrics, Value?>
+    ) -> Value? {
+        for sample in visibleSamples.reversed() {
+            guard let gpu = sample.gpus.first(where: { $0.index == gpuID }) else {
+                continue
+            }
+            if let value = gpu[keyPath: keyPath] {
+                return value
+            }
+        }
+        return nil
     }
 }
 
@@ -372,11 +511,12 @@ private struct MonitoringLineChartCard: View {
 private struct MonitoringMemoryChartCard: View {
     let samples: [WorkerMetricsSample]
     let domain: ClosedRange<Date>
+    let showsGPU: Bool
 
     private var points: [MonitoringSeriesPoint] {
         samples.flatMap { sample -> [MonitoringSeriesPoint] in
             var points: [MonitoringSeriesPoint] = []
-            if let value = sample.gpuMemoryUtilization {
+            if showsGPU, let value = sample.gpuMemoryUtilization {
                 points.append(.init(
                     timestamp: sample.timestamp,
                     value: clamped(value),
@@ -402,7 +542,9 @@ private struct MonitoringMemoryChartCard: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 HStack(spacing: 10) {
-                    MonitoringLegend(color: .mint, label: "显存")
+                    if showsGPU {
+                        MonitoringLegend(color: .mint, label: "显存")
+                    }
                     MonitoringLegend(color: .purple, label: "内存")
                 }
             }

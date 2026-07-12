@@ -79,6 +79,10 @@ public struct Worker: Identifiable, Codable, Hashable, Sendable {
     public let memoryGiB: Int
     public let gpuCount: Int
     public let gpuType: String?
+    /// Merlin's control-plane lifecycle value. This is deliberately separate
+    /// from `readiness`: a platform `running` Worker can still be unavailable
+    /// to an SSH/`mlx worker login` probe.
+    public let platformStatus: String?
     public let podIP: String?
     public let port: Int
     public let createdAt: String
@@ -91,6 +95,7 @@ public struct Worker: Identifiable, Codable, Hashable, Sendable {
         memoryGiB: Int,
         gpuCount: Int,
         gpuType: String?,
+        platformStatus: String? = nil,
         podIP: String?,
         port: Int,
         createdAt: String,
@@ -102,6 +107,7 @@ public struct Worker: Identifiable, Codable, Hashable, Sendable {
         self.memoryGiB = memoryGiB
         self.gpuCount = gpuCount
         self.gpuType = gpuType
+        self.platformStatus = platformStatus
         self.podIP = podIP
         self.port = port
         self.createdAt = createdAt
