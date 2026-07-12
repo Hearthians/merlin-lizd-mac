@@ -172,4 +172,95 @@ struct SSHMasterPoolTests {
         await shutdown.value
         #expect(await runner.count(argumentsContaining: "ControlMaster=yes") == 1)
     }
+
+    @Test("shutdown waits for an admitted child before stopping its master")
+    func shutdownWaitsForAdmittedChild() async throws {
+        let childGate = AsyncStartGate()
+        let runner = SSHMasterScriptedRunner(actions: [
+            .exit(255), .succeed,
+            .wait(childGate, then: .succeed),
+            .succeed, .exit(255),
+        ])
+        let pool = SSHMasterPool(testDirectory: temporarySSHDirectory(), runner: runner)
+        let command = CommandSpec(
+            executable: "/usr/bin/ssh",
+            arguments: ["-nT", "hl_gpu_2", "tmux list-sessions"]
+        )
+        let child = Task {
+            try await pool.run(command, alias: "hl_gpu_2", replay: .readOnly)
+        }
+        await childGate.waitUntilEntered()
+
+        let shutdown = Task { await pool.shutdown() }
+        await pool.waitUntilShutdownIsWaitingForCommandsForTesting()
+        #expect(await runner.count(argumentsContaining: "stop") == 0)
+
+        await childGate.open()
+        #expect(try await child.value.exitCode == 0)
+        await shutdown.value
+        let commands = await runner.commands()
+        let childIndex = try #require(commands.firstIndex(where: {
+            $0.arguments.last == "tmux list-sessions"
+        }))
+        let stopIndex = try #require(commands.firstIndex(where: {
+            $0.arguments.prefix(2) == ["-O", "stop"]
+        }))
+        #expect(childIndex < stopIndex)
+        #expect(await runner.childCommandCount(alias: "hl_gpu_2") == 1)
+    }
+
+    @Test("shutdown retains ownership while a failed child awaits retry")
+    func retryInvalidationKeepsShutdownOwnership() async {
+        let invalidationGate = AsyncStartGate()
+        let runner = SSHMasterScriptedRunner(actions: [
+            .exit(255), .succeed, .exit(255),
+            .succeed, .exit(255),
+        ])
+        let pool = SSHMasterPool(
+            testDirectory: temporarySSHDirectory(),
+            runner: runner,
+            retryInvalidationHook: { await invalidationGate.wait() }
+        )
+        let command = CommandSpec(
+            executable: "/usr/bin/ssh",
+            arguments: ["-nT", "hl_gpu_2", "tmux list-sessions"]
+        )
+        let child = Task {
+            try await pool.run(command, alias: "hl_gpu_2", replay: .readOnly)
+        }
+        await invalidationGate.waitUntilEntered()
+
+        await pool.shutdown()
+        #expect(await runner.count(argumentsContaining: "stop") == 1)
+        await invalidationGate.open()
+        _ = try? await child.value
+    }
+
+    @Test("foreground join promotes the same queued background alias")
+    func promotesCoalescedBackgroundPreparation() async {
+        let gate = AsyncStartGate()
+        let runner = SSHMasterScriptedRunner(actions: [
+            .exit(255), .wait(gate, then: .succeed),
+            .exit(255), .succeed,
+            .exit(255), .succeed,
+        ])
+        let pool = SSHMasterPool(
+            testDirectory: temporarySSHDirectory(),
+            runner: runner,
+            maxConcurrentPreparations: 1
+        )
+        let first = Task { await pool.prepare(alias: "first", priority: .background) }
+        await gate.waitUntilEntered()
+        let promoted = Task { await pool.prepare(alias: "promoted", priority: .background) }
+        let ordinary = Task { await pool.prepare(alias: "ordinary", priority: .background) }
+        await pool.waitUntilPreparationCountForTesting(3)
+        let foreground = Task {
+            await pool.prepare(alias: "promoted", priority: .foreground)
+        }
+        await pool.waitUntilPriorityForTesting(alias: "promoted", priority: .foreground)
+
+        await gate.open()
+        _ = await [first.value, promoted.value, foreground.value, ordinary.value]
+        #expect(await runner.masterStartAliases() == ["first", "promoted", "ordinary"])
+    }
 }

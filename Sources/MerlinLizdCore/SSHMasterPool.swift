@@ -25,6 +25,7 @@ public final class SSHMasterPool: @unchecked Sendable {
     private let commands: SSHMasterCommands
     private let runner: any InventoryProcessRunning
     private let state: SSHMasterPoolState
+    private let retryInvalidationHook: (@Sendable () async -> Void)?
 
     public convenience init(maxConcurrentPreparations: Int = 4) {
         let directory = FileManager.default.temporaryDirectory
@@ -32,30 +33,35 @@ public final class SSHMasterPool: @unchecked Sendable {
         self.init(
             directory: directory,
             runner: FoundationInventoryProcessRunner(),
-            maxConcurrentPreparations: maxConcurrentPreparations
+            maxConcurrentPreparations: maxConcurrentPreparations,
+            retryInvalidationHook: nil
         )
     }
 
     convenience init(
         testDirectory: URL,
         runner: any InventoryProcessRunning,
-        maxConcurrentPreparations: Int = 4
+        maxConcurrentPreparations: Int = 4,
+        retryInvalidationHook: (@Sendable () async -> Void)? = nil
     ) {
         self.init(
             directory: testDirectory,
             runner: runner,
-            maxConcurrentPreparations: maxConcurrentPreparations
+            maxConcurrentPreparations: maxConcurrentPreparations,
+            retryInvalidationHook: retryInvalidationHook
         )
     }
 
     private init(
         directory: URL,
         runner: any InventoryProcessRunning,
-        maxConcurrentPreparations: Int
+        maxConcurrentPreparations: Int,
+        retryInvalidationHook: (@Sendable () async -> Void)?
     ) {
         precondition(maxConcurrentPreparations > 0)
         commands = SSHMasterCommands(directory: directory)
         self.runner = runner
+        self.retryInvalidationHook = retryInvalidationHook
         state = SSHMasterPoolState(
             directory: directory,
             commands: commands,
@@ -102,7 +108,7 @@ public final class SSHMasterPool: @unchecked Sendable {
         let managed = try managedCommand(command, alias: alias)
         let output: InventoryProcessOutput?
         do {
-            output = try await runner.run(managed)
+            output = try await runAdmitted(managed)
         } catch {
             if error is CancellationError { throw error }
             guard replay == .readOnly else { throw error }
@@ -119,6 +125,9 @@ public final class SSHMasterPool: @unchecked Sendable {
         }
 
         await state.invalidate(alias: alias)
+        if let retryInvalidationHook {
+            await retryInvalidationHook()
+        }
         guard await prepare(alias: alias, priority: .foreground) == .ready else {
             if await state.shuttingDown() {
                 throw SSHMasterPoolError.shuttingDown
@@ -129,7 +138,7 @@ public final class SSHMasterPool: @unchecked Sendable {
             throw SSHMasterPoolError.shuttingDown
         }
 
-        let replayed = try await runner.run(managedCommand(command, alias: alias))
+        let replayed = try await runAdmitted(managedCommand(command, alias: alias))
         guard replayed.exitCode == 0 else {
             throw SSHMasterPoolError.commandFailed(exitCode: replayed.exitCode)
         }
@@ -141,7 +150,7 @@ public final class SSHMasterPool: @unchecked Sendable {
         for task in tasks {
             _ = await task.value
         }
-        let aliases = await state.readyAliasesForShutdown()
+        let aliases = await state.ownedAliasesForShutdown()
         for alias in aliases {
             guard let stop = try? commands.stop(alias: alias) else { continue }
             _ = try? await runner.run(stop)
@@ -162,10 +171,38 @@ public final class SSHMasterPool: @unchecked Sendable {
     func waitUntilShuttingDownForTesting() async {
         await state.waitUntilShuttingDown()
     }
+
+    func waitUntilShutdownIsWaitingForCommandsForTesting() async {
+        await state.waitUntilShutdownIsWaitingForCommands()
+    }
+
+    func waitUntilPriorityForTesting(
+        alias: String,
+        priority: SSHWarmupPriority
+    ) async {
+        await state.waitUntilPriority(alias: alias, priority: priority)
+    }
+
+    private func runAdmitted(
+        _ command: CommandSpec
+    ) async throws -> InventoryProcessOutput {
+        guard await state.acquireCommandLease() else {
+            throw SSHMasterPoolError.shuttingDown
+        }
+        do {
+            let output = try await runner.run(command)
+            await state.releaseCommandLease()
+            return output
+        } catch {
+            await state.releaseCommandLease()
+            throw error
+        }
+    }
 }
 
 private actor SSHMasterPoolState {
     private struct PreparationWaiter {
+        let alias: String
         let continuation: CheckedContinuation<Bool, Never>
     }
 
@@ -175,16 +212,25 @@ private actor SSHMasterPoolState {
     private let maxConcurrentPreparations: Int
 
     private var readyAliases: Set<String> = []
+    private var ownedAliases: Set<String> = []
     private var preparations: [String: Task<SSHLinkState, Never>] = [:]
+    private var preparationPriorities: [String: SSHWarmupPriority] = [:]
     private var foregroundWaiters: [PreparationWaiter] = []
     private var backgroundWaiters: [PreparationWaiter] = []
     private var activePreparations = 0
+    private var activeCommandLeases = 0
     private var isShuttingDown = false
+    private var isWaitingForCommandLeases = false
     private var directoryIsReady = false
     private var preparationCountWaiters: [
         (Int, CheckedContinuation<Void, Never>)
     ] = []
     private var shutdownWaiters: [CheckedContinuation<Void, Never>] = []
+    private var commandLeaseDrainWaiters: [CheckedContinuation<Void, Never>] = []
+    private var commandLeaseWaitObservers: [CheckedContinuation<Void, Never>] = []
+    private var priorityWaiters: [
+        (String, SSHWarmupPriority, CheckedContinuation<Void, Never>)
+    ] = []
 
     init(
         directory: URL,
@@ -204,9 +250,11 @@ private actor SSHMasterPoolState {
     ) async -> SSHLinkState {
         guard !isShuttingDown else { return .failed }
         if let task = preparations[alias] {
+            promotePreparationIfNeeded(alias: alias, priority: priority)
             return await task.value
         }
 
+        preparationPriorities[alias] = priority
         let task = Task { await self.performPreparation(alias: alias, priority: priority) }
         preparations[alias] = task
         resumePreparationCountWaiters()
@@ -221,24 +269,51 @@ private actor SSHMasterPoolState {
         isShuttingDown
     }
 
-    func beginShutdown() -> [Task<SSHLinkState, Never>] {
-        guard !isShuttingDown else { return Array(preparations.values) }
-        isShuttingDown = true
-        shutdownWaiters.forEach { $0.resume() }
-        shutdownWaiters.removeAll()
-        let queued = foregroundWaiters + backgroundWaiters
-        foregroundWaiters.removeAll()
-        backgroundWaiters.removeAll()
-        queued.forEach { $0.continuation.resume(returning: false) }
-        preparationCountWaiters.forEach { $0.1.resume() }
-        preparationCountWaiters.removeAll()
+    func beginShutdown() async -> [Task<SSHLinkState, Never>] {
+        if !isShuttingDown {
+            isShuttingDown = true
+            shutdownWaiters.forEach { $0.resume() }
+            shutdownWaiters.removeAll()
+            let queued = foregroundWaiters + backgroundWaiters
+            foregroundWaiters.removeAll()
+            backgroundWaiters.removeAll()
+            queued.forEach { $0.continuation.resume(returning: false) }
+            preparationCountWaiters.forEach { $0.1.resume() }
+            preparationCountWaiters.removeAll()
+            priorityWaiters.forEach { $0.2.resume() }
+            priorityWaiters.removeAll()
+        }
+        if activeCommandLeases > 0 {
+            isWaitingForCommandLeases = true
+            commandLeaseWaitObservers.forEach { $0.resume() }
+            commandLeaseWaitObservers.removeAll()
+            await withCheckedContinuation { continuation in
+                commandLeaseDrainWaiters.append(continuation)
+            }
+        }
         return Array(preparations.values)
     }
 
-    func readyAliasesForShutdown() -> [String] {
-        let aliases = Array(readyAliases)
+    func ownedAliasesForShutdown() -> [String] {
+        let aliases = Array(ownedAliases)
         readyAliases.removeAll()
+        ownedAliases.removeAll()
         return aliases
+    }
+
+    func acquireCommandLease() -> Bool {
+        guard !isShuttingDown else { return false }
+        activeCommandLeases += 1
+        return true
+    }
+
+    func releaseCommandLease() {
+        precondition(activeCommandLeases > 0)
+        activeCommandLeases -= 1
+        guard activeCommandLeases == 0 else { return }
+        isWaitingForCommandLeases = false
+        commandLeaseDrainWaiters.forEach { $0.resume() }
+        commandLeaseDrainWaiters.removeAll()
     }
 
     func waitUntilPreparationCount(_ count: Int) async {
@@ -255,35 +330,58 @@ private actor SSHMasterPoolState {
         }
     }
 
+    func waitUntilShutdownIsWaitingForCommands() async {
+        guard !isWaitingForCommandLeases else { return }
+        await withCheckedContinuation { continuation in
+            commandLeaseWaitObservers.append(continuation)
+        }
+    }
+
+    func waitUntilPriority(
+        alias: String,
+        priority: SSHWarmupPriority
+    ) async {
+        guard preparationPriorities[alias] != priority else { return }
+        await withCheckedContinuation { continuation in
+            priorityWaiters.append((alias, priority, continuation))
+        }
+    }
+
     private func performPreparation(
         alias: String,
         priority: SSHWarmupPriority
     ) async -> SSHLinkState {
-        guard await acquireSlot(priority: priority) else {
+        guard await acquireSlot(alias: alias, priority: priority) else {
             preparations.removeValue(forKey: alias)
+            preparationPriorities.removeValue(forKey: alias)
             return .failed
         }
 
         let result = await establish(alias: alias)
         if result == .ready {
             readyAliases.insert(alias)
+            ownedAliases.insert(alias)
         } else {
             readyAliases.remove(alias)
         }
         preparations.removeValue(forKey: alias)
+        preparationPriorities.removeValue(forKey: alias)
         releaseSlot()
         return result
     }
 
-    private func acquireSlot(priority: SSHWarmupPriority) async -> Bool {
+    private func acquireSlot(
+        alias: String,
+        priority: SSHWarmupPriority
+    ) async -> Bool {
         guard !isShuttingDown else { return false }
         if activePreparations < maxConcurrentPreparations {
             activePreparations += 1
             return true
         }
         return await withCheckedContinuation { continuation in
-            let waiter = PreparationWaiter(continuation: continuation)
-            switch priority {
+            let waiter = PreparationWaiter(alias: alias, continuation: continuation)
+            switch preparationPriorities[alias] ?? priority {
             case .foreground:
                 foregroundWaiters.append(waiter)
             case .background:
@@ -368,5 +466,24 @@ private actor SSHMasterPoolState {
         let satisfied = preparationCountWaiters.filter { $0.0 <= preparations.count }
         preparationCountWaiters.removeAll { $0.0 <= preparations.count }
         satisfied.forEach { $0.1.resume() }
+    }
+
+    private func promotePreparationIfNeeded(
+        alias: String,
+        priority: SSHWarmupPriority
+    ) {
+        guard
+            priority == .foreground,
+            preparationPriorities[alias] == .background
+        else { return }
+        preparationPriorities[alias] = .foreground
+        if let index = backgroundWaiters.firstIndex(where: { $0.alias == alias }) {
+            foregroundWaiters.append(backgroundWaiters.remove(at: index))
+        }
+        let satisfied = priorityWaiters.filter {
+            $0.0 == alias && $0.1 == .foreground
+        }
+        priorityWaiters.removeAll { $0.0 == alias && $0.1 == .foreground }
+        satisfied.forEach { $0.2.resume() }
     }
 }
