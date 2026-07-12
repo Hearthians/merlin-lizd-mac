@@ -141,11 +141,24 @@ public actor TmuxSessionDiscovery {
         refreshes[target]?.cancel()
     }
 
+    func mutationStateForTesting(
+        target: TerminalTarget
+    ) -> (revision: UInt64, journalCount: Int) {
+        (
+            mutationRevisions[target] ?? 0,
+            mutationJournal[target]?.count ?? 0
+        )
+    }
+
     public func recordRename(
         target: TerminalTarget,
         from currentName: String,
         to newName: String
     ) {
+        recordMutation(
+            .rename(from: currentName, to: newName),
+            target: target
+        )
         guard let snapshot = snapshots[target] else { return }
         guard snapshot.sessions.contains(where: { $0.name == currentName }) else {
             return
@@ -156,24 +169,19 @@ public actor TmuxSessionDiscovery {
                 : session
         }
         snapshots[target] = replacingSessions(in: snapshot, with: sessions)
-        recordMutation(
-            .rename(from: currentName, to: newName),
-            target: target
-        )
     }
 
     public func recordTermination(
         target: TerminalTarget,
         sessionNames: Set<String>
     ) {
-        guard !sessionNames.isEmpty, let snapshot = snapshots[target] else {
-            return
-        }
+        guard !sessionNames.isEmpty else { return }
+        recordMutation(.terminate(sessionNames), target: target)
+        guard let snapshot = snapshots[target] else { return }
         let sessions = snapshot.sessions.filter {
             !sessionNames.contains($0.name)
         }
         snapshots[target] = replacingSessions(in: snapshot, with: sessions)
-        recordMutation(.terminate(sessionNames), target: target)
     }
 
     private func startRefresh(
@@ -262,6 +270,7 @@ public actor TmuxSessionDiscovery {
     ) {
         let revision = (mutationRevisions[target] ?? 0) &+ 1
         mutationRevisions[target] = revision
+        guard refreshes[target] != nil else { return }
         mutationJournal[target, default: []].append(
             .init(revision: revision, mutation: mutation)
         )
