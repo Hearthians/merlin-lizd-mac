@@ -55,6 +55,40 @@ struct TmuxSessionDiscoveryTests {
         #expect(await runner.runCount == 2)
     }
 
+    @Test("browser-style stale load peeks cache then starts exactly one refresh")
+    func peekThenRefreshStartsOneRequest() async {
+        let clock = TmuxTestClock()
+        let runner = TmuxSnapshotRunner(steps: [
+            .output(.init(stdout: "cached\n", stderr: "", exitCode: 0)),
+            .gated(.init(stdout: "fresh\n", stderr: "", exitCode: 0)),
+        ])
+        let discovery = TmuxSessionDiscovery(
+            processRunner: runner,
+            now: { clock.now }
+        )
+
+        _ = await discovery.refresh(target: tmuxTestTarget)
+        clock.advance(by: 61)
+        let cached = await discovery.peekSnapshot(target: tmuxTestTarget)
+
+        #expect(cached?.sessions.map(\.name) == ["cached"])
+        #expect(cached?.isFresh(at: clock.now) == false)
+        #expect(await runner.runCount == 1)
+
+        let verification = Task {
+            await discovery.refresh(target: tmuxTestTarget)
+        }
+        await runner.waitUntilRunCount(2)
+        let verifying = await discovery.peekSnapshot(target: tmuxTestTarget)
+        #expect(verifying?.sessions.map(\.name) == ["cached"])
+        #expect(verifying?.verification == .verifying)
+        #expect(await runner.runCount == 2)
+
+        await runner.releaseGate()
+        #expect(await verification.value.sessions.map(\.name) == ["fresh"])
+        #expect(await runner.runCount == 2)
+    }
+
     @Test("failed refresh retains authoritative sessions and timestamp")
     func failedRefreshRetainsEvidence() async {
         let clock = TmuxTestClock()

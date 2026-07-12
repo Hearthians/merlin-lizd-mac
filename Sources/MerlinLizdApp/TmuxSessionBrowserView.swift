@@ -28,7 +28,7 @@ final class TmuxSessionBrowserModel: ObservableObject {
     }
 
     func load(force: Bool = false) async {
-        let snapshot = await discovery.snapshot(target: target)
+        let snapshot = await discovery.peekSnapshot(target: target)
         publish(snapshot)
         if !force, let snapshot, snapshot.isFresh(at: Date()) {
             return

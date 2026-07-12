@@ -16,7 +16,7 @@ final class TerminalTabsModel: ObservableObject {
     private var sessions: [String: TerminalSession] = [:]
     private let defaults: UserDefaults
     private let managedTerminalCommands: ManagedTerminalCommandBuilder
-    private let warmupCoordinator: TargetWarmupCoordinator
+    private let runtime: MerlinRemoteRuntime
     let tmuxSessionDiscovery: TmuxSessionDiscovery
     private let tmuxSessionController: TmuxSessionController
     private let externalTerminalLauncher = ExternalTerminalLauncher()
@@ -29,7 +29,7 @@ final class TerminalTabsModel: ObservableObject {
         managedTerminalCommands = ManagedTerminalCommandBuilder(
             sshMasterPool: runtime.sshMasterPool
         )
-        warmupCoordinator = runtime.warmupCoordinator
+        self.runtime = runtime
         tmuxSessionDiscovery = runtime.tmuxDiscovery
         tmuxSessionController = runtime.tmuxController
         self.defaults = defaults
@@ -122,8 +122,7 @@ final class TerminalTabsModel: ObservableObject {
     }
 
     func prioritize(_ target: TerminalTarget) {
-        let coordinator = warmupCoordinator
-        Task { await coordinator.prioritize(target) }
+        runtime.prioritize(target)
     }
 
     func select(_ id: String) {
@@ -468,11 +467,8 @@ final class TerminalTabsModel: ObservableObject {
         {
             desiredTargets.append(tab.target)
         }
-        let coordinator = warmupCoordinator
-        Task {
-            for target in desiredTargets.reversed() {
-                await coordinator.prioritize(target)
-            }
+        for target in desiredTargets.reversed() {
+            runtime.prioritize(target)
         }
     }
 }

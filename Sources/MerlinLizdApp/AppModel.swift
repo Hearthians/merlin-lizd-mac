@@ -27,7 +27,7 @@ final class AppModel: ObservableObject {
 
     private let inventory: MerlinInventory?
     private let devboxLifecycle: MerlinDevboxLifecycle?
-    private let warmupCoordinator: TargetWarmupCoordinator
+    private let runtime: MerlinRemoteRuntime
     private let sshAliases: [String]
     private var workerInventoryTask: Task<Void, Never>?
     private var workerInventoryGeneration: UUID?
@@ -36,8 +36,9 @@ final class AppModel: ObservableObject {
     private var workerInventoryCache: [String: CachedWorkerInventory] = [:]
     private let workerInventoryCacheLifetime: TimeInterval = 60
     private let failedWorkerRetryDelay: TimeInterval = 15
+    private lazy var warmupUpdateRelay = WarmupUpdateRelay(model: self)
     init(runtime: MerlinRemoteRuntime) {
-        warmupCoordinator = runtime.warmupCoordinator
+        self.runtime = runtime
         sshAliases = SSHConfigCandidates.load()
         do {
             let inventory = try MerlinInventory(
@@ -349,14 +350,9 @@ final class AppModel: ObservableObject {
         reason: WarmupReason
     ) {
         let inventory = Self.warmupInventory(from: snapshot)
-        let coordinator = warmupCoordinator
-        let updateModel = self
-        Task {
-            await coordinator.reconcile(inventory, reason: reason) { update in
-                Task { @MainActor in
-                    updateModel.applyWarmupUpdate(update)
-                }
-            }
+        let relay = warmupUpdateRelay
+        runtime.reconcile(inventory, reason: reason) { update in
+            relay.submit(update)
         }
     }
 
@@ -396,7 +392,7 @@ final class AppModel: ObservableObject {
         )
     }
 
-    private func applyWarmupUpdate(_ update: TargetWarmupUpdate) {
+    fileprivate func applyWarmupUpdate(_ update: TargetWarmupUpdate) {
         guard
             case let .worker(devboxSID, _, alias, workerID) = update.target,
             let current = snapshot,
@@ -483,8 +479,7 @@ final class AppModel: ObservableObject {
             )
         }
         guard let target else { return }
-        let coordinator = warmupCoordinator
-        Task { await coordinator.prioritize(target) }
+        runtime.prioritize(target)
     }
 
     private func seedCaches(from cached: PersistedInventoryCache) {
@@ -631,6 +626,21 @@ struct AppMessage: Equatable {
 
     let text: String
     let kind: Kind
+}
+
+@MainActor
+private final class WarmupUpdateRelay: @unchecked Sendable {
+    private weak var model: AppModel?
+
+    init(model: AppModel) {
+        self.model = model
+    }
+
+    nonisolated func submit(_ update: TargetWarmupUpdate) {
+        Task { @MainActor [weak self] in
+            self?.model?.applyWarmupUpdate(update)
+        }
+    }
 }
 
 private enum SSHConfigCandidates {

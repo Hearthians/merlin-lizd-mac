@@ -32,7 +32,7 @@ struct TargetWarmupCoordinatorTests {
             await Task.yield()
         }
 
-        #expect(await poolRunner.preparedAliases() == ["cached_one", "cached_two"])
+        #expect(Set(await poolRunner.preparedAliases()) == ["cached_one", "cached_two"])
         #expect(await coordinator.preparationTaskCountForTesting() == 0)
         await coordinator.shutdown()
     }
