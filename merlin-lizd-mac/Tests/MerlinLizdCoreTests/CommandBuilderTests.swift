@@ -222,6 +222,27 @@ struct CommandBuilderTests {
         ])
     }
 
+    @Test("Worker tmux warmup combines readiness and discovery in one login")
+    func buildsWorkerTmuxWarmupCommand() throws {
+        let target = TerminalTarget.worker(
+            devboxSID: "dbx_135679",
+            devboxName: "wt_hl",
+            alias: "hl_gpu_2",
+            workerID: "3966762"
+        )
+
+        let command = try MerlinCommands.warmWorker(target: target)
+        let remote = try #require(command.arguments.last)
+
+        #expect(remote.contains("mlx worker login 3966762 --"))
+        #expect(remote.contains("printf '__MLZ_READY__\\n'"))
+        #expect(remote.contains("tmux list-sessions -F#{session_name}"))
+        #expect(remote.components(separatedBy: "mlx worker login").count == 2)
+        #expect(!remote.contains("new-session"))
+        #expect(!remote.contains("attach"))
+        #expect(!remote.contains("kill"))
+    }
+
     @Test("renames the selected Worker tmux session through its parent Devbox")
     func buildsWorkerTmuxRenameCommand() throws {
         let command = try MerlinCommands.renameTmuxSession(

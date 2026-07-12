@@ -96,6 +96,10 @@ public actor TmuxSessionDiscovery {
         return await task.value
     }
 
+    func cancelRefresh(target: TerminalTarget) {
+        refreshes[target]?.cancel()
+    }
+
     public func cached(
         target: TerminalTarget,
         maximumAge: TimeInterval = 300
@@ -248,10 +252,15 @@ public actor TmuxSessionDiscovery {
                 localPath = localTmuxPath ?? "/opt/homebrew/bin/tmux"
             }
 
-            let command = try MerlinCommands.listTmuxSessions(
-                target: target,
-                localTmuxPath: localPath
-            )
+            let command: CommandSpec
+            if case .worker = target {
+                command = try MerlinCommands.warmWorker(target: target)
+            } else {
+                command = try MerlinCommands.listTmuxSessions(
+                    target: target,
+                    localTmuxPath: localPath
+                )
+            }
             if let alias = MerlinCommands.sshAlias(for: target),
                 let sshMasterPool
             {
@@ -290,9 +299,39 @@ public actor TmuxSessionDiscovery {
             )
         }
 
+        let isWorker: Bool
+        let workerWasReady: Bool
+        let sessionOutput: String
+        if case .worker = target {
+            isWorker = true
+            let lines = output.stdout.split(
+                separator: "\n",
+                omittingEmptySubsequences: false
+            )
+            let markerIndex = lines.firstIndex(of: "__MLZ_READY__")
+            workerWasReady = markerIndex != nil
+            sessionOutput = markerIndex.map {
+                lines[lines.index(after: $0)...].joined(separator: "\n")
+            } ?? output.stdout
+        } else {
+            isWorker = false
+            workerWasReady = false
+            sessionOutput = output.stdout
+        }
+
+        if isWorker, !workerWasReady, output.exitCode == 0 {
+            return failureSnapshot(
+                target: target,
+                previous: previous,
+                error: .transport,
+                now: now()
+            )
+        }
+
         guard output.exitCode == 0 else {
-            if diagnostic.contains("no server running")
-                || diagnostic.contains("no sessions")
+            if (diagnostic.contains("no server running")
+                || diagnostic.contains("no sessions"))
+                && !(isWorker && !workerWasReady)
             {
                 return authoritativeSnapshot(
                     target: target,
@@ -310,7 +349,7 @@ public actor TmuxSessionDiscovery {
 
         return authoritativeSnapshot(
             target: target,
-            sessions: TmuxSessionParser.parse(output.stdout),
+            sessions: TmuxSessionParser.parse(sessionOutput),
             now: now()
         )
     }
