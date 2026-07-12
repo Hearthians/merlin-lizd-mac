@@ -47,7 +47,11 @@ public actor MerlinInventory {
             workerPageSize: 100,
             loadDevboxRolesConcurrently: true,
             now: Date.init,
-            sshMasterPool: sshMasterPool
+            sshMasterPool: sshMasterPool,
+            pooledExecutionPolicy: BoundedAsyncOperationRunner(
+                maxConcurrentOperations: 2,
+                timeout: .seconds(20)
+            )
         )
         self.workerLoader = InventoryLoader(
             merlinCLIPath: merlinCLIPath,
@@ -55,7 +59,11 @@ public actor MerlinInventory {
             workerPageSize: 100,
             loadDevboxRolesConcurrently: true,
             now: Date.init,
-            sshMasterPool: sshMasterPool
+            sshMasterPool: sshMasterPool,
+            pooledExecutionPolicy: BoundedAsyncOperationRunner(
+                maxConcurrentOperations: maxConcurrentProcesses,
+                timeout: .seconds(45)
+            )
         )
     }
 
@@ -79,7 +87,8 @@ public actor MerlinInventory {
             workerPageSize: workerPageSize,
             loadDevboxRolesConcurrently: loadDevboxRolesConcurrently,
             now: now,
-            sshMasterPool: sshMasterPool
+            sshMasterPool: sshMasterPool,
+            pooledExecutionPolicy: nil
         )
         self.workerLoader = InventoryLoader(
             merlinCLIPath: merlinCLIPath,
@@ -87,7 +96,8 @@ public actor MerlinInventory {
             workerPageSize: workerPageSize,
             loadDevboxRolesConcurrently: loadDevboxRolesConcurrently,
             now: now,
-            sshMasterPool: sshMasterPool
+            sshMasterPool: sshMasterPool,
+            pooledExecutionPolicy: nil
         )
     }
 
@@ -184,6 +194,7 @@ private struct InventoryLoader: Sendable {
     let loadDevboxRolesConcurrently: Bool
     let now: @Sendable () -> Date
     let sshMasterPool: SSHMasterPool?
+    let pooledExecutionPolicy: BoundedAsyncOperationRunner?
 
     func load(sshAliases: [String]) async throws -> InventorySnapshot {
         let devboxes: [Devbox]
@@ -361,11 +372,21 @@ private struct InventoryLoader: Sendable {
             let output: InventoryProcessOutput
             do {
                 if let sshMasterPool {
-                    output = try await sshMasterPool.run(
-                        command,
-                        alias: alias,
-                        replay: .readOnly
-                    )
+                    if let pooledExecutionPolicy {
+                        output = try await pooledExecutionPolicy.run {
+                            try await sshMasterPool.run(
+                                command,
+                                alias: alias,
+                                replay: .readOnly
+                            )
+                        }
+                    } else {
+                        output = try await sshMasterPool.run(
+                            command,
+                            alias: alias,
+                            replay: .readOnly
+                        )
+                    }
                 } else {
                     output = try await processRunner.run(command)
                 }
@@ -427,11 +448,21 @@ private struct InventoryLoader: Sendable {
         do {
             let output: InventoryProcessOutput
             if let sshMasterPool {
-                output = try await sshMasterPool.run(
-                    command,
-                    alias: alias,
-                    replay: .readOnly
-                )
+                if let pooledExecutionPolicy {
+                    output = try await pooledExecutionPolicy.run {
+                        try await sshMasterPool.run(
+                            command,
+                            alias: alias,
+                            replay: .readOnly
+                        )
+                    }
+                } else {
+                    output = try await sshMasterPool.run(
+                        command,
+                        alias: alias,
+                        replay: .readOnly
+                    )
+                }
             } else {
                 output = try await processRunner.run(command)
             }

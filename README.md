@@ -21,8 +21,9 @@ processes; telemetry and signed monitoring URLs are never persisted.
 ## SSH reuse and session prewarming
 
 At launch, the app prepares one App-owned OpenSSH control socket for each
-running Devbox and prewarms read-only tmux snapshots for current Workers, with
-at most two Worker logins in flight. Socket names use hashed aliases in a
+running Devbox and prewarms read-only tmux snapshots for current Workers. All
+tmux discovery, including browser refreshes, shares a total limit of two
+Worker logins in flight. Socket names use hashed aliases in a
 private temporary directory. The app does not edit the user's SSH
 configuration; child SSH commands continue to use that configuration and the
 SSH Agent while explicitly opting into the App-owned socket.

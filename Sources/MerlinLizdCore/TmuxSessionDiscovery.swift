@@ -39,8 +39,19 @@ public struct TmuxSessionSnapshot: Equatable, Sendable {
 }
 
 public actor TmuxSessionDiscovery {
+    private enum SnapshotMutation: Sendable {
+        case rename(from: String, to: String)
+        case terminate(Set<String>)
+    }
+
+    private struct VersionedMutation: Sendable {
+        let revision: UInt64
+        let mutation: SnapshotMutation
+    }
+
     private let processRunner: any InventoryProcessRunning
     private let sshMasterPool: SSHMasterPool?
+    private let pooledExecutionPolicy: BoundedAsyncOperationRunner?
     private let localTmuxPath: String?
     private let now: @Sendable () -> Date
     private var snapshots: [TerminalTarget: TmuxSessionSnapshot] = [:]
@@ -48,11 +59,17 @@ public actor TmuxSessionDiscovery {
         TerminalTarget: Task<TmuxSessionSnapshot, Never>
     ] = [:]
     private var refreshGenerations: [TerminalTarget: UInt64] = [:]
+    private var mutationRevisions: [TerminalTarget: UInt64] = [:]
+    private var mutationJournal: [TerminalTarget: [VersionedMutation]] = [:]
 
     public init(
         sshMasterPool: SSHMasterPool,
         maxConcurrentProcesses: Int = 2
     ) {
+        let executionPolicy = BoundedAsyncOperationRunner(
+            maxConcurrentOperations: max(1, maxConcurrentProcesses),
+            timeout: .seconds(45)
+        )
         let runner = TimedInventoryProcessRunner(
             // `mlx worker login` can take ~25 seconds on a cold Worker even
             // when it succeeds, so share the inventory command budget.
@@ -64,6 +81,7 @@ public actor TmuxSessionDiscovery {
             underlying: runner
         )
         self.sshMasterPool = sshMasterPool
+        pooledExecutionPolicy = executionPolicy
         localTmuxPath = LocalTmuxResolver.resolve()
         now = Date.init
     }
@@ -72,9 +90,11 @@ public actor TmuxSessionDiscovery {
         sshMasterPool: SSHMasterPool? = nil,
         processRunner: any InventoryProcessRunning,
         localTmuxPath: String? = "/opt/homebrew/bin/tmux",
-        now: @escaping @Sendable () -> Date = Date.init
+        now: @escaping @Sendable () -> Date = Date.init,
+        pooledExecutionPolicy: BoundedAsyncOperationRunner? = nil
     ) {
         self.sshMasterPool = sshMasterPool
+        self.pooledExecutionPolicy = pooledExecutionPolicy
         self.processRunner = processRunner
         self.localTmuxPath = localTmuxPath
         self.now = now
@@ -121,23 +141,6 @@ public actor TmuxSessionDiscovery {
         refreshes[target]?.cancel()
     }
 
-    public func cached(
-        target: TerminalTarget,
-        maximumAge: TimeInterval = 300
-    ) -> [TmuxSessionRecord]? {
-        guard
-            let snapshot = snapshots[target],
-            now().timeIntervalSince(snapshot.fetchedAt) <= maximumAge
-        else { return nil }
-        return snapshot.sessions
-    }
-
-    public func list(target: TerminalTarget) async throws -> [TmuxSessionRecord] {
-        let snapshot = await refresh(target: target)
-        if let lastError = snapshot.lastError { throw lastError }
-        return snapshot.sessions
-    }
-
     public func recordRename(
         target: TerminalTarget,
         from currentName: String,
@@ -153,6 +156,10 @@ public actor TmuxSessionDiscovery {
                 : session
         }
         snapshots[target] = replacingSessions(in: snapshot, with: sessions)
+        recordMutation(
+            .rename(from: currentName, to: newName),
+            target: target
+        )
     }
 
     public func recordTermination(
@@ -166,6 +173,7 @@ public actor TmuxSessionDiscovery {
             !sessionNames.contains($0.name)
         }
         snapshots[target] = replacingSessions(in: snapshot, with: sessions)
+        recordMutation(.terminate(sessionNames), target: target)
     }
 
     private func startRefresh(
@@ -185,8 +193,10 @@ public actor TmuxSessionDiscovery {
 
         let generation = (refreshGenerations[target] ?? 0) &+ 1
         refreshGenerations[target] = generation
+        let startingMutationRevision = mutationRevisions[target] ?? 0
         let processRunner = processRunner
         let sshMasterPool = sshMasterPool
+        let pooledExecutionPolicy = pooledExecutionPolicy
         let localTmuxPath = localTmuxPath
         let now = now
         let task = Task {
@@ -195,13 +205,15 @@ public actor TmuxSessionDiscovery {
                 previous: previous,
                 processRunner: processRunner,
                 sshMasterPool: sshMasterPool,
+                pooledExecutionPolicy: pooledExecutionPolicy,
                 localTmuxPath: localTmuxPath,
                 now: now
             )
             return self.completeRefresh(
                 result,
                 target: target,
-                generation: generation
+                generation: generation,
+                startingMutationRevision: startingMutationRevision
             )
         }
         refreshes[target] = task
@@ -211,7 +223,8 @@ public actor TmuxSessionDiscovery {
     private func completeRefresh(
         _ snapshot: TmuxSessionSnapshot,
         target: TerminalTarget,
-        generation: UInt64
+        generation: UInt64,
+        startingMutationRevision: UInt64
     ) -> TmuxSessionSnapshot {
         guard refreshGenerations[target] == generation else {
             return snapshots[target] ?? snapshot
@@ -227,11 +240,49 @@ public actor TmuxSessionDiscovery {
                 lastError: snapshot.lastError
             )
         } else {
-            committed = snapshot
+            let laterMutations = mutationJournal[target, default: []]
+                .filter { $0.revision > startingMutationRevision }
+            committed = replacingSessions(
+                in: snapshot,
+                with: apply(
+                    laterMutations.map(\.mutation),
+                    to: snapshot.sessions
+                )
+            )
         }
         snapshots[target] = committed
+        mutationJournal[target] = nil
         refreshes[target] = nil
         return committed
+    }
+
+    private func recordMutation(
+        _ mutation: SnapshotMutation,
+        target: TerminalTarget
+    ) {
+        let revision = (mutationRevisions[target] ?? 0) &+ 1
+        mutationRevisions[target] = revision
+        mutationJournal[target, default: []].append(
+            .init(revision: revision, mutation: mutation)
+        )
+    }
+
+    private func apply(
+        _ mutations: [SnapshotMutation],
+        to sessions: [TmuxSessionRecord]
+    ) -> [TmuxSessionRecord] {
+        mutations.reduce(sessions) { current, mutation in
+            switch mutation {
+            case let .rename(oldName, newName):
+                return current.map { session in
+                    session.name == oldName
+                        ? TmuxSessionRecord(name: newName)
+                        : session
+                }
+            case let .terminate(names):
+                return current.filter { !names.contains($0.name) }
+            }
+        }
     }
 
     private func replacingSessions(
@@ -253,6 +304,7 @@ public actor TmuxSessionDiscovery {
         previous: TmuxSessionSnapshot?,
         processRunner: any InventoryProcessRunning,
         sshMasterPool: SSHMasterPool?,
+        pooledExecutionPolicy: BoundedAsyncOperationRunner?,
         localTmuxPath: String?,
         now: @Sendable () -> Date
     ) async -> TmuxSessionSnapshot {
@@ -285,11 +337,21 @@ public actor TmuxSessionDiscovery {
             if let alias = MerlinCommands.sshAlias(for: target),
                 let sshMasterPool
             {
-                output = try await sshMasterPool.run(
-                    command,
-                    alias: alias,
-                    replay: .readOnly
-                )
+                if let pooledExecutionPolicy {
+                    output = try await pooledExecutionPolicy.run {
+                        try await sshMasterPool.run(
+                            command,
+                            alias: alias,
+                            replay: .readOnly
+                        )
+                    }
+                } else {
+                    output = try await sshMasterPool.run(
+                        command,
+                        alias: alias,
+                        replay: .readOnly
+                    )
+                }
             } else {
                 output = try await processRunner.run(command)
             }

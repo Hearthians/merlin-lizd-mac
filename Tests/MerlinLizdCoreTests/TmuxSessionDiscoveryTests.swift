@@ -141,7 +141,7 @@ struct TmuxSessionDiscoveryTests {
         #expect(failed.readiness == .ready)
         #expect(failed.verification == .idle)
         #expect(failed.lastError == .transport)
-        #expect(await discovery.cached(target: tmuxTestTarget) == first.sessions)
+        #expect(await discovery.peekSnapshot(target: tmuxTestTarget)?.sessions == first.sessions)
     }
 
     @Test("in-flight transport failure preserves an authoritative rename")
@@ -207,6 +207,47 @@ struct TmuxSessionDiscoveryTests {
         #expect(notReady.fetchedAt == first.fetchedAt)
         #expect(notReady.readiness == .workerNotReady)
         #expect(notReady.lastError == .workerNotReady)
+    }
+
+    @Test("successful in-flight refresh preserves a concurrent rename")
+    func successfulRefreshPreservesConcurrentRename() async {
+        let runner = TmuxSnapshotRunner(steps: [
+            .output(.init(stdout: "old\nother\n", stderr: "", exitCode: 0)),
+            .gated(.init(stdout: "old\nother\n", stderr: "", exitCode: 0)),
+        ])
+        let discovery = TmuxSessionDiscovery(processRunner: runner)
+
+        _ = await discovery.refresh(target: tmuxTestTarget)
+        let refresh = Task { await discovery.refresh(target: tmuxTestTarget) }
+        await runner.waitUntilRunCount(2)
+        await discovery.recordRename(
+            target: tmuxTestTarget,
+            from: "old",
+            to: "renamed"
+        )
+        await runner.releaseGate()
+
+        #expect(await refresh.value.sessions.map(\.name) == ["renamed", "other"])
+    }
+
+    @Test("successful in-flight refresh preserves a concurrent termination")
+    func successfulRefreshPreservesConcurrentTermination() async {
+        let runner = TmuxSnapshotRunner(steps: [
+            .output(.init(stdout: "one\ntwo\n", stderr: "", exitCode: 0)),
+            .gated(.init(stdout: "one\ntwo\n", stderr: "", exitCode: 0)),
+        ])
+        let discovery = TmuxSessionDiscovery(processRunner: runner)
+
+        _ = await discovery.refresh(target: tmuxTestTarget)
+        let refresh = Task { await discovery.refresh(target: tmuxTestTarget) }
+        await runner.waitUntilRunCount(2)
+        await discovery.recordTermination(
+            target: tmuxTestTarget,
+            sessionNames: ["one"]
+        )
+        await runner.releaseGate()
+
+        #expect(await refresh.value.sessions.map(\.name) == ["two"])
     }
 
     @Test(
@@ -320,11 +361,10 @@ struct TmuxSessionDiscoveryTests {
             name: "wt_hl",
             alias: "hl_gpu_2"
         )
-        let sessions = try await discovery.list(target: target)
+        let sessions = await discovery.refresh(target: target).sessions
 
         #expect(sessions.map(\.name) == ["mlz-shell", "external.train"])
         #expect(await discovery.snapshot(target: target)?.sessions == sessions)
-        #expect(await discovery.cached(target: target) == sessions)
         let command = await runner.recordedCommand()
         #expect(command?.executable == "/usr/bin/ssh")
     }
@@ -344,7 +384,7 @@ struct TmuxSessionDiscoveryTests {
             workerID: "3966762"
         )
 
-        let sessions = try await discovery.list(target: target)
+        let sessions = await discovery.refresh(target: target).sessions
 
         #expect(sessions.map(\.name) == ["one", "two"])
         let remote = await runner.recordedCommand()?.arguments.last
@@ -365,9 +405,9 @@ struct TmuxSessionDiscoveryTests {
             processRunner: directRunner
         )
 
-        let sessions = try await discovery.list(target: .devbox(
+        let sessions = await discovery.refresh(target: .devbox(
             sid: "dbx_135679", name: "wt_hl", alias: "hl_gpu_2"
-        ))
+        )).sessions
 
         #expect(sessions.map(\.name) == ["pool-session"])
         let commands = await poolRunner.commands()
@@ -375,6 +415,88 @@ struct TmuxSessionDiscoveryTests {
             .socketPath(alias: "hl_gpu_2")
         #expect(commands.last?.arguments.contains("ControlPath=\(expectedPath)") == true)
         #expect(await directRunner.recordedCommand() == nil)
+    }
+
+    @Test("pooled coordinator and browser discovery share two execution slots")
+    func pooledDiscoverySharesExecutionSlots() async {
+        let runner = GatedPooledDiscoveryRunner()
+        let pool = SSHMasterPool(
+            testDirectory: temporarySSHDirectory(),
+            runner: runner
+        )
+        #expect(await pool.prepare(alias: "hl_gpu_2", priority: .foreground) == .ready)
+        let discovery = TmuxSessionDiscovery(
+            sshMasterPool: pool,
+            processRunner: TmuxScriptedRunner(output: .init(
+                stdout: "must-not-run", stderr: "", exitCode: 0
+            )),
+            pooledExecutionPolicy: BoundedAsyncOperationRunner(
+                maxConcurrentOperations: 2,
+                timeout: .seconds(5)
+            )
+        )
+        let coordinator = TargetWarmupCoordinator(
+            sshMasterPool: pool,
+            discovery: discovery,
+            maxConcurrentWorkerWarmups: 2
+        )
+        await coordinator.reconcile(
+            .init(
+                runningDevboxAliases: [],
+                workerTargets: [
+                    pooledWorker("7000001"), pooledWorker("7000002"),
+                ]
+            ),
+            reason: .inventoryChange,
+            onUpdate: { _ in }
+        )
+        await runner.waitForChildStarts(2)
+
+        let browser = Task {
+            await discovery.refresh(target: pooledWorker("7000003"))
+        }
+        for _ in 0 ..< 100 { await Task.yield() }
+        #expect(await runner.childStartCount() == 2)
+
+        await runner.releaseOne()
+        await runner.waitForChildStarts(3)
+        #expect(await runner.maximumChildConcurrency() == 2)
+
+        await runner.releaseAll()
+        _ = await browser.value
+        await coordinator.shutdown()
+        await pool.shutdown()
+    }
+
+    @Test("pooled discovery timeout reaps its child and releases shutdown lease")
+    func pooledDiscoveryTimeoutReapsChild() async throws {
+        let pidFile = TemporaryProcessIDFile()
+        defer { pidFile.remove() }
+        let runner = PooledDiscoveryChildRunner(pidFile: pidFile)
+        let pool = SSHMasterPool(
+            testDirectory: temporarySSHDirectory(),
+            runner: runner
+        )
+        #expect(await pool.prepare(alias: "hl_gpu_2", priority: .foreground) == .ready)
+        let discovery = TmuxSessionDiscovery(
+            sshMasterPool: pool,
+            processRunner: TmuxScriptedRunner(output: .init(
+                stdout: "must-not-run", stderr: "", exitCode: 0
+            )),
+            pooledExecutionPolicy: BoundedAsyncOperationRunner(
+                maxConcurrentOperations: 2,
+                timeout: .milliseconds(300)
+            )
+        )
+        let refresh = Task { await discovery.refresh(target: pooledWorker("7000004")) }
+        let processID = try await pidFile.waitForProcessID()
+
+        let snapshot = await refresh.value
+        #expect(snapshot.lastError == .transport)
+        #expect(pidFile.processIsAbsent(processID))
+        #expect(!pidFile.processHasExitedWithoutReaping(processID))
+
+        await pool.shutdown()
     }
 
     @Test("caches an empty result when tmux has no server")
@@ -394,7 +516,7 @@ struct TmuxSessionDiscoveryTests {
             workerID: "3966773"
         )
 
-        #expect(try await discovery.list(target: target).isEmpty)
+        #expect(await discovery.refresh(target: target).sessions.isEmpty)
         #expect(await discovery.snapshot(target: target)?.sessions == [])
     }
 
@@ -418,7 +540,7 @@ struct TmuxSessionDiscoveryTests {
             sid: "dbx_135679", name: "wt_hl", alias: "hl_gpu_2"
         )
 
-        #expect(try await discovery.list(target: target).isEmpty)
+        #expect(await discovery.refresh(target: target).sessions.isEmpty)
         #expect(await discovery.snapshot(target: target)?.sessions == [])
     }
 
@@ -437,12 +559,11 @@ struct TmuxSessionDiscoveryTests {
             ))
         )
 
-        await #expect(throws: TmuxSessionDiscoveryError.workerNotReady) {
-            try await discovery.list(target: .worker(
-                devboxSID: "dbx_135679", devboxName: "wt_hl",
-                alias: "hl_gpu_2", workerID: "3966773"
-            ))
-        }
+        let snapshot = await discovery.refresh(target: .worker(
+            devboxSID: "dbx_135679", devboxName: "wt_hl",
+            alias: "hl_gpu_2", workerID: "3966773"
+        ))
+        #expect(snapshot.lastError == .workerNotReady)
     }
 
     @Test("updates cached inventory after an authoritative rename")
@@ -461,7 +582,7 @@ struct TmuxSessionDiscoveryTests {
             alias: "hl_gpu_2"
         )
 
-        _ = try await discovery.list(target: target)
+        _ = await discovery.refresh(target: target)
         await discovery.recordRename(
             target: target,
             from: "old-name",
@@ -490,7 +611,7 @@ struct TmuxSessionDiscoveryTests {
             alias: "hl_gpu_2"
         )
 
-        _ = try await discovery.list(target: target)
+        _ = await discovery.refresh(target: target)
         await discovery.recordTermination(
             target: target,
             sessionNames: ["one", "three"]
@@ -508,6 +629,15 @@ private let tmuxTestTarget = TerminalTarget.devbox(
     name: "wt_hl",
     alias: "hl_gpu_2"
 )
+
+private func pooledWorker(_ workerID: String) -> TerminalTarget {
+    .worker(
+        devboxSID: "dbx_135679",
+        devboxName: "wt_hl",
+        alias: "hl_gpu_2",
+        workerID: workerID
+    )
+}
 
 private final class TmuxTestClock: @unchecked Sendable {
     private let value = OSAllocatedUnfairLock(
@@ -565,6 +695,79 @@ private actor TmuxSnapshotRunner: InventoryProcessRunning {
     func releaseGate() {
         gate?.resume()
         gate = nil
+    }
+}
+
+private actor GatedPooledDiscoveryRunner: InventoryProcessRunning {
+    private var childStarts = 0
+    private var activeChildren = 0
+    private var maximumChildren = 0
+    private var gates: [CheckedContinuation<Void, Never>] = []
+
+    func run(_ command: CommandSpec) async throws -> InventoryProcessOutput {
+        if command.arguments.starts(with: ["-O", "check"]) {
+            return .init(stdout: "", stderr: "", exitCode: 255)
+        }
+        if command.arguments.first == "-MNf"
+            || command.arguments.starts(with: ["-O", "stop"])
+        {
+            return .init(stdout: "", stderr: "", exitCode: 0)
+        }
+        childStarts += 1
+        activeChildren += 1
+        maximumChildren = max(maximumChildren, activeChildren)
+        await withCheckedContinuation { gates.append($0) }
+        activeChildren -= 1
+        let isWorker = command.arguments.last?.contains("mlx worker login") == true
+        return .init(
+            stdout: isWorker ? "__MLZ_READY__\n" : "browser\n",
+            stderr: "",
+            exitCode: 0
+        )
+    }
+
+    func waitForChildStarts(_ count: Int) async {
+        while childStarts < count { await Task.yield() }
+    }
+
+    func childStartCount() -> Int { childStarts }
+    func maximumChildConcurrency() -> Int { maximumChildren }
+
+    func releaseOne() {
+        gates.removeFirst().resume()
+    }
+
+    func releaseAll() {
+        let pending = gates
+        gates.removeAll()
+        for gate in pending { gate.resume() }
+    }
+}
+
+private actor PooledDiscoveryChildRunner: InventoryProcessRunning {
+    private let pidFile: TemporaryProcessIDFile
+    private let runner = FoundationInventoryProcessRunner()
+
+    init(pidFile: TemporaryProcessIDFile) {
+        self.pidFile = pidFile
+    }
+
+    func run(_ command: CommandSpec) async throws -> InventoryProcessOutput {
+        if command.arguments.starts(with: ["-O", "check"]) {
+            return .init(stdout: "", stderr: "", exitCode: 255)
+        }
+        if command.arguments.first == "-MNf"
+            || command.arguments.starts(with: ["-O", "stop"])
+        {
+            return .init(stdout: "", stderr: "", exitCode: 0)
+        }
+        return try await runner.run(.init(
+            executable: "/bin/sh",
+            arguments: [
+                "-c", "echo $$ > \"$1\"; exec /bin/sleep 30",
+                "pooled-discovery-timeout", pidFile.path,
+            ]
+        ))
     }
 }
 
