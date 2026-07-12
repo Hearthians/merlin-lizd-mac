@@ -199,11 +199,14 @@ public enum MerlinCommands {
 
     public static func warmWorker(target: TerminalTarget) throws -> CommandSpec {
         let (alias, workerID) = try validatedWorkerRoute(target)
-        let fixedBody = #"printf '__MLZ_READY__\n'; tmux list-sessions -F#{session_name}"#
         return workerCommand(
             alias: alias,
             workerID: workerID,
-            remoteCommands: #"sh -lc "\#(fixedBody)""#
+            // The Devbox shell removes the outer double quotes, leaving the
+            // literal single quotes in mlx's argv. When mlx rejoins argv for
+            // the Worker shell, those quotes still bind the entire fixed body
+            // as sh -lc's one command-string argument.
+            remoteCommands: #"sh -lc "'printf \"__MLZ_READY__\n\"; tmux list-sessions -F#{session_name}'""#
         )
     }
 

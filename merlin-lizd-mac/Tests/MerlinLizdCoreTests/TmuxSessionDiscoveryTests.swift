@@ -284,7 +284,7 @@ struct TmuxSessionDiscoveryTests {
         #expect(sessions.map(\.name) == ["one", "two"])
         let remote = await runner.recordedCommand()?.arguments.last
         #expect(remote?.components(separatedBy: "mlx worker login").count == 2)
-        #expect(remote?.contains("printf '__MLZ_READY__\\n'") == true)
+        #expect(remote?.contains("printf \\\"__MLZ_READY__\\n\\\"") == true)
     }
 
     @Test("routes remote discovery through the shared SSH control path")

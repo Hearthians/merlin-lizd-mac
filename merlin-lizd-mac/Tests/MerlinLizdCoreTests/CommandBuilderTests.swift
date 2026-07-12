@@ -235,12 +235,82 @@ struct CommandBuilderTests {
         let remote = try #require(command.arguments.last)
 
         #expect(remote.contains("mlx worker login 3966762 --"))
-        #expect(remote.contains("printf '__MLZ_READY__\\n'"))
+        #expect(remote.contains("printf \\\"__MLZ_READY__\\n\\\""))
         #expect(remote.contains("tmux list-sessions -F#{session_name}"))
         #expect(remote.components(separatedBy: "mlx worker login").count == 2)
         #expect(!remote.contains("new-session"))
         #expect(!remote.contains("attach"))
         #expect(!remote.contains("kill"))
+    }
+
+    @Test("Worker tmux warmup survives both shell parsing hops")
+    func workerWarmupSurvivesTwoShellHops() async throws {
+        let command = try MerlinCommands.warmWorker(target: .worker(
+            devboxSID: "dbx_135679",
+            devboxName: "wt_hl",
+            alias: "hl_gpu_2",
+            workerID: "3966762"
+        ))
+        let remote = try #require(command.arguments.last)
+        let runner = FoundationInventoryProcessRunner()
+        let devboxShell = """
+        mlx() {
+            while [ "$1" != "--" ]; do shift; done
+            shift
+            printf "%s\\n" "$*"
+        }
+        \(remote)
+        """
+
+        let devboxOutput = try await runner.run(.init(
+            executable: "/bin/sh",
+            arguments: ["-c", devboxShell]
+        ))
+        let reconstructed = devboxOutput.stdout.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+
+        #expect(reconstructed ==
+            #"sh -lc 'printf "__MLZ_READY__\n"; tmux list-sessions -F#{session_name}'"#)
+
+        let directory = temporarySSHDirectory()
+        _ = try await runner.run(.init(
+            executable: "/bin/mkdir",
+            arguments: [directory.path]
+        ))
+        let fakeTmux = """
+        #!/bin/sh
+        printf "__TMUX_ARGS__:%s\\n" "$*"
+        printf "worker-session\\n"
+        """
+        let installFakeTmux = """
+        printf "%s" '\(fakeTmux)' > \(directory.path)/tmux
+        chmod 700 \(directory.path)/tmux
+        printf "%s\\n" 'export PATH="\(directory.path):/usr/bin:/bin"' > \(directory.path)/.profile
+        """
+        _ = try await runner.run(.init(
+            executable: "/bin/sh",
+            arguments: ["-c", installFakeTmux]
+        ))
+        let workerOutput = try await runner.run(.init(
+            executable: "/usr/bin/env",
+            arguments: [
+                "HOME=\(directory.path)",
+                "PATH=\(directory.path):/usr/bin:/bin",
+                "/bin/sh", "-c", reconstructed,
+            ]
+        ))
+        _ = try await runner.run(.init(
+            executable: "/bin/rm",
+            arguments: ["-rf", directory.path]
+        ))
+
+        #expect(workerOutput.exitCode == 0)
+        #expect(workerOutput.stdout.split(separator: "\n").map(String.init) == [
+            "__MLZ_READY__",
+            "__TMUX_ARGS__:list-sessions -F#{session_name}",
+            "worker-session",
+        ])
     }
 
     @Test("renames the selected Worker tmux session through its parent Devbox")

@@ -27,8 +27,13 @@ struct TargetWarmupCoordinatorTests {
             onUpdate: { _ in }
         )
         await poolRunner.waitForPreparedAliases(2)
+        for _ in 0 ..< 1_000 {
+            if await coordinator.preparationTaskCountForTesting() == 0 { break }
+            await Task.yield()
+        }
 
         #expect(await poolRunner.preparedAliases() == ["cached_one", "cached_two"])
+        #expect(await coordinator.preparationTaskCountForTesting() == 0)
         await coordinator.shutdown()
     }
 
@@ -175,6 +180,41 @@ struct TargetWarmupCoordinatorTests {
         await coordinator.shutdown()
     }
 
+    @Test("new reconciliation supersedes an older cache-expiry follow-up")
+    func newerGenerationSupersedesQueuedExpiry() async {
+        let runner = WarmupDiscoveryRunner(gated: true)
+        let sleeper = WarmupTestSleeper()
+        let updates = WarmupUpdateRecorder()
+        let coordinator = makeWarmupCoordinator(
+            runner: runner,
+            maxConcurrentWorkerWarmups: 1,
+            sleeper: { duration in try await sleeper.sleep(duration) }
+        )
+        let target = warmupWorker("5500001")
+        await coordinator.reconcile(
+            .init(runningDevboxAliases: [], workerTargets: [target]),
+            reason: .appLaunch,
+            onUpdate: { _ in Task { await updates.record("launch") } }
+        )
+        await runner.waitForStarts(1)
+        await sleeper.waitUntilSleeping()
+        await sleeper.advance()
+        await sleeper.waitUntilSleepCount(2)
+
+        await coordinator.reconcile(
+            .init(runningDevboxAliases: [], workerTargets: [target]),
+            reason: .manualRefresh,
+            onUpdate: { _ in Task { await updates.record("manual") } }
+        )
+        await runner.releaseAll()
+        await updates.waitForCount(1)
+
+        #expect(await runner.startedWorkerIDs() == ["5500001"])
+        #expect(await updates.values() == ["manual"])
+        await sleeper.cancelAll()
+        await coordinator.shutdown()
+    }
+
     @Test("shutdown cancels active and queued read-only warmups")
     func shutdownCancelsWarmupsWithoutMutation() async {
         let runner = CancellingWarmupRunner()
@@ -204,6 +244,49 @@ struct TargetWarmupCoordinatorTests {
         #expect(!commands[0].arguments.joined(separator: " ").contains("new-session"))
         #expect(!commands[0].arguments.joined(separator: " ").contains("kill"))
         #expect(!commands[0].arguments.joined(separator: " ").contains("attach"))
+    }
+
+    @Test("concurrent shutdown callers await the same cleanup")
+    func concurrentShutdownIsSingleFlight() async {
+        let poolRunner = GatedWarmupPoolRunner()
+        let pool = SSHMasterPool(
+            testDirectory: temporarySSHDirectory(),
+            runner: poolRunner
+        )
+        let coordinator = TargetWarmupCoordinator(
+            sshMasterPool: pool,
+            discovery: TmuxSessionDiscovery(processRunner: WarmupDiscoveryRunner())
+        )
+        await coordinator.reconcile(
+            .init(runningDevboxAliases: ["shutdown_gate"], workerTargets: []),
+            reason: .appLaunch,
+            onUpdate: { _ in }
+        )
+        await poolRunner.waitUntilPreparationStarted()
+        let callers = WarmupUpdateRecorder()
+        let completions = WarmupUpdateRecorder()
+
+        let first = Task {
+            await callers.record("first")
+            await coordinator.shutdown()
+            await completions.record("first")
+        }
+        let second = Task {
+            await callers.record("second")
+            await coordinator.shutdown()
+            await completions.record("second")
+        }
+        await callers.waitForCount(2)
+        for _ in 0 ..< 1_000 {
+            if !(await completions.values()).isEmpty { break }
+            await Task.yield()
+        }
+
+        #expect(await completions.values().isEmpty)
+        await poolRunner.releasePreparation()
+        await completions.waitForCount(2)
+        _ = await (first.value, second.value)
+        #expect(Set(await completions.values()) == ["first", "second"])
     }
 }
 
@@ -262,6 +345,36 @@ private actor WarmupPoolRunner: InventoryProcessRunning {
     func preparedAliases() -> [String] { prepared }
 }
 
+private actor GatedWarmupPoolRunner: InventoryProcessRunning {
+    private var started = false
+    private var startedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var gate: CheckedContinuation<Void, Never>?
+
+    func run(_ command: CommandSpec) async throws -> InventoryProcessOutput {
+        if command.arguments.starts(with: ["-O", "check"]) {
+            return .init(stdout: "", stderr: "", exitCode: 255)
+        }
+        if command.arguments.first == "-MNf" {
+            started = true
+            let waiters = startedWaiters
+            startedWaiters.removeAll()
+            for waiter in waiters { waiter.resume() }
+            await withCheckedContinuation { gate = $0 }
+        }
+        return .init(stdout: "", stderr: "", exitCode: 0)
+    }
+
+    func waitUntilPreparationStarted() async {
+        guard !started else { return }
+        await withCheckedContinuation { startedWaiters.append($0) }
+    }
+
+    func releasePreparation() {
+        gate?.resume()
+        gate = nil
+    }
+}
+
 private actor WarmupDiscoveryRunner: InventoryProcessRunning {
     private var gated: Bool
     private var started: [String] = []
@@ -316,8 +429,14 @@ private actor WarmupDiscoveryRunner: InventoryProcessRunning {
 
 private actor WarmupTestSleeper {
     private var continuation: CheckedContinuation<Void, any Error>?
+    private var sleepCount = 0
+    private var countWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
 
     func sleep(_ duration: Duration) async throws {
+        sleepCount += 1
+        let ready = countWaiters.filter { sleepCount >= $0.0 }
+        countWaiters.removeAll { sleepCount >= $0.0 }
+        for waiter in ready { waiter.1.resume() }
         try await withCheckedThrowingContinuation { continuation = $0 }
     }
 
@@ -330,10 +449,34 @@ private actor WarmupTestSleeper {
         continuation = nil
     }
 
+    func waitUntilSleepCount(_ count: Int) async {
+        guard sleepCount < count else { return }
+        await withCheckedContinuation { countWaiters.append((count, $0)) }
+    }
+
     func cancelAll() {
         continuation?.resume(throwing: CancellationError())
         continuation = nil
     }
+}
+
+private actor WarmupUpdateRecorder {
+    private var recorded: [String] = []
+    private var waiters: [(Int, CheckedContinuation<Void, Never>)] = []
+
+    func record(_ value: String) {
+        recorded.append(value)
+        let ready = waiters.filter { recorded.count >= $0.0 }
+        waiters.removeAll { recorded.count >= $0.0 }
+        for waiter in ready { waiter.1.resume() }
+    }
+
+    func waitForCount(_ count: Int) async {
+        guard recorded.count < count else { return }
+        await withCheckedContinuation { waiters.append((count, $0)) }
+    }
+
+    func values() -> [String] { recorded }
 }
 
 private actor CancellingWarmupRunner: InventoryProcessRunning {
