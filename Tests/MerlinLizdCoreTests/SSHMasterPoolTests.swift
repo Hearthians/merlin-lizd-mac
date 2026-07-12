@@ -263,4 +263,66 @@ struct SSHMasterPoolTests {
         _ = await [first.value, promoted.value, foreground.value, ordinary.value]
         #expect(await runner.masterStartAliases() == ["first", "promoted", "ordinary"])
     }
+
+    @Test("concurrent shutdown callers await one complete cleanup")
+    func coalescesShutdownThroughCleanup() async {
+        let stopGate = AsyncStartGate()
+        let completions = AsyncCompletionProbe()
+        let runner = SSHMasterScriptedRunner(actions: [
+            .exit(255), .succeed,
+            .wait(stopGate, then: .succeed), .exit(255),
+        ])
+        let pool = SSHMasterPool(testDirectory: temporarySSHDirectory(), runner: runner)
+        #expect(await pool.prepare(alias: "hl_gpu_2", priority: .background) == .ready)
+
+        let first = Task {
+            await pool.shutdown()
+            await completions.complete()
+        }
+        await stopGate.waitUntilEntered()
+        let second = Task {
+            await pool.shutdown()
+            await completions.complete()
+        }
+        await pool.waitUntilShutdownCallerCountForTesting(2)
+        #expect(await completions.count() == 0)
+
+        await stopGate.open()
+        await first.value
+        await second.value
+        #expect(await completions.count() == 2)
+        #expect(await runner.count(argumentsContaining: "stop") == 1)
+    }
+
+    @Test("task cancellation after exit 255 prevents rebuild and replay")
+    func cancellationAtRetryBoundaryStopsRun() async {
+        let retryGate = AsyncStartGate()
+        let runner = SSHMasterScriptedRunner(actions: [
+            .exit(255), .succeed, .exit(255),
+            .succeed, .exit(255),
+        ])
+        let pool = SSHMasterPool(
+            testDirectory: temporarySSHDirectory(),
+            runner: runner,
+            retryBoundaryHook: { await retryGate.wait() }
+        )
+        let command = CommandSpec(
+            executable: "/usr/bin/ssh",
+            arguments: ["-nT", "hl_gpu_2", "tmux list-sessions"]
+        )
+        let child = Task {
+            try await pool.run(command, alias: "hl_gpu_2", replay: .readOnly)
+        }
+        await retryGate.waitUntilEntered()
+        child.cancel()
+        await retryGate.open()
+
+        await #expect(throws: CancellationError.self) {
+            try await child.value
+        }
+        #expect(await runner.count(argumentsContaining: "ControlMaster=yes") == 1)
+        #expect(await runner.childCommandCount(alias: "hl_gpu_2") == 1)
+        await pool.shutdown()
+        #expect(await runner.count(argumentsContaining: "stop") == 1)
+    }
 }

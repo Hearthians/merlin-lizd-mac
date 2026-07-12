@@ -25,6 +25,8 @@ public final class SSHMasterPool: @unchecked Sendable {
     private let commands: SSHMasterCommands
     private let runner: any InventoryProcessRunning
     private let state: SSHMasterPoolState
+    private let shutdownCoordinator = SSHMasterShutdownCoordinator()
+    private let retryBoundaryHook: (@Sendable () async -> Void)?
     private let retryInvalidationHook: (@Sendable () async -> Void)?
 
     public convenience init(maxConcurrentPreparations: Int = 4) {
@@ -34,6 +36,7 @@ public final class SSHMasterPool: @unchecked Sendable {
             directory: directory,
             runner: FoundationInventoryProcessRunner(),
             maxConcurrentPreparations: maxConcurrentPreparations,
+            retryBoundaryHook: nil,
             retryInvalidationHook: nil
         )
     }
@@ -42,12 +45,14 @@ public final class SSHMasterPool: @unchecked Sendable {
         testDirectory: URL,
         runner: any InventoryProcessRunning,
         maxConcurrentPreparations: Int = 4,
+        retryBoundaryHook: (@Sendable () async -> Void)? = nil,
         retryInvalidationHook: (@Sendable () async -> Void)? = nil
     ) {
         self.init(
             directory: testDirectory,
             runner: runner,
             maxConcurrentPreparations: maxConcurrentPreparations,
+            retryBoundaryHook: retryBoundaryHook,
             retryInvalidationHook: retryInvalidationHook
         )
     }
@@ -56,11 +61,13 @@ public final class SSHMasterPool: @unchecked Sendable {
         directory: URL,
         runner: any InventoryProcessRunning,
         maxConcurrentPreparations: Int,
+        retryBoundaryHook: (@Sendable () async -> Void)?,
         retryInvalidationHook: (@Sendable () async -> Void)?
     ) {
         precondition(maxConcurrentPreparations > 0)
         commands = SSHMasterCommands(directory: directory)
         self.runner = runner
+        self.retryBoundaryHook = retryBoundaryHook
         self.retryInvalidationHook = retryInvalidationHook
         state = SSHMasterPoolState(
             directory: directory,
@@ -124,20 +131,27 @@ public final class SSHMasterPool: @unchecked Sendable {
             throw SSHMasterPoolError.commandFailed(exitCode: 255)
         }
 
+        if let retryBoundaryHook {
+            await retryBoundaryHook()
+        }
+        try Task.checkCancellation()
         await state.invalidate(alias: alias)
         if let retryInvalidationHook {
             await retryInvalidationHook()
         }
+        try Task.checkCancellation()
         guard await prepare(alias: alias, priority: .foreground) == .ready else {
             if await state.shuttingDown() {
                 throw SSHMasterPoolError.shuttingDown
             }
             throw SSHMasterPoolError.commandFailed(exitCode: 255)
         }
+        try Task.checkCancellation()
         if await state.shuttingDown() {
             throw SSHMasterPoolError.shuttingDown
         }
 
+        try Task.checkCancellation()
         let replayed = try await runAdmitted(managedCommand(command, alias: alias))
         guard replayed.exitCode == 0 else {
             throw SSHMasterPoolError.commandFailed(exitCode: replayed.exitCode)
@@ -146,6 +160,13 @@ public final class SSHMasterPool: @unchecked Sendable {
     }
 
     public func shutdown() async {
+        let task = await shutdownCoordinator.task { [weak self] in
+            await self?.performShutdown()
+        }
+        await task.value
+    }
+
+    private func performShutdown() async {
         let tasks = await state.beginShutdown()
         for task in tasks {
             _ = await task.value
@@ -183,19 +204,54 @@ public final class SSHMasterPool: @unchecked Sendable {
         await state.waitUntilPriority(alias: alias, priority: priority)
     }
 
+    func waitUntilShutdownCallerCountForTesting(_ count: Int) async {
+        await shutdownCoordinator.waitUntilCallerCount(count)
+    }
+
     private func runAdmitted(
         _ command: CommandSpec
     ) async throws -> InventoryProcessOutput {
+        try Task.checkCancellation()
         guard await state.acquireCommandLease() else {
             throw SSHMasterPoolError.shuttingDown
         }
         do {
+            try Task.checkCancellation()
             let output = try await runner.run(command)
             await state.releaseCommandLease()
             return output
         } catch {
             await state.releaseCommandLease()
             throw error
+        }
+    }
+}
+
+private actor SSHMasterShutdownCoordinator {
+    private var shutdownTask: Task<Void, Never>?
+    private var callerCount = 0
+    private var callerCountWaiters: [
+        (Int, CheckedContinuation<Void, Never>)
+    ] = []
+
+    func task(
+        operation: @escaping @Sendable () async -> Void
+    ) -> Task<Void, Never> {
+        callerCount += 1
+        let satisfied = callerCountWaiters.filter { $0.0 <= callerCount }
+        callerCountWaiters.removeAll { $0.0 <= callerCount }
+        satisfied.forEach { $0.1.resume() }
+
+        if let shutdownTask { return shutdownTask }
+        let task = Task { await operation() }
+        shutdownTask = task
+        return task
+    }
+
+    func waitUntilCallerCount(_ count: Int) async {
+        guard callerCount < count else { return }
+        await withCheckedContinuation { continuation in
+            callerCountWaiters.append((count, continuation))
         }
     }
 }
