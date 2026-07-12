@@ -21,6 +21,7 @@ struct MerlinLizdApplication: App {
         _terminals = StateObject(
             wrappedValue: terminals
         )
+        appDelegate.configure(runtime: runtime)
         model.start()
     }
 
@@ -32,9 +33,6 @@ struct MerlinLizdApplication: App {
                 metricsStreamer: runtime.metricsStreamer
             )
                 .frame(minWidth: 960, minHeight: 640)
-                .onAppear {
-                    appDelegate.configure(runtime: runtime)
-                }
         }
         .defaultSize(width: 1180, height: 760)
         .windowToolbarStyle(.unifiedCompact)
@@ -65,21 +63,25 @@ struct MerlinLizdApplication: App {
 
 @MainActor
 private final class MerlinLizdApplicationDelegate: NSObject, NSApplicationDelegate {
-    private var isFinishingTermination = false
     private var runtime: MerlinRemoteRuntime?
+    private var terminationTask: Task<Void, Never>?
 
     func configure(runtime: MerlinRemoteRuntime) {
+        precondition(self.runtime == nil || self.runtime === runtime)
         self.runtime = runtime
     }
 
     func applicationShouldTerminate(
         _ sender: NSApplication
     ) -> NSApplication.TerminateReply {
-        guard !isFinishingTermination else { return .terminateLater }
-        isFinishingTermination = true
+        guard terminationTask == nil else { return .terminateLater }
+        guard let runtime else {
+            assertionFailure("App delegate must be configured with its runtime")
+            return .terminateNow
+        }
 
-        Task {
-            await runtime?.shutdown()
+        terminationTask = Task {
+            await runtime.shutdown()
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater

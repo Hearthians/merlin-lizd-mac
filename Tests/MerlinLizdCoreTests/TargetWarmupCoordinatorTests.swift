@@ -241,9 +241,44 @@ struct TargetWarmupCoordinatorTests {
         let commands = await runner.commands()
         #expect(commands.count == 1)
         #expect(await runner.wasCancelled())
-        #expect(!commands[0].arguments.joined(separator: " ").contains("new-session"))
-        #expect(!commands[0].arguments.joined(separator: " ").contains("kill"))
-        #expect(!commands[0].arguments.joined(separator: " ").contains("attach"))
+        let argv = commands[0].arguments.joined(separator: " ")
+        for forbidden in [
+            "new-session", "attach", "tmux kill", "kill-session",
+            "rename-session", "worker stop", "worker delete",
+        ] {
+            #expect(!argv.contains(forbidden))
+        }
+    }
+
+    @Test("shutdown cancels and reaps the active local warmup child")
+    func shutdownReapsActiveWarmupChild() async throws {
+        let pidFile = TemporaryProcessIDFile()
+        defer { pidFile.remove() }
+        let runner = LocalWarmupChildRunner(pidFile: pidFile)
+        let pool = SSHMasterPool(
+            testDirectory: temporarySSHDirectory(),
+            runner: WarmupPoolRunner()
+        )
+        let coordinator = TargetWarmupCoordinator(
+            sshMasterPool: pool,
+            discovery: TmuxSessionDiscovery(processRunner: runner),
+            maxConcurrentWorkerWarmups: 1
+        )
+        await coordinator.reconcile(
+            .init(
+                runningDevboxAliases: [],
+                workerTargets: [warmupWorker("6000003"), warmupWorker("6000004")]
+            ),
+            reason: .appLaunch,
+            onUpdate: { _ in }
+        )
+        let processID = try await pidFile.waitForProcessID()
+
+        await coordinator.shutdown()
+
+        #expect(pidFile.processIsAbsent(processID))
+        #expect(!pidFile.processHasExitedWithoutReaping(processID))
+        #expect(await runner.runCount() == 1)
     }
 
     @Test("concurrent shutdown callers await the same cleanup")
@@ -500,4 +535,29 @@ private actor CancellingWarmupRunner: InventoryProcessRunning {
 
     func commands() -> [CommandSpec] { recorded }
     func wasCancelled() -> Bool { cancelled }
+}
+
+private actor LocalWarmupChildRunner: InventoryProcessRunning {
+    private let pidFile: TemporaryProcessIDFile
+    private let runner = FoundationInventoryProcessRunner()
+    private var count = 0
+
+    init(pidFile: TemporaryProcessIDFile) {
+        self.pidFile = pidFile
+    }
+
+    func run(_ command: CommandSpec) async throws -> InventoryProcessOutput {
+        count += 1
+        return try await runner.run(CommandSpec(
+            executable: "/bin/sh",
+            arguments: [
+                "-c",
+                "echo $$ > \"$1\"; exec /bin/sleep 30",
+                "merlin-lizd-warmup-shutdown-test",
+                pidFile.path,
+            ]
+        ))
+    }
+
+    func runCount() -> Int { count }
 }
