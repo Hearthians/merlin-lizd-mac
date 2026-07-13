@@ -65,7 +65,7 @@ public actor TargetWarmupCoordinator {
     public init(
         sshMasterPool: SSHMasterPool,
         discovery: TmuxSessionDiscovery,
-        maxConcurrentWorkerWarmups: Int = 2
+        maxConcurrentWorkerWarmups: Int = 16
     ) {
         precondition(maxConcurrentWorkerWarmups > 0)
         self.sshMasterPool = sshMasterPool
@@ -77,7 +77,7 @@ public actor TargetWarmupCoordinator {
     init(
         sshMasterPool: SSHMasterPool,
         discovery: TmuxSessionDiscovery,
-        maxConcurrentWorkerWarmups: Int = 2,
+        maxConcurrentWorkerWarmups: Int = 16,
         sleeper: @escaping Sleeper
     ) {
         precondition(maxConcurrentWorkerWarmups > 0)

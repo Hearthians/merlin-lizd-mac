@@ -74,29 +74,46 @@ struct TargetWarmupCoordinatorTests {
         await coordinator.shutdown()
     }
 
-    @Test("warmup runs no more than two Worker refreshes concurrently")
+    @Test("warmup runs no more than sixteen Worker refreshes concurrently")
     func boundsWorkerConcurrency() async {
         let runner = WarmupDiscoveryRunner(gated: true)
-        let coordinator = makeWarmupCoordinator(runner: runner)
+        let pool = SSHMasterPool(
+            testDirectory: temporarySSHDirectory(),
+            runner: WarmupPoolRunner()
+        )
+        let coordinator = TargetWarmupCoordinator(
+            sshMasterPool: pool,
+            discovery: TmuxSessionDiscovery(processRunner: runner)
+        )
+        let workers = (1 ... 17).map {
+            warmupWorker(String(2_000_000 + $0))
+        }
         await coordinator.reconcile(
             .init(
                 runningDevboxAliases: [],
-                workerTargets: [
-                    warmupWorker("2000001"),
-                    warmupWorker("2000002"),
-                    warmupWorker("2000003"),
-                ]
+                workerTargets: workers
             ),
             reason: .inventoryChange,
             onUpdate: { _ in }
         )
 
         await runner.waitForStarts(2)
-        #expect(await runner.startedWorkerIDs().count == 2)
-        #expect(await runner.maximumConcurrency() == 2)
+        for _ in 0 ..< 10_000 {
+            if await runner.startedWorkerIDs().count >= 16 { break }
+            await Task.yield()
+        }
+        let initialCount = await runner.startedWorkerIDs().count
+        #expect(initialCount == 16)
+        guard initialCount == 16 else {
+            await runner.releaseAll()
+            await coordinator.shutdown()
+            return
+        }
+        #expect(await runner.maximumConcurrency() == 16)
+        await runner.releaseNext()
+        await runner.waitForStarts(17)
+        #expect(await runner.maximumConcurrency() == 16)
         await runner.releaseAll()
-        await runner.waitForStarts(3)
-        #expect(await runner.maximumConcurrency() == 2)
         await coordinator.shutdown()
     }
 

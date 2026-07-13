@@ -15,14 +15,14 @@ final class MerlinRemoteRuntime {
         sshMasterPool = pool
         tmuxDiscovery = TmuxSessionDiscovery(
             sshMasterPool: pool,
-            maxConcurrentProcesses: 2
+            maxConcurrentBackgroundWorkerRefreshes: 16
         )
         tmuxController = TmuxSessionController(sshMasterPool: pool)
         metricsStreamer = WorkerMetricsStreamer(sshMasterPool: pool)
         warmupCoordinator = TargetWarmupCoordinator(
             sshMasterPool: pool,
             discovery: tmuxDiscovery,
-            maxConcurrentWorkerWarmups: 2
+            maxConcurrentWorkerWarmups: 16
         )
     }
 

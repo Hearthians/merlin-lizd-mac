@@ -70,14 +70,17 @@ public actor TmuxSessionDiscovery {
 
     public init(
         sshMasterPool: SSHMasterPool,
-        maxConcurrentProcesses: Int = 2
+        maxConcurrentBackgroundWorkerRefreshes: Int = 16
     ) {
         foregroundExecutionPolicy = BoundedAsyncOperationRunner(
             maxConcurrentOperations: 16,
             timeout: .seconds(45)
         )
         backgroundExecutionPolicy = BoundedAsyncOperationRunner(
-            maxConcurrentOperations: max(1, maxConcurrentProcesses),
+            maxConcurrentOperations: max(
+                1,
+                maxConcurrentBackgroundWorkerRefreshes
+            ),
             timeout: .seconds(45)
         )
         let runner = TimedInventoryProcessRunner(
@@ -87,7 +90,10 @@ public actor TmuxSessionDiscovery {
             underlying: FoundationInventoryProcessRunner()
         )
         processRunner = BoundedInventoryProcessRunner(
-            maxConcurrentProcesses: max(1, maxConcurrentProcesses),
+            maxConcurrentProcesses: max(
+                1,
+                maxConcurrentBackgroundWorkerRefreshes
+            ),
             underlying: runner
         )
         self.sshMasterPool = sshMasterPool
