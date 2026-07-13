@@ -14,6 +14,11 @@ public enum TmuxVerificationState: Equatable, Sendable {
     case verifying
 }
 
+public enum TmuxRefreshLane: Sendable {
+    case foreground
+    case background
+}
+
 public enum TmuxReadinessEvidence: Equatable, Sendable {
     case ready
     case workerNotReady
@@ -51,7 +56,8 @@ public actor TmuxSessionDiscovery {
 
     private let processRunner: any InventoryProcessRunning
     private let sshMasterPool: SSHMasterPool?
-    private let pooledExecutionPolicy: BoundedAsyncOperationRunner?
+    private let foregroundExecutionPolicy: BoundedAsyncOperationRunner?
+    private let backgroundExecutionPolicy: BoundedAsyncOperationRunner?
     private let localTmuxPath: String?
     private let now: @Sendable () -> Date
     private var snapshots: [TerminalTarget: TmuxSessionSnapshot] = [:]
@@ -66,7 +72,11 @@ public actor TmuxSessionDiscovery {
         sshMasterPool: SSHMasterPool,
         maxConcurrentProcesses: Int = 2
     ) {
-        let executionPolicy = BoundedAsyncOperationRunner(
+        foregroundExecutionPolicy = BoundedAsyncOperationRunner(
+            maxConcurrentOperations: 16,
+            timeout: .seconds(45)
+        )
+        backgroundExecutionPolicy = BoundedAsyncOperationRunner(
             maxConcurrentOperations: max(1, maxConcurrentProcesses),
             timeout: .seconds(45)
         )
@@ -81,7 +91,6 @@ public actor TmuxSessionDiscovery {
             underlying: runner
         )
         self.sshMasterPool = sshMasterPool
-        pooledExecutionPolicy = executionPolicy
         localTmuxPath = LocalTmuxResolver.resolve()
         now = Date.init
     }
@@ -91,10 +100,12 @@ public actor TmuxSessionDiscovery {
         processRunner: any InventoryProcessRunning,
         localTmuxPath: String? = "/opt/homebrew/bin/tmux",
         now: @escaping @Sendable () -> Date = Date.init,
-        pooledExecutionPolicy: BoundedAsyncOperationRunner? = nil
+        foregroundExecutionPolicy: BoundedAsyncOperationRunner? = nil,
+        backgroundExecutionPolicy: BoundedAsyncOperationRunner? = nil
     ) {
         self.sshMasterPool = sshMasterPool
-        self.pooledExecutionPolicy = pooledExecutionPolicy
+        self.foregroundExecutionPolicy = foregroundExecutionPolicy
+        self.backgroundExecutionPolicy = backgroundExecutionPolicy
         self.processRunner = processRunner
         self.localTmuxPath = localTmuxPath
         self.now = now
@@ -106,7 +117,7 @@ public actor TmuxSessionDiscovery {
         guard let snapshot = snapshots[target] else { return nil }
         guard !snapshot.isFresh(at: now()) else { return snapshot }
         if refreshes[target] == nil {
-            _ = startRefresh(target: target)
+            _ = startRefresh(target: target, lane: .background)
         }
         return snapshots[target]
     }
@@ -118,8 +129,11 @@ public actor TmuxSessionDiscovery {
         snapshots[target]
     }
 
-    public func refresh(target: TerminalTarget) async -> TmuxSessionSnapshot {
-        let task = refreshes[target] ?? startRefresh(target: target)
+    public func refresh(
+        target: TerminalTarget,
+        lane: TmuxRefreshLane = .foreground
+    ) async -> TmuxSessionSnapshot {
+        let task = refreshes[target] ?? startRefresh(target: target, lane: lane)
         return await task.value
     }
 
@@ -127,14 +141,15 @@ public actor TmuxSessionDiscovery {
     /// one refresh after rechecking state inside the discovery actor.
     public func refreshIfStale(
         target: TerminalTarget,
-        maximumAge: TimeInterval = 60
+        maximumAge: TimeInterval = 60,
+        lane: TmuxRefreshLane = .foreground
     ) async -> TmuxSessionSnapshot {
         if let snapshot = snapshots[target],
             snapshot.isFresh(at: now(), maximumAge: maximumAge)
         {
             return snapshot
         }
-        return await refresh(target: target)
+        return await refresh(target: target, lane: lane)
     }
 
     func cancelRefresh(target: TerminalTarget) {
@@ -185,7 +200,8 @@ public actor TmuxSessionDiscovery {
     }
 
     private func startRefresh(
-        target: TerminalTarget
+        target: TerminalTarget,
+        lane: TmuxRefreshLane
     ) -> Task<TmuxSessionSnapshot, Never> {
         let previous = snapshots[target]
         if let previous {
@@ -204,7 +220,8 @@ public actor TmuxSessionDiscovery {
         let startingMutationRevision = mutationRevisions[target] ?? 0
         let processRunner = processRunner
         let sshMasterPool = sshMasterPool
-        let pooledExecutionPolicy = pooledExecutionPolicy
+        let foregroundExecutionPolicy = foregroundExecutionPolicy
+        let backgroundExecutionPolicy = backgroundExecutionPolicy
         let localTmuxPath = localTmuxPath
         let now = now
         let task = Task {
@@ -213,7 +230,9 @@ public actor TmuxSessionDiscovery {
                 previous: previous,
                 processRunner: processRunner,
                 sshMasterPool: sshMasterPool,
-                pooledExecutionPolicy: pooledExecutionPolicy,
+                lane: lane,
+                foregroundExecutionPolicy: foregroundExecutionPolicy,
+                backgroundExecutionPolicy: backgroundExecutionPolicy,
                 localTmuxPath: localTmuxPath,
                 now: now
             )
@@ -313,7 +332,9 @@ public actor TmuxSessionDiscovery {
         previous: TmuxSessionSnapshot?,
         processRunner: any InventoryProcessRunning,
         sshMasterPool: SSHMasterPool?,
-        pooledExecutionPolicy: BoundedAsyncOperationRunner?,
+        lane: TmuxRefreshLane,
+        foregroundExecutionPolicy: BoundedAsyncOperationRunner?,
+        backgroundExecutionPolicy: BoundedAsyncOperationRunner?,
         localTmuxPath: String?,
         now: @Sendable () -> Date
     ) async -> TmuxSessionSnapshot {
@@ -346,8 +367,14 @@ public actor TmuxSessionDiscovery {
             if let alias = MerlinCommands.sshAlias(for: target),
                 let sshMasterPool
             {
-                if let pooledExecutionPolicy {
-                    output = try await pooledExecutionPolicy.run {
+                let executionPolicy = switch lane {
+                case .foreground:
+                    foregroundExecutionPolicy
+                case .background:
+                    backgroundExecutionPolicy
+                }
+                if let executionPolicy {
+                    output = try await executionPolicy.run {
                         try await sshMasterPool.run(
                             command,
                             alias: alias,

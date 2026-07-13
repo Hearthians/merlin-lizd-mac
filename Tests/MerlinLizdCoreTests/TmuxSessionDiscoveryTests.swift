@@ -486,8 +486,8 @@ struct TmuxSessionDiscoveryTests {
         #expect(await directRunner.recordedCommand() == nil)
     }
 
-    @Test("pooled coordinator and browser discovery share two execution slots")
-    func pooledDiscoverySharesExecutionSlots() async {
+    @Test("foreground discovery bypasses occupied background slots")
+    func foregroundDiscoveryBypassesBackgroundSlots() async {
         let runner = GatedPooledDiscoveryRunner()
         let pool = SSHMasterPool(
             testDirectory: temporarySSHDirectory(),
@@ -499,7 +499,11 @@ struct TmuxSessionDiscoveryTests {
             processRunner: TmuxScriptedRunner(output: .init(
                 stdout: "must-not-run", stderr: "", exitCode: 0
             )),
-            pooledExecutionPolicy: BoundedAsyncOperationRunner(
+            foregroundExecutionPolicy: BoundedAsyncOperationRunner(
+                maxConcurrentOperations: 2,
+                timeout: .seconds(5)
+            ),
+            backgroundExecutionPolicy: BoundedAsyncOperationRunner(
                 maxConcurrentOperations: 2,
                 timeout: .seconds(5)
             )
@@ -522,18 +526,56 @@ struct TmuxSessionDiscoveryTests {
         await runner.waitForChildStarts(2)
 
         let browser = Task {
-            await discovery.refresh(target: pooledWorker("7000003"))
+            await discovery.refresh(
+                target: pooledWorker("7000003"),
+                lane: .foreground
+            )
         }
-        for _ in 0 ..< 100 { await Task.yield() }
-        #expect(await runner.childStartCount() == 2)
-
-        await runner.releaseOne()
         await runner.waitForChildStarts(3)
-        #expect(await runner.maximumChildConcurrency() == 2)
+        #expect(await runner.childStartCount() == 3)
+        #expect(await runner.maximumChildConcurrency() == 3)
 
         await runner.releaseAll()
         _ = await browser.value
         await coordinator.shutdown()
+        await pool.shutdown()
+    }
+
+    @Test("foreground joins an in-flight background refresh for the same Worker")
+    func foregroundJoinsBackgroundRefreshForSameWorker() async {
+        let runner = GatedPooledDiscoveryRunner()
+        let pool = SSHMasterPool(
+            testDirectory: temporarySSHDirectory(),
+            runner: runner
+        )
+        #expect(await pool.prepare(alias: "hl_gpu_2", priority: .foreground) == .ready)
+        let discovery = TmuxSessionDiscovery(
+            sshMasterPool: pool,
+            processRunner: TmuxScriptedRunner(output: .init(
+                stdout: "must-not-run", stderr: "", exitCode: 0
+            )),
+            foregroundExecutionPolicy: BoundedAsyncOperationRunner(
+                maxConcurrentOperations: 2,
+                timeout: .seconds(5)
+            ),
+            backgroundExecutionPolicy: BoundedAsyncOperationRunner(
+                maxConcurrentOperations: 2,
+                timeout: .seconds(5)
+            )
+        )
+        let target = pooledWorker("7000004")
+        let background = Task {
+            await discovery.refresh(target: target, lane: .background)
+        }
+        await runner.waitForChildStarts(1)
+        let foreground = Task {
+            await discovery.refresh(target: target, lane: .foreground)
+        }
+        for _ in 0 ..< 1_000 { await Task.yield() }
+        #expect(await runner.childStartCount() == 1)
+
+        await runner.releaseAll()
+        _ = await (background.value, foreground.value)
         await pool.shutdown()
     }
 
@@ -552,7 +594,7 @@ struct TmuxSessionDiscoveryTests {
             processRunner: TmuxScriptedRunner(output: .init(
                 stdout: "must-not-run", stderr: "", exitCode: 0
             )),
-            pooledExecutionPolicy: BoundedAsyncOperationRunner(
+            foregroundExecutionPolicy: BoundedAsyncOperationRunner(
                 maxConcurrentOperations: 2,
                 timeout: .milliseconds(300)
             )

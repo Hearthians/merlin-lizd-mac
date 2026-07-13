@@ -241,7 +241,10 @@ public actor TargetWarmupCoordinator {
             nextWarmupToken &+= 1
             let token = nextWarmupToken
             let task = Task { [weak self] in
-                let snapshot = await discovery.refresh(target: entry.target)
+                let snapshot = await discovery.refresh(
+                    target: entry.target,
+                    lane: .background
+                )
                 await self?.completeWarmup(
                     target: entry.target,
                     token: token,
