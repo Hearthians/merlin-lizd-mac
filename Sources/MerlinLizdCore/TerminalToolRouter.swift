@@ -95,6 +95,7 @@ public actor TerminalToolRouter {
 
     private struct PreparedTurn: Sendable {
         let handle: AgentTurnHandle
+        let bindingToken: TerminalEndpointBindingToken
         let conversationKey: TerminalConversationKey
         let task: Task<TerminalEndpointBinding, any Error>
     }
@@ -190,34 +191,37 @@ public actor TerminalToolRouter {
             throw TerminalEndpointRegistryError.threadAlreadyPrepared
         }
         let handle = AgentTurnHandle(threadID: threadID)
+        let bindingToken = TerminalEndpointBindingToken()
         let registry = self.registry
         let task = Task.detached {
             try await registry.prepareTurn(
-                threadID: threadID,
+                handle: handle,
+                token: bindingToken,
                 conversationKey: conversationKey
             )
         }
         preparedTurns[threadID] = PreparedTurn(
             handle: handle,
+            bindingToken: bindingToken,
             conversationKey: conversationKey,
             task: task
         )
-        var preparedBinding: TerminalEndpointBinding?
         do {
-            preparedBinding = try await task.value
+            let preparedBinding = try await task.value
+            guard preparedBinding.token == bindingToken else {
+                throw TerminalToolRouterError.turnUnavailable
+            }
             guard preparedTurns[threadID]?.handle == handle else {
                 throw TerminalToolRouterError.turnUnavailable
             }
             try Task.checkCancellation()
             return handle
         } catch {
-            if takePreparedTurn(threadID: threadID, handle: handle) != nil,
-                let preparedBinding
-            {
+            if takePreparedTurn(threadID: threadID, handle: handle) != nil {
                 await registry.releasePrepared(
-                    threadID: threadID,
-                    conversationKey: conversationKey,
-                    token: preparedBinding.token
+                    handle: handle,
+                    token: bindingToken,
+                    conversationKey: conversationKey
                 )
             }
             throw error
@@ -1804,16 +1808,16 @@ public actor TerminalToolRouter {
         }
         blockedTurns.remove(turn)
         if let prepared {
-            if case let .success(binding) = await prepared.task.result {
-                await registry.releasePrepared(
-                    threadID: turn.threadID,
-                    conversationKey: prepared.conversationKey,
-                    token: binding.token
-                )
-            }
-        } else {
+            _ = await prepared.task.result
+            await registry.releasePrepared(
+                handle: turn.handle,
+                token: prepared.bindingToken,
+                conversationKey: prepared.conversationKey
+            )
+        } else if let binding = activeBindings[turn] {
             await registry.releaseTurn(
-                threadID: turn.threadID,
+                handle: turn.handle,
+                token: binding.token,
                 turnID: turn.turnID
             )
         }
@@ -2137,7 +2141,8 @@ public actor TerminalToolRouter {
     ) async throws {
         do {
             let current = try await registry.binding(
-                threadID: turn.threadID,
+                handle: turn.handle,
+                token: binding.token,
                 turnID: turn.turnID,
                 conversationKey: binding.conversationKey
             )
@@ -2497,16 +2502,17 @@ public actor TerminalToolRouter {
         prepared: PreparedTurn,
         activationToken: UUID
     ) async throws -> TerminalEndpointBinding {
-        var preparedBinding: TerminalEndpointBinding?
         do {
             let preparedValue = try await prepared.task.value
-            preparedBinding = preparedValue
             let binding = try await registry.claimPreparedTurn(
-                threadID: turn.threadID,
+                handle: turn.handle,
+                token: prepared.bindingToken,
                 conversationKey: prepared.conversationKey,
                 turnID: turn.turnID
             )
-            guard binding.token == preparedValue.token else {
+            guard preparedValue.token == prepared.bindingToken,
+                binding.token == prepared.bindingToken
+            else {
                 throw TerminalEndpointRegistryError.bindingMismatch
             }
             guard activationTasks[turn]?.token == activationToken else {
@@ -2519,13 +2525,11 @@ public actor TerminalToolRouter {
             activationTasks.removeValue(forKey: turn)
             return binding
         } catch {
-            if let preparedBinding {
-                await registry.releasePrepared(
-                    threadID: turn.threadID,
-                    conversationKey: prepared.conversationKey,
-                    token: preparedBinding.token
-                )
-            }
+            await registry.releasePrepared(
+                handle: turn.handle,
+                token: prepared.bindingToken,
+                conversationKey: prepared.conversationKey
+            )
             if activationTasks[turn]?.token == activationToken {
                 activationTasks.removeValue(forKey: turn)
                 activeBindings.removeValue(forKey: turn)

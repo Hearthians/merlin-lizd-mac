@@ -2180,9 +2180,9 @@ struct TerminalToolRouterTests {
         while await firstPort.keyboardOwnerTransitionsStarted().isEmpty {
             await Task.yield()
         }
-        let stream = await registry.events()
+        let subscription = await registry.subscribe()
         let eventTask = Task {
-            var iterator = stream.makeAsyncIterator()
+            var iterator = subscription.events.makeAsyncIterator()
             return await iterator.next()
         }
         let unregister = Task {
@@ -2409,9 +2409,12 @@ struct TerminalToolRouterTests {
     func failedActivationCannotClaimLaterPreparation() async throws {
         let screen = TerminalToolFixtures.screen(revision: 1501)
         let registry = TerminalEndpointRegistry()
+        let endpointID = TerminalEndpointID(
+            rawValue: TerminalToolFixtures.newID()
+        )
         try await registry.register(
             TerminalToolFixtures.endpoint(
-                id: TerminalToolFixtures.newID(),
+                id: endpointID.rawValue,
                 port: FakeTerminalToolPort(snapshot: screen),
                 controller: FakeTerminalSurfaceController(
                     surface: TerminalToolFixtures.surface()
@@ -2429,9 +2432,15 @@ struct TerminalToolRouterTests {
             threadID: threadID,
             conversationKey: TerminalToolFixtures.key
         )
-        await registry.releasePrepared(
-            threadID: threadID,
-            conversationKey: TerminalToolFixtures.key
+        await registry.unregister(endpointID)
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: endpointID.rawValue,
+                port: FakeTerminalToolPort(snapshot: screen),
+                controller: FakeTerminalSurfaceController(
+                    surface: TerminalToolFixtures.surface()
+                )
+            )
         )
         await #expect(throws: TerminalToolRouterError.turnUnavailable) {
             try await router.confirmTurnID(

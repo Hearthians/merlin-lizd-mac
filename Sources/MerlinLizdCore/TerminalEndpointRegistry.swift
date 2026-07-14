@@ -24,20 +24,24 @@ public struct TerminalEndpoint: Sendable {
 
 public struct TerminalEndpointBinding: Sendable {
     public let token: TerminalEndpointBindingToken
-    public let threadID: AgentThreadID
+    public let handle: AgentTurnHandle
     public let turnID: AgentTurnID?
     public let conversationKey: TerminalConversationKey
     public let endpoint: TerminalEndpoint
 
+    public var threadID: AgentThreadID {
+        handle.threadID
+    }
+
     public init(
         token: TerminalEndpointBindingToken = TerminalEndpointBindingToken(),
-        threadID: AgentThreadID,
+        handle: AgentTurnHandle,
         turnID: AgentTurnID?,
         conversationKey: TerminalConversationKey,
         endpoint: TerminalEndpoint
     ) {
         self.token = token
-        self.threadID = threadID
+        self.handle = handle
         self.turnID = turnID
         self.conversationKey = conversationKey
         self.endpoint = endpoint
@@ -52,26 +56,33 @@ public struct TerminalEndpointBindingToken: Hashable, Sendable {
     }
 }
 
-public enum TerminalEndpointPinPhase: Equatable, Sendable {
+public enum TerminalEndpointPinPhase: Hashable, Sendable {
     case prepared
     case active
 }
 
-public struct TerminalEndpointPinLoss: Equatable, Sendable {
-    public let threadID: AgentThreadID
+public struct TerminalEndpointPin: Hashable, Sendable {
+    public let handle: AgentTurnHandle
+    public let bindingToken: TerminalEndpointBindingToken
     public let turnID: AgentTurnID?
     public let phase: TerminalEndpointPinPhase
     public let conversationKey: TerminalConversationKey
     public let endpointID: TerminalEndpointID
 
+    public var threadID: AgentThreadID {
+        handle.threadID
+    }
+
     public init(
-        threadID: AgentThreadID,
+        handle: AgentTurnHandle,
+        bindingToken: TerminalEndpointBindingToken,
         turnID: AgentTurnID?,
         phase: TerminalEndpointPinPhase,
         conversationKey: TerminalConversationKey,
         endpointID: TerminalEndpointID
     ) {
-        self.threadID = threadID
+        self.handle = handle
+        self.bindingToken = bindingToken
         self.turnID = turnID
         self.phase = phase
         self.conversationKey = conversationKey
@@ -79,9 +90,60 @@ public struct TerminalEndpointPinLoss: Equatable, Sendable {
     }
 }
 
+public struct TerminalEndpointPinLoss: Equatable, Sendable {
+    public let pin: TerminalEndpointPin
+
+    public var handle: AgentTurnHandle { pin.handle }
+    public var bindingToken: TerminalEndpointBindingToken {
+        pin.bindingToken
+    }
+    public var threadID: AgentThreadID { pin.threadID }
+    public var turnID: AgentTurnID? { pin.turnID }
+    public var phase: TerminalEndpointPinPhase { pin.phase }
+    public var conversationKey: TerminalConversationKey {
+        pin.conversationKey
+    }
+    public var endpointID: TerminalEndpointID { pin.endpointID }
+
+    public init(pin: TerminalEndpointPin) {
+        self.pin = pin
+    }
+}
+
 public enum TerminalEndpointRegistryEvent: Equatable, Sendable {
-    case pinLost(TerminalEndpointPinLoss)
-    case reconciliationRequired
+    case pinLost(TerminalEndpointPinLoss, revision: UInt64)
+    case reconciliationRequired(revision: UInt64)
+
+    public var revision: UInt64 {
+        switch self {
+        case let .pinLost(_, revision),
+            let .reconciliationRequired(revision):
+            revision
+        }
+    }
+}
+
+public struct TerminalEndpointRegistrySnapshot: Equatable, Sendable {
+    public let revision: UInt64
+    public let pins: Set<TerminalEndpointPin>
+
+    public init(revision: UInt64, pins: Set<TerminalEndpointPin>) {
+        self.revision = revision
+        self.pins = pins
+    }
+}
+
+public struct TerminalEndpointRegistrySubscription: Sendable {
+    public let snapshot: TerminalEndpointRegistrySnapshot
+    public let events: AsyncStream<TerminalEndpointRegistryEvent>
+
+    public init(
+        snapshot: TerminalEndpointRegistrySnapshot,
+        events: AsyncStream<TerminalEndpointRegistryEvent>
+    ) {
+        self.snapshot = snapshot
+        self.events = events
+    }
 }
 
 public enum TerminalEndpointRegistryError: Error, Equatable, Sendable {
@@ -131,7 +193,7 @@ public actor TerminalEndpointRegistry {
 
     private struct StoredBinding: Sendable {
         let token: TerminalEndpointBindingToken
-        let threadID: AgentThreadID
+        let handle: AgentTurnHandle
         let conversationKey: TerminalConversationKey
         let endpoint: TerminalEndpoint
         var turnID: AgentTurnID?
@@ -142,7 +204,7 @@ public actor TerminalEndpointRegistry {
         var value: TerminalEndpointBinding {
             TerminalEndpointBinding(
                 token: token,
-                threadID: threadID,
+                handle: handle,
                 turnID: turnID,
                 conversationKey: conversationKey,
                 endpoint: endpoint
@@ -153,7 +215,7 @@ public actor TerminalEndpointRegistry {
     private var endpoints: [TerminalEndpointID: RegisteredEndpoint] = [:]
     private var retiringEndpointIDs: Set<TerminalEndpointID> = []
     private var bindings: [AgentThreadID: StoredBinding] = [:]
-    private var conversationOwners: [TerminalConversationKey: AgentThreadID]
+    private var conversationOwners: [TerminalConversationKey: AgentTurnHandle]
         = [:]
     private var focusOrder: UInt64 = 0
     private var keyboardTransitions: [TerminalEndpointID: KeyboardTransition]
@@ -161,6 +223,7 @@ public actor TerminalEndpointRegistry {
     private var eventSubscribers: [
         UUID: AsyncStream<TerminalEndpointRegistryEvent>.Continuation
     ] = [:]
+    private var pinLossRevision: UInt64 = 0
     private let bindingValidationHook: (@Sendable () async -> Void)?
     private let claimPreparedTurnHook: (@Sendable () async -> Void)?
 
@@ -203,7 +266,7 @@ public actor TerminalEndpointRegistry {
         defer { retiringEndpointIDs.remove(endpointID) }
         endpoints.removeValue(forKey: endpointID)
         var cleanup: [(
-            threadID: AgentThreadID,
+            handle: AgentTurnHandle,
             token: TerminalEndpointBindingToken,
             removeAfterTransition: Bool,
             transition: KeyboardTransition
@@ -215,6 +278,14 @@ public actor TerminalEndpointRegistry {
                 binding.phase != .releasing
             else { continue }
             let removeAfterTransition = binding.turnID == nil
+            let lostPin = TerminalEndpointPin(
+                handle: binding.handle,
+                bindingToken: binding.token,
+                turnID: binding.turnID,
+                phase: binding.turnID == nil ? .prepared : .active,
+                conversationKey: binding.conversationKey,
+                endpointID: endpointID
+            )
             binding.phase = .pinLost
             let transition = enqueueKeyboardOwner(
                 .user,
@@ -224,25 +295,24 @@ public actor TerminalEndpointRegistry {
             bindings[threadID] = binding
             cleanup.append(
                 (
-                    threadID,
+                    binding.handle,
                     binding.token,
                     removeAfterTransition,
                     transition
                 )
             )
-            let loss = TerminalEndpointPinLoss(
-                threadID: threadID,
-                turnID: binding.turnID,
-                phase: binding.turnID == nil ? .prepared : .active,
-                conversationKey: binding.conversationKey,
-                endpointID: endpointID
+            pinLossRevision += 1
+            publish(
+                .pinLost(
+                    TerminalEndpointPinLoss(pin: lostPin),
+                    revision: pinLossRevision
+                )
             )
-            publish(.pinLost(loss))
         }
         for item in cleanup {
             await item.transition.task.value
             guard item.removeAfterTransition else { continue }
-            removeBinding(threadID: item.threadID, token: item.token)
+            removeBinding(handle: item.handle, token: item.token)
         }
     }
 
@@ -255,10 +325,12 @@ public actor TerminalEndpointRegistry {
         endpoints[endpointID] = endpoint
     }
 
-    public func prepareTurn(
-        threadID: AgentThreadID,
+    func prepareTurn(
+        handle: AgentTurnHandle,
+        token: TerminalEndpointBindingToken,
         conversationKey: TerminalConversationKey
     ) async throws -> TerminalEndpointBinding {
+        let threadID = handle.threadID
         guard bindings[threadID] == nil else {
             throw TerminalEndpointRegistryError.threadAlreadyPrepared
         }
@@ -274,8 +346,8 @@ public actor TerminalEndpointRegistry {
         }
 
         let stored = StoredBinding(
-            token: TerminalEndpointBindingToken(),
-            threadID: threadID,
+            token: token,
+            handle: handle,
             conversationKey: conversationKey,
             endpoint: endpoint,
             turnID: nil,
@@ -287,10 +359,10 @@ public actor TerminalEndpointRegistry {
             releaseTransition: nil
         )
         bindings[threadID] = stored
-        conversationOwners[conversationKey] = threadID
+        conversationOwners[conversationKey] = handle
         await stored.preparationTransition.task.value
         guard var current = exactBinding(
-            threadID: threadID,
+            handle: handle,
             token: stored.token
         ) else {
             if endpoints[stored.endpoint.id] == nil {
@@ -313,7 +385,7 @@ public actor TerminalEndpointRegistry {
                 current.releaseTransition = transition
                 bindings[threadID] = current
                 await transition.task.value
-                removeBinding(threadID: threadID, token: current.token)
+                removeBinding(handle: handle, token: current.token)
                 throw CancellationError()
             }
             current.phase = .prepared
@@ -324,13 +396,14 @@ public actor TerminalEndpointRegistry {
         }
     }
 
-    public func claimPreparedTurn(
-        threadID: AgentThreadID,
+    func claimPreparedTurn(
+        handle: AgentTurnHandle,
+        token: TerminalEndpointBindingToken,
         conversationKey: TerminalConversationKey,
         turnID: AgentTurnID
     ) async throws -> TerminalEndpointBinding {
         await claimPreparedTurnHook?()
-        guard let initial = bindings[threadID] else {
+        guard let initial = exactBinding(handle: handle, token: token) else {
             throw TerminalEndpointRegistryError.preparedBindingNotFound
         }
         guard initial.conversationKey == conversationKey else {
@@ -341,8 +414,8 @@ public actor TerminalEndpointRegistry {
             try Task.checkCancellation()
         }
         guard var stored = exactBinding(
-            threadID: threadID,
-            token: initial.token
+            handle: handle,
+            token: token
         ) else {
             throw TerminalEndpointRegistryError.preparedBindingNotFound
         }
@@ -363,15 +436,16 @@ public actor TerminalEndpointRegistry {
         }
         stored.phase = .claimed
         stored.turnID = turnID
-        bindings[threadID] = stored
+        bindings[handle.threadID] = stored
         return stored.value
     }
 
-    public func confirmTurnID(
-        threadID: AgentThreadID,
+    func confirmTurnID(
+        handle: AgentTurnHandle,
+        token: TerminalEndpointBindingToken,
         turnID: AgentTurnID
     ) async throws {
-        guard let initial = bindings[threadID] else {
+        guard let initial = exactBinding(handle: handle, token: token) else {
             throw TerminalEndpointRegistryError.preparedBindingNotFound
         }
         if initial.phase == .preparing {
@@ -379,8 +453,8 @@ public actor TerminalEndpointRegistry {
             try Task.checkCancellation()
         }
         guard var stored = exactBinding(
-            threadID: threadID,
-            token: initial.token
+            handle: handle,
+            token: token
         ) else {
             throw TerminalEndpointRegistryError.preparedBindingNotFound
         }
@@ -398,16 +472,17 @@ public actor TerminalEndpointRegistry {
         }
         stored.phase = .claimed
         stored.turnID = turnID
-        bindings[threadID] = stored
+        bindings[handle.threadID] = stored
     }
 
-    public func binding(
-        threadID: AgentThreadID,
+    func binding(
+        handle: AgentTurnHandle,
+        token: TerminalEndpointBindingToken,
         turnID: AgentTurnID,
         conversationKey: TerminalConversationKey
     ) async throws -> TerminalEndpointBinding {
         await bindingValidationHook?()
-        guard let stored = bindings[threadID] else {
+        guard let stored = exactBinding(handle: handle, token: token) else {
             throw TerminalEndpointRegistryError.preparedBindingNotFound
         }
         guard stored.phase != .pinLost else {
@@ -428,11 +503,14 @@ public actor TerminalEndpointRegistry {
         return stored.value
     }
 
-    public func releaseTurn(
-        threadID: AgentThreadID,
+    func releaseTurn(
+        handle: AgentTurnHandle,
+        token: TerminalEndpointBindingToken,
         turnID: AgentTurnID
     ) async {
-        guard var stored = bindings[threadID] else { return }
+        guard var stored = exactBinding(handle: handle, token: token) else {
+            return
+        }
         guard stored.turnID == turnID else { return }
         let transition: KeyboardTransition
         if stored.phase == .releasing,
@@ -443,50 +521,26 @@ public actor TerminalEndpointRegistry {
             let existing = stored.releaseTransition
         {
             stored.phase = .releasing
-            bindings[threadID] = stored
+            bindings[handle.threadID] = stored
             transition = existing
         } else {
             stored.phase = .releasing
             transition = enqueueKeyboardOwner(.user, for: stored.endpoint)
             stored.releaseTransition = transition
-            bindings[threadID] = stored
+            bindings[handle.threadID] = stored
         }
         await transition.task.value
-        removeBinding(threadID: threadID, token: stored.token)
+        removeBinding(handle: handle, token: token)
     }
 
-    public func releasePrepared(
-        threadID: AgentThreadID,
+    func releasePrepared(
+        handle: AgentTurnHandle,
+        token: TerminalEndpointBindingToken,
         conversationKey: TerminalConversationKey
     ) async {
-        await releasePreparedMatching(
-            threadID: threadID,
-            conversationKey: conversationKey,
-            token: nil
-        )
-    }
-
-    public func releasePrepared(
-        threadID: AgentThreadID,
-        conversationKey: TerminalConversationKey,
-        token: TerminalEndpointBindingToken
-    ) async {
-        await releasePreparedMatching(
-            threadID: threadID,
-            conversationKey: conversationKey,
-            token: token
-        )
-    }
-
-    private func releasePreparedMatching(
-        threadID: AgentThreadID,
-        conversationKey: TerminalConversationKey,
-        token: TerminalEndpointBindingToken?
-    ) async {
-        guard var stored = bindings[threadID],
+        guard var stored = exactBinding(handle: handle, token: token),
             stored.turnID == nil,
-            stored.conversationKey == conversationKey,
-            token == nil || stored.token == token
+            stored.conversationKey == conversationKey
         else { return }
         let transition: KeyboardTransition
         if stored.phase == .releasing,
@@ -497,16 +551,16 @@ public actor TerminalEndpointRegistry {
             let existing = stored.releaseTransition
         {
             stored.phase = .releasing
-            bindings[threadID] = stored
+            bindings[handle.threadID] = stored
             transition = existing
         } else {
             stored.phase = .releasing
             transition = enqueueKeyboardOwner(.user, for: stored.endpoint)
             stored.releaseTransition = transition
-            bindings[threadID] = stored
+            bindings[handle.threadID] = stored
         }
         await transition.task.value
-        removeBinding(threadID: threadID, token: stored.token)
+        removeBinding(handle: handle, token: token)
     }
 
     func testingStateSnapshot() -> TerminalEndpointRegistryStateSnapshot {
@@ -522,16 +576,29 @@ public actor TerminalEndpointRegistry {
         )
     }
 
-    public func events() -> AsyncStream<TerminalEndpointRegistryEvent> {
+    /// Atomically captures the authoritative pin set and starts a bounded
+    /// event stream. Consumers should initialize their known pins from the
+    /// returned snapshot, ignore events at or below its revision, and replace
+    /// their known pins with `pinSnapshot()` after reconciliation is required.
+    public func subscribe() -> TerminalEndpointRegistrySubscription {
         let subscriberID = UUID()
-        return AsyncStream(
+        let pair = AsyncStream<TerminalEndpointRegistryEvent>.makeStream(
             bufferingPolicy: .bufferingNewest(Self.eventBufferCapacity)
-        ) { continuation in
-            eventSubscribers[subscriberID] = continuation
-            continuation.onTermination = { [weak self] _ in
-                Task { await self?.removeEventSubscriber(subscriberID) }
-            }
+        )
+        pair.continuation.onTermination = { [weak self] _ in
+            Task { await self?.removeEventSubscriber(subscriberID) }
         }
+        eventSubscribers[subscriberID] = pair.continuation
+        return TerminalEndpointRegistrySubscription(
+            snapshot: makePinSnapshot(),
+            events: pair.stream
+        )
+    }
+
+    /// Returns the current authoritative exact pins at the latest pin-loss
+    /// revision. Use this to replace local state after a reconciliation event.
+    public func pinSnapshot() -> TerminalEndpointRegistrySnapshot {
+        makePinSnapshot()
     }
 
     private func publish(_ event: TerminalEndpointRegistryEvent) {
@@ -541,7 +608,9 @@ public actor TerminalEndpointRegistry {
             case .enqueued:
                 break
             case .dropped:
-                _ = subscriber.yield(.reconciliationRequired)
+                _ = subscriber.yield(
+                    .reconciliationRequired(revision: pinLossRevision)
+                )
             case .terminated:
                 terminatedSubscriberIDs.append(subscriberID)
             @unknown default:
@@ -555,6 +624,33 @@ public actor TerminalEndpointRegistry {
 
     private func removeEventSubscriber(_ subscriberID: UUID) {
         eventSubscribers.removeValue(forKey: subscriberID)
+    }
+
+    private func makePinSnapshot() -> TerminalEndpointRegistrySnapshot {
+        TerminalEndpointRegistrySnapshot(
+            revision: pinLossRevision,
+            pins: Set(bindings.values.compactMap(makePin))
+        )
+    }
+
+    private func makePin(_ binding: StoredBinding) -> TerminalEndpointPin? {
+        let phase: TerminalEndpointPinPhase
+        switch binding.phase {
+        case .preparing, .prepared:
+            phase = .prepared
+        case .claimed:
+            phase = .active
+        case .releasing, .pinLost:
+            return nil
+        }
+        return TerminalEndpointPin(
+            handle: binding.handle,
+            bindingToken: binding.token,
+            turnID: binding.turnID,
+            phase: phase,
+            conversationKey: binding.conversationKey,
+            endpointID: binding.endpoint.id
+        )
     }
 
     private func enqueueKeyboardOwner(
@@ -589,24 +685,27 @@ public actor TerminalEndpointRegistry {
     }
 
     private func exactBinding(
-        threadID: AgentThreadID,
+        handle: AgentTurnHandle,
         token: TerminalEndpointBindingToken
     ) -> StoredBinding? {
-        guard let stored = bindings[threadID], stored.token == token else {
+        guard let stored = bindings[handle.threadID],
+            stored.handle == handle,
+            stored.token == token
+        else {
             return nil
         }
         return stored
     }
 
     private func removeBinding(
-        threadID: AgentThreadID,
+        handle: AgentTurnHandle,
         token: TerminalEndpointBindingToken
     ) {
-        guard let stored = exactBinding(threadID: threadID, token: token) else {
+        guard let stored = exactBinding(handle: handle, token: token) else {
             return
         }
-        bindings.removeValue(forKey: threadID)
-        if conversationOwners[stored.conversationKey] == threadID {
+        bindings.removeValue(forKey: handle.threadID)
+        if conversationOwners[stored.conversationKey] == handle {
             conversationOwners.removeValue(forKey: stored.conversationKey)
         }
     }

@@ -3,6 +3,114 @@ import Testing
 
 @Suite("Terminal endpoint registry", .serialized)
 struct TerminalEndpointRegistryTests {
+    @Test("stale exact registry calls cannot consume a reused raw turn ID")
+    func staleExactCallsCannotConsumeReusedRawTurnID() async throws {
+        let registry = TerminalEndpointRegistry()
+        let port = FakeTerminalToolPort(
+            snapshot: TerminalToolFixtures.screen(revision: 101)
+        )
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: TerminalToolFixtures.newID(),
+                port: port,
+                controller: FakeTerminalSurfaceController(
+                    surface: TerminalToolFixtures.surface()
+                )
+            )
+        )
+        let threadID = AgentThreadID(rawValue: "registry-generation-thread")
+        let reusedTurnID = AgentTurnID(rawValue: "registry-reused-turn")
+        let firstHandle = AgentTurnHandle(
+            threadID: threadID,
+            generationID: TerminalToolFixtures.uuid(
+                "91000000-0000-0000-0000-000000000001"
+            )
+        )
+        let firstPrepared = try await registry.prepareTurn(
+            handle: firstHandle,
+            token: TerminalEndpointBindingToken(),
+            conversationKey: TerminalToolFixtures.key
+        )
+        _ = try await registry.claimPreparedTurn(
+            handle: firstHandle,
+            token: firstPrepared.token,
+            conversationKey: TerminalToolFixtures.key,
+            turnID: reusedTurnID
+        )
+        await registry.releaseTurn(
+            handle: firstHandle,
+            token: firstPrepared.token,
+            turnID: reusedTurnID
+        )
+
+        let successorHandle = AgentTurnHandle(
+            threadID: threadID,
+            generationID: TerminalToolFixtures.uuid(
+                "91000000-0000-0000-0000-000000000002"
+            )
+        )
+        let successorPrepared = try await registry.prepareTurn(
+            handle: successorHandle,
+            token: TerminalEndpointBindingToken(),
+            conversationKey: TerminalToolFixtures.key
+        )
+        await #expect(
+            throws: TerminalEndpointRegistryError.preparedBindingNotFound
+        ) {
+            try await registry.confirmTurnID(
+                handle: firstHandle,
+                token: firstPrepared.token,
+                turnID: reusedTurnID
+            )
+        }
+        await #expect(
+            throws: TerminalEndpointRegistryError.preparedBindingNotFound
+        ) {
+            _ = try await registry.binding(
+                handle: firstHandle,
+                token: firstPrepared.token,
+                turnID: reusedTurnID,
+                conversationKey: TerminalToolFixtures.key
+            )
+        }
+        await registry.releaseTurn(
+            handle: firstHandle,
+            token: firstPrepared.token,
+            turnID: reusedTurnID
+        )
+        await registry.releasePrepared(
+            handle: firstHandle,
+            token: firstPrepared.token,
+            conversationKey: TerminalToolFixtures.key
+        )
+
+        let successor = try await registry.claimPreparedTurn(
+            handle: successorHandle,
+            token: successorPrepared.token,
+            conversationKey: TerminalToolFixtures.key,
+            turnID: reusedTurnID
+        )
+        try await registry.confirmTurnID(
+            handle: successorHandle,
+            token: successorPrepared.token,
+            turnID: reusedTurnID
+        )
+        #expect(
+            try await registry.binding(
+                handle: successorHandle,
+                token: successorPrepared.token,
+                turnID: reusedTurnID,
+                conversationKey: TerminalToolFixtures.key
+            ).token == successor.token
+        )
+        await registry.releaseTurn(
+            handle: successorHandle,
+            token: successorPrepared.token,
+            turnID: reusedTurnID
+        )
+        #expect(await port.keyboardOwners() == [.codex, .user, .codex, .user])
+    }
+
     @Test("most recent focus pins only while idle and turn confirmation is exact")
     func focusPinsOnlyWhileIdle() async throws {
         let registry = TerminalEndpointRegistry()
@@ -44,8 +152,10 @@ struct TerminalEndpointRegistryTests {
         )
 
         let threadID = AgentThreadID(rawValue: "thread-1")
+        let handle = AgentTurnHandle(threadID: threadID)
         let prepared = try await registry.prepareTurn(
-            threadID: threadID,
+            handle: handle,
+            token: TerminalEndpointBindingToken(),
             conversationKey: TerminalToolFixtures.key
         )
         #expect(prepared.endpoint.id.rawValue == secondID)
@@ -53,19 +163,22 @@ struct TerminalEndpointRegistryTests {
         try await registry.focus(TerminalEndpointID(rawValue: firstID))
         let turnID = AgentTurnID(rawValue: "turn-1")
         let claimed = try await registry.claimPreparedTurn(
-            threadID: threadID,
+            handle: handle,
+            token: prepared.token,
             conversationKey: TerminalToolFixtures.key,
             turnID: turnID
         )
         #expect(claimed.endpoint.id.rawValue == secondID)
         try await registry.confirmTurnID(
-            threadID: threadID,
+            handle: handle,
+            token: prepared.token,
             turnID: turnID
         )
 
         await #expect(throws: TerminalEndpointRegistryError.turnIDMismatch) {
             try await registry.confirmTurnID(
-                threadID: threadID,
+                handle: handle,
+                token: prepared.token,
                 turnID: AgentTurnID(rawValue: "other")
             )
         }
@@ -92,38 +205,45 @@ struct TerminalEndpointRegistryTests {
         )
         try await registry.focus(endpointID)
         let threadID = AgentThreadID(rawValue: "thread-loss")
+        let handle = AgentTurnHandle(threadID: threadID)
         let turnID = AgentTurnID(rawValue: "turn-loss")
-        _ = try await registry.prepareTurn(
-            threadID: threadID,
+        let prepared = try await registry.prepareTurn(
+            handle: handle,
+            token: TerminalEndpointBindingToken(),
             conversationKey: TerminalToolFixtures.key
         )
         _ = try await registry.claimPreparedTurn(
-            threadID: threadID,
+            handle: handle,
+            token: prepared.token,
             conversationKey: TerminalToolFixtures.key,
             turnID: turnID
         )
-        let stream = await registry.events()
+        let subscription = await registry.subscribe()
         let eventTask = Task {
-            var iterator = stream.makeAsyncIterator()
+            var iterator = subscription.events.makeAsyncIterator()
             return await iterator.next()
         }
 
         await registry.unregister(endpointID)
 
-        #expect(
-            await eventTask.value == .pinLost(
-                TerminalEndpointPinLoss(
-                    threadID: threadID,
-                    turnID: turnID,
-                    phase: .active,
-                    conversationKey: TerminalToolFixtures.key,
-                    endpointID: endpointID
-                )
-            )
+        let expectedPin = TerminalEndpointPin(
+            handle: handle,
+            bindingToken: prepared.token,
+            turnID: turnID,
+            phase: .active,
+            conversationKey: TerminalToolFixtures.key,
+            endpointID: endpointID
         )
+        guard case let .pinLost(loss, revision) = await eventTask.value else {
+            Issue.record("expected pin-loss event")
+            return
+        }
+        #expect(loss.pin == expectedPin)
+        #expect(revision > subscription.snapshot.revision)
         await #expect(throws: TerminalEndpointRegistryError.pinLost) {
             try await registry.binding(
-                threadID: threadID,
+                handle: handle,
+                token: prepared.token,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key
             )
@@ -152,35 +272,42 @@ struct TerminalEndpointRegistryTests {
             )
         )
         let threadID = AgentThreadID(rawValue: "thread-event")
+        let handle = AgentTurnHandle(threadID: threadID)
         let turnID = AgentTurnID(rawValue: "turn-event")
-        _ = try await registry.prepareTurn(
-            threadID: threadID,
+        let prepared = try await registry.prepareTurn(
+            handle: handle,
+            token: TerminalEndpointBindingToken(),
             conversationKey: TerminalToolFixtures.key
         )
         _ = try await registry.claimPreparedTurn(
-            threadID: threadID,
+            handle: handle,
+            token: prepared.token,
             conversationKey: TerminalToolFixtures.key,
             turnID: turnID
         )
-        let stream = await registry.events()
+        let subscription = await registry.subscribe()
         let eventTask = Task {
-            var iterator = stream.makeAsyncIterator()
+            var iterator = subscription.events.makeAsyncIterator()
             return await iterator.next()
         }
 
         await registry.unregister(endpointID)
 
+        guard case let .pinLost(loss, revision) = await eventTask.value else {
+            Issue.record("expected pin-loss event")
+            return
+        }
         #expect(
-            await eventTask.value == .pinLost(
-                TerminalEndpointPinLoss(
-                    threadID: threadID,
-                    turnID: turnID,
-                    phase: .active,
-                    conversationKey: TerminalToolFixtures.key,
-                    endpointID: endpointID
-                )
+            loss.pin == TerminalEndpointPin(
+                handle: handle,
+                bindingToken: prepared.token,
+                turnID: turnID,
+                phase: .active,
+                conversationKey: TerminalToolFixtures.key,
+                endpointID: endpointID
             )
         )
+        #expect(revision > subscription.snapshot.revision)
     }
 
     @Test("route mismatch is rejected without registering the endpoint")
@@ -213,7 +340,10 @@ struct TerminalEndpointRegistryTests {
         }
         await #expect(throws: TerminalEndpointRegistryError.noFocusedEndpoint) {
             try await registry.prepareTurn(
-                threadID: AgentThreadID(rawValue: "route-mismatch"),
+                handle: AgentTurnHandle(
+                    threadID: AgentThreadID(rawValue: "route-mismatch")
+                ),
+                token: TerminalEndpointBindingToken(),
                 conversationKey: TerminalToolFixtures.key
             )
         }
@@ -273,8 +403,10 @@ struct TerminalEndpointRegistryTests {
         )
         try await registry.register(original)
         let threadID = AgentThreadID(rawValue: "duplicate-endpoint")
-        _ = try await registry.prepareTurn(
-            threadID: threadID,
+        let handle = AgentTurnHandle(threadID: threadID)
+        let prepared = try await registry.prepareTurn(
+            handle: handle,
+            token: TerminalEndpointBindingToken(),
             conversationKey: TerminalToolFixtures.key
         )
 
@@ -287,7 +419,8 @@ struct TerminalEndpointRegistryTests {
         }
         let turnID = AgentTurnID(rawValue: "duplicate-endpoint-turn")
         let claimed = try await registry.claimPreparedTurn(
-            threadID: threadID,
+            handle: handle,
+            token: prepared.token,
             conversationKey: TerminalToolFixtures.key,
             turnID: turnID
         )
@@ -317,11 +450,17 @@ struct TerminalEndpointRegistryTests {
         }
         await userGate.open()
         await unregister.value
-        await registry.releaseTurn(threadID: threadID, turnID: turnID)
+        await registry.releaseTurn(
+            handle: handle,
+            token: prepared.token,
+            turnID: turnID
+        )
         try await registry.register(differentConversationReplacement)
         let replacementThread = AgentThreadID(rawValue: "replacement-endpoint")
+        let replacementHandle = AgentTurnHandle(threadID: replacementThread)
         let rebound = try await registry.prepareTurn(
-            threadID: replacementThread,
+            handle: replacementHandle,
+            token: TerminalEndpointBindingToken(),
             conversationKey: replacementKey
         )
         #expect(try await rebound.endpoint.terminal.observeScreen() == replacementScreen)
@@ -346,18 +485,22 @@ struct TerminalEndpointRegistryTests {
             )
         )
         let threadID = AgentThreadID(rawValue: "prepared-release")
-        _ = try await registry.prepareTurn(
-            threadID: threadID,
+        let handle = AgentTurnHandle(threadID: threadID)
+        let prepared = try await registry.prepareTurn(
+            handle: handle,
+            token: TerminalEndpointBindingToken(),
             conversationKey: TerminalToolFixtures.key
         )
 
         await registry.releaseTurn(
-            threadID: threadID,
+            handle: handle,
+            token: prepared.token,
             turnID: AgentTurnID(rawValue: "unrelated")
         )
 
         _ = try await registry.claimPreparedTurn(
-            threadID: threadID,
+            handle: handle,
+            token: prepared.token,
             conversationKey: TerminalToolFixtures.key,
             turnID: AgentTurnID(rawValue: "actual")
         )
@@ -381,8 +524,10 @@ struct TerminalEndpointRegistryTests {
             )
         )
         let threadID = AgentThreadID(rawValue: "exact-prepared-release")
-        _ = try await registry.prepareTurn(
-            threadID: threadID,
+        let handle = AgentTurnHandle(threadID: threadID)
+        let prepared = try await registry.prepareTurn(
+            handle: handle,
+            token: TerminalEndpointBindingToken(),
             conversationKey: TerminalToolFixtures.key
         )
         let otherKey = TerminalConversationKey(
@@ -394,21 +539,25 @@ struct TerminalEndpointRegistryTests {
         )
 
         await registry.releasePrepared(
-            threadID: threadID,
+            handle: handle,
+            token: prepared.token,
             conversationKey: otherKey
         )
         await #expect(throws: TerminalEndpointRegistryError.threadAlreadyPrepared) {
             try await registry.prepareTurn(
-                threadID: threadID,
+                handle: AgentTurnHandle(threadID: threadID),
+                token: TerminalEndpointBindingToken(),
                 conversationKey: TerminalToolFixtures.key
             )
         }
         await registry.releasePrepared(
-            threadID: threadID,
+            handle: handle,
+            token: prepared.token,
             conversationKey: TerminalToolFixtures.key
         )
         _ = try await registry.prepareTurn(
-            threadID: threadID,
+            handle: AgentTurnHandle(threadID: threadID),
+            token: TerminalEndpointBindingToken(),
             conversationKey: TerminalToolFixtures.key
         )
         #expect(await port.keyboardOwners() == [.codex, .user, .codex])
@@ -432,26 +581,36 @@ struct TerminalEndpointRegistryTests {
             )
         )
         let threadID = AgentThreadID(rawValue: "prepared-pin-loss")
-        _ = try await registry.prepareTurn(
-            threadID: threadID,
+        let handle = AgentTurnHandle(threadID: threadID)
+        let prepared = try await registry.prepareTurn(
+            handle: handle,
+            token: TerminalEndpointBindingToken(),
             conversationKey: TerminalToolFixtures.key
         )
-        let stream = await registry.events()
+        let subscription = await registry.subscribe()
         let eventTask = Task {
-            var iterator = stream.makeAsyncIterator()
+            var iterator = subscription.events.makeAsyncIterator()
             return await iterator.next()
         }
 
         await registry.unregister(endpointID)
 
         let expected = TerminalEndpointPinLoss(
-            threadID: threadID,
-            turnID: nil,
-            phase: .prepared,
-            conversationKey: TerminalToolFixtures.key,
-            endpointID: endpointID
+            pin: TerminalEndpointPin(
+                handle: handle,
+                bindingToken: prepared.token,
+                turnID: nil,
+                phase: .prepared,
+                conversationKey: TerminalToolFixtures.key,
+                endpointID: endpointID
+            )
         )
-        #expect(await eventTask.value == .pinLost(expected))
+        guard case let .pinLost(loss, revision) = await eventTask.value else {
+            Issue.record("expected prepared pin-loss event")
+            return
+        }
+        #expect(loss == expected)
+        #expect(revision > subscription.snapshot.revision)
     }
 
     @Test("release waits for preparing ownership and blocks replacement")
@@ -473,9 +632,12 @@ struct TerminalEndpointRegistryTests {
             )
         )
         let threadID = AgentThreadID(rawValue: "preparing-release")
+        let handle = AgentTurnHandle(threadID: threadID)
+        let token = TerminalEndpointBindingToken()
         let prepare = Task {
             try await registry.prepareTurn(
-                threadID: threadID,
+                handle: handle,
+                token: token,
                 conversationKey: TerminalToolFixtures.key
             )
         }
@@ -485,7 +647,8 @@ struct TerminalEndpointRegistryTests {
 
         let release = Task {
             await registry.releasePrepared(
-                threadID: threadID,
+                handle: handle,
+                token: token,
                 conversationKey: TerminalToolFixtures.key
             )
         }
@@ -493,7 +656,8 @@ struct TerminalEndpointRegistryTests {
         let replacement = Task {
             do {
                 _ = try await registry.prepareTurn(
-                    threadID: threadID,
+                    handle: AgentTurnHandle(threadID: threadID),
+                    token: TerminalEndpointBindingToken(),
                     conversationKey: TerminalToolFixtures.key
                 )
                 await replacementProbe.complete(with: nil)
@@ -537,8 +701,10 @@ struct TerminalEndpointRegistryTests {
             )
         )
         let threadID = AgentThreadID(rawValue: "releasing")
-        _ = try await registry.prepareTurn(
-            threadID: threadID,
+        let handle = AgentTurnHandle(threadID: threadID)
+        let prepared = try await registry.prepareTurn(
+            handle: handle,
+            token: TerminalEndpointBindingToken(),
             conversationKey: TerminalToolFixtures.key
         )
         let userGate = TerminalToolTestGate()
@@ -546,7 +712,8 @@ struct TerminalEndpointRegistryTests {
 
         let release = Task {
             await registry.releasePrepared(
-                threadID: threadID,
+                handle: handle,
+                token: prepared.token,
                 conversationKey: TerminalToolFixtures.key
             )
         }
@@ -555,7 +722,8 @@ struct TerminalEndpointRegistryTests {
         }
         await #expect(throws: TerminalEndpointRegistryError.threadAlreadyPrepared) {
             _ = try await registry.prepareTurn(
-                threadID: threadID,
+                handle: AgentTurnHandle(threadID: threadID),
+                token: TerminalEndpointBindingToken(),
                 conversationKey: TerminalToolFixtures.key
             )
         }
@@ -565,7 +733,8 @@ struct TerminalEndpointRegistryTests {
         await release.value
         await port.blockKeyboardOwner(.user, on: nil)
         _ = try await registry.prepareTurn(
-            threadID: threadID,
+            handle: AgentTurnHandle(threadID: threadID),
+            token: TerminalEndpointBindingToken(),
             conversationKey: TerminalToolFixtures.key
         )
         #expect(await port.keyboardOwners() == [.codex, .user, .codex])
@@ -590,9 +759,12 @@ struct TerminalEndpointRegistryTests {
         )
         try await registry.register(endpoint)
         let threadID = AgentThreadID(rawValue: "unregister-preparing")
+        let handle = AgentTurnHandle(threadID: threadID)
+        let token = TerminalEndpointBindingToken()
         let prepare = Task {
             try await registry.prepareTurn(
-                threadID: threadID,
+                handle: handle,
+                token: token,
                 conversationKey: TerminalToolFixtures.key
             )
         }
@@ -604,7 +776,8 @@ struct TerminalEndpointRegistryTests {
         for _ in 0..<100 { await Task.yield() }
         await #expect(throws: TerminalEndpointRegistryError.threadAlreadyPrepared) {
             _ = try await registry.prepareTurn(
-                threadID: threadID,
+                handle: AgentTurnHandle(threadID: threadID),
+                token: TerminalEndpointBindingToken(),
                 conversationKey: TerminalToolFixtures.key
             )
         }
@@ -620,7 +793,8 @@ struct TerminalEndpointRegistryTests {
         await port.blockKeyboardOwner(.codex, on: nil)
         try await registry.register(endpoint)
         _ = try await registry.prepareTurn(
-            threadID: threadID,
+            handle: AgentTurnHandle(threadID: threadID),
+            token: TerminalEndpointBindingToken(),
             conversationKey: TerminalToolFixtures.key
         )
         #expect(await port.keyboardOwners() == [.codex, .user, .codex])
@@ -679,7 +853,10 @@ struct TerminalEndpointRegistryTests {
         )
         let firstPrepare = Task {
             try await registry.prepareTurn(
-                threadID: AgentThreadID(rawValue: "parallel-first"),
+                handle: AgentTurnHandle(
+                    threadID: AgentThreadID(rawValue: "parallel-first")
+                ),
+                token: TerminalEndpointBindingToken(),
                 conversationKey: firstKey
             )
         }
@@ -688,7 +865,10 @@ struct TerminalEndpointRegistryTests {
         }
 
         _ = try await registry.prepareTurn(
-            threadID: AgentThreadID(rawValue: "parallel-second"),
+            handle: AgentTurnHandle(
+                threadID: AgentThreadID(rawValue: "parallel-second")
+            ),
+            token: TerminalEndpointBindingToken(),
             conversationKey: secondKey
         )
         #expect(await secondPort.keyboardOwners() == [.codex])
@@ -701,8 +881,8 @@ struct TerminalEndpointRegistryTests {
     @Test("endpoint churn leaves no keyboard transition or ownership tombstones")
     func endpointChurnPrunesTransientState() async throws {
         let registry = TerminalEndpointRegistry()
-        let stream = await registry.events()
-        var iterator = stream.makeAsyncIterator()
+        let subscription = await registry.subscribe()
+        var iterator = subscription.events.makeAsyncIterator()
         var events: [TerminalEndpointRegistryEvent] = []
         for index in 0..<25 {
             let port = FakeTerminalToolPort(
@@ -722,7 +902,8 @@ struct TerminalEndpointRegistryTests {
             )
             let threadID = AgentThreadID(rawValue: "churn-\(index)")
             _ = try await registry.prepareTurn(
-                threadID: threadID,
+                handle: AgentTurnHandle(threadID: threadID),
+                token: TerminalEndpointBindingToken(),
                 conversationKey: TerminalToolFixtures.key
             )
             await registry.unregister(endpointID)
@@ -733,9 +914,10 @@ struct TerminalEndpointRegistryTests {
 
         #expect(events.count == 25)
         #expect(events.allSatisfy { event in
-            guard case let .pinLost(loss) = event else { return false }
+            guard case let .pinLost(loss, _) = event else { return false }
             return loss.phase == .prepared && loss.turnID == nil
         })
+        #expect(events.map(\.revision) == Array(1...25).map(UInt64.init))
         let snapshot = await registry.testingStateSnapshot()
         #expect(snapshot.endpointCount == 0)
         #expect(snapshot.bindingCount == 0)
@@ -748,7 +930,7 @@ struct TerminalEndpointRegistryTests {
     @Test("slow event subscribers receive bounded overflow reconciliation")
     func slowSubscriberReceivesOverflowReconciliation() async throws {
         let registry = TerminalEndpointRegistry()
-        let stream = await registry.events()
+        let subscription = await registry.subscribe()
 
         for index in 0..<5 {
             let endpointID = TerminalEndpointID(
@@ -768,19 +950,263 @@ struct TerminalEndpointRegistryTests {
                 )
             )
             _ = try await registry.prepareTurn(
-                threadID: AgentThreadID(rawValue: "slow-\(index)"),
+                handle: AgentTurnHandle(
+                    threadID: AgentThreadID(rawValue: "slow-\(index)")
+                ),
+                token: TerminalEndpointBindingToken(),
                 conversationKey: TerminalToolFixtures.key
             )
             await registry.unregister(endpointID)
         }
 
-        var iterator = stream.makeAsyncIterator()
-        #expect(await iterator.next() == .reconciliationRequired)
+        var iterator = subscription.events.makeAsyncIterator()
+        guard case let .reconciliationRequired(revision) = await iterator.next()
+        else {
+            Issue.record("expected overflow reconciliation")
+            return
+        }
+        #expect(revision > subscription.snapshot.revision)
         let snapshot = await registry.testingStateSnapshot()
         #expect(snapshot.eventSubscriberCount == 1)
         #expect(snapshot.eventBufferCapacity == 1)
         #expect(snapshot.bindingCount == 0)
         #expect(snapshot.conversationOwnerCount == 0)
         #expect(snapshot.pinLossHistoryCount == 0)
+    }
+
+    @Test("subscription atomically snapshots exact pins before later loss events")
+    func subscriptionAtomicallySnapshotsExactPins() async throws {
+        let registry = TerminalEndpointRegistry()
+        let endpointID = TerminalEndpointID(
+            rawValue: TerminalToolFixtures.newID()
+        )
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: endpointID.rawValue,
+                port: FakeTerminalToolPort(
+                    snapshot: TerminalToolFixtures.screen(revision: 1601)
+                ),
+                controller: FakeTerminalSurfaceController(
+                    surface: TerminalToolFixtures.surface()
+                )
+            )
+        )
+        let handle = AgentTurnHandle(
+            threadID: AgentThreadID(rawValue: "atomic-subscription")
+        )
+        let turnID = AgentTurnID(rawValue: "atomic-turn")
+        let prepared = try await registry.prepareTurn(
+            handle: handle,
+            token: TerminalEndpointBindingToken(),
+            conversationKey: TerminalToolFixtures.key
+        )
+        _ = try await registry.claimPreparedTurn(
+            handle: handle,
+            token: prepared.token,
+            conversationKey: TerminalToolFixtures.key,
+            turnID: turnID
+        )
+        let expectedPin = TerminalEndpointPin(
+            handle: handle,
+            bindingToken: prepared.token,
+            turnID: turnID,
+            phase: .active,
+            conversationKey: TerminalToolFixtures.key,
+            endpointID: endpointID
+        )
+
+        let subscription = await registry.subscribe()
+        #expect(subscription.snapshot.pins == [expectedPin])
+        let eventTask = Task {
+            var iterator = subscription.events.makeAsyncIterator()
+            return await iterator.next()
+        }
+
+        await registry.unregister(endpointID)
+
+        guard case let .pinLost(loss, revision) = await eventTask.value else {
+            Issue.record("expected exact pin-loss event")
+            return
+        }
+        #expect(loss.pin == expectedPin)
+        #expect(revision > subscription.snapshot.revision)
+        let reconciled = await registry.pinSnapshot()
+        #expect(reconciled.revision == revision)
+        #expect(reconciled.pins.isEmpty)
+    }
+
+    @Test("subscription after unregister publication starts from reconciled state")
+    func subscriptionAfterUnregisterPublicationHasNoGap() async throws {
+        let registry = TerminalEndpointRegistry()
+        let endpointID = TerminalEndpointID(
+            rawValue: TerminalToolFixtures.newID()
+        )
+        let port = FakeTerminalToolPort(
+            snapshot: TerminalToolFixtures.screen(revision: 1604)
+        )
+        let userGate = TerminalToolTestGate()
+        await port.blockKeyboardOwner(.user, on: userGate)
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: endpointID.rawValue,
+                port: port,
+                controller: FakeTerminalSurfaceController(
+                    surface: TerminalToolFixtures.surface()
+                )
+            )
+        )
+        _ = try await registry.prepareTurn(
+            handle: AgentTurnHandle(
+                threadID: AgentThreadID(rawValue: "unregister-first")
+            ),
+            token: TerminalEndpointBindingToken(),
+            conversationKey: TerminalToolFixtures.key
+        )
+        let unregister = Task { await registry.unregister(endpointID) }
+        while !(
+            await port.keyboardOwnerTransitionsStarted().contains(.user)
+        ) {
+            await Task.yield()
+        }
+
+        let subscription = await registry.subscribe()
+        #expect(subscription.snapshot.revision == 1)
+        #expect(subscription.snapshot.pins.isEmpty)
+
+        await userGate.open()
+        await unregister.value
+    }
+
+    @Test("overflow reconciliation snapshots all current exact pins")
+    func overflowReconciliationSnapshotsCurrentExactPins() async throws {
+        let registry = TerminalEndpointRegistry()
+        let firstID = TerminalEndpointID(
+            rawValue: TerminalToolFixtures.newID()
+        )
+        let secondID = TerminalEndpointID(
+            rawValue: TerminalToolFixtures.newID()
+        )
+        let secondIdentity = TmuxSessionIdentity(
+            serverSessionID: "$overflow-second",
+            createdAtEpoch: 1_602
+        )
+        let secondKey = TerminalConversationKey(
+            target: .local,
+            tmux: secondIdentity
+        )
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: firstID.rawValue,
+                port: FakeTerminalToolPort(
+                    snapshot: TerminalToolFixtures.screen(revision: 1602)
+                ),
+                controller: FakeTerminalSurfaceController(
+                    surface: TerminalToolFixtures.surface()
+                )
+            )
+        )
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: secondID.rawValue,
+                key: secondKey,
+                port: FakeTerminalToolPort(
+                    snapshot: TerminalToolFixtures.screen(revision: 1603)
+                ),
+                controller: FakeTerminalSurfaceController(
+                    surface: TmuxSurface(
+                        sessionIdentity: secondIdentity,
+                        windowID: "@overflow",
+                        paneID: "%overflow",
+                        currentCommand: "zsh"
+                    )
+                ),
+                route: TmuxRoute(
+                    target: .local,
+                    sessionName: "overflow-second",
+                    expectedIdentity: secondIdentity
+                )
+            )
+        )
+        let firstHandle = AgentTurnHandle(
+            threadID: AgentThreadID(rawValue: "overflow-first")
+        )
+        let secondHandle = AgentTurnHandle(
+            threadID: AgentThreadID(rawValue: "overflow-second")
+        )
+        let first = try await registry.prepareTurn(
+            handle: firstHandle,
+            token: TerminalEndpointBindingToken(),
+            conversationKey: TerminalToolFixtures.key
+        )
+        let second = try await registry.prepareTurn(
+            handle: secondHandle,
+            token: TerminalEndpointBindingToken(),
+            conversationKey: secondKey
+        )
+        let expectedPins: Set<TerminalEndpointPin> = [
+            TerminalEndpointPin(
+                handle: firstHandle,
+                bindingToken: first.token,
+                turnID: nil,
+                phase: .prepared,
+                conversationKey: TerminalToolFixtures.key,
+                endpointID: firstID
+            ),
+            TerminalEndpointPin(
+                handle: secondHandle,
+                bindingToken: second.token,
+                turnID: nil,
+                phase: .prepared,
+                conversationKey: secondKey,
+                endpointID: secondID
+            ),
+        ]
+        let subscription = await registry.subscribe()
+        #expect(subscription.snapshot.pins == expectedPins)
+        var consumerRevision = subscription.snapshot.revision
+        var consumerPins = subscription.snapshot.pins
+
+        await registry.unregister(firstID)
+        await registry.unregister(secondID)
+
+        var iterator = subscription.events.makeAsyncIterator()
+        guard case let .reconciliationRequired(revision) = await iterator.next()
+        else {
+            Issue.record("expected bounded overflow reconciliation")
+            return
+        }
+        guard revision > consumerRevision else {
+            Issue.record("expected a newer reconciliation revision")
+            return
+        }
+        let authoritative = await registry.pinSnapshot()
+        let lostPins = consumerPins.subtracting(authoritative.pins)
+        consumerPins = authoritative.pins
+        consumerRevision = authoritative.revision
+
+        #expect(consumerRevision == revision)
+        #expect(lostPins == expectedPins)
+        #expect(consumerPins.isEmpty)
+    }
+
+    @Test("cancelled subscriptions promptly release bounded subscriber state")
+    func cancelledSubscriptionReleasesSubscriberState() async {
+        let registry = TerminalEndpointRegistry()
+        let subscription = await registry.subscribe()
+        let consumer = Task {
+            var iterator = subscription.events.makeAsyncIterator()
+            _ = await iterator.next()
+        }
+        #expect(await registry.testingStateSnapshot().eventSubscriberCount == 1)
+
+        consumer.cancel()
+        await consumer.value
+        for _ in 0..<100
+        where await registry.testingStateSnapshot().eventSubscriberCount != 0
+        {
+            await Task.yield()
+        }
+
+        #expect(await registry.testingStateSnapshot().eventSubscriberCount == 0)
     }
 }
