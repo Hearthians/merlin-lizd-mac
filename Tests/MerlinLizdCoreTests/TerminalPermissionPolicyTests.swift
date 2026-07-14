@@ -177,6 +177,46 @@ struct TerminalPermissionPolicyTests {
         assertRequiresApproval(semanticEnter, context: "semantic Enter")
     }
 
+    @Test("text allows only printable grapheme clusters")
+    func validatesPrintableTextGraphemes() throws {
+        let printable = [
+            "", "ASCII 09 !?[]", " ", "é", "e\u{301}", "你好",
+            "😀", "👩‍💻", "✈️", "👍🏽", "1️⃣",
+        ]
+        for value in printable {
+            let evaluation = try evaluate(events: [.text(value)])
+            #expect(evaluation.deterministicRisk == .routine)
+            #expect(evaluation.decision == .allow)
+        }
+
+        let nonPrintable = [
+            "\u{202E}",
+            "\u{200B}",
+            "\u{2028}",
+            "\u{2029}",
+            "\u{0378}",
+            "\u{E000}",
+            "\u{301}",
+            "\u{0903}",
+            "\u{20DD}",
+            "\u{200D}",
+            "\u{FE0F}",
+            "\u{00AD}",
+            "ن\u{200C}",
+            "x\u{2060}",
+            "e\u{034F}",
+            "字\u{E0100}",
+            "safe\u{202E}txt",
+            "x\u{200D}",
+        ]
+        for value in nonPrintable {
+            assertDenied(
+                try evaluate(events: [.text(value)]),
+                context: value.debugDescription
+            )
+        }
+    }
+
     @Test("raw controls and malformed character keys deny before approval")
     func deniesMalformedInputShapes() throws {
         let forbiddenValues = Array(0x00...0x1F).filter {
@@ -358,44 +398,97 @@ struct TerminalPermissionPolicyTests {
 
     @Test("only the finite allow shapes ever return allow")
     func enforcesClosedWorldAllowInvariant() throws {
-        let normal = terminalTestScreen()
-        let alternate = terminalTestScreen(
-            mode: TerminalScreenMode(
+        let modes = [
+            TerminalScreenMode(
+                isAlternateScreen: false,
+                keyboardMode: .normal
+            ),
+            TerminalScreenMode(
+                isAlternateScreen: false,
+                keyboardMode: .applicationCursor
+            ),
+            TerminalScreenMode(
+                isAlternateScreen: true,
+                keyboardMode: .normal
+            ),
+            TerminalScreenMode(
                 isAlternateScreen: true,
                 keyboardMode: .applicationCursor
-            )
-        )
-        let samples: [(TerminalInputEvent, Bool, Bool)] = [
-            (.text("printable rm -rf /"), true, false),
-            (.text("printable 👩‍💻"), true, false),
-            (.text("submit\r\n"), false, false),
-            (.text("control\u{85}"), false, false),
-            (.key(.character("x"), modifiers: []), true, false),
-            (.key(.character("xy"), modifiers: []), false, false),
-            (.key(.backspace, modifiers: []), true, false),
-            (.key(.delete, modifiers: []), true, false),
-            (.key(.left, modifiers: []), true, true),
-            (.key(.right, modifiers: []), true, true),
-            (.key(.home, modifiers: []), true, true),
-            (.key(.end, modifiers: []), true, true),
-            (.key(.pageUp, modifiers: []), true, true),
-            (.key(.pageDown, modifiers: []), true, true),
-            (.key(.enter, modifiers: []), false, false),
-            (.key(.escape, modifiers: []), false, false),
-            (.key(.tab, modifiers: []), false, false),
-            (.key(.up, modifiers: .control), false, false),
-            (.key(.insert, modifiers: []), false, false),
-            (.key(.function(1), modifiers: []), false, false),
+            ),
         ]
+        let textCases: [(String, Bool)] = [
+            ("", true),
+            ("printable rm -rf /", true),
+            ("é e\u{301} 你好 👩‍💻", true),
+            ("submit\r", false),
+            ("submit\n", false),
+            ("submit\r\n", false),
+            ("control\u{85}", false),
+            ("bidi\u{202E}", false),
+            ("zero-width\u{200B}", false),
+            ("line\u{2028}", false),
+            ("paragraph\u{2029}", false),
+            ("unassigned\u{0378}", false),
+            ("private\u{E000}", false),
+            ("\u{301}", false),
+            ("\u{200D}", false),
+        ]
+        var keyCases: [(TerminalKey, Bool, Bool)] = [
+            (.character("x"), true, false),
+            (.character("xy"), false, false),
+            (.enter, false, false),
+            (.escape, false, false),
+            (.backspace, true, false),
+            (.tab, false, false),
+            (.up, true, true),
+            (.down, true, true),
+            (.right, true, true),
+            (.left, true, true),
+            (.home, true, true),
+            (.end, true, true),
+            (.insert, false, false),
+            (.delete, true, false),
+            (.pageUp, true, true),
+            (.pageDown, true, true),
+            (.function(0), false, false),
+            (.function(13), false, false),
+        ]
+        keyCases += (1...12).map { (.function($0), false, false) }
 
-        for (event, normalAllows, alternateAllows) in samples {
-            let normalEvaluation = try evaluate(events: [event], screen: normal)
-            #expect((normalEvaluation.decision == .allow) == normalAllows)
-            let alternateEvaluation = try evaluate(
-                events: [event],
-                screen: alternate
-            )
-            #expect((alternateEvaluation.decision == .allow) == alternateAllows)
+        for mode in modes {
+            let screen = terminalTestScreen(mode: mode)
+            for (value, normalAllows) in textCases {
+                let evaluation = try evaluate(
+                    events: [.text(value)],
+                    screen: screen
+                )
+                let expected = !mode.isAlternateScreen && normalAllows
+                #expect((evaluation.decision == .allow) == expected)
+            }
+            for (key, normalAllows, alternateAllows) in keyCases {
+                let evaluation = try evaluate(
+                    events: [.key(key, modifiers: [])],
+                    screen: screen
+                )
+                let expected = mode.isAlternateScreen
+                    ? alternateAllows
+                    : normalAllows
+                #expect((evaluation.decision == .allow) == expected)
+            }
+            for rawValue in UInt8.min...UInt8.max {
+                let evaluation = try evaluate(
+                    events: [
+                        .key(
+                            .left,
+                            modifiers: TerminalKeyModifiers(rawValue: rawValue)
+                        ),
+                    ],
+                    screen: screen
+                )
+                #expect(
+                    (evaluation.decision == .allow) == (rawValue == 0)
+                )
+            }
         }
     }
 

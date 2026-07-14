@@ -174,8 +174,8 @@ public struct TerminalPermissionPolicy: Sendable {
     private func validateRawEvent(_ event: TerminalInputEvent) -> String? {
         switch event {
         case let .text(value):
-            if value.unicodeScalars.contains(where: isForbiddenRawTextScalar) {
-                return "Text input contains an unsupported terminal control scalar"
+            if !value.allSatisfy(isPrintableTextGrapheme) {
+                return "Text input must contain only printable grapheme clusters or submission boundaries"
             }
         case let .key(.character(value), _):
             guard value.unicodeScalars.count == 1,
@@ -188,6 +188,99 @@ public struct TerminalPermissionPolicy: Sendable {
             break
         }
         return nil
+    }
+
+    private func isPrintableTextGrapheme(_ grapheme: Character) -> Bool {
+        let scalars = Array(grapheme.unicodeScalars)
+        if scalars.allSatisfy(isSubmissionBoundaryScalar) {
+            return true
+        }
+
+        var hasVisibleBase = false
+        var hasSpace = false
+        var hasMark = false
+        var hasEmojiVariationSelector = false
+        var joinerIndices: [Int] = []
+
+        for (index, scalar) in scalars.enumerated() {
+            if isEmojiVariationSelector(scalar) {
+                hasEmojiVariationSelector = true
+                continue
+            }
+            if scalar.value == 0x200D {
+                joinerIndices.append(index)
+                continue
+            }
+            if scalar.properties.isDefaultIgnorableCodePoint {
+                return false
+            }
+            if isVisibleTextBaseScalar(scalar) {
+                hasVisibleBase = true
+                continue
+            }
+            switch scalar.properties.generalCategory {
+            case .spaceSeparator:
+                hasSpace = true
+            case .nonspacingMark, .spacingMark, .enclosingMark:
+                hasMark = true
+            default:
+                return false
+            }
+        }
+
+        guard hasVisibleBase || (hasSpace && !hasMark) else { return false }
+        if hasMark, !hasVisibleBase { return false }
+        if hasEmojiVariationSelector,
+            !scalars.contains(where: isEmojiTextBaseScalar)
+        {
+            return false
+        }
+        return joinerIndices.allSatisfy { index in
+            hasEmojiTextBase(before: index, in: scalars)
+                && hasEmojiTextBase(after: index, in: scalars)
+        }
+    }
+
+    private func isSubmissionBoundaryScalar(_ scalar: Unicode.Scalar) -> Bool {
+        scalar.value == 0x0A || scalar.value == 0x0D
+    }
+
+    private func isEmojiVariationSelector(_ scalar: Unicode.Scalar) -> Bool {
+        scalar.value == 0xFE0E || scalar.value == 0xFE0F
+    }
+
+    private func isVisibleTextBaseScalar(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.properties.generalCategory {
+        case .uppercaseLetter, .lowercaseLetter, .titlecaseLetter,
+            .modifierLetter, .otherLetter, .decimalNumber, .letterNumber,
+            .otherNumber, .connectorPunctuation, .dashPunctuation,
+            .openPunctuation, .closePunctuation, .initialPunctuation,
+            .finalPunctuation, .otherPunctuation, .mathSymbol,
+            .currencySymbol, .modifierSymbol, .otherSymbol:
+            true
+        default:
+            false
+        }
+    }
+
+    private func isEmojiTextBaseScalar(_ scalar: Unicode.Scalar) -> Bool {
+        isVisibleTextBaseScalar(scalar) && scalar.properties.isEmoji
+    }
+
+    private func hasEmojiTextBase(
+        before index: Int,
+        in scalars: [Unicode.Scalar]
+    ) -> Bool {
+        scalars[..<index].last(where: isVisibleTextBaseScalar)
+            .map(isEmojiTextBaseScalar) ?? false
+    }
+
+    private func hasEmojiTextBase(
+        after index: Int,
+        in scalars: [Unicode.Scalar]
+    ) -> Bool {
+        scalars[(index + 1)...].first(where: isVisibleTextBaseScalar)
+            .map(isEmojiTextBaseScalar) ?? false
     }
 
     private func isForbiddenRawTextScalar(_ scalar: Unicode.Scalar) -> Bool {
