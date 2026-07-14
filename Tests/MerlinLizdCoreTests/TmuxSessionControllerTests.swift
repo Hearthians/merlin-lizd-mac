@@ -1019,10 +1019,30 @@ struct TmuxSessionControllerTests {
 
     @Test("a post-split user switch exposes and retains the exact pane")
     func postSplitSwitchExposesRetainedPane() async throws {
-        let switched = surface(paneID: "%99", command: "vim")
+        let sensitiveCommand =
+            "/private/key worker_alias tmux capture-pane SECRET"
+        let switched = surface(paneID: "%99", command: sensitiveCommand)
+        let location = RetainedSurfaceLocation(
+            sessionIdentity: switched.sessionIdentity,
+            windowID: switched.windowID,
+            paneID: switched.paneID
+        )
         try await expectRetainedPaneAfterVerificationFailure(
-            .output(surfaceOutput(paneID: "%99", command: "vim")),
-            reason: .createdPaneNotCurrent(actual: switched)
+            .output(surfaceOutput(
+                paneID: "%99",
+                command: sensitiveCommand
+            )),
+            reason: .createdPaneNotCurrent(actual: location),
+            requiredEncodedTexts: ["$3", "100", "@12", "%99"],
+            forbiddenEncodedTexts: [
+                sensitiveCommand,
+                "/private/key",
+                "worker_alias",
+                "capture-pane",
+                "SECRET",
+                "currentCommand",
+            ],
+            roundTripEncodedReason: true
         )
     }
 
@@ -1049,7 +1069,7 @@ struct TmuxSessionControllerTests {
             .sensitiveFailure(secret),
             reason: .unavailable,
             expectedEncodedReason: #"{"unavailable":{}}"#,
-            forbiddenEncodedText: secret
+            forbiddenEncodedTexts: [secret]
         )
     }
 
@@ -1530,7 +1550,9 @@ private func expectRetainedPaneAfterVerificationFailure(
     _ verification: GatedSurfaceRunner.Action,
     reason: RetainedTemporaryPaneReason,
     expectedEncodedReason: String? = nil,
-    forbiddenEncodedText: String? = nil
+    requiredEncodedTexts: [String] = [],
+    forbiddenEncodedTexts: [String] = [],
+    roundTripEncodedReason: Bool = false
 ) async throws {
     let runner = GatedSurfaceRunner(actions: retainedPaneActions(
         verification: verification
@@ -1553,7 +1575,9 @@ private func expectRetainedPaneAfterVerificationFailure(
         runner: runner,
         origin: origin,
         expectedEncodedReason: expectedEncodedReason,
-        forbiddenEncodedText: forbiddenEncodedText
+        requiredEncodedTexts: requiredEncodedTexts,
+        forbiddenEncodedTexts: forbiddenEncodedTexts,
+        roundTripEncodedReason: roundTripEncodedReason
     )
 }
 
@@ -1599,7 +1623,9 @@ private func expectRetainedPaneRecovery(
     origin: TmuxSurface,
     creationCommandCount: Int = 2,
     expectedEncodedReason: String? = nil,
-    forbiddenEncodedText: String? = nil
+    requiredEncodedTexts: [String] = [],
+    forbiddenEncodedTexts: [String] = [],
+    roundTripEncodedReason: Bool = false
 ) async throws {
     guard let error else {
         Issue.record("Expected a retained temporary-pane error")
@@ -1615,11 +1641,24 @@ private func expectRetainedPaneRecovery(
     )
     #expect(retained == expectedPane)
     #expect(actualReason == reason)
-    if let expectedEncodedReason {
+    if expectedEncodedReason != nil
+        || !requiredEncodedTexts.isEmpty
+        || !forbiddenEncodedTexts.isEmpty
+        || roundTripEncodedReason
+    {
         let encoded = try encodeRetainedTemporaryPaneReason(actualReason)
-        #expect(encoded == expectedEncodedReason)
-        if let forbiddenEncodedText {
+        if let expectedEncodedReason {
+            #expect(encoded == expectedEncodedReason)
+        }
+        for requiredEncodedText in requiredEncodedTexts {
+            #expect(encoded.contains(requiredEncodedText))
+        }
+        for forbiddenEncodedText in forbiddenEncodedTexts {
             #expect(!encoded.contains(forbiddenEncodedText))
+        }
+        if roundTripEncodedReason {
+            #expect(try decodeRetainedTemporaryPaneReason(encoded)
+                == actualReason)
         }
     }
     #expect(await runner.commands().count == creationCommandCount)

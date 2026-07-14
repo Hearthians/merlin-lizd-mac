@@ -98,6 +98,25 @@ public struct RetainedTemporaryPane: Codable, Equatable, Sendable {
     }
 }
 
+/// Bounded tmux location metadata retained after a verified surface is found
+/// somewhere other than the pane just created. Display labels, commands, and
+/// diagnostics are intentionally excluded from this persisted payload.
+public struct RetainedSurfaceLocation: Codable, Equatable, Sendable {
+    public let sessionIdentity: TmuxSessionIdentity
+    public let windowID: String
+    public let paneID: String
+
+    public init(
+        sessionIdentity: TmuxSessionIdentity,
+        windowID: String,
+        paneID: String
+    ) {
+        self.sessionIdentity = sessionIdentity
+        self.windowID = windowID
+        self.paneID = paneID
+    }
+}
+
 /// The typed cause that prevented a successfully created and retained pane
 /// from being returned as a verified current surface.
 public enum RetainedTemporaryPaneReason: Codable, Equatable, Sendable {
@@ -111,7 +130,7 @@ public enum RetainedTemporaryPaneReason: Codable, Equatable, Sendable {
         expected: TmuxSessionIdentity,
         actual: TmuxSessionIdentity
     )
-    case createdPaneNotCurrent(actual: TmuxSurface)
+    case createdPaneNotCurrent(actual: RetainedSurfaceLocation)
     case unavailable
 }
 

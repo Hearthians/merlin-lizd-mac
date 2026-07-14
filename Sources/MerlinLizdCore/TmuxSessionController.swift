@@ -237,7 +237,11 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
         else {
             throw TmuxSurfaceControlError.temporaryPaneRetained(
                 pane: retained,
-                reason: .createdPaneNotCurrent(actual: temporary)
+                reason: .createdPaneNotCurrent(actual: RetainedSurfaceLocation(
+                    sessionIdentity: temporary.sessionIdentity,
+                    windowID: temporary.windowID,
+                    paneID: temporary.paneID
+                ))
             )
         }
         temporaryPanes[key] = OwnedTemporaryPane(
