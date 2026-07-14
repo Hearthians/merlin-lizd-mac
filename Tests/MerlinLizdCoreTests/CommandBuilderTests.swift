@@ -761,6 +761,14 @@ struct CommandBuilderTests {
             try MerlinCommands.selectTmuxPane(
                 target: workerTarget(), paneID: "%456", selection: .nextPane
             ),
+            try MerlinCommands.renameTmuxSession(
+                target: workerTarget(),
+                from: "mlz-old",
+                to: "training-main",
+                identity: TmuxSessionIdentity(
+                    serverSessionID: "$3", createdAtEpoch: 100
+                )
+            ),
         ]
         let runner = FoundationInventoryProcessRunner()
         var reconstructed: [String] = []
@@ -787,6 +795,52 @@ struct CommandBuilderTests {
             "tmux display-message -p -t mlz-shell -F#{session_id},#{session_created},#{window_id},#{pane_id},#{pane_current_command}",
             "tmux split-window -t %456 -P -F#{window_id},#{pane_id}",
             #"tmux select-pane -t %456 \; select-pane -t :.+"#,
+            "tmux rename-session -t '$3' training-main",
+        ])
+
+        let directory = temporarySSHDirectory()
+        _ = try await runner.run(.init(
+            executable: "/bin/mkdir",
+            arguments: [directory.path]
+        ))
+        let fakeTmux = """
+        #!/bin/sh
+        for argument in "$@"; do
+            printf "<%s>" "$argument"
+        done
+        printf "\\n"
+        """
+        let installFakeTmux = """
+        printf "%s" '\(fakeTmux)' > \(directory.path)/tmux
+        chmod 700 \(directory.path)/tmux
+        """
+        _ = try await runner.run(.init(
+            executable: "/bin/sh",
+            arguments: ["-c", installFakeTmux]
+        ))
+        var finalArguments: [String] = []
+        for workerCommand in reconstructed {
+            let output = try await runner.run(.init(
+                executable: "/usr/bin/env",
+                arguments: [
+                    "PATH=\(directory.path):/usr/bin:/bin",
+                    "/bin/sh", "-c", workerCommand,
+                ]
+            ))
+            finalArguments.append(output.stdout.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ))
+        }
+        _ = try await runner.run(.init(
+            executable: "/bin/rm",
+            arguments: ["-rf", directory.path]
+        ))
+
+        #expect(finalArguments == [
+            "<display-message><-p><-t><mlz-shell><-F#{session_id},#{session_created},#{window_id},#{pane_id},#{pane_current_command}>",
+            "<split-window><-t><%456><-P><-F#{window_id},#{pane_id}>",
+            "<select-pane><-t><%456><;><select-pane><-t><:.+>",
+            "<rename-session><-t><$3><training-main>",
         ])
     }
 

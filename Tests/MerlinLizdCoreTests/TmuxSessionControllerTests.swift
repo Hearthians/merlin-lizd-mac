@@ -210,6 +210,309 @@ struct TmuxSessionControllerTests {
         #expect(await runner.commands().count == 2)
     }
 
+    @Test("same-route selections serialize mutation through verification")
+    func sameRouteSelectionsDoNotInterleave() async throws {
+        let gate = AsyncStartGate()
+        let runner = GatedSurfaceRunner(actions: [
+            .wait(gate, then: successfulOutput()),
+            .output(surfaceOutput(paneID: "%35")),
+            .output(successfulOutput()),
+            .output(surfaceOutput(paneID: "%36")),
+        ])
+        let controller = TmuxSessionController(processRunner: runner)
+        let first = Task {
+            try await controller.select(
+                .paneRight,
+                from: surface(paneID: "%34"),
+                route: localRoute()
+            )
+        }
+        await gate.waitUntilEntered()
+        let secondStarted = AsyncCompletionProbe()
+        let second = Task {
+            await secondStarted.complete()
+            return try await controller.select(
+                .paneLeft,
+                from: surface(paneID: "%34"),
+                route: localRoute()
+            )
+        }
+        await waitUntilStarted(secondStarted)
+        await settleSubmittedOperation()
+
+        #expect(await runner.commands().map(\.arguments) == [[
+            "select-pane", "-t", "%34", "-R",
+        ]])
+
+        await gate.open()
+        #expect(try await first.value == surface(paneID: "%35"))
+        #expect(try await second.value == surface(paneID: "%36"))
+        #expect(await runner.commands().map(\.arguments) == [
+            ["select-pane", "-t", "%34", "-R"],
+            currentSurfaceArguments(sessionName: "mlz-shell"),
+            ["select-pane", "-t", "%34", "-L"],
+            currentSurfaceArguments(sessionName: "mlz-shell"),
+        ])
+    }
+
+    @Test("same-route creates serialize and retain each split pane ownership")
+    func sameRouteCreatesRegisterTheirOwnPanes() async throws {
+        let gate = AsyncStartGate()
+        let runner = GatedSurfaceRunner(actions: [
+            .wait(gate, then: splitOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%35")),
+            .output(splitOutput(paneID: "%36")),
+            .output(surfaceOutput(paneID: "%36")),
+            .output(surfaceOutput(paneID: "%35")),
+            .output(successfulOutput()),
+            .output(successfulOutput()),
+            .output(successfulOutput()),
+            .output(surfaceOutput(paneID: "%34")),
+            .output(surfaceOutput(paneID: "%36")),
+            .output(successfulOutput()),
+            .output(successfulOutput()),
+            .output(successfulOutput()),
+            .output(surfaceOutput(paneID: "%34")),
+        ])
+        let controller = TmuxSessionController(processRunner: runner)
+        let origin = surface(paneID: "%34")
+        let first = Task {
+            try await controller.createTemporaryPane(
+                from: origin, route: localRoute()
+            )
+        }
+        await gate.waitUntilEntered()
+        let secondStarted = AsyncCompletionProbe()
+        let second = Task {
+            await secondStarted.complete()
+            return try await controller.createTemporaryPane(
+                from: origin, route: localRoute()
+            )
+        }
+        await waitUntilStarted(secondStarted)
+        await settleSubmittedOperation()
+
+        #expect(await runner.commands().map(\.arguments) == [[
+            "split-window", "-t", "%34", "-P",
+            "-F#{window_id},#{pane_id}",
+        ]])
+
+        await gate.open()
+        #expect(try await first.value == surface(paneID: "%35"))
+        #expect(try await second.value == surface(paneID: "%36"))
+        try await controller.closeTemporaryPane(
+            "%35", restoring: origin, route: localRoute()
+        )
+        try await controller.closeTemporaryPane(
+            "%36", restoring: origin, route: localRoute()
+        )
+
+        #expect(await runner.commands().filter {
+            $0.arguments.first == "kill-pane"
+        }.map(\.arguments) == [
+            ["kill-pane", "-t", "%35"],
+            ["kill-pane", "-t", "%36"],
+        ])
+    }
+
+    @Test("concurrent closes on one lease issue one kill and one ownership failure")
+    func concurrentClosesKillOwnedPaneOnce() async throws {
+        let gate = AsyncStartGate()
+        let runner = GatedSurfaceRunner(actions: [
+            .output(splitOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%35")),
+            .wait(gate, then: surfaceOutput(paneID: "%35")),
+            .output(successfulOutput()),
+            .output(successfulOutput()),
+            .output(successfulOutput()),
+            .output(surfaceOutput(paneID: "%34")),
+        ])
+        let controller = TmuxSessionController(processRunner: runner)
+        let origin = surface(paneID: "%34")
+        _ = try await controller.createTemporaryPane(
+            from: origin, route: localRoute()
+        )
+        let first = Task {
+            await closeOutcome(
+                controller: controller,
+                paneID: "%35",
+                origin: origin,
+                route: localRoute()
+            )
+        }
+        await gate.waitUntilEntered()
+        let secondStarted = AsyncCompletionProbe()
+        let second = Task {
+            await secondStarted.complete()
+            return await closeOutcome(
+                controller: controller,
+                paneID: "%35",
+                origin: origin,
+                route: localRoute()
+            )
+        }
+        await waitUntilStarted(secondStarted)
+        await settleSubmittedOperation()
+
+        #expect(await runner.commands().count == 3)
+
+        await gate.open()
+        #expect(await first.value == .success)
+        #expect(await second.value == .surfaceFailure(
+            .paneNotOwned(paneID: "%35")
+        ))
+        #expect(await runner.commands().filter {
+            $0.arguments.first == "kill-pane"
+        }.map(\.arguments) == [["kill-pane", "-t", "%35"]])
+    }
+
+    @Test("a failed same-route operation releases the next FIFO waiter")
+    func failedOperationReleasesRouteGate() async throws {
+        let gate = AsyncStartGate()
+        let runner = GatedSurfaceRunner(actions: [
+            .wait(gate, then: InventoryProcessOutput(
+                stdout: "", stderr: "selection failed", exitCode: 1
+            )),
+            .output(successfulOutput()),
+            .output(surfaceOutput(paneID: "%36")),
+        ])
+        let controller = TmuxSessionController(processRunner: runner)
+        let first = Task {
+            try await controller.select(
+                .paneRight,
+                from: surface(paneID: "%34"),
+                route: localRoute()
+            )
+        }
+        await gate.waitUntilEntered()
+        let secondStarted = AsyncCompletionProbe()
+        let second = Task {
+            await secondStarted.complete()
+            return try await controller.select(
+                .paneLeft,
+                from: surface(paneID: "%34"),
+                route: localRoute()
+            )
+        }
+        await waitUntilStarted(secondStarted)
+        await settleSubmittedOperation()
+
+        #expect(await runner.commands().count == 1)
+        await gate.open()
+        await #expect(throws: TmuxSurfaceControlError.commandFailed(
+            exitCode: 1
+        )) {
+            try await first.value
+        }
+        #expect(try await second.value == surface(paneID: "%36"))
+    }
+
+    @Test("cancelling a same-route FIFO waiter does not block its successor")
+    func cancelledWaiterDoesNotBlockRoute() async throws {
+        let gate = AsyncStartGate()
+        let runner = GatedSurfaceRunner(actions: [
+            .wait(gate, then: successfulOutput()),
+            .output(surfaceOutput(paneID: "%35")),
+            .output(successfulOutput()),
+            .output(surfaceOutput(paneID: "%37")),
+        ])
+        let controller = TmuxSessionController(processRunner: runner)
+        let first = Task {
+            try await controller.select(
+                .paneRight,
+                from: surface(paneID: "%34"),
+                route: localRoute()
+            )
+        }
+        await gate.waitUntilEntered()
+        let cancelledStarted = AsyncCompletionProbe()
+        let cancelled = Task {
+            await cancelledStarted.complete()
+            return try await controller.select(
+                .paneLeft,
+                from: surface(paneID: "%34"),
+                route: localRoute()
+            )
+        }
+        await waitUntilStarted(cancelledStarted)
+        await settleSubmittedOperation()
+        cancelled.cancel()
+        let third = Task {
+            try await controller.select(
+                .paneDown,
+                from: surface(paneID: "%34"),
+                route: localRoute()
+            )
+        }
+        await settleSubmittedOperation()
+
+        #expect(await runner.commands().count == 1)
+        await gate.open()
+        #expect(try await first.value == surface(paneID: "%35"))
+        await #expect(throws: CancellationError.self) {
+            try await cancelled.value
+        }
+        #expect(try await third.value == surface(paneID: "%37"))
+        #expect(await runner.commands().filter {
+            $0.arguments.first == "select-pane"
+        }.map(\.arguments) == [
+            ["select-pane", "-t", "%34", "-R"],
+            ["select-pane", "-t", "%34", "-D"],
+        ])
+    }
+
+    @Test("different stable routes continue while one route is suspended")
+    func differentRoutesProceedConcurrently() async throws {
+        let gate = AsyncStartGate()
+        let otherIdentity = TmuxSessionIdentity(
+            serverSessionID: "$4", createdAtEpoch: 101
+        )
+        let otherRoute = TmuxRoute(
+            target: .local,
+            sessionName: "mlz-other",
+            expectedIdentity: otherIdentity
+        )
+        let runner = GatedSurfaceRunner(actions: [
+            .wait(gate, then: successfulOutput()),
+            .output(successfulOutput()),
+            .output(surfaceOutput(
+                identity: otherIdentity,
+                paneID: "%44"
+            )),
+            .output(surfaceOutput(paneID: "%35")),
+        ])
+        let controller = TmuxSessionController(processRunner: runner)
+        let first = Task {
+            try await controller.select(
+                .nextWindow,
+                from: surface(paneID: "%34"),
+                route: localRoute()
+            )
+        }
+        await gate.waitUntilEntered()
+
+        let other = try await controller.select(
+            .previousWindow,
+            from: surface(
+                identity: otherIdentity,
+                paneID: "%43"
+            ),
+            route: otherRoute
+        )
+
+        #expect(other == surface(
+            identity: otherIdentity,
+            paneID: "%44"
+        ))
+        #expect(await runner.commands().map(\.arguments) == [
+            ["next-window", "-t", "mlz-shell"],
+            ["previous-window", "-t", "mlz-other"],
+            currentSurfaceArguments(sessionName: "mlz-other"),
+        ])
+        await gate.open()
+        #expect(try await first.value == surface(paneID: "%35"))
+    }
+
     @Test("remote metadata reads replay once through the shared SSH master")
     func metadataReadUsesSharedControlPathWithReadOnlyReplay() async throws {
         let direct = SurfaceRecordingRunner(outputs: [])
@@ -322,6 +625,100 @@ struct TmuxSessionControllerTests {
             )
         }
         #expect(await runner.commands().isEmpty)
+    }
+
+    @Test("an existing lease rejects a cross-route close without probing")
+    func existingLeaseRejectsCrossRouteClose() async throws {
+        let runner = SurfaceRecordingRunner(outputs: [
+            splitOutput(paneID: "%35"),
+            surfaceOutput(paneID: "%35"),
+        ])
+        let controller = TmuxSessionController(processRunner: runner)
+        _ = try await controller.createTemporaryPane(
+            from: surface(paneID: "%34"),
+            route: localRoute()
+        )
+        let otherIdentity = TmuxSessionIdentity(
+            serverSessionID: "$4", createdAtEpoch: 101
+        )
+        let otherRoute = TmuxRoute(
+            target: .local,
+            sessionName: "mlz-other",
+            expectedIdentity: otherIdentity
+        )
+        let commandCount = await runner.commands().count
+
+        await #expect(throws: TmuxSurfaceControlError.paneNotOwned(
+            paneID: "%35"
+        )) {
+            try await controller.closeTemporaryPane(
+                "%35",
+                restoring: surface(
+                    identity: otherIdentity,
+                    paneID: "%44"
+                ),
+                route: otherRoute
+            )
+        }
+        #expect(await runner.commands().count == commandCount)
+    }
+
+    @Test("an existing lease rejects a mismatched origin without probing")
+    func existingLeaseRejectsMismatchedOrigin() async throws {
+        let runner = SurfaceRecordingRunner(outputs: [
+            splitOutput(paneID: "%35"),
+            surfaceOutput(paneID: "%35"),
+        ])
+        let controller = TmuxSessionController(processRunner: runner)
+        _ = try await controller.createTemporaryPane(
+            from: surface(paneID: "%34"),
+            route: localRoute()
+        )
+        let commandCount = await runner.commands().count
+
+        await #expect(throws: TmuxSurfaceControlError.paneNotOwned(
+            paneID: "%35"
+        )) {
+            try await controller.closeTemporaryPane(
+                "%35",
+                restoring: surface(paneID: "%33"),
+                route: localRoute()
+            )
+        }
+        #expect(await runner.commands().count == commandCount)
+    }
+
+    @Test("a post-split user switch retains created-pane ownership and context")
+    func postSplitSwitchRetainsCreatedPane() async throws {
+        let runner = SurfaceRecordingRunner(outputs: [
+            splitOutput(paneID: "%35"),
+            surfaceOutput(paneID: "%99", command: "vim"),
+            surfaceOutput(paneID: "%35"),
+            successfulOutput(),
+            successfulOutput(),
+            successfulOutput(),
+            surfaceOutput(paneID: "%34"),
+        ])
+        let controller = TmuxSessionController(processRunner: runner)
+        let origin = surface(paneID: "%34")
+        let switched = surface(paneID: "%99", command: "vim")
+
+        await #expect(throws: TmuxSurfaceControlError.createdPaneNotCurrent(
+            createdWindowID: "@12",
+            createdPaneID: "%35",
+            actual: switched
+        )) {
+            try await controller.createTemporaryPane(
+                from: origin, route: localRoute()
+            )
+        }
+
+        try await controller.closeTemporaryPane(
+            "%35", restoring: origin, route: localRoute()
+        )
+        #expect(await runner.commands().filter {
+            $0.arguments.first == "kill-pane"
+        }.map(\.arguments) == [["kill-pane", "-t", "%35"]])
     }
 
     @Test("closes only the owned pane then structurally restores and verifies the origin")
@@ -454,6 +851,60 @@ private func successfulOutput() -> InventoryProcessOutput {
     InventoryProcessOutput(stdout: "", stderr: "", exitCode: 0)
 }
 
+private func splitOutput(
+    windowID: String = "@12",
+    paneID: String
+) -> InventoryProcessOutput {
+    InventoryProcessOutput(
+        stdout: "\(windowID),\(paneID)\n",
+        stderr: "",
+        exitCode: 0
+    )
+}
+
+private func currentSurfaceArguments(sessionName: String) -> [String] {
+    [
+        "display-message", "-p", "-t", sessionName,
+        "-F#{session_id},#{session_created},#{window_id},#{pane_id},#{pane_current_command}",
+    ]
+}
+
+private func waitUntilStarted(_ probe: AsyncCompletionProbe) async {
+    while await probe.count() == 0 {
+        await Task.yield()
+    }
+}
+
+private func settleSubmittedOperation() async {
+    for _ in 0 ..< 1_000 {
+        await Task.yield()
+    }
+}
+
+private enum CloseOutcome: Equatable, Sendable {
+    case success
+    case surfaceFailure(TmuxSurfaceControlError)
+    case unexpectedFailure
+}
+
+private func closeOutcome(
+    controller: TmuxSessionController,
+    paneID: String,
+    origin: TmuxSurface,
+    route: TmuxRoute
+) async -> CloseOutcome {
+    do {
+        try await controller.closeTemporaryPane(
+            paneID, restoring: origin, route: route
+        )
+        return .success
+    } catch let error as TmuxSurfaceControlError {
+        return .surfaceFailure(error)
+    } catch {
+        return .unexpectedFailure
+    }
+}
+
 private func surfaceOutput(
     identity: TmuxSessionIdentity = tmuxIdentity(),
     windowID: String = "@12",
@@ -495,6 +946,37 @@ private actor SurfaceRecordingRunner: InventoryProcessRunning {
             return InventoryProcessOutput(stdout: "", stderr: "", exitCode: 0)
         }
         return outputs.removeFirst()
+    }
+
+    func commands() -> [CommandSpec] {
+        recordedCommands
+    }
+}
+
+private actor GatedSurfaceRunner: InventoryProcessRunning {
+    enum Action: Sendable {
+        case output(InventoryProcessOutput)
+        case wait(AsyncStartGate, then: InventoryProcessOutput)
+    }
+
+    private var actions: [Action]
+    private var recordedCommands: [CommandSpec] = []
+
+    init(actions: [Action]) {
+        self.actions = actions
+    }
+
+    func run(_ command: CommandSpec) async throws -> InventoryProcessOutput {
+        recordedCommands.append(command)
+        guard !actions.isEmpty else { return successfulOutput() }
+        let action = actions.removeFirst()
+        switch action {
+        case let .output(output):
+            return output
+        case let .wait(gate, output):
+            await gate.wait()
+            return output
+        }
     }
 
     func commands() -> [CommandSpec] {

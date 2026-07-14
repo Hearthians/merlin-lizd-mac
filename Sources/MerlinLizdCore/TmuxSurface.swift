@@ -93,7 +93,11 @@ public enum TmuxSurfaceControlError: Error, Equatable, Sendable {
         expected: TmuxSessionIdentity,
         actual: TmuxSessionIdentity
     )
-    case createdPaneNotCurrent
+    case createdPaneNotCurrent(
+        createdWindowID: String,
+        createdPaneID: String,
+        actual: TmuxSurface
+    )
     case paneNotOwned(paneID: String)
     case leasePaneMissing(paneID: String)
     case restoreFailed

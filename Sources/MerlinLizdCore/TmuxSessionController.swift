@@ -13,6 +13,7 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
     private let sshMasterPool: SSHMasterPool?
     private let pooledExecutionPolicy: BoundedAsyncOperationRunner?
     private let localTmuxPath: String?
+    private let surfaceOperations = TmuxSurfaceOperationGate()
     private var temporaryPanes: [TemporaryPaneKey: OwnedTemporaryPane] = [:]
 
     public init(
@@ -113,6 +114,14 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
 
     public func currentSurface(route: TmuxRoute) async throws -> TmuxSurface {
         try validate(route: route)
+        return try await surfaceOperations.run(for: route.operationKey) { [self] in
+            try await currentSurfaceUnlocked(route: route)
+        }
+    }
+
+    private func currentSurfaceUnlocked(
+        route: TmuxRoute
+    ) async throws -> TmuxSurface {
         let command = try MerlinCommands.currentTmuxSurface(
             target: route.target,
             sessionName: route.sessionName,
@@ -127,6 +136,16 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
         route: TmuxRoute
     ) async throws -> TmuxSurface {
         try validate(surface: from, route: route)
+        return try await surfaceOperations.run(for: route.operationKey) { [self] in
+            try await selectUnlocked(selection, from: from, route: route)
+        }
+    }
+
+    private func selectUnlocked(
+        _ selection: TmuxVisibleSelection,
+        from: TmuxSurface,
+        route: TmuxRoute
+    ) async throws -> TmuxSurface {
         let localPath = try resolvedLocalTmuxPath(for: route.target)
         let command = switch selection {
         case .nextWindow, .previousWindow, .windowIndex:
@@ -146,7 +165,7 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
             )
         }
         try await runSurfaceMutation(command, target: route.target)
-        return try await currentSurface(route: route)
+        return try await currentSurfaceUnlocked(route: route)
     }
 
     public func createTemporaryPane(
@@ -154,6 +173,15 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
         route: TmuxRoute
     ) async throws -> TmuxSurface {
         try validate(surface: from, route: route)
+        return try await surfaceOperations.run(for: route.operationKey) { [self] in
+            try await createTemporaryPaneUnlocked(from: from, route: route)
+        }
+    }
+
+    private func createTemporaryPaneUnlocked(
+        from: TmuxSurface,
+        route: TmuxRoute
+    ) async throws -> TmuxSurface {
         let command = try MerlinCommands.splitTmuxPane(
             target: route.target,
             paneID: from.paneID,
@@ -169,18 +197,34 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
             throw TmuxSurfaceControlError.invalidSurfaceOutput
         }
 
-        let temporary = try await currentSurface(route: route)
+        let key = TemporaryPaneKey(
+            target: route.target,
+            sessionIdentity: route.expectedIdentity,
+            paneID: location.paneID
+        )
+        temporaryPanes[key] = OwnedTemporaryPane(
+            route: route,
+            origin: from,
+            temporary: TmuxSurface(
+                sessionIdentity: route.expectedIdentity,
+                windowID: location.windowID,
+                paneID: location.paneID,
+                currentCommand: ""
+            )
+        )
+
+        let temporary = try await currentSurfaceUnlocked(route: route)
         guard
             temporary.windowID == location.windowID,
             temporary.paneID == location.paneID
         else {
-            throw TmuxSurfaceControlError.createdPaneNotCurrent
+            throw TmuxSurfaceControlError.createdPaneNotCurrent(
+                createdWindowID: location.windowID,
+                createdPaneID: location.paneID,
+                actual: temporary
+            )
         }
-        temporaryPanes[TemporaryPaneKey(
-            target: route.target,
-            sessionIdentity: route.expectedIdentity,
-            paneID: temporary.paneID
-        )] = OwnedTemporaryPane(
+        temporaryPanes[key] = OwnedTemporaryPane(
             route: route,
             origin: from,
             temporary: temporary
@@ -197,6 +241,20 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
         guard MerlinIdentifierValidator.isTmuxPaneID(paneID) else {
             throw CommandValidationError.invalidTmuxPaneID
         }
+        try await surfaceOperations.run(for: route.operationKey) { [self] in
+            try await closeTemporaryPaneUnlocked(
+                paneID,
+                restoring: origin,
+                route: route
+            )
+        }
+    }
+
+    private func closeTemporaryPaneUnlocked(
+        _ paneID: String,
+        restoring origin: TmuxSurface,
+        route: TmuxRoute
+    ) async throws {
         let key = TemporaryPaneKey(
             target: route.target,
             sessionIdentity: route.expectedIdentity,
@@ -248,7 +306,7 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
             )
             try await runSurfaceMutation(restorePane, target: route.target)
 
-            let restored = try await currentSurface(route: route)
+            let restored = try await currentSurfaceUnlocked(route: route)
             guard
                 restored.windowID == origin.windowID,
                 restored.paneID == origin.paneID
@@ -424,6 +482,101 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
         } catch let SSHMasterPoolError.commandFailed(exitCode) {
             throw TmuxSessionMutationError.commandFailed(exitCode: exitCode)
         }
+    }
+}
+
+private struct TmuxSurfaceOperationKey: Hashable, Sendable {
+    let target: TerminalTarget
+    let sessionIdentity: TmuxSessionIdentity
+}
+
+private extension TmuxRoute {
+    var operationKey: TmuxSurfaceOperationKey {
+        TmuxSurfaceOperationKey(
+            target: target,
+            sessionIdentity: expectedIdentity
+        )
+    }
+}
+
+private actor TmuxSurfaceOperationGate {
+    private struct Waiter {
+        let id: UUID
+        let continuation: CheckedContinuation<UUID, Error>
+    }
+
+    private struct Lane {
+        var activeID: UUID?
+        var waiters: [Waiter] = []
+    }
+
+    private var lanes: [TmuxSurfaceOperationKey: Lane] = [:]
+
+    func run<Value: Sendable>(
+        for key: TmuxSurfaceOperationKey,
+        operation: @escaping @Sendable () async throws -> Value
+    ) async throws -> Value {
+        let id = try await acquire(for: key)
+        defer { release(id: id, for: key) }
+        try Task.checkCancellation()
+        return try await operation()
+    }
+
+    private func acquire(
+        for key: TmuxSurfaceOperationKey
+    ) async throws -> UUID {
+        let id = UUID()
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                var lane = lanes[key, default: Lane()]
+                if lane.activeID == nil {
+                    lane.activeID = id
+                    lanes[key] = lane
+                    continuation.resume(returning: id)
+                } else {
+                    lane.waiters.append(Waiter(
+                        id: id,
+                        continuation: continuation
+                    ))
+                    lanes[key] = lane
+                }
+            }
+        } onCancel: {
+            Task { await self.cancel(id: id, for: key) }
+        }
+    }
+
+    private func release(
+        id: UUID,
+        for key: TmuxSurfaceOperationKey
+    ) {
+        guard var lane = lanes[key], lane.activeID == id else { return }
+        guard !lane.waiters.isEmpty else {
+            lanes[key] = nil
+            return
+        }
+        let waiter = lane.waiters.removeFirst()
+        lane.activeID = waiter.id
+        lanes[key] = lane
+        waiter.continuation.resume(returning: waiter.id)
+    }
+
+    private func cancel(
+        id: UUID,
+        for key: TmuxSurfaceOperationKey
+    ) {
+        guard var lane = lanes[key] else { return }
+        if lane.activeID == id {
+            release(id: id, for: key)
+            return
+        }
+        guard let index = lane.waiters.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        let waiter = lane.waiters.remove(at: index)
+        lanes[key] = lane
+        waiter.continuation.resume(throwing: CancellationError())
     }
 }
 
