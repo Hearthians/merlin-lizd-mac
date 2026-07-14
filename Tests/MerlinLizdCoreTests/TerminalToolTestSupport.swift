@@ -44,6 +44,40 @@ actor TerminalToolCompletionProbe {
     }
 }
 
+actor TerminalRegistryCompletionProbe {
+    private var error: TerminalEndpointRegistryError?
+    private var didComplete = false
+
+    func complete(with error: TerminalEndpointRegistryError?) {
+        self.error = error
+        didComplete = true
+    }
+
+    func snapshot() -> (
+        didComplete: Bool,
+        error: TerminalEndpointRegistryError?
+    ) {
+        (didComplete, error)
+    }
+}
+
+actor TerminalTerminationCompletionProbe {
+    private var error: TerminalTurnTerminationError?
+    private var didComplete = false
+
+    func complete(with error: TerminalTurnTerminationError?) {
+        self.error = error
+        didComplete = true
+    }
+
+    func snapshot() -> (
+        didComplete: Bool,
+        error: TerminalTurnTerminationError?
+    ) {
+        (didComplete, error)
+    }
+}
+
 actor FakeTerminalToolPort: TerminalSessionPort {
     enum Failure: Error, Equatable {
         case send
@@ -57,6 +91,8 @@ actor FakeTerminalToolPort: TerminalSessionPort {
     private var sendFailures: [Failure?] = []
     private var sentBatches: [TerminalInputBatch] = []
     private var owners: [TerminalKeyboardOwner] = []
+    private var ownerTransitionsStarted: [TerminalKeyboardOwner] = []
+    private var ownerGates: [TerminalKeyboardOwner: TerminalToolTestGate] = [:]
     private var observeCount = 0
     private var waitCount = 0
     private var sendCount = 0
@@ -121,6 +157,11 @@ actor FakeTerminalToolPort: TerminalSessionPort {
     }
 
     func setKeyboardOwner(_ owner: TerminalKeyboardOwner) async {
+        ownerTransitionsStarted.append(owner)
+        await log?.append("\(label):owner-start:\(owner)")
+        if let gate = ownerGates[owner] {
+            await gate.wait()
+        }
         owners.append(owner)
         await log?.append("\(label):owner:\(owner)")
     }
@@ -153,6 +194,13 @@ actor FakeTerminalToolPort: TerminalSessionPort {
         checkCancellationAfterWaitGate = checkCancellationAfterGate
     }
 
+    func blockKeyboardOwner(
+        _ owner: TerminalKeyboardOwner,
+        on gate: TerminalToolTestGate?
+    ) {
+        ownerGates[owner] = gate
+    }
+
     func counts() -> (observe: Int, send: Int, wait: Int) {
         (observeCount, sendCount, waitCount)
     }
@@ -163,6 +211,10 @@ actor FakeTerminalToolPort: TerminalSessionPort {
 
     func keyboardOwners() -> [TerminalKeyboardOwner] {
         owners
+    }
+
+    func keyboardOwnerTransitionsStarted() -> [TerminalKeyboardOwner] {
+        ownerTransitionsStarted
     }
 }
 
@@ -182,6 +234,8 @@ actor FakeTerminalSurfaceController: TmuxSurfaceControlling {
         pane: RetainedTemporaryPane,
         reason: RetainedTemporaryPaneReason
     )?
+    private var currentGate: TerminalToolTestGate?
+    private var checkCancellationAfterCurrentGate = false
     private var calls: [String] = []
     private let log: TerminalToolTestLog?
 
@@ -198,6 +252,12 @@ actor FakeTerminalSurfaceController: TmuxSurfaceControlling {
     func currentSurface(route: TmuxRoute) async throws -> TmuxSurface {
         calls.append("current")
         await log?.append("surface:current")
+        if let currentGate {
+            await currentGate.wait()
+            if checkCancellationAfterCurrentGate {
+                try Task.checkCancellation()
+            }
+        }
         if failure == .currentCancelled { throw CancellationError() }
         if failure == .current { throw Failure.current }
         return surface
@@ -253,6 +313,14 @@ actor FakeTerminalSurfaceController: TmuxSurfaceControlling {
 
     func setFailure(_ failure: Failure?) {
         self.failure = failure
+    }
+
+    func blockCurrentSurface(
+        on gate: TerminalToolTestGate?,
+        checkCancellationAfterGate: Bool = false
+    ) {
+        currentGate = gate
+        checkCancellationAfterCurrentGate = checkCancellationAfterGate
     }
 
     func setRetainedCreateError(

@@ -83,7 +83,8 @@ public actor TerminalToolRouter {
         let binding: TerminalEndpointBinding
         let provenance: RetainedTemporaryPaneLease
         let lease: TemporaryPaneLease?
-        let retentionReason: TemporaryPaneRetentionReason?
+        var retentionReason: TemporaryPaneRetentionReason?
+        var isAutoCloseable: Bool
     }
 
     private struct LeaseKey: Hashable, Sendable {
@@ -119,6 +120,7 @@ public actor TerminalToolRouter {
     private var blockedTurns: Set<TurnKey> = []
     private var preparedTurns: [AgentThreadID: TerminalConversationKey] = [:]
     private var turnLifecycles: [TurnKey: TurnLifecycle] = [:]
+    private var terminationTasks: [TurnKey: Task<Void, any Error>] = [:]
 
     public init(
         registry: TerminalEndpointRegistry,
@@ -208,6 +210,17 @@ public actor TerminalToolRouter {
                     turnID: turnID
                 )
             } catch {
+                if case let .finishTemporaryPane(leaseID, _) = call,
+                    error as? TerminalEndpointRegistryError == .pinLost,
+                    let record = self.leases[
+                        LeaseKey(turn: turn, leaseID: leaseID)
+                    ]
+                {
+                    return try await self.runSerializedPinLossRetention(
+                        record: record,
+                        turn: turn
+                    )
+                }
                 if let preparedKey {
                     self.turnLifecycles[turn] = .ended
                     await self.registry.releasePrepared(
@@ -302,12 +315,48 @@ public actor TerminalToolRouter {
         }
     }
 
+    private func runSerializedPinLossRetention(
+        record: LeaseRecord,
+        turn: TurnKey
+    ) async throws -> TerminalToolResult {
+        try await gate.acquire(record.binding.conversationKey)
+        do {
+            let result = try await retainExistingLease(
+                record,
+                reason: pinLossRetentionReason(for: record),
+                operationID: UUID(),
+                turn: turn,
+                binding: record.binding
+            )
+            await gate.release(record.binding.conversationKey)
+            return result
+        } catch {
+            await gate.release(record.binding.conversationKey)
+            throw error
+        }
+    }
+
     private func perform(
         turn: TurnKey,
         binding: TerminalEndpointBinding,
         call: TerminalToolCall
     ) async throws -> TerminalToolResult {
-        try await ensureBinding(turn: turn, binding: binding)
+        do {
+            try await ensureBinding(turn: turn, binding: binding)
+        } catch TerminalToolRouterError.pinLost {
+            if case let .finishTemporaryPane(leaseID, _) = call,
+                let record = leases[LeaseKey(turn: turn, leaseID: leaseID)]
+            {
+                return try await retainExistingLease(
+                    record,
+                    reason: pinLossRetentionReason(for: record),
+                    operationID: UUID(),
+                    turn: turn,
+                    binding: record.binding
+                )
+            }
+            throw TerminalToolRouterError.pinLost
+        }
         switch call {
         case .observeScreen:
             return try await observe(turn: turn, binding: binding)
@@ -638,7 +687,8 @@ public actor TerminalToolRouter {
                 binding: binding,
                 provenance: provenance,
                 lease: lease,
-                retentionReason: nil
+                retentionReason: nil,
+                isAutoCloseable: true
             )
             do {
                 try await appendTemporary(
@@ -670,20 +720,28 @@ public actor TerminalToolRouter {
             guard temporary.sessionIdentity == binding.conversationKey.tmux,
                 temporary.sessionIdentity == binding.endpoint.route.expectedIdentity
             else {
-                throw TerminalToolRouterError.temporaryPaneRetained(
+                try await throwRetainedCreatedLease(
+                    lease,
                     provenance,
                     reason: .controllerRetained(
                         .sessionIdentityMismatch(
                             expected: binding.endpoint.route.expectedIdentity,
                             actual: temporary.sessionIdentity
                         )
-                    )
+                    ),
+                    isAutoCloseable: false,
+                    preparation: preparation,
+                    turn: turn
                 )
             }
             guard temporary.paneID != origin.paneID else {
-                throw TerminalToolRouterError.temporaryPaneRetained(
+                try await throwRetainedCreatedLease(
+                    lease,
                     provenance,
-                    reason: .controllerRetained(.unavailable)
+                    reason: .controllerRetained(.unavailable),
+                    isAutoCloseable: false,
+                    preparation: preparation,
+                    turn: turn
                 )
             }
             let waitResult: TerminalScreenWaitResult
@@ -797,7 +855,8 @@ public actor TerminalToolRouter {
                     binding: binding,
                     provenance: provenance,
                     lease: nil,
-                    retentionReason: retentionReason
+                    retentionReason: retentionReason,
+                    isAutoCloseable: false
                 )
                 do {
                     try await appendTemporary(
@@ -864,6 +923,15 @@ public actor TerminalToolRouter {
         let leaseKey = LeaseKey(turn: turn, leaseID: leaseID)
         guard let record = leases[leaseKey] else {
             throw TerminalToolRouterError.leaseNotFound
+        }
+        if !record.isAutoCloseable {
+            return try await retainExistingLease(
+                record,
+                reason: record.retentionReason ?? .routeUnavailable,
+                operationID: UUID(),
+                turn: turn,
+                binding: record.binding
+            )
         }
         guard let lease = record.lease else {
             throw TerminalToolRouterError.temporaryPaneRetained(
@@ -999,11 +1067,27 @@ public actor TerminalToolRouter {
                 let receipt = try await binding.endpoint.terminal.sendInput(
                     batch
                 )
+                if Task.isCancelled {
+                    return try await retainExistingLease(
+                        record,
+                        reason: .interrupted,
+                        preparation: preparation,
+                        turn: turn
+                    )
+                }
                 try await appendResult(
                     .success(receipt),
                     preparation: preparation,
                     turn: turn
                 )
+                if Task.isCancelled {
+                    return try await retainExistingLease(
+                        record,
+                        reason: .interrupted,
+                        preparation: preparation,
+                        turn: turn
+                    )
+                }
                 let waitResult = try await binding.endpoint.terminal
                     .waitForScreen(
                         TerminalScreenWaitRequest(
@@ -1014,6 +1098,14 @@ public actor TerminalToolRouter {
                             timeout: probeTimeout
                         )
                     )
+                if Task.isCancelled {
+                    return try await retainExistingLease(
+                        record,
+                        reason: .interrupted,
+                        preparation: preparation,
+                        turn: turn
+                    )
+                }
                 guard !waitResult.timedOut else {
                     return try await retainExistingLease(
                         record,
@@ -1028,6 +1120,14 @@ public actor TerminalToolRouter {
                     return try await retainExistingLease(
                         record,
                         reason: .pinLost,
+                        preparation: preparation,
+                        turn: turn
+                    )
+                }
+                if Task.isCancelled {
+                    return try await retainExistingLease(
+                        record,
+                        reason: .interrupted,
                         preparation: preparation,
                         turn: turn
                     )
@@ -1062,11 +1162,24 @@ public actor TerminalToolRouter {
                 do {
                     afterProbe = try await currentSurface(binding)
                 } catch TerminalToolRouterError.interrupted {
-                    throw TerminalToolRouterError.interrupted
+                    return try await retainExistingLease(
+                        record,
+                        reason: .interrupted,
+                        preparation: preparation,
+                        turn: turn
+                    )
                 } catch {
                     return try await retainExistingLease(
                         record,
                         reason: .routeUnavailable,
+                        preparation: preparation,
+                        turn: turn
+                    )
+                }
+                if Task.isCancelled {
+                    return try await retainExistingLease(
+                        record,
+                        reason: .interrupted,
                         preparation: preparation,
                         turn: turn
                     )
@@ -1088,6 +1201,7 @@ public actor TerminalToolRouter {
                 do {
                     try Task.checkCancellation()
                     try await ensureBinding(turn: turn, binding: binding)
+                    try Task.checkCancellation()
                     try await binding.endpoint.surfaces.closeTemporaryPane(
                         lease.temporary.paneID,
                         restoring: lease.origin,
@@ -1444,17 +1558,42 @@ public actor TerminalToolRouter {
         _ turn: TurnKey,
         reason: TemporaryPaneRetentionReason
     ) async throws {
+        if let existing = terminationTasks[turn] {
+            return try await existing.value
+        }
+
         let preparedKey: TerminalConversationKey?
         switch turnLifecycles[turn] {
         case .active:
             turnLifecycles[turn] = .terminating
             preparedKey = nil
-        case .terminating, .ended:
+        case .terminating:
+            if let existing = terminationTasks[turn] {
+                return try await existing.value
+            }
+            return
+        case .ended:
             return
         case nil:
             preparedKey = preparedTurns.removeValue(forKey: turn.threadID)
             turnLifecycles[turn] = .terminating
         }
+        let task = Task.detached {
+            try await self.performTermination(
+                turn,
+                reason: reason,
+                preparedKey: preparedKey
+            )
+        }
+        terminationTasks[turn] = task
+        try await task.value
+    }
+
+    private func performTermination(
+        _ turn: TurnKey,
+        reason: TemporaryPaneRetentionReason,
+        preparedKey: TerminalConversationKey?
+    ) async throws {
         await approvalBroker.cancelTurn(brokerTurnID(turn))
         let tasks = activeOperations.values
             .filter { $0.turn == turn }
@@ -1468,6 +1607,7 @@ public actor TerminalToolRouter {
         for key in retainedKeys {
             guard let record = leases.removeValue(forKey: key) else { continue }
             let operationID = UUID()
+            let retainedReason = record.retentionReason ?? reason
             do {
                 try await append(
                     event(
@@ -1480,7 +1620,7 @@ public actor TerminalToolRouter {
                                 pane: TerminalJournalPaneProvenance(
                                     record.provenance.pane
                                 ),
-                                reason: String(describing: reason)
+                                reason: String(describing: retainedReason)
                             )
                         )
                     ),
@@ -1491,7 +1631,7 @@ public actor TerminalToolRouter {
                 auditFailures.append(
                     TerminalTurnRetainedPaneAudit(
                         provenance: record.provenance,
-                        reason: reason
+                        reason: retainedReason
                     )
                 )
             }
@@ -1520,6 +1660,11 @@ public actor TerminalToolRouter {
         preparation: MutationPreparation,
         turn: TurnKey
     ) async throws -> TerminalToolResult {
+        updateLeaseRetention(
+            turn: turn,
+            leaseID: lease.id,
+            reason: reason
+        )
         do {
             try await appendTemporary(
                 .retained(
@@ -1550,9 +1695,16 @@ public actor TerminalToolRouter {
         _ lease: TemporaryPaneLease,
         _ provenance: RetainedTemporaryPaneLease,
         reason: TemporaryPaneRetentionReason,
+        isAutoCloseable: Bool = true,
         preparation: MutationPreparation,
         turn: TurnKey
     ) async throws -> Never {
+        updateLeaseRetention(
+            turn: turn,
+            leaseID: lease.id,
+            reason: reason,
+            isAutoCloseable: isAutoCloseable
+        )
         do {
             try await appendTemporary(
                 .retained(
@@ -1590,6 +1742,11 @@ public actor TerminalToolRouter {
                 reason: record.retentionReason ?? reason
             )
         }
+        updateLeaseRetention(
+            turn: turn,
+            leaseID: record.provenance.id,
+            reason: reason
+        )
         do {
             try await appendTemporary(
                 .retained(
@@ -1624,6 +1781,11 @@ public actor TerminalToolRouter {
                 reason: record.retentionReason ?? reason
             )
         }
+        updateLeaseRetention(
+            turn: turn,
+            leaseID: record.provenance.id,
+            reason: reason
+        )
         do {
             try await append(
                 event(
@@ -1775,7 +1937,9 @@ public actor TerminalToolRouter {
                 turnID: turn.turnID,
                 conversationKey: binding.conversationKey
             )
-            guard current.endpoint.id == binding.endpoint.id else {
+            guard current.token == binding.token,
+                current.endpoint.id == binding.endpoint.id
+            else {
                 throw TerminalToolRouterError.pinLost
             }
         } catch TerminalEndpointRegistryError.pinLost {
@@ -2017,6 +2181,30 @@ public actor TerminalToolRouter {
 
     private func liveLease(for turn: TurnKey) -> LeaseRecord? {
         leases.first(where: { $0.key.turn == turn })?.value
+    }
+
+    private func updateLeaseRetention(
+        turn: TurnKey,
+        leaseID: UUID,
+        reason: TemporaryPaneRetentionReason,
+        isAutoCloseable: Bool? = nil
+    ) {
+        let key = LeaseKey(turn: turn, leaseID: leaseID)
+        guard var record = leases[key] else { return }
+        record.retentionReason = reason
+        if let isAutoCloseable {
+            record.isAutoCloseable = isAutoCloseable
+        }
+        leases[key] = record
+    }
+
+    private func pinLossRetentionReason(
+        for record: LeaseRecord
+    ) -> TemporaryPaneRetentionReason {
+        if !record.isAutoCloseable, let reason = record.retentionReason {
+            return reason
+        }
+        return .pinLost
     }
 
     private func activateTurn(

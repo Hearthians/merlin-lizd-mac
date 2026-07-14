@@ -344,4 +344,248 @@ struct TerminalEndpointRegistryTests {
         )
         #expect(await eventTask.value == .pinLost(expected))
     }
+
+    @Test("release waits for preparing ownership and blocks replacement")
+    func preparingReleaseIsSerialized() async throws {
+        let registry = TerminalEndpointRegistry()
+        let port = FakeTerminalToolPort(
+            snapshot: TerminalToolFixtures.screen(revision: 1)
+        )
+        let surfaces = FakeTerminalSurfaceController(
+            surface: TerminalToolFixtures.surface()
+        )
+        let codexGate = TerminalToolTestGate()
+        await port.blockKeyboardOwner(.codex, on: codexGate)
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: TerminalToolFixtures.newID(),
+                port: port,
+                controller: surfaces
+            )
+        )
+        let threadID = AgentThreadID(rawValue: "preparing-release")
+        let prepare = Task {
+            try await registry.prepareTurn(
+                threadID: threadID,
+                conversationKey: TerminalToolFixtures.key
+            )
+        }
+        while await port.keyboardOwnerTransitionsStarted().isEmpty {
+            await Task.yield()
+        }
+
+        let release = Task {
+            await registry.releasePrepared(
+                threadID: threadID,
+                conversationKey: TerminalToolFixtures.key
+            )
+        }
+        let replacementProbe = TerminalRegistryCompletionProbe()
+        let replacement = Task {
+            do {
+                _ = try await registry.prepareTurn(
+                    threadID: threadID,
+                    conversationKey: TerminalToolFixtures.key
+                )
+                await replacementProbe.complete(with: nil)
+            } catch let error as TerminalEndpointRegistryError {
+                await replacementProbe.complete(with: error)
+            } catch {
+                await replacementProbe.complete(with: nil)
+            }
+        }
+        for _ in 0..<100 { await Task.yield() }
+
+        let replacementState = await replacementProbe.snapshot()
+        #expect(replacementState.didComplete)
+        #expect(replacementState.error == .threadAlreadyPrepared)
+        #expect(await port.keyboardOwnerTransitionsStarted() == [.codex])
+        #expect(await port.keyboardOwners().isEmpty)
+
+        await codexGate.open()
+        await release.value
+        await replacement.value
+        await #expect(throws: TerminalEndpointRegistryError.preparedBindingNotFound) {
+            _ = try await prepare.value
+        }
+        #expect(await port.keyboardOwners() == [.codex, .user])
+    }
+
+    @Test("release retains ownership until the user transition completes")
+    func releasingBlocksReplacement() async throws {
+        let registry = TerminalEndpointRegistry()
+        let port = FakeTerminalToolPort(
+            snapshot: TerminalToolFixtures.screen(revision: 1)
+        )
+        let surfaces = FakeTerminalSurfaceController(
+            surface: TerminalToolFixtures.surface()
+        )
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: TerminalToolFixtures.newID(),
+                port: port,
+                controller: surfaces
+            )
+        )
+        let threadID = AgentThreadID(rawValue: "releasing")
+        _ = try await registry.prepareTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        let userGate = TerminalToolTestGate()
+        await port.blockKeyboardOwner(.user, on: userGate)
+
+        let release = Task {
+            await registry.releasePrepared(
+                threadID: threadID,
+                conversationKey: TerminalToolFixtures.key
+            )
+        }
+        while !(await port.keyboardOwnerTransitionsStarted().contains(.user)) {
+            await Task.yield()
+        }
+        await #expect(throws: TerminalEndpointRegistryError.threadAlreadyPrepared) {
+            _ = try await registry.prepareTurn(
+                threadID: threadID,
+                conversationKey: TerminalToolFixtures.key
+            )
+        }
+        #expect(await port.keyboardOwners() == [.codex])
+
+        await userGate.open()
+        await release.value
+        await port.blockKeyboardOwner(.user, on: nil)
+        _ = try await registry.prepareTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        #expect(await port.keyboardOwners() == [.codex, .user, .codex])
+    }
+
+    @Test("unregister serializes pin loss cleanup behind preparing ownership")
+    func unregisterWhilePreparingIsSerialized() async throws {
+        let registry = TerminalEndpointRegistry()
+        let port = FakeTerminalToolPort(
+            snapshot: TerminalToolFixtures.screen(revision: 1)
+        )
+        let surfaces = FakeTerminalSurfaceController(
+            surface: TerminalToolFixtures.surface()
+        )
+        let endpointID = TerminalEndpointID(rawValue: TerminalToolFixtures.newID())
+        let codexGate = TerminalToolTestGate()
+        await port.blockKeyboardOwner(.codex, on: codexGate)
+        let endpoint = TerminalToolFixtures.endpoint(
+            id: endpointID.rawValue,
+            port: port,
+            controller: surfaces
+        )
+        try await registry.register(endpoint)
+        let threadID = AgentThreadID(rawValue: "unregister-preparing")
+        let prepare = Task {
+            try await registry.prepareTurn(
+                threadID: threadID,
+                conversationKey: TerminalToolFixtures.key
+            )
+        }
+        while await port.keyboardOwnerTransitionsStarted().isEmpty {
+            await Task.yield()
+        }
+
+        let unregister = Task { await registry.unregister(endpointID) }
+        for _ in 0..<100 { await Task.yield() }
+        await #expect(throws: TerminalEndpointRegistryError.threadAlreadyPrepared) {
+            _ = try await registry.prepareTurn(
+                threadID: threadID,
+                conversationKey: TerminalToolFixtures.key
+            )
+        }
+        #expect(await port.keyboardOwnerTransitionsStarted() == [.codex])
+
+        await codexGate.open()
+        await unregister.value
+        await #expect(throws: TerminalEndpointRegistryError.pinLost) {
+            _ = try await prepare.value
+        }
+        #expect(await port.keyboardOwners() == [.codex, .user])
+
+        await port.blockKeyboardOwner(.codex, on: nil)
+        try await registry.register(endpoint)
+        _ = try await registry.prepareTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        #expect(await port.keyboardOwners() == [.codex, .user, .codex])
+    }
+
+    @Test("keyboard transitions on different endpoints remain parallel")
+    func differentEndpointsRemainParallel() async throws {
+        let registry = TerminalEndpointRegistry()
+        let firstPort = FakeTerminalToolPort(
+            snapshot: TerminalToolFixtures.screen(revision: 1)
+        )
+        let secondPort = FakeTerminalToolPort(
+            snapshot: TerminalToolFixtures.screen(revision: 1)
+        )
+        let firstGate = TerminalToolTestGate()
+        await firstPort.blockKeyboardOwner(.codex, on: firstGate)
+        let firstKey = TerminalToolFixtures.key
+        let secondIdentity = TmuxSessionIdentity(
+            serverSessionID: "$parallel",
+            createdAtEpoch: 123
+        )
+        let secondKey = TerminalConversationKey(
+            target: .local,
+            tmux: secondIdentity
+        )
+        let secondRoute = TmuxRoute(
+            target: .local,
+            sessionName: "parallel",
+            expectedIdentity: secondIdentity
+        )
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: TerminalToolFixtures.newID(),
+                key: firstKey,
+                port: firstPort,
+                controller: FakeTerminalSurfaceController(
+                    surface: TerminalToolFixtures.surface()
+                )
+            )
+        )
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: TerminalToolFixtures.newID(),
+                key: secondKey,
+                port: secondPort,
+                controller: FakeTerminalSurfaceController(
+                    surface: TmuxSurface(
+                        sessionIdentity: secondIdentity,
+                        windowID: "@2",
+                        paneID: "%2",
+                        currentCommand: "zsh"
+                    )
+                ),
+                route: secondRoute
+            )
+        )
+        let firstPrepare = Task {
+            try await registry.prepareTurn(
+                threadID: AgentThreadID(rawValue: "parallel-first"),
+                conversationKey: firstKey
+            )
+        }
+        while await firstPort.keyboardOwnerTransitionsStarted().isEmpty {
+            await Task.yield()
+        }
+
+        _ = try await registry.prepareTurn(
+            threadID: AgentThreadID(rawValue: "parallel-second"),
+            conversationKey: secondKey
+        )
+        #expect(await secondPort.keyboardOwners() == [.codex])
+        #expect(await firstPort.keyboardOwners().isEmpty)
+
+        await firstGate.open()
+        _ = try await firstPrepare.value
+    }
 }
