@@ -214,7 +214,24 @@ public class LocalProcess {
      */
     public func send (data: ArraySlice<UInt8>)
     {
+        send(data: data) { _ in }
+    }
+
+    /**
+     * Sends the array slice to the local process and reports when DispatchIO
+     * has accepted all bytes, or when the write fails.
+     */
+    public func send(
+        data: ArraySlice<UInt8>,
+        completion: @escaping (Result<Void, POSIXError>) -> Void
+    ) {
+        let completion = LocalProcessSendCompletion(completion)
         guard running else {
+            completion.finish(.failure(POSIXError(.EPIPE)))
+            return
+        }
+        guard !data.isEmpty else {
+            completion.finish(.success(()))
             return
         }
         let copy = sendCount
@@ -226,18 +243,19 @@ public class LocalProcess {
                 print ("[SEND-\(copy)] Queuing data to client: \(data) ")
             }
 
-            DispatchIO.write(toFileDescriptor: childfd, data: ddata, runningHandlerOn: DispatchQueue.global(qos: .userInitiated), handler:  { [weak self] dd, errno in
-                guard let self else { return }
-                self.total += copyCount
+            DispatchIO.write(toFileDescriptor: childfd, data: ddata, runningHandlerOn: DispatchQueue.global(qos: .userInitiated), handler:  { [self] remainingData, errorNumber in
+                self.total += copyCount - (remainingData?.count ?? 0)
                 if self.debugIO {
                     print ("[SEND-\(copy)] completed bytes=\(self.total)")
                 }
-                if errno != 0 {
-                    print ("Error writing data to the child, errno=\(errno)")
+                if errorNumber != 0 {
+                    let code = POSIXError.Code(rawValue: errorNumber) ?? .EIO
+                    completion.finish(.failure(POSIXError(code)))
+                } else {
+                    completion.finish(.success(()))
                 }
             })
         }
-
     }
     
     /* Used to generate the next file name counter */
@@ -580,6 +598,23 @@ public class LocalProcess {
     public func setHostLogging (directory: String?)
     {
         loggingDir = directory
+    }
+}
+
+private final class LocalProcessSendCompletion {
+    private let lock = NSLock()
+    private var completion: ((Result<Void, POSIXError>) -> Void)?
+
+    init(_ completion: @escaping (Result<Void, POSIXError>) -> Void) {
+        self.completion = completion
+    }
+
+    func finish(_ result: Result<Void, POSIXError>) {
+        lock.lock()
+        let completion = self.completion
+        self.completion = nil
+        lock.unlock()
+        completion?(result)
     }
 }
 #endif

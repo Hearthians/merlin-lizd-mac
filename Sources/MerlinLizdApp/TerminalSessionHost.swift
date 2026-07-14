@@ -35,9 +35,9 @@ struct TerminalSessionHost: NSViewRepresentable {
 
 @MainActor
 final class TerminalContainerView: NSView {
-    private weak var displayedTerminal: LocalProcessTerminalView?
+    private weak var displayedTerminal: AgentTerminalView?
 
-    func show(_ terminal: LocalProcessTerminalView) {
+    func show(_ terminal: AgentTerminalView) {
         guard displayedTerminal !== terminal else {
             terminal.frame = bounds
             return

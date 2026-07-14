@@ -1,0 +1,14 @@
+{
+  "columns": 8,
+  "rows": 3,
+  "cells": [
+    {"grapheme":"C","style":0}, {"grapheme":"h","style":0}, {"grapheme":"o","style":0}, {"grapheme":"o","style":0},
+    {"grapheme":"s","style":0}, {"grapheme":"e","style":0}, {"grapheme":":","style":0}, {"grapheme":" ","style":0},
+    {"grapheme":">","style":12}, {"grapheme":" ","style":12}, {"grapheme":"A","style":12}, {"grapheme":"l","style":12},
+    {"grapheme":"p","style":12}, {"grapheme":"h","style":12}, {"grapheme":"a","style":12}, {"grapheme":" ","style":12},
+    {"grapheme":" ","style":0}, {"grapheme":" ","style":0}, {"grapheme":"B","style":0}, {"grapheme":"e","style":0},
+    {"grapheme":"t","style":0}, {"grapheme":"a","style":0}, {"grapheme":" ","style":0}, {"grapheme":" ","style":0}
+  ],
+  "cursor": {"row":1,"column":0,"isVisible":false},
+  "mode": {"isAlternateScreen":false,"keyboardMode":{"normal":{}}}
+}

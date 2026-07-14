@@ -942,7 +942,7 @@ extension TerminalView {
     }
     
     /// Returns the selection range for the specified row, if any.
-    func selectedColumnsRange(row: Int, cols: Int) -> Range<Int>? {
+    public func selectedColumnsRange(row: Int, cols: Int) -> Range<Int>? {
         guard let selection = self.selection, selection.active else {
             return nil
         }

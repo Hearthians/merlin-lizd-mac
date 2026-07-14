@@ -32,6 +32,9 @@ let package = Package(
             name: "MerlinLizdCoreTests",
             dependencies: ["MerlinLizdCore", "_Testing_Foundation"],
             path: "Tests/MerlinLizdCoreTests",
+            resources: [
+                .copy("Fixtures")
+            ],
             swiftSettings: [
                 .unsafeFlags([
                     "-F", "/Library/Developer/CommandLineTools/Library/Developer/Frameworks"

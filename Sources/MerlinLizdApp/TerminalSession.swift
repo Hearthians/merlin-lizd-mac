@@ -17,7 +17,8 @@ final class TerminalSession: ObservableObject, Identifiable, LocalProcessTermina
     typealias ProcessExitHandler = @MainActor (Int32?) -> Void
 
     let id: UUID
-    let terminalView: LocalProcessTerminalView
+    let terminalView: AgentTerminalView
+    let terminalDriver: SwiftTermTerminalDriver
 
     private let command: CommandSpec
     private let currentDirectory: String?
@@ -43,8 +44,9 @@ final class TerminalSession: ObservableObject, Identifiable, LocalProcessTermina
         self.onTitleChange = onTitleChange
         self.onProcessExit = onProcessExit
 
-        let terminalView = LocalProcessTerminalView(frame: .zero)
+        let terminalView = AgentTerminalView(frame: .zero)
         self.terminalView = terminalView
+        terminalDriver = SwiftTermTerminalDriver(terminalView: terminalView)
         terminalView.processDelegate = self
     }
 
@@ -73,6 +75,7 @@ final class TerminalSession: ObservableObject, Identifiable, LocalProcessTermina
         let shouldTerminate = state == .running && terminalView.process.running
         let processID = shouldTerminate ? terminalView.process.shellPid : 0
         state = .closed
+        terminalDriver.disconnect()
 
         // LocalProcess retains its last PID after exit. Calling terminate() when
         // it is no longer running could therefore signal an unrelated reused PID.
@@ -126,6 +129,7 @@ final class TerminalSession: ObservableObject, Identifiable, LocalProcessTermina
         }
 
         didReportExit = true
+        terminalDriver.disconnect()
         state = .exited(exitCode)
         onProcessExit?(exitCode)
     }
