@@ -565,6 +565,63 @@ struct TerminalOperationJournalTests {
         #expect(try await reopened.entries(for: event.key) == [event])
     }
 
+    @Test("existing mapping retries failed directory sync before journal append")
+    func existingMappingRetriesDirectorySyncAfterPublishFailure() async throws {
+        let fixture = try TerminalPersistenceFixture()
+        defer { fixture.remove() }
+        let syncRecorder = TerminalDirectorySyncRecorder(failingCalls: [5, 6])
+        let publishRecorder = TerminalMappingPublishRecorder()
+        let journal = try FileTerminalOperationJournal(
+            applicationSupportDirectory: fixture.applicationSupportDirectory,
+            hooks: TerminalOperationJournalHooks(
+                beforeMappingPublish: {
+                    await publishRecorder.record()
+                },
+                directorySync: syncRecorder.sync
+            )
+        )
+        let event = terminalTestJournalEvent(
+            kind: .request(operation: "sendInput", purpose: "durability retry")
+        )
+        let mappingURL = journal.mappingURL(for: event.key)
+        let journalURL = journal.journalURL(for: event.key)
+
+        await #expect(throws: ScriptedTerminalJournalError.unavailable) {
+            try await journal.append(event)
+        }
+        #expect(terminalFileExists(at: mappingURL))
+        #expect(!terminalFileExists(at: journalURL))
+        let publishedMapping = try terminalRawData(at: mappingURL)
+        #expect(try terminalDecodedMapping(at: mappingURL) == event.key)
+
+        await #expect(throws: ScriptedTerminalJournalError.unavailable) {
+            try await journal.append(event)
+        }
+        #expect(try terminalRawData(at: mappingURL) == publishedMapping)
+        #expect(!terminalFileExists(at: journalURL))
+
+        try await journal.append(event)
+
+        let application = fixture.applicationSupportDirectory
+            .appendingPathComponent("MerlinLizd", isDirectory: true)
+        let root = application
+            .appendingPathComponent("TerminalOperations", isDirectory: true)
+        #expect(
+            syncRecorder.paths() == [
+                fixture.applicationSupportDirectory.path,
+                application.path,
+                root.path,
+                root.path,
+                journal.mappingsDirectory.path,
+                journal.mappingsDirectory.path,
+                journal.mappingsDirectory.path,
+            ]
+        )
+        #expect(await publishRecorder.count() == 1)
+        #expect(try terminalRawData(at: mappingURL) == publishedMapping)
+        #expect(try await journal.entries(for: event.key) == [event])
+    }
+
     @Test("directory descriptor anchoring contains mappings and journals across symlink swaps")
     func containsAncestorSymlinkSwaps() async throws {
         let fixture = try TerminalPersistenceFixture()

@@ -57,6 +57,18 @@ final class TerminalDirectorySyncRecorder: @unchecked Sendable {
     }
 }
 
+actor TerminalMappingPublishRecorder {
+    private var recordedCount = 0
+
+    func record() {
+        recordedCount += 1
+    }
+
+    func count() -> Int {
+        recordedCount
+    }
+}
+
 final class TerminalAuditQueueProbe: @unchecked Sendable {
     private let lock = NSLock()
     private var reached = false
@@ -200,6 +212,13 @@ func appendTerminalPartialRecord(_ contents: String, at url: URL) throws {
 
 func terminalFileExists(at url: URL) -> Bool {
     FileManager.default.fileExists(atPath: url.path)
+}
+
+func terminalDecodedMapping(at url: URL) throws -> TerminalConversationKey {
+    try JSONDecoder().decode(
+        TerminalConversationKey.self,
+        from: terminalRawData(at: url)
+    )
 }
 
 func createTerminalDirectory(at url: URL) throws {

@@ -364,6 +364,7 @@ public actor FileTerminalOperationJournal: TerminalOperationJournaling {
             directoryDescriptor: mappingsDescriptor
         ) {
             try validateMapping(for: key, storageID: storageID)
+            try syncMappingsDirectory()
             return
         }
 
@@ -412,13 +413,22 @@ public actor FileTerminalOperationJournal: TerminalOperationJournaling {
                 throw Self.posixError("renameatx_np", mappingURL(for: key).path)
             }
             try validateMapping(for: key, storageID: storageID)
+            try syncMappingsDirectory()
             return
         }
         shouldRemoveTemporary = false
-        try Self.syncDirectory(
-            descriptor: mappingsDescriptor,
-            path: mappingsDirectory.path
-        )
+        try syncMappingsDirectory()
+    }
+
+    private func syncMappingsDirectory() throws {
+        if let directorySync = hooks.directorySync {
+            try directorySync(mappingsDescriptor, mappingsDirectory.path)
+        } else {
+            try Self.syncDirectory(
+                descriptor: mappingsDescriptor,
+                path: mappingsDirectory.path
+            )
+        }
     }
 
     private func validateMapping(
