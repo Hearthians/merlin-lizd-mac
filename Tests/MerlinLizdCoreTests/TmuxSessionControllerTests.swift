@@ -693,6 +693,130 @@ struct TmuxSessionControllerTests {
         ])
     }
 
+    @Test("a post-split command failure exposes and retains the exact pane")
+    func postSplitCommandFailureRetainsPane() async throws {
+        try await expectRetainedPaneAfterVerificationFailure(
+            .output(InventoryProcessOutput(
+                stdout: "", stderr: "tmux failed", exitCode: 7
+            )),
+            reason: .commandFailed(exitCode: 7)
+        )
+    }
+
+    @Test("post-split Worker readiness exposes and retains the exact pane")
+    func postSplitWorkerNotReadyRetainsPane() async throws {
+        try await expectRetainedPaneAfterVerificationFailure(
+            .output(InventoryProcessOutput(
+                stdout: "",
+                stderr: "worker has not been ready yet",
+                exitCode: 1
+            )),
+            reason: .workerNotReady
+        )
+    }
+
+    @Test("post-split malformed metadata exposes and retains the exact pane")
+    func postSplitMalformedSurfaceRetainsPane() async throws {
+        try await expectRetainedPaneAfterVerificationFailure(
+            .output(InventoryProcessOutput(
+                stdout: "malformed\n", stderr: "", exitCode: 0
+            )),
+            reason: .invalidSurfaceOutput
+        )
+    }
+
+    @Test("post-split identity mismatch exposes and retains the exact pane")
+    func postSplitIdentityMismatchRetainsPane() async throws {
+        let replacement = TmuxSessionIdentity(
+            serverSessionID: "$9", createdAtEpoch: 200
+        )
+        try await expectRetainedPaneAfterVerificationFailure(
+            .output(surfaceOutput(
+                identity: replacement,
+                paneID: "%35"
+            )),
+            reason: .sessionIdentityMismatch(
+                expected: tmuxIdentity(),
+                actual: replacement
+            )
+        )
+    }
+
+    @Test("a post-split user switch exposes and retains the exact pane")
+    func postSplitSwitchExposesRetainedPane() async throws {
+        let switched = surface(paneID: "%99", command: "vim")
+        try await expectRetainedPaneAfterVerificationFailure(
+            .output(surfaceOutput(paneID: "%99", command: "vim")),
+            reason: .createdPaneNotCurrent(actual: switched)
+        )
+    }
+
+    @Test("a post-split transport failure exposes and retains the exact pane")
+    func postSplitTransportFailureRetainsPane() async throws {
+        try await expectRetainedPaneAfterVerificationFailure(
+            .failure(.transportDisconnected),
+            reason: .transportFailure(description: "transportDisconnected")
+        )
+    }
+
+    @Test("post-split cancellation exposes and retains the exact pane")
+    func postSplitCancellationRetainsPane() async throws {
+        let started = AsyncCompletionProbe()
+        let runner = GatedSurfaceRunner(actions: retainedPaneActions(
+            verification: .suspendUntilCancelled(started)
+        ))
+        let controller = TmuxSessionController(processRunner: runner)
+        let origin = surface(paneID: "%34")
+        let creation = Task {
+            try await controller.createTemporaryPane(
+                from: origin,
+                route: localRoute()
+            )
+        }
+        await waitUntilStarted(started)
+
+        creation.cancel()
+        let error = await surfaceError(from: creation)
+
+        try await expectRetainedPaneRecovery(
+            error: error,
+            reason: .cancelled,
+            controller: controller,
+            runner: runner,
+            origin: origin
+        )
+    }
+
+    @Test("cancellation delivered with split output retains before verification")
+    func cancellationAtSplitBoundaryRetainsPane() async throws {
+        let splitGate = AsyncStartGate()
+        let runner = GatedSurfaceRunner(actions: [
+            .wait(splitGate, then: splitOutput(paneID: "%35")),
+        ] + closeLifecycleActions())
+        let controller = TmuxSessionController(processRunner: runner)
+        let origin = surface(paneID: "%34")
+        let creation = Task {
+            try await controller.createTemporaryPane(
+                from: origin,
+                route: localRoute()
+            )
+        }
+        await splitGate.waitUntilEntered()
+
+        creation.cancel()
+        await splitGate.open()
+        let error = await surfaceError(from: creation)
+
+        try await expectRetainedPaneRecovery(
+            error: error,
+            reason: .cancelled,
+            controller: controller,
+            runner: runner,
+            origin: origin,
+            creationCommandCount: 1
+        )
+    }
+
     @Test("rejects close for a pane the controller did not lease")
     func rejectsUnownedTemporaryPane() async {
         let runner = SurfaceRecordingRunner(outputs: [])
@@ -865,39 +989,6 @@ struct TmuxSessionControllerTests {
             )
         }
         #expect(await runner.commands().count == commandCount)
-    }
-
-    @Test("a post-split user switch retains created-pane ownership and context")
-    func postSplitSwitchRetainsCreatedPane() async throws {
-        let runner = SurfaceRecordingRunner(outputs: [
-            splitOutput(paneID: "%35"),
-            surfaceOutput(paneID: "%99", command: "vim"),
-            surfaceOutput(paneID: "%35"),
-            successfulOutput(),
-            successfulOutput(),
-            successfulOutput(),
-            surfaceOutput(paneID: "%34"),
-        ])
-        let controller = TmuxSessionController(processRunner: runner)
-        let origin = surface(paneID: "%34")
-        let switched = surface(paneID: "%99", command: "vim")
-
-        await #expect(throws: TmuxSurfaceControlError.createdPaneNotCurrent(
-            createdWindowID: "@12",
-            createdPaneID: "%35",
-            actual: switched
-        )) {
-            try await controller.createTemporaryPane(
-                from: origin, route: localRoute()
-            )
-        }
-
-        try await controller.closeTemporaryPane(
-            "%35", restoring: origin, route: localRoute()
-        )
-        #expect(await runner.commands().filter {
-            $0.arguments.first == "kill-pane"
-        }.map(\.arguments) == [["kill-pane", "-t", "%35"]])
     }
 
     @Test("closes only the owned pane then structurally restores and verifies the origin")
@@ -1101,6 +1192,125 @@ private func expectStableRouteSerialization(
     ) == true)
 }
 
+private func expectRetainedPaneAfterVerificationFailure(
+    _ verification: GatedSurfaceRunner.Action,
+    reason: RetainedTemporaryPaneReason
+) async throws {
+    let runner = GatedSurfaceRunner(actions: retainedPaneActions(
+        verification: verification
+    ))
+    let controller = TmuxSessionController(processRunner: runner)
+    let origin = surface(paneID: "%34")
+    let creation = Task {
+        try await controller.createTemporaryPane(
+            from: origin,
+            route: localRoute()
+        )
+    }
+
+    let error = await surfaceError(from: creation)
+
+    try await expectRetainedPaneRecovery(
+        error: error,
+        reason: reason,
+        controller: controller,
+        runner: runner,
+        origin: origin
+    )
+}
+
+private func retainedPaneActions(
+    verification: GatedSurfaceRunner.Action
+) -> [GatedSurfaceRunner.Action] {
+    [
+        .output(splitOutput(paneID: "%35")),
+        verification,
+    ] + closeLifecycleActions()
+}
+
+private func closeLifecycleActions() -> [GatedSurfaceRunner.Action] {
+    [
+        .output(surfaceOutput(paneID: "%35")),
+        .output(successfulOutput()),
+        .output(successfulOutput()),
+        .output(successfulOutput()),
+        .output(surfaceOutput(paneID: "%34")),
+    ]
+}
+
+private func surfaceError(
+    from task: Task<TmuxSurface, Error>
+) async -> TmuxSurfaceControlError? {
+    do {
+        _ = try await task.value
+        Issue.record("Expected temporary-pane verification to fail")
+        return nil
+    } catch let error as TmuxSurfaceControlError {
+        return error
+    } catch {
+        Issue.record("Expected a surface error, got \(error)")
+        return nil
+    }
+}
+
+private func expectRetainedPaneRecovery(
+    error: TmuxSurfaceControlError?,
+    reason: RetainedTemporaryPaneReason,
+    controller: TmuxSessionController,
+    runner: GatedSurfaceRunner,
+    origin: TmuxSurface,
+    creationCommandCount: Int = 2
+) async throws {
+    guard let error else {
+        Issue.record("Expected a retained temporary-pane error")
+        return
+    }
+    guard case let .temporaryPaneRetained(retained, actualReason) = error else {
+        Issue.record("Expected retained-pane provenance, got \(error)")
+        return
+    }
+    let expectedPane = RetainedTemporaryPane(
+        windowID: "@12",
+        paneID: "%35"
+    )
+    #expect(retained == expectedPane)
+    #expect(actualReason == reason)
+    #expect(await runner.commands().count == creationCommandCount)
+
+    try await controller.closeTemporaryPane(
+        retained.paneID,
+        restoring: origin,
+        route: localRoute()
+    )
+
+    let commands = await runner.commands().map(\.arguments)
+    #expect(commands.count == creationCommandCount + 5)
+    #expect(Array(commands.suffix(5)) == [
+        [
+            "display-message", "-p", "-t", "%35",
+            "-F#{session_id},#{session_created},#{window_id},#{pane_id},#{pane_current_command}",
+        ],
+        ["kill-pane", "-t", "%35"],
+        ["select-window", "-t", "@12"],
+        ["select-pane", "-t", "%34"],
+        currentSurfaceArguments(sessionName: "mlz-shell"),
+    ])
+    #expect(commands.filter { $0.first == "kill-pane" } == [[
+        "kill-pane", "-t", "%35",
+    ]])
+
+    await #expect(throws: TmuxSurfaceControlError.paneNotOwned(
+        paneID: retained.paneID
+    )) {
+        try await controller.closeTemporaryPane(
+            retained.paneID,
+            restoring: origin,
+            route: localRoute()
+        )
+    }
+    #expect(await runner.commands().count == creationCommandCount + 5)
+}
+
 private func surface(
     identity: TmuxSessionIdentity = tmuxIdentity(),
     windowID: String = "@12",
@@ -1225,6 +1435,8 @@ private actor GatedSurfaceRunner: InventoryProcessRunning {
     enum Action: Sendable {
         case output(InventoryProcessOutput)
         case wait(AsyncStartGate, then: InventoryProcessOutput)
+        case failure(SurfaceRunnerFailure)
+        case suspendUntilCancelled(AsyncCompletionProbe)
     }
 
     private var actions: [Action]
@@ -1244,12 +1456,22 @@ private actor GatedSurfaceRunner: InventoryProcessRunning {
         case let .wait(gate, output):
             await gate.wait()
             return output
+        case let .failure(error):
+            throw error
+        case let .suspendUntilCancelled(started):
+            await started.complete()
+            try await Task.sleep(for: .seconds(60))
+            return successfulOutput()
         }
     }
 
     func commands() -> [CommandSpec] {
         recordedCommands
     }
+}
+
+private enum SurfaceRunnerFailure: Error, Equatable, Sendable {
+    case transportDisconnected
 }
 
 private actor SurfacePoolRunner: InventoryProcessRunning {

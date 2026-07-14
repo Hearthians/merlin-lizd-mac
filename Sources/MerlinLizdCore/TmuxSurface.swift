@@ -84,6 +84,37 @@ public protocol TmuxSurfaceControlling: Sendable {
     ) async throws
 }
 
+/// Provenance for a pane that tmux created successfully but whose current
+/// surface could not be verified. The controller keeps this exact pane owned;
+/// callers should retain these IDs and later pass `paneID`, the known origin,
+/// and the current stable route to `closeTemporaryPane` for cleanup.
+public struct RetainedTemporaryPane: Codable, Equatable, Sendable {
+    public let windowID: String
+    public let paneID: String
+
+    public init(windowID: String, paneID: String) {
+        self.windowID = windowID
+        self.paneID = paneID
+    }
+}
+
+/// The typed cause that prevented a successfully created and retained pane
+/// from being returned as a verified current surface.
+public enum RetainedTemporaryPaneReason: Codable, Equatable, Sendable {
+    case cancelled
+    case localTmuxNotFound
+    case workerNotReady
+    case commandFailed(exitCode: Int32)
+    case invalidSurfaceOutput
+    case sessionIdentityMismatch(
+        expected: TmuxSessionIdentity,
+        actual: TmuxSessionIdentity
+    )
+    case createdPaneNotCurrent(actual: TmuxSurface)
+    case transportFailure(description: String)
+    case surfaceFailure(description: String)
+}
+
 public enum TmuxSurfaceControlError: Error, Equatable, Sendable {
     case localTmuxNotFound
     case workerNotReady
@@ -93,10 +124,9 @@ public enum TmuxSurfaceControlError: Error, Equatable, Sendable {
         expected: TmuxSessionIdentity,
         actual: TmuxSessionIdentity
     )
-    case createdPaneNotCurrent(
-        createdWindowID: String,
-        createdPaneID: String,
-        actual: TmuxSurface
+    case temporaryPaneRetained(
+        pane: RetainedTemporaryPane,
+        reason: RetainedTemporaryPaneReason
     )
     case paneNotOwned(paneID: String)
     case leasePaneMissing(paneID: String)

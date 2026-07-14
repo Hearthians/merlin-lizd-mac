@@ -197,6 +197,10 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
             throw TmuxSurfaceControlError.invalidSurfaceOutput
         }
 
+        let retained = RetainedTemporaryPane(
+            windowID: location.windowID,
+            paneID: location.paneID
+        )
         let key = TemporaryPaneKey(
             conversationKey: route.conversationKey,
             paneID: location.paneID
@@ -211,15 +215,23 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
             )
         )
 
-        let temporary = try await currentSurfaceUnlocked(route: route)
+        let temporary: TmuxSurface
+        do {
+            try Task.checkCancellation()
+            temporary = try await currentSurfaceUnlocked(route: route)
+        } catch {
+            throw TmuxSurfaceControlError.temporaryPaneRetained(
+                pane: retained,
+                reason: retainedPaneReason(for: error)
+            )
+        }
         guard
             temporary.windowID == location.windowID,
             temporary.paneID == location.paneID
         else {
-            throw TmuxSurfaceControlError.createdPaneNotCurrent(
-                createdWindowID: location.windowID,
-                createdPaneID: location.paneID,
-                actual: temporary
+            throw TmuxSurfaceControlError.temporaryPaneRetained(
+                pane: retained,
+                reason: .createdPaneNotCurrent(actual: temporary)
             )
         }
         temporaryPanes[key] = OwnedTemporaryPane(
@@ -227,6 +239,33 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
             temporary: temporary
         )
         return temporary
+    }
+
+    private func retainedPaneReason(
+        for error: Error
+    ) -> RetainedTemporaryPaneReason {
+        if error is CancellationError {
+            return .cancelled
+        }
+        guard let error = error as? TmuxSurfaceControlError else {
+            return .transportFailure(description: String(describing: error))
+        }
+        return switch error {
+        case .localTmuxNotFound:
+            .localTmuxNotFound
+        case .workerNotReady:
+            .workerNotReady
+        case let .commandFailed(exitCode):
+            .commandFailed(exitCode: exitCode)
+        case .invalidSurfaceOutput:
+            .invalidSurfaceOutput
+        case let .sessionIdentityMismatch(expected, actual):
+            .sessionIdentityMismatch(expected: expected, actual: actual)
+        case let .temporaryPaneRetained(_, reason):
+            reason
+        case .paneNotOwned, .leasePaneMissing, .restoreFailed:
+            .surfaceFailure(description: String(describing: error))
+        }
     }
 
     public func closeTemporaryPane(
