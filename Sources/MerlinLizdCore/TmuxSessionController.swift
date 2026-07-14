@@ -293,17 +293,23 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
         _ paneID: String,
         restoring origin: TmuxSurface,
         route: TmuxRoute
-    ) async throws {
+    ) async throws -> TmuxTemporaryPaneCloseOutcome {
         try validate(surface: origin, route: route)
         guard MerlinIdentifierValidator.isTmuxPaneID(paneID) else {
             throw CommandValidationError.invalidTmuxPaneID
         }
-        try await surfaceOperations.run(for: route.conversationKey) { [self] in
-            try await closeTemporaryPaneUnlocked(
-                paneID,
-                restoring: origin,
-                route: route
-            )
+        do {
+            return try await surfaceOperations.run(
+                for: route.conversationKey
+            ) { [self] in
+                await closeTemporaryPaneUnlocked(
+                    paneID,
+                    restoring: origin,
+                    route: route
+                )
+            }
+        } catch {
+            return .notCommitted(reason: closeFailureReason(for: error))
         }
     }
 
@@ -311,7 +317,7 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
         _ paneID: String,
         restoring origin: TmuxSurface,
         route: TmuxRoute
-    ) async throws {
+    ) async -> TmuxTemporaryPaneCloseOutcome {
         let key = TemporaryPaneKey(
             conversationKey: route.conversationKey,
             paneID: paneID
@@ -320,35 +326,40 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
             let ownership = temporaryPanes[key],
             ownership.origin == origin
         else {
-            throw TmuxSurfaceControlError.paneNotOwned(paneID: paneID)
+            return .notCommitted(reason: .paneNotOwned)
         }
 
-        let localPath = try resolvedLocalTmuxPath(for: route.target)
-        let inspection = try MerlinCommands.tmuxPaneSurface(
-            target: route.target,
-            paneID: paneID,
-            localTmuxPath: localPath
-        )
-        let leasedSurface = try await readSurface(
-            inspection,
-            route: route,
-            missingLeasePaneID: paneID
-        )
-        try Task.checkCancellation()
-        guard leasedSurface.paneID == ownership.temporary.paneID else {
-            throw TmuxSurfaceControlError.leasePaneMissing(paneID: paneID)
-        }
+        let localPath: String
+        do {
+            localPath = try resolvedLocalTmuxPath(for: route.target)
+            let inspection = try MerlinCommands.tmuxPaneSurface(
+                target: route.target,
+                paneID: paneID,
+                localTmuxPath: localPath
+            )
+            let leasedSurface = try await readSurface(
+                inspection,
+                route: route,
+                missingLeasePaneID: paneID
+            )
+            try Task.checkCancellation()
+            guard leasedSurface.paneID == ownership.temporary.paneID else {
+                return .notCommitted(reason: .leasePaneMissing)
+            }
 
-        let kill = try MerlinCommands.killTmuxPane(
-            target: route.target,
-            paneID: paneID,
-            localTmuxPath: localPath
-        )
-        try await runSurfaceMutation(kill, target: route.target)
+            let kill = try MerlinCommands.killTmuxPane(
+                target: route.target,
+                paneID: paneID,
+                localTmuxPath: localPath
+            )
+            try await runSurfaceMutation(kill, target: route.target)
+        } catch {
+            return .notCommitted(reason: closeFailureReason(for: error))
+        }
         temporaryPanes[key] = nil
-        try Task.checkCancellation()
 
         do {
+            try Task.checkCancellation()
             let restoreWindow = try MerlinCommands.restoreTmuxWindow(
                 target: route.target,
                 windowID: origin.windowID,
@@ -373,10 +384,88 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
             else {
                 throw TmuxSurfaceControlError.restoreFailed
             }
-        } catch is CancellationError {
-            throw CancellationError()
+            return .closed(restoration: .restored)
         } catch {
-            throw TmuxSurfaceControlError.restoreFailed
+            return .closed(
+                restoration: .failed(restoreFailureReason(for: error))
+            )
+        }
+    }
+
+    private func closeFailureReason(
+        for error: Error
+    ) -> TmuxTemporaryPaneCloseFailureReason {
+        if Task.isCancelled || error is CancellationError {
+            return .cancelled
+        }
+        if error is InventoryProcessTimeoutError {
+            return .timedOut
+        }
+        if let error = error as? SSHMasterPoolError {
+            return switch error {
+            case .shuttingDown: .transportUnavailable
+            case .commandFailed: .commandFailed
+            }
+        }
+        guard let error = error as? TmuxSurfaceControlError else {
+            return .unavailable
+        }
+        return switch error {
+        case .localTmuxNotFound: .transportUnavailable
+        case .workerNotReady: .workerNotReady
+        case .commandFailed: .commandFailed
+        case .invalidSurfaceOutput: .invalidSurfaceOutput
+        case .sessionIdentityMismatch: .sessionIdentityMismatch
+        case let .temporaryPaneRetained(_, reason):
+            closeFailureReason(for: reason)
+        case .paneNotOwned: .paneNotOwned
+        case .leasePaneMissing: .leasePaneMissing
+        case .restoreFailed: .unavailable
+        }
+    }
+
+    private func closeFailureReason(
+        for reason: RetainedTemporaryPaneReason
+    ) -> TmuxTemporaryPaneCloseFailureReason {
+        switch reason {
+        case .cancelled: .cancelled
+        case .workerNotReady: .workerNotReady
+        case .timedOut: .timedOut
+        case .transportUnavailable: .transportUnavailable
+        case .commandFailed: .commandFailed
+        case .invalidSurfaceOutput: .invalidSurfaceOutput
+        case .sessionIdentityMismatch: .sessionIdentityMismatch
+        case .createdPaneNotCurrent, .unavailable: .unavailable
+        }
+    }
+
+    private func restoreFailureReason(
+        for error: Error
+    ) -> TmuxOriginRestoreFailureReason {
+        if Task.isCancelled || error is CancellationError {
+            return .cancelled
+        }
+        if error is InventoryProcessTimeoutError {
+            return .timedOut
+        }
+        if let error = error as? SSHMasterPoolError {
+            return switch error {
+            case .shuttingDown: .transportUnavailable
+            case .commandFailed: .commandFailed
+            }
+        }
+        guard let error = error as? TmuxSurfaceControlError else {
+            return .unavailable
+        }
+        return switch error {
+        case .localTmuxNotFound: .transportUnavailable
+        case .workerNotReady: .workerNotReady
+        case .commandFailed: .commandFailed
+        case .invalidSurfaceOutput: .invalidSurfaceOutput
+        case .sessionIdentityMismatch: .sessionIdentityMismatch
+        case .restoreFailed: .originNotRestored
+        case .temporaryPaneRetained, .paneNotOwned, .leasePaneMissing:
+            .unavailable
         }
     }
 

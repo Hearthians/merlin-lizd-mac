@@ -274,6 +274,9 @@ actor FakeTerminalSurfaceController: TmuxSurfaceControlling {
     private var checkCancellationAfterCurrentGate = false
     private var closeGate: TerminalToolTestGate?
     private var checkCancellationAfterCloseGate = false
+    private var closeOutcome: TmuxTemporaryPaneCloseOutcome = .closed(
+        restoration: .restored
+    )
     private var calls: [String] = []
     private let log: TerminalToolTestLog?
 
@@ -334,7 +337,7 @@ actor FakeTerminalSurfaceController: TmuxSurfaceControlling {
         _ paneID: String,
         restoring origin: TmuxSurface,
         route: TmuxRoute
-    ) async throws {
+    ) async throws -> TmuxTemporaryPaneCloseOutcome {
         calls.append("close:\(paneID)")
         await log?.append("surface:close")
         if let closeGate {
@@ -344,7 +347,10 @@ actor FakeTerminalSurfaceController: TmuxSurfaceControlling {
             }
         }
         if failure == .close { throw Failure.close }
-        surface = origin
+        if closeOutcome == .closed(restoration: .restored) {
+            surface = origin
+        }
+        return closeOutcome
     }
 
     func setSurface(_ surface: TmuxSurface) {
@@ -373,6 +379,10 @@ actor FakeTerminalSurfaceController: TmuxSurfaceControlling {
     ) {
         closeGate = gate
         checkCancellationAfterCloseGate = checkCancellationAfterGate
+    }
+
+    func setCloseOutcome(_ outcome: TmuxTemporaryPaneCloseOutcome) {
+        closeOutcome = outcome
     }
 
     func setRetainedCreateError(
@@ -427,6 +437,10 @@ actor MemoryTerminalToolJournal: TerminalOperationJournaling {
 
     func failOnAppend(_ number: Int?) {
         failOnAppendNumber = number
+    }
+
+    func failAfterAdditionalAppends(_ count: Int) {
+        failOnAppendNumber = appendCount + count
     }
 
     func snapshot() -> [TerminalJournalEvent] {

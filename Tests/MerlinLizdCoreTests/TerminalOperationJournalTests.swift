@@ -154,6 +154,42 @@ struct TerminalOperationJournalTests {
         #expect(encoded.contains("\"reasonCode\":\"controllerCommandFailed\""))
         #expect(!encoded.contains("secret"))
         #expect(!encoded.contains("reason\""))
+
+        let committed = TerminalJournalTemporaryPaneEvent.closed(
+            leaseID: leaseID,
+            pane: TerminalJournalPaneProvenance(
+                windowID: "@12",
+                paneID: "%34"
+            ),
+            restoration: .failed(.commandFailed)
+        )
+        let committedJSON = try #require(terminalUTF8String(
+            terminalEncodeTemporaryPaneEvent(committed)
+        ))
+        #expect(committedJSON.contains("\"commandFailed\""))
+        let poisonedJSON = committedJSON.replacingOccurrences(
+            of: "commandFailed",
+            with: "secret diagnostic: /private/token"
+        )
+        #expect(throws: DecodingError.self) {
+            try terminalDecodeTemporaryPaneEvent(
+                terminalUTF8Data(poisonedJSON)
+            )
+        }
+        #expect(
+            try terminalDecodeTemporaryPaneEvent(
+                terminalUTF8Data("""
+                {"closed":{"leaseID":"\(leaseID.uuidString)","pane":{"windowID":"@12","paneID":"%34"}}}
+                """)
+            ) == .closed(
+                leaseID: leaseID,
+                pane: TerminalJournalPaneProvenance(
+                    windowID: "@12",
+                    paneID: "%34"
+                ),
+                restoration: .restored
+            )
+        )
     }
 
     @Test("screen evidence round-trips exact cursor mode dimensions and diff")

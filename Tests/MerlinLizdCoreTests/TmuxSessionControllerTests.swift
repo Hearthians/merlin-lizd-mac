@@ -324,10 +324,10 @@ struct TmuxSessionControllerTests {
         await gate.open()
         #expect(try await first.value == surface(paneID: "%35"))
         #expect(try await second.value == surface(paneID: "%36"))
-        try await controller.closeTemporaryPane(
+        _ = try await controller.closeTemporaryPane(
             "%35", restoring: origin, route: localRoute()
         )
-        try await controller.closeTemporaryPane(
+        _ = try await controller.closeTemporaryPane(
             "%36", restoring: origin, route: localRoute()
         )
 
@@ -417,9 +417,11 @@ struct TmuxSessionControllerTests {
         #expect(await runner.commands().count == 3)
 
         await gate.open()
-        #expect(await first.value == .success)
-        #expect(await second.value == .surfaceFailure(
-            .paneNotOwned(paneID: "%35")
+        #expect(await first.value == .outcome(
+            .closed(restoration: .restored)
+        ))
+        #expect(await second.value == .outcome(
+            .notCommitted(reason: .paneNotOwned)
         ))
         #expect(await runner.commands().filter {
             $0.arguments.first == "kill-pane"
@@ -466,10 +468,12 @@ struct TmuxSessionControllerTests {
 
         #expect(await runner.commands().count == 3)
         await probeGate.open()
-        await #expect(throws: CancellationError.self) {
-            try await first.value
-        }
-        try await second.value
+        #expect(
+            try await first.value == .notCommitted(reason: .cancelled)
+        )
+        #expect(
+            try await second.value == .closed(restoration: .restored)
+        )
         #expect(await runner.commands().filter {
             $0.arguments.first == "kill-pane"
         }.map(\.arguments) == [["kill-pane", "-t", "%35"]])
@@ -479,7 +483,7 @@ struct TmuxSessionControllerTests {
         #expect(await runner.commands().count == 9)
     }
 
-    @Test("cancellation after kill consumes ownership before unwinding")
+    @Test("cancellation after kill reports committed close and consumes ownership")
     func cancellationAfterKillConsumesOwnership() async throws {
         let killGate = AsyncStartGate()
         let runner = GatedSurfaceRunner(actions: [
@@ -506,19 +510,19 @@ struct TmuxSessionControllerTests {
 
         close.cancel()
         await killGate.open()
-        await #expect(throws: CancellationError.self) {
+        #expect(
             try await close.value
-        }
+                == .closed(restoration: .failed(.cancelled))
+        )
         #expect(await runner.commands().count == 4)
-        await #expect(throws: TmuxSurfaceControlError.paneNotOwned(
-            paneID: "%35"
-        )) {
+        #expect(
             try await controller.closeTemporaryPane(
                 "%35",
                 restoring: origin,
                 route: localRoute()
             )
-        }
+                == .notCommitted(reason: .paneNotOwned)
+        )
         #expect(await runner.commands().filter {
             $0.arguments.first == "kill-pane"
         }.map(\.arguments) == [["kill-pane", "-t", "%35"]])
@@ -1172,19 +1176,18 @@ struct TmuxSessionControllerTests {
     }
 
     @Test("rejects close for a pane the controller did not lease")
-    func rejectsUnownedTemporaryPane() async {
+    func rejectsUnownedTemporaryPane() async throws {
         let runner = SurfaceRecordingRunner(outputs: [])
         let controller = TmuxSessionController(processRunner: runner)
 
-        await #expect(throws: TmuxSurfaceControlError.paneNotOwned(
-            paneID: "%99"
-        )) {
+        #expect(
             try await controller.closeTemporaryPane(
                 "%99",
                 restoring: surface(paneID: "%34"),
                 route: localRoute()
             )
-        }
+                == .notCommitted(reason: .paneNotOwned)
+        )
         #expect(await runner.commands().isEmpty)
     }
 
@@ -1209,9 +1212,7 @@ struct TmuxSessionControllerTests {
         )
         let commandCount = await runner.commands().count
 
-        await #expect(throws: TmuxSurfaceControlError.paneNotOwned(
-            paneID: "%35"
-        )) {
+        #expect(
             try await controller.closeTemporaryPane(
                 "%35",
                 restoring: surface(
@@ -1220,7 +1221,8 @@ struct TmuxSessionControllerTests {
                 ),
                 route: otherRoute
             )
-        }
+                == .notCommitted(reason: .paneNotOwned)
+        )
         #expect(await runner.commands().count == commandCount)
     }
 
@@ -1238,7 +1240,7 @@ struct TmuxSessionControllerTests {
             )
         )
 
-        try await controller.closeTemporaryPane(
+        _ = try await controller.closeTemporaryPane(
             "%35",
             restoring: origin,
             route: workerRoute(
@@ -1278,9 +1280,7 @@ struct TmuxSessionControllerTests {
         )
         let commandCount = await runner.commands().count
 
-        await #expect(throws: TmuxSurfaceControlError.paneNotOwned(
-            paneID: "%35"
-        )) {
+        #expect(
             try await controller.closeTemporaryPane(
                 "%35",
                 restoring: surface(paneID: "%33"),
@@ -1290,7 +1290,8 @@ struct TmuxSessionControllerTests {
                     sessionName: "training-main"
                 )
             )
-        }
+                == .notCommitted(reason: .paneNotOwned)
+        )
         #expect(await runner.commands().count == commandCount)
     }
 
@@ -1308,15 +1309,14 @@ struct TmuxSessionControllerTests {
         )
         let commandCount = await runner.commands().count
 
-        await #expect(throws: TmuxSurfaceControlError.paneNotOwned(
-            paneID: "%35"
-        )) {
+        #expect(
             try await controller.closeTemporaryPane(
                 "%35",
                 restoring: origin,
                 route: workerRoute(workerID: "3966762")
             )
-        }
+                == .notCommitted(reason: .paneNotOwned)
+        )
         #expect(await runner.commands().count == commandCount)
     }
 
@@ -1333,15 +1333,14 @@ struct TmuxSessionControllerTests {
         )
         let commandCount = await runner.commands().count
 
-        await #expect(throws: TmuxSurfaceControlError.paneNotOwned(
-            paneID: "%35"
-        )) {
+        #expect(
             try await controller.closeTemporaryPane(
                 "%35",
                 restoring: surface(paneID: "%33"),
                 route: localRoute()
             )
-        }
+                == .notCommitted(reason: .paneNotOwned)
+        )
         #expect(await runner.commands().count == commandCount)
     }
 
@@ -1354,9 +1353,11 @@ struct TmuxSessionControllerTests {
             from: origin, route: localRoute()
         )
 
-        try await controller.closeTemporaryPane(
+        let close = try await controller.closeTemporaryPane(
             "%35", restoring: origin, route: localRoute()
         )
+
+        #expect(close == .closed(restoration: .restored))
 
         let arguments = await runner.commands().map(\.arguments)
         #expect(arguments.suffix(5) == [
@@ -1394,13 +1395,12 @@ struct TmuxSessionControllerTests {
             from: origin, route: localRoute()
         )
 
-        await #expect(throws: TmuxSurfaceControlError.leasePaneMissing(
-            paneID: "%35"
-        )) {
+        #expect(
             try await controller.closeTemporaryPane(
                 "%35", restoring: origin, route: localRoute()
             )
-        }
+                == .notCommitted(reason: .leasePaneMissing)
+        )
 
         let arguments = await runner.commands().map(\.arguments)
         #expect(arguments.count == 3)
@@ -1430,11 +1430,18 @@ struct TmuxSessionControllerTests {
             from: origin, route: localRoute()
         )
 
-        await #expect(throws: TmuxSurfaceControlError.restoreFailed) {
+        #expect(
             try await controller.closeTemporaryPane(
                 "%35", restoring: origin, route: localRoute()
             )
-        }
+                == .closed(restoration: .failed(.commandFailed))
+        )
+
+        #expect(
+            try await controller.closeTemporaryPane(
+                "%35", restoring: origin, route: localRoute()
+            ) == .notCommitted(reason: .paneNotOwned)
+        )
 
         let arguments = await runner.commands().map(\.arguments)
         #expect(arguments.filter { $0.first == "kill-pane" } == [
@@ -1663,7 +1670,7 @@ private func expectRetainedPaneRecovery(
     }
     #expect(await runner.commands().count == creationCommandCount)
 
-    try await controller.closeTemporaryPane(
+    _ = try await controller.closeTemporaryPane(
         retained.paneID,
         restoring: origin,
         route: localRoute()
@@ -1685,15 +1692,14 @@ private func expectRetainedPaneRecovery(
         "kill-pane", "-t", "%35",
     ]])
 
-    await #expect(throws: TmuxSurfaceControlError.paneNotOwned(
-        paneID: retained.paneID
-    )) {
+    #expect(
         try await controller.closeTemporaryPane(
             retained.paneID,
             restoring: origin,
             route: localRoute()
         )
-    }
+            == .notCommitted(reason: .paneNotOwned)
+    )
     #expect(await runner.commands().count == creationCommandCount + 5)
 }
 
@@ -1746,8 +1752,7 @@ private func settleSubmittedOperation() async {
 }
 
 private enum CloseOutcome: Equatable, Sendable {
-    case success
-    case surfaceFailure(TmuxSurfaceControlError)
+    case outcome(TmuxTemporaryPaneCloseOutcome)
     case unexpectedFailure
 }
 
@@ -1758,12 +1763,10 @@ private func closeOutcome(
     route: TmuxRoute
 ) async -> CloseOutcome {
     do {
-        try await controller.closeTemporaryPane(
+        let outcome = try await controller.closeTemporaryPane(
             paneID, restoring: origin, route: route
         )
-        return .success
-    } catch let error as TmuxSurfaceControlError {
-        return .surfaceFailure(error)
+        return .outcome(outcome)
     } catch {
         return .unexpectedFailure
     }

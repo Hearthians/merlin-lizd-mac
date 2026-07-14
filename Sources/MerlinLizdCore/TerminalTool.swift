@@ -55,6 +55,7 @@ public enum TemporaryPaneRetentionReason: Codable, Equatable, Sendable {
     case turnEnded
     case pinLost
     case controllerRetained(RetainedTemporaryPaneReason)
+    case closeNotCommitted(TmuxTemporaryPaneCloseFailureReason)
 }
 
 public struct RetainedTemporaryPaneLease: Codable, Equatable, Sendable {
@@ -98,6 +99,10 @@ public enum TerminalTurnTerminationError: Error, Equatable, Sendable {
 
 public enum TemporaryPaneFinishOutcome: Codable, Equatable, Sendable {
     case closed(TemporaryPaneLease)
+    case closedWithRestoreFailure(
+        TemporaryPaneLease,
+        reason: TmuxOriginRestoreFailureReason
+    )
     case retained(
         TemporaryPaneLease,
         reason: TemporaryPaneRetentionReason
@@ -141,5 +146,9 @@ public enum TerminalToolRouterError: Error, Equatable, Sendable {
     case temporaryPaneAuditUnavailable(
         RetainedTemporaryPaneLease,
         reason: TemporaryPaneRetentionReason
+    )
+    case temporaryPaneCloseAuditUnavailable(
+        TemporaryPaneLease,
+        restoration: TmuxOriginRestoreOutcome
     )
 }

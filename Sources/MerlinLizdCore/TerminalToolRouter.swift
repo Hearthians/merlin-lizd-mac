@@ -1316,15 +1316,17 @@ public actor TerminalToolRouter {
                         turn: turn
                     )
                 }
+                let closeOutcome: TmuxTemporaryPaneCloseOutcome
                 do {
                     try Task.checkCancellation()
                     try await ensureBinding(turn: turn, binding: binding)
                     try Task.checkCancellation()
-                    try await binding.endpoint.surfaces.closeTemporaryPane(
-                        lease.temporary.paneID,
-                        restoring: lease.origin,
-                        route: binding.endpoint.route
-                    )
+                    closeOutcome = try await binding.endpoint.surfaces
+                        .closeTemporaryPane(
+                            lease.temporary.paneID,
+                            restoring: lease.origin,
+                            route: binding.endpoint.route
+                        )
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch TerminalToolRouterError.pinLost {
@@ -1342,6 +1344,20 @@ public actor TerminalToolRouter {
                         turn: turn
                     )
                 }
+                let restoration: TmuxOriginRestoreOutcome
+                switch closeOutcome {
+                case let .notCommitted(reason):
+                    return try await retainExistingLease(
+                        record,
+                        reason: reason == .cancelled
+                            ? .interrupted
+                            : .closeNotCommitted(reason),
+                        preparation: preparation,
+                        turn: turn
+                    )
+                case let .closed(outcome):
+                    restoration = outcome
+                }
                 leases.removeValue(forKey: leaseKey)
                 do {
                     try await appendTemporary(
@@ -1350,18 +1366,27 @@ public actor TerminalToolRouter {
                             pane: TerminalJournalPaneProvenance(
                                 windowID: lease.temporary.windowID,
                                 paneID: lease.temporary.paneID
-                            )
+                            ),
+                            restoration: restoration
                         ),
                         preparation: preparation,
                         turn: turn
                     )
                 } catch {
-                    throw TerminalToolRouterError.temporaryPaneAuditUnavailable(
-                        record.provenance,
-                        reason: .auditUnavailable
+                    throw TerminalToolRouterError
+                        .temporaryPaneCloseAuditUnavailable(
+                            lease,
+                            restoration: restoration
+                        )
+                }
+                return switch restoration {
+                case .restored:
+                    .temporaryPaneFinished(.closed(lease))
+                case let .failed(reason):
+                    .temporaryPaneFinished(
+                        .closedWithRestoreFailure(lease, reason: reason)
                     )
                 }
-                return .temporaryPaneFinished(.closed(lease))
             } catch is CancellationError {
                 if leases[leaseKey]?.lease?.id == lease.id {
                     return try await retainExistingLease(

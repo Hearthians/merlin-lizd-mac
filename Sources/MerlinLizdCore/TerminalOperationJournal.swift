@@ -29,9 +29,7 @@ public struct TerminalJournalPaneProvenance: Codable, Equatable, Sendable {
     }
 }
 
-public enum TerminalJournalRetentionReasonCode: String, Codable, Equatable,
-    Sendable
-{
+public enum TerminalJournalRetentionReasonCode: String, Codable, Equatable, Sendable {
     case foregroundProcess
     case backgroundJobs
     case unsupportedShell
@@ -56,6 +54,8 @@ public enum TerminalJournalRetentionReasonCode: String, Codable, Equatable,
     case controllerSessionIdentityMismatch
     case controllerCreatedPaneNotCurrent
     case controllerUnavailable
+    case controllerPaneNotOwned
+    case controllerLeasePaneMissing
     case legacyUnknown
 
     public init(_ reason: TemporaryPaneRetentionReason) {
@@ -89,6 +89,22 @@ public enum TerminalJournalRetentionReasonCode: String, Codable, Equatable,
                 self = .controllerSessionIdentityMismatch
             case .createdPaneNotCurrent:
                 self = .controllerCreatedPaneNotCurrent
+            case .unavailable: self = .controllerUnavailable
+            }
+        case let .closeNotCommitted(reason):
+            switch reason {
+            case .cancelled: self = .interrupted
+            case .paneNotOwned: self = .controllerPaneNotOwned
+            case .leasePaneMissing: self = .controllerLeasePaneMissing
+            case .workerNotReady: self = .controllerWorkerNotReady
+            case .timedOut: self = .controllerTimedOut
+            case .transportUnavailable:
+                self = .controllerTransportUnavailable
+            case .commandFailed: self = .controllerCommandFailed
+            case .invalidSurfaceOutput:
+                self = .controllerInvalidSurfaceOutput
+            case .sessionIdentityMismatch:
+                self = .controllerSessionIdentityMismatch
             case .unavailable: self = .controllerUnavailable
             }
         }
@@ -147,7 +163,11 @@ public enum TerminalJournalRetentionReasonCode: String, Codable, Equatable,
 
 public enum TerminalJournalTemporaryPaneEvent: Equatable, Sendable {
     case created(leaseID: UUID, pane: TerminalJournalPaneProvenance)
-    case closed(leaseID: UUID, pane: TerminalJournalPaneProvenance)
+    case closed(
+        leaseID: UUID,
+        pane: TerminalJournalPaneProvenance,
+        restoration: TmuxOriginRestoreOutcome
+    )
     case retained(
         leaseID: UUID,
         pane: TerminalJournalPaneProvenance,
@@ -168,17 +188,20 @@ extension TerminalJournalTemporaryPaneEvent: Codable {
         let paneID: String?
         let reasonCode: TerminalJournalRetentionReasonCode?
         let reason: String?
+        let restoration: TmuxOriginRestoreOutcome?
 
         init(
             leaseID: UUID,
             pane: TerminalJournalPaneProvenance,
-            reasonCode: TerminalJournalRetentionReasonCode? = nil
+            reasonCode: TerminalJournalRetentionReasonCode? = nil,
+            restoration: TmuxOriginRestoreOutcome? = nil
         ) {
             self.leaseID = leaseID
             self.pane = pane
             paneID = nil
             self.reasonCode = reasonCode
             reason = nil
+            self.restoration = restoration
         }
 
         var decodedPane: TerminalJournalPaneProvenance? {
@@ -226,7 +249,11 @@ extension TerminalJournalTemporaryPaneEvent: Codable {
                     debugDescription: "Missing temporary pane provenance"
                 )
             }
-            self = .closed(leaseID: payload.leaseID, pane: pane)
+            self = .closed(
+                leaseID: payload.leaseID,
+                pane: pane,
+                restoration: payload.restoration ?? .restored
+            )
             return
         }
         let payload = try container.decode(Payload.self, forKey: .retained)
@@ -266,9 +293,13 @@ extension TerminalJournalTemporaryPaneEvent: Codable {
                 Payload(leaseID: leaseID, pane: pane),
                 forKey: .created
             )
-        case let .closed(leaseID, pane):
+        case let .closed(leaseID, pane, restoration):
             try container.encode(
-                Payload(leaseID: leaseID, pane: pane),
+                Payload(
+                    leaseID: leaseID,
+                    pane: pane,
+                    restoration: restoration
+                ),
                 forKey: .closed
             )
         case let .retained(leaseID, pane, reason):

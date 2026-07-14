@@ -66,6 +66,43 @@ public struct TmuxRoute: Codable, Equatable, Sendable {
     }
 }
 
+public enum TmuxTemporaryPaneCloseFailureReason: String, Codable, Equatable,
+    Sendable {
+    case cancelled
+    case paneNotOwned
+    case leasePaneMissing
+    case workerNotReady
+    case timedOut
+    case transportUnavailable
+    case commandFailed
+    case invalidSurfaceOutput
+    case sessionIdentityMismatch
+    case unavailable
+}
+
+public enum TmuxOriginRestoreFailureReason: String, Codable, Equatable,
+    Sendable {
+    case cancelled
+    case workerNotReady
+    case timedOut
+    case transportUnavailable
+    case commandFailed
+    case invalidSurfaceOutput
+    case sessionIdentityMismatch
+    case originNotRestored
+    case unavailable
+}
+
+public enum TmuxOriginRestoreOutcome: Codable, Equatable, Sendable {
+    case restored
+    case failed(TmuxOriginRestoreFailureReason)
+}
+
+public enum TmuxTemporaryPaneCloseOutcome: Codable, Equatable, Sendable {
+    case notCommitted(reason: TmuxTemporaryPaneCloseFailureReason)
+    case closed(restoration: TmuxOriginRestoreOutcome)
+}
+
 public protocol TmuxSurfaceControlling: Sendable {
     func currentSurface(route: TmuxRoute) async throws -> TmuxSurface
     func select(
@@ -81,7 +118,7 @@ public protocol TmuxSurfaceControlling: Sendable {
         _ paneID: String,
         restoring origin: TmuxSurface,
         route: TmuxRoute
-    ) async throws
+    ) async throws -> TmuxTemporaryPaneCloseOutcome
 }
 
 /// Provenance for a pane that tmux created successfully but whose current

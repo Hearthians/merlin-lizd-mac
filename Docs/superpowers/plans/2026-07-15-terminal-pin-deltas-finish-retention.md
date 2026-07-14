@@ -76,7 +76,7 @@ case let .reconciliationRequired(revision):
     let snapshot = await registry.pinSnapshot()
     knownPins = snapshot.pins
     knownRevision = snapshot.revision
-    #expect(snapshot.revision == revision)
+    #expect(snapshot.revision >= revision)
 }
 ```
 
@@ -226,3 +226,171 @@ git commit -m "fix: publish exact terminal pin deltas"
 - New pins and normal releases are visible at unique monotonic revisions.
 - Every pre-close finish cancellation retains and audits the live lease with typed interrupted provenance, while audit failure remains provenance-rich and no close occurs.
 - Focused tests, full tests, app build, whitespace validation, exact API audit, and tracked worktree status are clean.
+
+---
+
+### Task 4: Make Temporary-Pane Close Commit Explicit
+
+**Files:**
+- Modify: `Sources/MerlinLizdCore/TmuxSurface.swift`
+- Modify: `Sources/MerlinLizdCore/TmuxSessionController.swift`
+- Modify: `Sources/MerlinLizdCore/TerminalTool.swift`
+- Modify: `Sources/MerlinLizdCore/TerminalToolRouter.swift`
+- Modify: `Sources/MerlinLizdCore/TerminalOperationJournal.swift`
+- Modify: `Tests/MerlinLizdCoreTests/TmuxSessionControllerTests.swift`
+- Modify: `Tests/MerlinLizdCoreTests/TerminalToolRouterTests.swift`
+- Modify: `Tests/MerlinLizdCoreTests/TerminalToolTestSupport.swift`
+- Modify: `Tests/MerlinLizdCoreTests/TerminalOperationJournalTests.swift`
+
+**Interfaces:**
+- Consumes: the controller's exact owned-pane record, the router's exact lease record, and the existing structured retention/audit helpers.
+- Produces:
+
+```swift
+public enum TmuxTemporaryPaneCloseFailureReason: String, Codable, Equatable, Sendable {
+    case cancelled
+    case paneNotOwned
+    case leasePaneMissing
+    case workerNotReady
+    case timedOut
+    case transportUnavailable
+    case commandFailed
+    case invalidSurfaceOutput
+    case sessionIdentityMismatch
+    case unavailable
+}
+
+public enum TmuxOriginRestoreFailureReason: String, Codable, Equatable, Sendable {
+    case cancelled
+    case workerNotReady
+    case timedOut
+    case transportUnavailable
+    case commandFailed
+    case invalidSurfaceOutput
+    case sessionIdentityMismatch
+    case originNotRestored
+    case unavailable
+}
+
+public enum TmuxOriginRestoreOutcome: Codable, Equatable, Sendable {
+    case restored
+    case failed(TmuxOriginRestoreFailureReason)
+}
+
+public enum TmuxTemporaryPaneCloseOutcome: Codable, Equatable, Sendable {
+    case notCommitted(reason: TmuxTemporaryPaneCloseFailureReason)
+    case closed(restoration: TmuxOriginRestoreOutcome)
+}
+
+func closeTemporaryPane(
+    _ paneID: String,
+    restoring origin: TmuxSurface,
+    route: TmuxRoute
+) async throws -> TmuxTemporaryPaneCloseOutcome
+```
+
+The throwing boundary remains only for malformed caller inputs. Valid close attempts return `.notCommitted` while controller ownership remains live, or `.closed` after `kill-pane` succeeds and ownership is removed. No cancellation or restoration failure after that commit point can turn `.closed` back into retention.
+
+- [x] **Step 1: Write controller commit-point RED tests**
+
+Replace the old post-kill cancellation expectation with deterministic tests that gate the successful kill command, cancel the close task, and expect:
+
+```swift
+#expect(
+    try await close.value
+        == .closed(restoration: .failed(.cancelled))
+)
+```
+
+Retry the same exact pane and expect `.notCommitted(reason: .paneNotOwned)` with exactly one `kill-pane`. Change the existing restoration failure test to expect `.closed(restoration: .failed(.commandFailed))`, no controller ownership, and no collateral kill. Keep the normal path expecting `.closed(restoration: .restored)`. Add a pre-kill gate test that expects `.notCommitted(reason: .cancelled)` and proves the retry performs the one and only kill.
+
+- [x] **Step 2: Run controller RED**
+
+Run:
+
+```bash
+/usr/bin/swift run MerlinLizdCoreTests --filter 'TmuxSessionControllerTests'
+```
+
+Expected: compile failures because `closeTemporaryPane` returns `Void` and the typed close/restore outcomes do not exist.
+
+- [x] **Step 3: Implement the controller commit point**
+
+Map every valid pre-kill failure into the bounded `TmuxTemporaryPaneCloseFailureReason`, leaving the exact ownership entry in place. After `runSurfaceMutation(kill, ...)` succeeds, remove the exact ownership entry before any cancellation check. Run structural origin restoration inside a catch-all that returns `.closed(restoration: .failed(code))`; use only bounded failure codes and never raw process diagnostics. Return `.closed(restoration: .restored)` only after exact window/pane verification succeeds.
+
+- [x] **Step 4: Run controller GREEN**
+
+Run:
+
+```bash
+/usr/bin/swift run MerlinLizdCoreTests --filter 'TmuxSessionControllerTests'
+```
+
+Expected: the post-kill cancellation, restoration failure, pre-kill cancellation, one-kill retry, and normal restoration tests pass without sleeps.
+
+- [x] **Step 5: Write router and journal RED tests**
+
+Teach the surface fake to return a scripted close outcome. For `.closed(restoration: .failed(.cancelled))` and `.closed(restoration: .failed(.commandFailed))`, assert that finish removes the exact lease, returns a new typed finished result:
+
+```swift
+.temporaryPaneFinished(
+    .closedWithRestoreFailure(lease, reason: .cancelled)
+)
+```
+
+Assert the journal contains one `.closed` event with the same restoration status and no `.retained` event, retry throws `leaseNotFound`, and the fake records exactly one close call. For `.notCommitted(reason: .cancelled)` assert the existing lease is retained/audited as `.interrupted`; for any other close failure assert `.closeNotCommitted(reason)` with exact lease provenance. Keep full restoration returning the unchanged `.temporaryPaneFinished(.closed(lease))` result.
+
+Add journal codec tests that new closed records include the bounded restoration outcome, legacy closed records decode as `.restored`, and arbitrary raw diagnostic strings cannot enter the schema.
+
+- [x] **Step 6: Run router/journal RED**
+
+Run:
+
+```bash
+/usr/bin/swift run MerlinLizdCoreTests --filter \
+  'TerminalToolRouterTests|TerminalOperationJournalTests'
+```
+
+Expected: compile failures for the missing typed close result, restoration-bearing closed event, and scripted controller outcome.
+
+- [x] **Step 7: Route committed close without retention**
+
+Add `TemporaryPaneFinishOutcome.closedWithRestoreFailure` and `TemporaryPaneRetentionReason.closeNotCommitted`. After the controller returns `.closed`, remove the router lease before journal append, append `.closed(..., restoration:)`, and return the normal closed result or typed restore-failure result. After `.notCommitted`, call the existing retention helper with `.interrupted` for cancellation and `.closeNotCommitted(reason)` otherwise. Preserve exact provenance and the existing audit-unavailable error. Do not read the surface again and do not retry close.
+
+- [x] **Step 8: Run GREEN and finish grammar regressions**
+
+Run:
+
+```bash
+/usr/bin/swift run MerlinLizdCoreTests --filter \
+  'TmuxSessionControllerTests|TerminalToolRouterTests|TerminalOperationJournalTests'
+```
+
+Expected: all commit-point, pre-kill retention, first termination reason, finish audit grammar, codec compatibility, and normal close tests pass.
+
+- [x] **Step 9: Apply the two style/documentation minors**
+
+Keep the overflow plan assertion as `snapshot.revision >= revision`, format `TerminalJournalRetentionReasonCode` with the opening brace on its declaration line, and update `.superpowers/sdd/task-5-report.md` to say no event history or pin-loss history is retained.
+
+- [x] **Step 10: Verify, report, and commit**
+
+Run:
+
+```bash
+/usr/bin/swift run MerlinLizdCoreTests --filter \
+  'TmuxSessionControllerTests|TerminalToolRouterTests|TerminalOperationJournalTests'
+./scripts/test.sh
+/usr/bin/swift build
+git diff --check
+git status --short
+```
+
+Record witnessed RED/GREEN output, the exact public outcomes, test counts, diff/status, and final SHA in `.superpowers/sdd/task-5-report.md`, then commit the one closure as `fix: make terminal close commits explicit`.
+
+## Task 4 Completion Criteria
+
+- A controller result identifies whether `kill-pane` committed; no post-kill cancellation or restoration failure is representable as a retained live pane.
+- Controller and router ownership agree after every outcome, and retry after committed close cannot issue a second kill.
+- Every committed close has a structured closed audit containing bounded restoration status; no retained audit is emitted for a dead pane.
+- Pre-kill cancellation/failure still retains the exact lease and reason through the existing finish audit grammar.
+- Normal close behavior and first-termination-reason behavior remain unchanged.
