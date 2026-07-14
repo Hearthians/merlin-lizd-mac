@@ -220,15 +220,18 @@ actor BoundedInventoryProcessRunner: InventoryProcessRunning {
 
 final class FoundationInventoryProcessRunner: InventoryProcessRunning, @unchecked Sendable {
     private let processExitBoundaryHook: @Sendable () async -> Void
+    private let cancellationDecisionHook: (@Sendable (Bool) -> Void)?
     private let completionDecisionBoundaryHook: @Sendable () async -> Void
     private let completionBoundaryHook: @Sendable () async -> Void
 
     init(
         processExitBoundaryHook: @escaping @Sendable () async -> Void = {},
+        cancellationDecisionHook: (@Sendable (Bool) -> Void)? = nil,
         completionDecisionBoundaryHook: @escaping @Sendable () async -> Void = {},
         completionBoundaryHook: @escaping @Sendable () async -> Void = {}
     ) {
         self.processExitBoundaryHook = processExitBoundaryHook
+        self.cancellationDecisionHook = cancellationDecisionHook
         self.completionDecisionBoundaryHook = completionDecisionBoundaryHook
         self.completionBoundaryHook = completionBoundaryHook
     }
@@ -243,7 +246,8 @@ final class FoundationInventoryProcessRunner: InventoryProcessRunning, @unchecke
             childDescriptorsToClose: [
                 stdoutPipe.fileHandleForReading.fileDescriptor,
                 stderrPipe.fileHandleForReading.fileDescriptor,
-            ]
+            ],
+            cancellationDecisionHook: cancellationDecisionHook
         )
         let stdout = FileHandleBox(stdoutPipe.fileHandleForReading)
         let stderr = FileHandleBox(stderrPipe.fileHandleForReading)
@@ -294,12 +298,14 @@ final class POSIXInventoryProcessStreamer: InventoryProcessOutputStreaming, @unc
     private let stderrTailByteLimit: Int
     private let stdoutBufferChunkLimit: Int
     private let stdoutBufferByteLimit: Int
+    private let cancellationDecisionHook: (@Sendable (Bool) -> Void)?
     private let completionDecisionBoundaryHook: @Sendable () async -> Void
     private let completionBoundaryHook: @Sendable () async -> Void
 
     init(
         stderrTailByteLimit: Int = 64 * 1_024,
         maximumBufferedStdoutBytes: Int = defaultStdoutBufferBytes,
+        cancellationDecisionHook: (@Sendable (Bool) -> Void)? = nil,
         completionDecisionBoundaryHook: @escaping @Sendable () async -> Void = {},
         completionBoundaryHook: @escaping @Sendable () async -> Void = {}
     ) {
@@ -309,6 +315,7 @@ final class POSIXInventoryProcessStreamer: InventoryProcessOutputStreaming, @unc
             / inventoryProcessIOChunkBytes
         stdoutBufferByteLimit = stdoutBufferChunkLimit
             * inventoryProcessIOChunkBytes
+        self.cancellationDecisionHook = cancellationDecisionHook
         self.completionDecisionBoundaryHook = completionDecisionBoundaryHook
         self.completionBoundaryHook = completionBoundaryHook
     }
@@ -364,7 +371,8 @@ final class POSIXInventoryProcessStreamer: InventoryProcessOutputStreaming, @unc
             childDescriptorsToClose: [
                 stdoutPipe.fileHandleForReading.fileDescriptor,
                 stderrPipe.fileHandleForReading.fileDescriptor,
-            ]
+            ],
+            cancellationDecisionHook: cancellationDecisionHook
         )
         let stdout = FileHandleBox(stdoutPipe.fileHandleForReading)
         let stderr = FileHandleBox(stderrPipe.fileHandleForReading)
@@ -547,6 +555,7 @@ private final class RunningProcessBox: @unchecked Sendable {
     private let standardOutput: Int32
     private let standardError: Int32
     private let childDescriptorsToClose: [Int32]
+    private let cancellationDecisionHook: (@Sendable (Bool) -> Void)?
     private let lock = NSLock()
     private var lifecycle = Lifecycle.ready
     private var observedExitCode: Int32?
@@ -556,12 +565,14 @@ private final class RunningProcessBox: @unchecked Sendable {
         command: CommandSpec,
         standardOutput: Int32,
         standardError: Int32,
-        childDescriptorsToClose: [Int32]
+        childDescriptorsToClose: [Int32],
+        cancellationDecisionHook: (@Sendable (Bool) -> Void)?
     ) {
         self.command = command
         self.standardOutput = standardOutput
         self.standardError = standardError
         self.childDescriptorsToClose = childDescriptorsToClose
+        self.cancellationDecisionHook = cancellationDecisionHook
     }
 
     /// Serializes cancellation with `posix_spawn()` so cancellation cannot
@@ -633,22 +644,23 @@ private final class RunningProcessBox: @unchecked Sendable {
 
     @discardableResult
     func cancel() -> Bool {
+        let cancelled: Bool
         lock.lock()
         switch lifecycle {
         case .ready:
             lifecycle = .cancelledBeforeStart
-            lock.unlock()
-            return true
+            cancelled = true
         case let .running(processID, processGroupID):
             signalProcessGroup(processGroupID, signal: SIGTERM)
             signalProcessGroup(processGroupID, signal: SIGKILL)
             lifecycle = .cancelled(processID: processID)
-            lock.unlock()
-            return true
+            cancelled = true
         case .cancelledBeforeStart, .cancelled, .finalized:
-            lock.unlock()
-            return false
+            cancelled = false
         }
+        lock.unlock()
+        cancellationDecisionHook?(cancelled)
+        return cancelled
     }
 
     private func signalProcessGroup(_ processGroupID: pid_t, signal: Int32) {

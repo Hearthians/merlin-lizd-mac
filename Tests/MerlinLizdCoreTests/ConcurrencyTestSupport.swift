@@ -96,6 +96,20 @@ enum ConcurrencyRegressionTestError: Error {
     case unexpectedExit
 }
 
+func withAsyncCleanup<Result>(
+    _ operation: () async throws -> Result,
+    cleanup: () async -> Void
+) async rethrows -> Result {
+    do {
+        let result = try await operation()
+        await cleanup()
+        return result
+    } catch {
+        await cleanup()
+        throw error
+    }
+}
+
 actor AsyncStartGate {
     private var isOpen = false
     private var hasEntered = false

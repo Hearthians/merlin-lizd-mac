@@ -87,7 +87,6 @@ struct WorkerMetricsStreamerTests {
     @Test("stdout flood without a consumer overflows the bounded buffer and reaps")
     func stdoutFloodFailsClosed() async throws {
         let pidFile = TemporaryProcessIDFile()
-        defer { pidFile.remove() }
 
         let runner = POSIXInventoryProcessStreamer(
             maximumBufferedStdoutBytes: 16 * 1_024
@@ -101,31 +100,50 @@ struct WorkerMetricsStreamerTests {
                 pidFile.path,
             ]
         ))
-        let processID = try await pidFile.waitForProcessID()
+        var processID: pid_t?
 
-        // Deliberately do not create an iterator until the producer has
-        // detected overflow, terminated the process group, and reaped it.
-        await output.waitForTermination()
-        #expect(pidFile.processIsAbsent(processID))
+        try await withAsyncCleanup({
+            processID = try await pidFile.waitForProcessID()
+            let child = try #require(processID)
 
-        do {
-            for try await _ in output.chunks {}
-            Issue.record("Expected a bounded stdout overflow")
-        } catch InventoryProcessStreamError.stdoutBufferOverflow(
-            let maxBufferedBytes
-        ) {
-            #expect(maxBufferedBytes == 16 * 1_024)
-        } catch {
-            Issue.record("Unexpected stream error: \(error)")
-        }
+            // Deliberately do not create an iterator until the producer has
+            // detected overflow, terminated the process group, and reaped it.
+            await output.waitForTermination()
+            #expect(pidFile.processIsAbsent(child))
+
+            do {
+                for try await _ in output.chunks {}
+                Issue.record("Expected a bounded stdout overflow")
+            } catch InventoryProcessStreamError.stdoutBufferOverflow(
+                let maxBufferedBytes
+            ) {
+                #expect(maxBufferedBytes == 16 * 1_024)
+            } catch {
+                Issue.record("Unexpected stream error: \(error)")
+            }
+        }, cleanup: {
+            if let processID {
+                _ = kill(processID, SIGKILL)
+            }
+            await output.cancelAndWait()
+            pidFile.remove()
+        })
     }
 
     @Test("stream completion wins a later cancellation without signaling descendants")
     func finalizedStreamIgnoresLateCancellation() async throws {
         let parentPIDFile = TemporaryProcessIDFile()
         let descendantPIDFile = TemporaryProcessIDFile()
+        let descendantProbeFile = TemporaryProcessIDFile()
+        let descendantProbeFIFO = TemporaryMarkerFile()
         let completionGate = AsyncStartGate()
+        let (cancellationDecisions, cancellationDecisionContinuation) =
+            AsyncStream<Bool>.makeStream()
+        var cancellationDecisionIterator = cancellationDecisions.makeAsyncIterator()
         let runner = POSIXInventoryProcessStreamer(
+            cancellationDecisionHook: { cancelled in
+                cancellationDecisionContinuation.yield(cancelled)
+            },
             completionBoundaryHook: {
                 await completionGate.wait()
             }
@@ -134,53 +152,57 @@ struct WorkerMetricsStreamerTests {
             executable: "/bin/sh",
             arguments: [
                 "-c",
-                "echo $$ > \"$1\"; /bin/sh -c 'exec 1>&- 2>&-; exec /bin/sleep 30' & echo $! > \"$2\"; exit 0",
+                "echo $$ > \"$1\"; /bin/sh -c '/usr/bin/mkfifo \"$2\"; exec 3<> \"$2\"; trap \"echo \\$\\$ > \\\"$1\\\"\" USR1; exec 1>&- 2>&-; while :; do read value <&3; done' probe \"$3\" \"$4\" & echo $! > \"$2\"; exit 0",
                 "merlin-lizd-stream-finalized-cancel-test",
                 parentPIDFile.path,
                 descendantPIDFile.path,
+                descendantProbeFile.path,
+                descendantProbeFIFO.path,
             ]
         ))
         var parentProcessID: pid_t?
         var descendantProcessID: pid_t?
         var cancellationTask: Task<Void, Never>?
-        defer {
-            cancellationTask?.cancel()
-            Task {
-                await completionGate.open()
+
+        try await withAsyncCleanup({
+            await completionGate.waitUntilEntered()
+            parentProcessID = try await parentPIDFile.waitForProcessID()
+            descendantProcessID = try await descendantPIDFile.waitForProcessID()
+            let parent = try #require(parentProcessID)
+            let descendant = try #require(descendantProcessID)
+            #expect(parentPIDFile.processIsAbsent(parent))
+            #expect(!descendantPIDFile.processIsAbsent(descendant))
+
+            cancellationTask = Task {
                 await output.cancelAndWait()
             }
+            #expect(await cancellationDecisionIterator.next() == false)
+            #expect(kill(descendant, SIGUSR1) == 0)
+            #expect(try await descendantProbeFile.waitForProcessID() == descendant)
+            await completionGate.open()
+            await cancellationTask?.value
+
+            do {
+                for try await _ in output.chunks {}
+            } catch {
+                Issue.record("Expected finalized stream success, got \(error)")
+            }
+        }, cleanup: {
+            cancellationTask?.cancel()
+            await completionGate.open()
             if let parentProcessID {
-                _ = kill(-parentProcessID, SIGKILL)
+                _ = kill(parentProcessID, SIGKILL)
             }
             if let descendantProcessID {
                 _ = kill(descendantProcessID, SIGKILL)
             }
+            await output.cancelAndWait()
+            await cancellationTask?.value
             parentPIDFile.remove()
             descendantPIDFile.remove()
-        }
-
-        await completionGate.waitUntilEntered()
-        parentProcessID = try await parentPIDFile.waitForProcessID()
-        descendantProcessID = try await descendantPIDFile.waitForProcessID()
-        let parent = try #require(parentProcessID)
-        let descendant = try #require(descendantProcessID)
-        #expect(parentPIDFile.processIsAbsent(parent))
-        #expect(!descendantPIDFile.processIsAbsent(descendant))
-
-        cancellationTask = Task {
-            await output.cancelAndWait()
-            await output.cancelAndWait()
-        }
-        try? await Task.sleep(for: .milliseconds(20))
-        #expect(!descendantPIDFile.processIsAbsent(descendant))
-        await completionGate.open()
-        await cancellationTask?.value
-
-        do {
-            for try await _ in output.chunks {}
-        } catch {
-            Issue.record("Expected finalized stream success, got \(error)")
-        }
+            descendantProbeFile.remove()
+            descendantProbeFIFO.remove()
+        })
     }
 
     @Test("stream cancellation before atomic finalization kills before reap")
@@ -206,45 +228,45 @@ struct WorkerMetricsStreamerTests {
         var parentProcessID: pid_t?
         var descendantProcessID: pid_t?
         var cancellationTask: Task<Void, Never>?
-        defer {
-            cancellationTask?.cancel()
-            Task {
-                await decisionGate.open()
-                await output.cancelAndWait()
+
+        try await withAsyncCleanup({
+            await decisionGate.waitUntilEntered()
+            parentProcessID = try await parentPIDFile.waitForProcessID()
+            descendantProcessID = try await descendantPIDFile.waitForProcessID()
+            let parent = try #require(parentProcessID)
+            let descendant = try #require(descendantProcessID)
+            #expect(parentPIDFile.processHasExitedWithoutReaping(parent))
+            #expect(getpgid(descendant) == parent)
+
+            cancellationTask = Task { await output.cancelAndWait() }
+            var descendantWasKilledBeforeReap = false
+            for _ in 0..<100 {
+                if descendantPIDFile.processIsAbsent(descendant) {
+                    descendantWasKilledBeforeReap = true
+                    break
+                }
+                try? await Task.sleep(for: .milliseconds(5))
             }
+            await decisionGate.open()
+            await cancellationTask?.value
+
+            #expect(descendantWasKilledBeforeReap)
+            #expect(parentPIDFile.processIsAbsent(parent))
+            #expect(descendantPIDFile.processIsAbsent(descendant))
+        }, cleanup: {
+            cancellationTask?.cancel()
+            await decisionGate.open()
             if let parentProcessID {
                 _ = kill(-parentProcessID, SIGKILL)
             }
             if let descendantProcessID {
                 _ = kill(descendantProcessID, SIGKILL)
             }
+            await output.cancelAndWait()
+            await cancellationTask?.value
             parentPIDFile.remove()
             descendantPIDFile.remove()
-        }
-
-        await decisionGate.waitUntilEntered()
-        parentProcessID = try await parentPIDFile.waitForProcessID()
-        descendantProcessID = try await descendantPIDFile.waitForProcessID()
-        let parent = try #require(parentProcessID)
-        let descendant = try #require(descendantProcessID)
-        #expect(parentPIDFile.processHasExitedWithoutReaping(parent))
-        #expect(getpgid(descendant) == parent)
-
-        cancellationTask = Task { await output.cancelAndWait() }
-        var descendantWasKilledBeforeReap = false
-        for _ in 0..<100 {
-            if descendantPIDFile.processIsAbsent(descendant) {
-                descendantWasKilledBeforeReap = true
-                break
-            }
-            try? await Task.sleep(for: .milliseconds(5))
-        }
-        await decisionGate.open()
-        await cancellationTask?.value
-
-        #expect(descendantWasKilledBeforeReap)
-        #expect(parentPIDFile.processIsAbsent(parent))
-        #expect(descendantPIDFile.processIsAbsent(descendant))
+        })
     }
 
     @Test("streamer yields each framed sample from one process stream")
@@ -324,35 +346,37 @@ struct WorkerMetricsStreamerTests {
         let consumer = Task {
             for try await _ in output.chunks {}
         }
-        defer {
+
+        try await withAsyncCleanup({
+            parentProcessID = try await parentPIDFile.waitForProcessID()
+            descendantProcessID = try await descendantPIDFile.waitForProcessID()
+            let parent = try #require(parentProcessID)
+            #expect(getpgid(parent) == parent)
+            if let descendantProcessID {
+                #expect(getpgid(descendantProcessID) == parent)
+            }
+
             consumer.cancel()
-            Task { await output.cancelAndWait() }
+            _ = try? await consumer.value
+            await output.cancelAndWait()
+
+            #expect(await waitUntilAbsent(parent))
+            if let descendantProcessID {
+                #expect(await waitUntilAbsent(descendantProcessID))
+            }
+        }, cleanup: {
+            consumer.cancel()
             if let parentProcessID {
                 _ = kill(-parentProcessID, SIGKILL)
             }
             if let descendantProcessID {
                 _ = kill(descendantProcessID, SIGKILL)
             }
+            await output.cancelAndWait()
+            _ = try? await consumer.value
             parentPIDFile.remove()
             descendantPIDFile.remove()
-        }
-
-        parentProcessID = try await parentPIDFile.waitForProcessID()
-        descendantProcessID = try await descendantPIDFile.waitForProcessID()
-        let parent = try #require(parentProcessID)
-        #expect(getpgid(parent) == parent)
-        if let descendantProcessID {
-            #expect(getpgid(descendantProcessID) == parent)
-        }
-
-        consumer.cancel()
-        _ = try? await consumer.value
-        await output.cancelAndWait()
-
-        #expect(await waitUntilAbsent(parent))
-        if let descendantProcessID {
-            #expect(await waitUntilAbsent(descendantProcessID))
-        }
+        })
     }
 
     @Test("shutdown cancels lease waiters and permanently rejects late producers")
@@ -412,32 +436,33 @@ struct WorkerMetricsStreamerTests {
         ))
         var firstProcessID: pid_t?
         var secondProcessID: pid_t?
-        defer {
-            Task {
-                await first.cancelAndWait()
-                await second.cancelAndWait()
-            }
+
+        try await withAsyncCleanup({
+            firstProcessID = try await firstPIDFile.waitForProcessID()
+            secondProcessID = try await secondPIDFile.waitForProcessID()
+            let firstChild = try #require(firstProcessID)
+            let secondChild = try #require(secondProcessID)
+
+            await WorkerMetricsStreamer.shutdownAll()
+            WorkerMetricsStreamer.resetShutdownStateForTesting()
+            await first.waitForTermination()
+            await second.waitForTermination()
+
+            #expect(firstPIDFile.processIsAbsent(firstChild))
+            #expect(secondPIDFile.processIsAbsent(secondChild))
+        }, cleanup: {
             if let firstProcessID {
                 _ = kill(firstProcessID, SIGKILL)
             }
             if let secondProcessID {
                 _ = kill(secondProcessID, SIGKILL)
             }
+            await first.cancelAndWait()
+            await second.cancelAndWait()
+            WorkerMetricsStreamer.resetShutdownStateForTesting()
             firstPIDFile.remove()
             secondPIDFile.remove()
-        }
-        firstProcessID = try await firstPIDFile.waitForProcessID()
-        secondProcessID = try await secondPIDFile.waitForProcessID()
-        let firstChild = try #require(firstProcessID)
-        let secondChild = try #require(secondProcessID)
-
-        await WorkerMetricsStreamer.shutdownAll()
-        WorkerMetricsStreamer.resetShutdownStateForTesting()
-        await first.waitForTermination()
-        await second.waitForTermination()
-
-        #expect(firstPIDFile.processIsAbsent(firstChild))
-        #expect(secondPIDFile.processIsAbsent(secondChild))
+        })
     }
 
     private func termResistantCommand(

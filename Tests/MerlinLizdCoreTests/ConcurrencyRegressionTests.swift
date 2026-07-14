@@ -41,8 +41,16 @@ struct ConcurrencyRegressionTests {
     func authoritativeCompletionWinsLateCancellation() async throws {
         let parentPIDFile = TemporaryProcessIDFile()
         let descendantPIDFile = TemporaryProcessIDFile()
+        let descendantProbeFile = TemporaryProcessIDFile()
+        let descendantProbeFIFO = TemporaryMarkerFile()
         let completionGate = AsyncStartGate()
+        let (cancellationDecisions, cancellationDecisionContinuation) =
+            AsyncStream<Bool>.makeStream()
+        var cancellationDecisionIterator = cancellationDecisions.makeAsyncIterator()
         let runner = FoundationInventoryProcessRunner(
+            cancellationDecisionHook: { cancelled in
+                cancellationDecisionContinuation.yield(cancelled)
+            },
             completionBoundaryHook: {
                 await completionGate.wait()
             }
@@ -52,45 +60,52 @@ struct ConcurrencyRegressionTests {
                 executable: "/bin/sh",
                 arguments: [
                     "-c",
-                    "echo $$ > \"$1\"; /bin/sh -c 'exec 1>&- 2>&-; exec /bin/sleep 30' & echo $! > \"$2\"; exit 0",
+                    "echo $$ > \"$1\"; /bin/sh -c '/usr/bin/mkfifo \"$2\"; exec 3<> \"$2\"; trap \"echo \\$\\$ > \\\"$1\\\"\" USR1; exec 1>&- 2>&-; while :; do read value <&3; done' probe \"$3\" \"$4\" & echo $! > \"$2\"; exit 0",
                     "merlin-lizd-finalized-cancel-test",
                     parentPIDFile.path,
                     descendantPIDFile.path,
+                    descendantProbeFile.path,
+                    descendantProbeFIFO.path,
                 ]
             ))
         }
         var parentProcessID: pid_t?
         var descendantProcessID: pid_t?
-        defer {
+
+        try await withAsyncCleanup({
+            await completionGate.waitUntilEntered()
+            parentProcessID = try await parentPIDFile.waitForProcessID()
+            descendantProcessID = try await descendantPIDFile.waitForProcessID()
+            #expect(parentPIDFile.processIsAbsent(try #require(parentProcessID)))
+            #expect(!descendantPIDFile.processIsAbsent(
+                try #require(descendantProcessID)
+            ))
             task.cancel()
-            Task { await completionGate.open() }
+            #expect(await cancellationDecisionIterator.next() == false)
+            #expect(kill(try #require(descendantProcessID), SIGUSR1) == 0)
+            #expect(
+                try await descendantProbeFile.waitForProcessID()
+                    == descendantProcessID
+            )
+            await completionGate.open()
+
+            let output = try await task.value
+            #expect(output.exitCode == 0)
+        }, cleanup: {
+            task.cancel()
+            await completionGate.open()
             if let parentProcessID {
-                _ = kill(-parentProcessID, SIGKILL)
+                _ = kill(parentProcessID, SIGKILL)
             }
             if let descendantProcessID {
                 _ = kill(descendantProcessID, SIGKILL)
             }
+            _ = try? await task.value
             parentPIDFile.remove()
             descendantPIDFile.remove()
-        }
-
-        await completionGate.waitUntilEntered()
-        parentProcessID = try await parentPIDFile.waitForProcessID()
-        descendantProcessID = try await descendantPIDFile.waitForProcessID()
-        #expect(parentPIDFile.processIsAbsent(try #require(parentProcessID)))
-        #expect(!descendantPIDFile.processIsAbsent(
-            try #require(descendantProcessID)
-        ))
-        task.cancel()
-        task.cancel()
-        try? await Task.sleep(for: .milliseconds(20))
-        #expect(!descendantPIDFile.processIsAbsent(
-            try #require(descendantProcessID)
-        ))
-        await completionGate.open()
-
-        let output = try await task.value
-        #expect(output.exitCode == 0)
+            descendantProbeFile.remove()
+            descendantProbeFIFO.remove()
+        })
     }
 
     @Test("cancellation after leader exit terminates a descendant holding output pipes")
@@ -118,41 +133,43 @@ struct ConcurrencyRegressionTests {
         }
         var parentProcessID: pid_t?
         var descendantProcessID: pid_t?
-        defer {
+
+        try await withAsyncCleanup({
+            await exitGate.waitUntilEntered()
+            parentProcessID = try await parentPIDFile.waitForProcessID()
+            descendantProcessID = try await descendantPIDFile.waitForProcessID()
+            let parent = try #require(parentProcessID)
+            let descendant = try #require(descendantProcessID)
+            #expect(parentPIDFile.processHasExitedWithoutReaping(parent))
+            #expect(!descendantPIDFile.processIsAbsent(descendant))
+
             task.cancel()
-            Task { await exitGate.open() }
+            await exitGate.open()
+
+            let descendantWasTerminated = await descendantPIDFile
+                .waitUntilProcessIsAbsent(descendant)
+            if !descendantWasTerminated {
+                _ = kill(-parent, SIGKILL)
+                _ = await descendantPIDFile.waitUntilProcessIsAbsent(
+                    descendant
+                )
+            }
+            #expect(descendantWasTerminated)
+            await expectCancellation(from: task)
+            #expect(await parentPIDFile.waitUntilProcessIsAbsent(parent))
+        }, cleanup: {
+            task.cancel()
+            await exitGate.open()
             if let parentProcessID {
                 _ = kill(-parentProcessID, SIGKILL)
             }
             if let descendantProcessID {
                 _ = kill(descendantProcessID, SIGKILL)
             }
+            _ = try? await task.value
             parentPIDFile.remove()
             descendantPIDFile.remove()
-        }
-
-        await exitGate.waitUntilEntered()
-        parentProcessID = try await parentPIDFile.waitForProcessID()
-        descendantProcessID = try await descendantPIDFile.waitForProcessID()
-        let parent = try #require(parentProcessID)
-        let descendant = try #require(descendantProcessID)
-        #expect(parentPIDFile.processHasExitedWithoutReaping(parent))
-        #expect(!descendantPIDFile.processIsAbsent(descendant))
-
-        task.cancel()
-        await exitGate.open()
-
-        let descendantWasTerminated = await descendantPIDFile
-            .waitUntilProcessIsAbsent(descendant)
-        if !descendantWasTerminated {
-            _ = kill(-parent, SIGKILL)
-            _ = await descendantPIDFile.waitUntilProcessIsAbsent(
-                descendant
-            )
-        }
-        #expect(descendantWasTerminated)
-        await expectCancellation(from: task)
-        #expect(await parentPIDFile.waitUntilProcessIsAbsent(parent))
+        })
     }
 
     @Test("cancellation before atomic finalization kills the group before reap")
@@ -180,36 +197,38 @@ struct ConcurrencyRegressionTests {
         }
         var parentProcessID: pid_t?
         var descendantProcessID: pid_t?
-        defer {
+
+        try await withAsyncCleanup({
+            await decisionGate.waitUntilEntered()
+            parentProcessID = try await parentPIDFile.waitForProcessID()
+            descendantProcessID = try await descendantPIDFile.waitForProcessID()
+            let parent = try #require(parentProcessID)
+            let descendant = try #require(descendantProcessID)
+            #expect(parentPIDFile.processHasExitedWithoutReaping(parent))
+            #expect(getpgid(descendant) == parent)
+
+            let clock = ContinuousClock()
+            let cancelledAt = clock.now
             task.cancel()
-            Task { await decisionGate.open() }
+            task.cancel()
+            await decisionGate.open()
+            await expectCancellation(from: task)
+            #expect(cancelledAt.duration(to: clock.now) < .seconds(1))
+            #expect(parentPIDFile.processIsAbsent(parent))
+            #expect(await descendantPIDFile.waitUntilProcessIsAbsent(descendant))
+        }, cleanup: {
+            task.cancel()
+            await decisionGate.open()
             if let parentProcessID {
                 _ = kill(-parentProcessID, SIGKILL)
             }
             if let descendantProcessID {
                 _ = kill(descendantProcessID, SIGKILL)
             }
+            _ = try? await task.value
             parentPIDFile.remove()
             descendantPIDFile.remove()
-        }
-
-        await decisionGate.waitUntilEntered()
-        parentProcessID = try await parentPIDFile.waitForProcessID()
-        descendantProcessID = try await descendantPIDFile.waitForProcessID()
-        let parent = try #require(parentProcessID)
-        let descendant = try #require(descendantProcessID)
-        #expect(parentPIDFile.processHasExitedWithoutReaping(parent))
-        #expect(getpgid(descendant) == parent)
-
-        let clock = ContinuousClock()
-        let cancelledAt = clock.now
-        task.cancel()
-        task.cancel()
-        await decisionGate.open()
-        await expectCancellation(from: task)
-        #expect(cancelledAt.duration(to: clock.now) < .seconds(1))
-        #expect(parentPIDFile.processIsAbsent(parent))
-        #expect(await descendantPIDFile.waitUntilProcessIsAbsent(descendant))
+        })
     }
 
     @Test("a task cancelled before process launch never starts the child")
@@ -252,24 +271,26 @@ struct ConcurrencyRegressionTests {
             ))
         }
         var processID: pid_t?
-        defer {
+
+        try await withAsyncCleanup({
+            processID = try await pidFile.waitForProcessID()
+            let child = try #require(processID)
+            let clock = ContinuousClock()
+            let cancelledAt = clock.now
+            task.cancel()
+
+            await expectCancellation(from: task)
+            let cancellationDuration = cancelledAt.duration(to: clock.now)
+            #expect(cancellationDuration < .seconds(1))
+            #expect(pidFile.processIsAbsent(child))
+        }, cleanup: {
             task.cancel()
             if let processID {
                 _ = kill(processID, SIGKILL)
             }
+            _ = try? await task.value
             pidFile.remove()
-        }
-
-        processID = try await pidFile.waitForProcessID()
-        let child = try #require(processID)
-        let clock = ContinuousClock()
-        let cancelledAt = clock.now
-        task.cancel()
-
-        await expectCancellation(from: task)
-        let cancellationDuration = cancelledAt.duration(to: clock.now)
-        #expect(cancellationDuration < .seconds(1))
-        #expect(pidFile.processIsAbsent(child))
+        })
     }
 
     @Test("timeout force-kills a TERM-resistant process group")
@@ -296,7 +317,39 @@ struct ConcurrencyRegressionTests {
                 ]
             ))
         }
-        defer {
+
+        try await withAsyncCleanup({
+            parentProcessID = try await parentPIDFile.waitForProcessID()
+            descendantProcessID = try await descendantPIDFile.waitForProcessID()
+            let parent = try #require(parentProcessID)
+            #expect(getpgid(parent) == parent)
+            #expect(parent != getpgrp())
+            if let descendantProcessID {
+                #expect(getpgid(descendantProcessID) == parent)
+            }
+
+            try await clock.sleep(
+                until: startedAt.advanced(by: .milliseconds(1_500))
+            )
+            #expect(parentPIDFile.processIsAbsent(parent))
+            if let descendantProcessID {
+                #expect(descendantPIDFile.processIsAbsent(descendantProcessID))
+            }
+
+            await #expect(throws: InventoryProcessTimeoutError.timedOut) {
+                _ = try await task.value
+            }
+
+            let elapsed = startedAt.duration(to: clock.now)
+            #expect(elapsed >= .seconds(1))
+            #expect(elapsed < .seconds(3))
+            #expect(await parentPIDFile.waitUntilProcessIsAbsent(parent))
+            if let descendantProcessID {
+                #expect(await descendantPIDFile.waitUntilProcessIsAbsent(
+                    descendantProcessID
+                ))
+            }
+        }, cleanup: {
             task.cancel()
             if let parentProcessID {
                 _ = kill(-parentProcessID, SIGKILL)
@@ -304,36 +357,10 @@ struct ConcurrencyRegressionTests {
             if let descendantProcessID {
                 _ = kill(descendantProcessID, SIGKILL)
             }
+            _ = try? await task.value
             parentPIDFile.remove()
             descendantPIDFile.remove()
-        }
-
-        parentProcessID = try await parentPIDFile.waitForProcessID()
-        descendantProcessID = try await descendantPIDFile.waitForProcessID()
-        let parent = try #require(parentProcessID)
-        #expect(getpgid(parent) == parent)
-        #expect(parent != getpgrp())
-        if let descendantProcessID {
-            #expect(getpgid(descendantProcessID) == parent)
-        }
-
-        try await clock.sleep(until: startedAt.advanced(by: .milliseconds(1_500)))
-        #expect(parentPIDFile.processIsAbsent(parent))
-        if let descendantProcessID {
-            #expect(descendantPIDFile.processIsAbsent(descendantProcessID))
-        }
-
-        await #expect(throws: InventoryProcessTimeoutError.timedOut) {
-            _ = try await task.value
-        }
-
-        let elapsed = startedAt.duration(to: clock.now)
-        #expect(elapsed >= .seconds(1))
-        #expect(elapsed < .seconds(3))
-        #expect(await parentPIDFile.waitUntilProcessIsAbsent(parent))
-        if let descendantProcessID {
-            #expect(await descendantPIDFile.waitUntilProcessIsAbsent(descendantProcessID))
-        }
+        })
     }
 
     @Test("a cancelled slot waiter never reaches the underlying runner")
