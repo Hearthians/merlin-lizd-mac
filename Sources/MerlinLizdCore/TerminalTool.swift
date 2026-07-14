@@ -16,6 +16,16 @@ public struct AgentTurnID: RawRepresentable, Codable, Hashable, Sendable {
     }
 }
 
+public struct AgentTurnHandle: Hashable, Sendable {
+    public let threadID: AgentThreadID
+    let generationID: UUID
+
+    init(threadID: AgentThreadID, generationID: UUID = UUID()) {
+        self.threadID = threadID
+        self.generationID = generationID
+    }
+}
+
 public enum TerminalToolCall: Codable, Equatable, Sendable {
     case observeScreen
     case sendInput(TerminalInputBatch)

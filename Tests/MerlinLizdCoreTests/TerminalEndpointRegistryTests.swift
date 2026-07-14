@@ -220,6 +220,115 @@ struct TerminalEndpointRegistryTests {
         #expect(await port.keyboardOwners().isEmpty)
     }
 
+    @Test("duplicate endpoint identity is rejected until unregister completes")
+    func duplicateEndpointIdentityIsRejected() async throws {
+        let registry = TerminalEndpointRegistry()
+        let endpointID = TerminalEndpointID(
+            rawValue: TerminalToolFixtures.newID()
+        )
+        let originalScreen = TerminalToolFixtures.screen(revision: 41)
+        let replacementScreen = TerminalToolFixtures.screen(revision: 42)
+        let originalPort = FakeTerminalToolPort(snapshot: originalScreen)
+        let replacementPort = FakeTerminalToolPort(snapshot: replacementScreen)
+        let replacementIdentity = TmuxSessionIdentity(
+            serverSessionID: "$duplicate-replacement",
+            createdAtEpoch: 42
+        )
+        let replacementKey = TerminalConversationKey(
+            target: .local,
+            tmux: replacementIdentity
+        )
+        let replacementRoute = TmuxRoute(
+            target: .local,
+            sessionName: "duplicate-replacement",
+            expectedIdentity: replacementIdentity
+        )
+        let original = TerminalToolFixtures.endpoint(
+            id: endpointID.rawValue,
+            port: originalPort,
+            controller: FakeTerminalSurfaceController(
+                surface: TerminalToolFixtures.surface()
+            )
+        )
+        let sameConversationReplacement = TerminalToolFixtures.endpoint(
+            id: endpointID.rawValue,
+            port: replacementPort,
+            controller: FakeTerminalSurfaceController(
+                surface: TerminalToolFixtures.surface()
+            )
+        )
+        let differentConversationReplacement = TerminalToolFixtures.endpoint(
+            id: endpointID.rawValue,
+            key: replacementKey,
+            port: replacementPort,
+            controller: FakeTerminalSurfaceController(
+                surface: TmuxSurface(
+                    sessionIdentity: replacementIdentity,
+                    windowID: "@replacement",
+                    paneID: "%replacement",
+                    currentCommand: "zsh"
+                )
+            ),
+            route: replacementRoute
+        )
+        try await registry.register(original)
+        let threadID = AgentThreadID(rawValue: "duplicate-endpoint")
+        _ = try await registry.prepareTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+
+        await #expect(
+            throws: TerminalEndpointRegistryError.endpointAlreadyRegistered(
+                endpointID
+            )
+        ) {
+            try await registry.register(sameConversationReplacement)
+        }
+        let turnID = AgentTurnID(rawValue: "duplicate-endpoint-turn")
+        let claimed = try await registry.claimPreparedTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key,
+            turnID: turnID
+        )
+        #expect(try await claimed.endpoint.terminal.observeScreen() == originalScreen)
+
+        await #expect(
+            throws: TerminalEndpointRegistryError.endpointAlreadyRegistered(
+                endpointID
+            )
+        ) {
+            try await registry.register(differentConversationReplacement)
+        }
+        #expect(await replacementPort.keyboardOwners().isEmpty)
+
+        let userGate = TerminalToolTestGate()
+        await originalPort.blockKeyboardOwner(.user, on: userGate)
+        let unregister = Task { await registry.unregister(endpointID) }
+        while !(await originalPort.keyboardOwnerTransitionsStarted().contains(.user)) {
+            await Task.yield()
+        }
+        await #expect(
+            throws: TerminalEndpointRegistryError.endpointAlreadyRegistered(
+                endpointID
+            )
+        ) {
+            try await registry.register(differentConversationReplacement)
+        }
+        await userGate.open()
+        await unregister.value
+        await registry.releaseTurn(threadID: threadID, turnID: turnID)
+        try await registry.register(differentConversationReplacement)
+        let replacementThread = AgentThreadID(rawValue: "replacement-endpoint")
+        let rebound = try await registry.prepareTurn(
+            threadID: replacementThread,
+            conversationKey: replacementKey
+        )
+        #expect(try await rebound.endpoint.terminal.observeScreen() == replacementScreen)
+        #expect(await originalPort.keyboardOwners() == [.codex, .user])
+        #expect(await replacementPort.keyboardOwners() == [.codex])
+    }
+
     @Test("active release cannot consume an unclaimed prepared binding")
     func activeReleaseDoesNotReleasePreparedBinding() async throws {
         let registry = TerminalEndpointRegistry()
@@ -593,15 +702,8 @@ struct TerminalEndpointRegistryTests {
     func endpointChurnPrunesTransientState() async throws {
         let registry = TerminalEndpointRegistry()
         let stream = await registry.events()
-        let eventTask = Task {
-            var iterator = stream.makeAsyncIterator()
-            var events: [TerminalEndpointRegistryEvent] = []
-            for _ in 0..<25 {
-                guard let event = await iterator.next() else { break }
-                events.append(event)
-            }
-            return events
-        }
+        var iterator = stream.makeAsyncIterator()
+        var events: [TerminalEndpointRegistryEvent] = []
         for index in 0..<25 {
             let port = FakeTerminalToolPort(
                 snapshot: TerminalToolFixtures.screen(revision: UInt64(index))
@@ -624,9 +726,11 @@ struct TerminalEndpointRegistryTests {
                 conversationKey: TerminalToolFixtures.key
             )
             await registry.unregister(endpointID)
+            if let event = await iterator.next() {
+                events.append(event)
+            }
         }
 
-        let events = await eventTask.value
         #expect(events.count == 25)
         #expect(events.allSatisfy { event in
             guard case let .pinLost(loss) = event else { return false }
@@ -637,6 +741,46 @@ struct TerminalEndpointRegistryTests {
         #expect(snapshot.bindingCount == 0)
         #expect(snapshot.conversationOwnerCount == 0)
         #expect(snapshot.keyboardTransitionCount == 0)
+        #expect(snapshot.pinLossHistoryCount == 0)
+        #expect(snapshot.retiringEndpointCount == 0)
+    }
+
+    @Test("slow event subscribers receive bounded overflow reconciliation")
+    func slowSubscriberReceivesOverflowReconciliation() async throws {
+        let registry = TerminalEndpointRegistry()
+        let stream = await registry.events()
+
+        for index in 0..<5 {
+            let endpointID = TerminalEndpointID(
+                rawValue: TerminalToolFixtures.newID()
+            )
+            try await registry.register(
+                TerminalToolFixtures.endpoint(
+                    id: endpointID.rawValue,
+                    port: FakeTerminalToolPort(
+                        snapshot: TerminalToolFixtures.screen(
+                            revision: UInt64(index)
+                        )
+                    ),
+                    controller: FakeTerminalSurfaceController(
+                        surface: TerminalToolFixtures.surface()
+                    )
+                )
+            )
+            _ = try await registry.prepareTurn(
+                threadID: AgentThreadID(rawValue: "slow-\(index)"),
+                conversationKey: TerminalToolFixtures.key
+            )
+            await registry.unregister(endpointID)
+        }
+
+        var iterator = stream.makeAsyncIterator()
+        #expect(await iterator.next() == .reconciliationRequired)
+        let snapshot = await registry.testingStateSnapshot()
+        #expect(snapshot.eventSubscriberCount == 1)
+        #expect(snapshot.eventBufferCapacity == 1)
+        #expect(snapshot.bindingCount == 0)
+        #expect(snapshot.conversationOwnerCount == 0)
         #expect(snapshot.pinLossHistoryCount == 0)
     }
 }

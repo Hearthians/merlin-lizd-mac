@@ -81,10 +81,12 @@ public struct TerminalEndpointPinLoss: Equatable, Sendable {
 
 public enum TerminalEndpointRegistryEvent: Equatable, Sendable {
     case pinLost(TerminalEndpointPinLoss)
+    case reconciliationRequired
 }
 
 public enum TerminalEndpointRegistryError: Error, Equatable, Sendable {
     case endpointNotFound
+    case endpointAlreadyRegistered(TerminalEndpointID)
     case endpointRouteMismatch
     case noFocusedEndpoint
     case threadAlreadyPrepared
@@ -101,9 +103,14 @@ struct TerminalEndpointRegistryStateSnapshot: Equatable, Sendable {
     let conversationOwnerCount: Int
     let keyboardTransitionCount: Int
     let pinLossHistoryCount: Int
+    let retiringEndpointCount: Int
+    let eventSubscriberCount: Int
+    let eventBufferCapacity: Int
 }
 
 public actor TerminalEndpointRegistry {
+    private static let eventBufferCapacity = 1
+
     private struct RegisteredEndpoint: Sendable {
         let endpoint: TerminalEndpoint
         var focusOrder: UInt64
@@ -144,6 +151,7 @@ public actor TerminalEndpointRegistry {
     }
 
     private var endpoints: [TerminalEndpointID: RegisteredEndpoint] = [:]
+    private var retiringEndpointIDs: Set<TerminalEndpointID> = []
     private var bindings: [AgentThreadID: StoredBinding] = [:]
     private var conversationOwners: [TerminalConversationKey: AgentThreadID]
         = [:]
@@ -154,16 +162,31 @@ public actor TerminalEndpointRegistry {
         UUID: AsyncStream<TerminalEndpointRegistryEvent>.Continuation
     ] = [:]
     private let bindingValidationHook: (@Sendable () async -> Void)?
+    private let claimPreparedTurnHook: (@Sendable () async -> Void)?
 
     public init() {
         bindingValidationHook = nil
+        claimPreparedTurnHook = nil
     }
 
     init(bindingValidationHook: @escaping @Sendable () async -> Void) {
         self.bindingValidationHook = bindingValidationHook
+        claimPreparedTurnHook = nil
+    }
+
+    init(claimPreparedTurnHook: @escaping @Sendable () async -> Void) {
+        bindingValidationHook = nil
+        self.claimPreparedTurnHook = claimPreparedTurnHook
     }
 
     public func register(_ endpoint: TerminalEndpoint) throws {
+        guard endpoints[endpoint.id] == nil,
+            !retiringEndpointIDs.contains(endpoint.id)
+        else {
+            throw TerminalEndpointRegistryError.endpointAlreadyRegistered(
+                endpoint.id
+            )
+        }
         guard routeMatchesConversation(endpoint) else {
             throw TerminalEndpointRegistryError.endpointRouteMismatch
         }
@@ -175,6 +198,9 @@ public actor TerminalEndpointRegistry {
     }
 
     public func unregister(_ endpointID: TerminalEndpointID) async {
+        guard endpoints[endpointID] != nil else { return }
+        retiringEndpointIDs.insert(endpointID)
+        defer { retiringEndpointIDs.remove(endpointID) }
         endpoints.removeValue(forKey: endpointID)
         var cleanup: [(
             threadID: AgentThreadID,
@@ -211,9 +237,7 @@ public actor TerminalEndpointRegistry {
                 conversationKey: binding.conversationKey,
                 endpointID: endpointID
             )
-            eventSubscribers.values.forEach {
-                $0.yield(.pinLost(loss))
-            }
+            publish(.pinLost(loss))
         }
         for item in cleanup {
             await item.transition.task.value
@@ -305,6 +329,7 @@ public actor TerminalEndpointRegistry {
         conversationKey: TerminalConversationKey,
         turnID: AgentTurnID
     ) async throws -> TerminalEndpointBinding {
+        await claimPreparedTurnHook?()
         guard let initial = bindings[threadID] else {
             throw TerminalEndpointRegistryError.preparedBindingNotFound
         }
@@ -490,17 +515,41 @@ public actor TerminalEndpointRegistry {
             bindingCount: bindings.count,
             conversationOwnerCount: conversationOwners.count,
             keyboardTransitionCount: keyboardTransitions.count,
-            pinLossHistoryCount: 0
+            pinLossHistoryCount: 0,
+            retiringEndpointCount: retiringEndpointIDs.count,
+            eventSubscriberCount: eventSubscribers.count,
+            eventBufferCapacity: Self.eventBufferCapacity
         )
     }
 
     public func events() -> AsyncStream<TerminalEndpointRegistryEvent> {
         let subscriberID = UUID()
-        return AsyncStream { continuation in
+        return AsyncStream(
+            bufferingPolicy: .bufferingNewest(Self.eventBufferCapacity)
+        ) { continuation in
             eventSubscribers[subscriberID] = continuation
             continuation.onTermination = { [weak self] _ in
                 Task { await self?.removeEventSubscriber(subscriberID) }
             }
+        }
+    }
+
+    private func publish(_ event: TerminalEndpointRegistryEvent) {
+        var terminatedSubscriberIDs: [UUID] = []
+        for (subscriberID, subscriber) in eventSubscribers {
+            switch subscriber.yield(event) {
+            case .enqueued:
+                break
+            case .dropped:
+                _ = subscriber.yield(.reconciliationRequired)
+            case .terminated:
+                terminatedSubscriberIDs.append(subscriberID)
+            @unknown default:
+                terminatedSubscriberIDs.append(subscriberID)
+            }
+        }
+        for subscriberID in terminatedSubscriberIDs {
+            eventSubscribers.removeValue(forKey: subscriberID)
         }
     }
 

@@ -34,7 +34,7 @@ struct TerminalToolRouterTests {
         )
 
         let observed = try await router.execute(
-            threadID: threadID,
+            handle: threadID,
             turnID: turnID,
             conversationKey: TerminalToolFixtures.key,
             call: .observeScreen
@@ -43,7 +43,7 @@ struct TerminalToolRouterTests {
 
         let input = TerminalToolFixtures.input(revision: 10)
         let sent = try await router.execute(
-            threadID: threadID,
+            handle: threadID,
             turnID: turnID,
             conversationKey: TerminalToolFixtures.key,
             call: .sendInput(input)
@@ -51,7 +51,7 @@ struct TerminalToolRouterTests {
         #expect(sent == .inputAccepted(.init(acceptedRevision: 10, byteCount: 1)))
 
         let waited = try await router.execute(
-            threadID: threadID,
+            handle: threadID,
             turnID: turnID,
             conversationKey: TerminalToolFixtures.key,
             call: .waitForScreen(.init(condition: .changed(after: 10), timeout: .seconds(1)))
@@ -61,7 +61,7 @@ struct TerminalToolRouterTests {
         await port.setSnapshot(changed)
         let selectionTask = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .selectVisibleSurface(.nextPane, expectedRevision: 11)
@@ -74,7 +74,7 @@ struct TerminalToolRouterTests {
         await surfaces.setCreatedSurface(temporary)
         let createTask = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 11)
@@ -93,7 +93,7 @@ struct TerminalToolRouterTests {
         await port.setSnapshot(paneScreen)
         let finishTask = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .finishTemporaryPane(
@@ -137,7 +137,7 @@ struct TerminalToolRouterTests {
             throws: TerminalToolRouterError.staleRevision(expected: 3, actual: 4)
         ) {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .sendInput(TerminalToolFixtures.input(revision: 3))
@@ -148,7 +148,7 @@ struct TerminalToolRouterTests {
         await port.enqueueSendFailure(.send)
         await #expect(throws: TerminalToolRouterError.terminalFailure) {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .sendInput(TerminalToolFixtures.input(revision: 4))
@@ -180,7 +180,7 @@ struct TerminalToolRouterTests {
 
         let deniedTask = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .sendInput(action)
@@ -195,27 +195,27 @@ struct TerminalToolRouterTests {
 
         let interruptedTask = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .sendInput(action)
             )
         }
         _ = try await pendingRequest(router: router)
-        try await router.interruptTurn(threadID: threadID, turnID: turnID)
+        try await router.interruptTurn(handle: threadID, turnID: turnID)
         await #expect(throws: TerminalToolRouterError.interrupted) {
             try await interruptedTask.value
         }
         #expect(await port.counts().send == 0)
 
         let secondTurn = AgentTurnID(rawValue: "turn-after-interrupt")
-        _ = try await router.beginTurn(
-            threadID: threadID,
+        let secondHandle = try await router.beginTurn(
+            threadID: threadID.threadID,
             conversationKey: TerminalToolFixtures.key
         )
         let driftTask = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: secondHandle,
                 turnID: secondTurn,
                 conversationKey: TerminalToolFixtures.key,
                 call: .sendInput(action)
@@ -258,14 +258,14 @@ struct TerminalToolRouterTests {
         )
         let thread = AgentThreadID(rawValue: "thread-serial")
         let turn = AgentTurnID(rawValue: "turn-serial")
-        _ = try await router.beginTurn(
+        let handle = try await router.beginTurn(
             threadID: thread,
             conversationKey: TerminalToolFixtures.key
         )
 
         let first = Task {
             try await router.execute(
-                threadID: thread,
+                handle: handle,
                 turnID: turn,
                 conversationKey: TerminalToolFixtures.key,
                 call: .sendInput(TerminalToolFixtures.input(revision: 1, purpose: "first"))
@@ -274,7 +274,7 @@ struct TerminalToolRouterTests {
         while await firstPort.counts().send == 0 { await Task.yield() }
         let second = Task {
             try await router.execute(
-                threadID: thread,
+                handle: handle,
                 turnID: turn,
                 conversationKey: TerminalToolFixtures.key,
                 call: .sendInput(TerminalToolFixtures.input(revision: 1, purpose: "second"))
@@ -316,9 +316,12 @@ struct TerminalToolRouterTests {
         )
         let otherThread = AgentThreadID(rawValue: "thread-other")
         let otherTurn = AgentTurnID(rawValue: "turn-other")
-        _ = try await router.beginTurn(threadID: otherThread, conversationKey: otherKey)
-        _ = try await router.execute(
+        let otherHandle = try await router.beginTurn(
             threadID: otherThread,
+            conversationKey: otherKey
+        )
+        _ = try await router.execute(
+            handle: otherHandle,
             turnID: otherTurn,
             conversationKey: otherKey,
             call: .sendInput(TerminalToolFixtures.input(revision: 1))
@@ -355,7 +358,7 @@ struct TerminalToolRouterTests {
 
         let createTask = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 20)
@@ -370,7 +373,7 @@ struct TerminalToolRouterTests {
 
         let finishTask = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .finishTemporaryPane(
@@ -392,7 +395,7 @@ struct TerminalToolRouterTests {
 
         let retryFinish = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .finishTemporaryPane(
@@ -416,7 +419,7 @@ struct TerminalToolRouterTests {
         )
         let duplicateCreate = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 21)
@@ -433,7 +436,7 @@ struct TerminalToolRouterTests {
             try await duplicateCreate.value
         }
 
-        try await router.interruptTurn(threadID: threadID, turnID: turnID)
+        try await router.interruptTurn(handle: threadID, turnID: turnID)
         #expect(await port.counts().send == 0)
     }
 
@@ -455,7 +458,7 @@ struct TerminalToolRouterTests {
         )
         let first = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .sendInput(
@@ -469,7 +472,7 @@ struct TerminalToolRouterTests {
         while await port.counts().send == 0 { await Task.yield() }
         let cancelled = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .sendInput(
@@ -486,7 +489,7 @@ struct TerminalToolRouterTests {
 
         let third = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .sendInput(
@@ -529,7 +532,7 @@ struct TerminalToolRouterTests {
 
         let create = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 50)
@@ -548,7 +551,7 @@ struct TerminalToolRouterTests {
         #expect(!calls.contains { $0.hasPrefix("close:") })
         let duplicateCreate = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 50)
@@ -586,7 +589,7 @@ struct TerminalToolRouterTests {
         )
         let create = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 55)
@@ -622,7 +625,7 @@ struct TerminalToolRouterTests {
 
         await #expect(throws: TerminalToolRouterError.liveLeaseExists) {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 55)
@@ -648,7 +651,7 @@ struct TerminalToolRouterTests {
                 )
             ) {
                 _ = try await router.execute(
-                    threadID: threadID,
+                    handle: threadID,
                     turnID: turnID,
                     conversationKey: TerminalToolFixtures.key,
                     call: .finishTemporaryPane(
@@ -671,7 +674,7 @@ struct TerminalToolRouterTests {
             )
         ) {
             _ = try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .finishTemporaryPane(
@@ -681,7 +684,7 @@ struct TerminalToolRouterTests {
             )
         }
         await journal.setFailAppend(false)
-        try await router.endTurn(threadID: threadID, turnID: turnID)
+        try await router.endTurn(handle: threadID, turnID: turnID)
     }
 
     @Test("pin loss finish audits controller-retained provenance without terminal access")
@@ -715,14 +718,14 @@ struct TerminalToolRouterTests {
         )
         let threadID = AgentThreadID(rawValue: "controller-pin-loss-thread")
         let turnID = AgentTurnID(rawValue: "controller-pin-loss-turn")
-        _ = try await router.beginTurn(
+        let handle = try await router.beginTurn(
             threadID: threadID,
             conversationKey: TerminalToolFixtures.key
         )
-        try await router.confirmTurnID(threadID: threadID, turnID: turnID)
+        try await router.confirmTurnID(handle: handle, turnID: turnID)
         let create = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: handle,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 550)
@@ -755,7 +758,7 @@ struct TerminalToolRouterTests {
             )
         ) {
             _ = try await router.execute(
-                threadID: threadID,
+                handle: handle,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .finishTemporaryPane(
@@ -778,7 +781,7 @@ struct TerminalToolRouterTests {
         } else {
             Issue.record("expected retained pin-loss audit")
         }
-        try await router.endTurn(threadID: threadID, turnID: turnID)
+        try await router.endTurn(handle: handle, turnID: turnID)
     }
 
     @Test("returned split is owned before identity verification")
@@ -809,7 +812,7 @@ struct TerminalToolRouterTests {
         )
         let create = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 55)
@@ -875,7 +878,7 @@ struct TerminalToolRouterTests {
         let callsBeforeFinish = await surfaces.recordedCalls()
         let finish = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .finishTemporaryPane(
@@ -910,13 +913,13 @@ struct TerminalToolRouterTests {
 
         await #expect(throws: TerminalToolRouterError.liveLeaseExists) {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 55)
             )
         }
-        try await router.endTurn(threadID: threadID, turnID: turnID)
+        try await router.endTurn(handle: threadID, turnID: turnID)
         let finalEvents = await journal.snapshot()
         let retainedReasons: [TerminalJournalRetentionReasonCode]
             = finalEvents.compactMap { event in
@@ -946,7 +949,7 @@ struct TerminalToolRouterTests {
         )
         let create = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 551)
@@ -975,7 +978,7 @@ struct TerminalToolRouterTests {
         let countsBeforeFinish = await port.counts()
         let finish = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .finishTemporaryPane(
@@ -1052,7 +1055,7 @@ struct TerminalToolRouterTests {
         )
         let create = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 552)
@@ -1104,7 +1107,7 @@ struct TerminalToolRouterTests {
         )
         let create = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 56)
@@ -1131,13 +1134,13 @@ struct TerminalToolRouterTests {
         await journal.failOnAppend(nil)
         await #expect(throws: TerminalToolRouterError.liveLeaseExists) {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 56)
             )
         }
-        try await router.endTurn(threadID: threadID, turnID: turnID)
+        try await router.endTurn(handle: threadID, turnID: turnID)
         let retainedReasons: [TerminalJournalRetentionReasonCode]
             = await journal.snapshot().compactMap {
             event in
@@ -1172,7 +1175,7 @@ struct TerminalToolRouterTests {
         )
         let create = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 56)
@@ -1200,7 +1203,7 @@ struct TerminalToolRouterTests {
 
         await #expect(throws: TerminalToolRouterError.liveLeaseExists) {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 56)
@@ -1228,7 +1231,7 @@ struct TerminalToolRouterTests {
         )
         let create = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 57)
@@ -1244,7 +1247,7 @@ struct TerminalToolRouterTests {
 
         #expect(
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .finishTemporaryPane(
@@ -1255,7 +1258,7 @@ struct TerminalToolRouterTests {
         )
         await #expect(throws: TerminalToolRouterError.liveLeaseExists) {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 58)
@@ -1292,13 +1295,13 @@ struct TerminalToolRouterTests {
         )
         let threadID = AgentThreadID(rawValue: "pin-loss-thread")
         let turnID = AgentTurnID(rawValue: "pin-loss-turn")
-        _ = try await router.beginTurn(
+        let handle = try await router.beginTurn(
             threadID: threadID,
             conversationKey: TerminalToolFixtures.key
         )
         let create = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: handle,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 581)
@@ -1315,7 +1318,7 @@ struct TerminalToolRouterTests {
 
         #expect(
             try await router.execute(
-                threadID: threadID,
+                handle: handle,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .finishTemporaryPane(
@@ -1326,7 +1329,7 @@ struct TerminalToolRouterTests {
         )
         #expect(
             try await router.execute(
-                threadID: threadID,
+                handle: handle,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .finishTemporaryPane(
@@ -1339,7 +1342,7 @@ struct TerminalToolRouterTests {
         #expect(await surfaces.recordedCalls() == callsBeforeLoss)
         #expect(!(await surfaces.recordedCalls()).contains { $0.hasPrefix("close:") })
 
-        try await router.endTurn(threadID: threadID, turnID: turnID)
+        try await router.endTurn(handle: handle, turnID: turnID)
         let retainedReasons: [TerminalJournalRetentionReasonCode]
             = await journal.snapshot().compactMap { event in
             guard case let .temporaryPane(.retained(id, pane, reason)) = event.kind,
@@ -1381,13 +1384,13 @@ struct TerminalToolRouterTests {
         )
         let threadID = AgentThreadID(rawValue: "pin-audit-thread")
         let turnID = AgentTurnID(rawValue: "pin-audit-turn")
-        _ = try await router.beginTurn(
+        let handle = try await router.beginTurn(
             threadID: threadID,
             conversationKey: TerminalToolFixtures.key
         )
         let create = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: handle,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 583)
@@ -1418,7 +1421,7 @@ struct TerminalToolRouterTests {
             )
         ) {
             _ = try await router.execute(
-                threadID: threadID,
+                handle: handle,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .finishTemporaryPane(
@@ -1454,7 +1457,7 @@ struct TerminalToolRouterTests {
         )
         let create = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 585)
@@ -1471,7 +1474,7 @@ struct TerminalToolRouterTests {
         await port.blockWaits(on: waitGate)
         let finish = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .finishTemporaryPane(
@@ -1528,7 +1531,7 @@ struct TerminalToolRouterTests {
         )
         let create = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 5871)
@@ -1545,7 +1548,7 @@ struct TerminalToolRouterTests {
         await port.blockWaits(on: waitGate)
         let finish = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .finishTemporaryPane(
@@ -1557,7 +1560,7 @@ struct TerminalToolRouterTests {
         try await approveNextRequest(router: router)
         while await port.counts().wait < 2 { await Task.yield() }
         let crash = Task {
-            try await router.crashTurn(threadID: threadID, turnID: turnID)
+            try await router.crashTurn(handle: threadID, turnID: turnID)
         }
         for _ in 0..<100 { await Task.yield() }
         await waitGate.open()
@@ -1605,7 +1608,7 @@ struct TerminalToolRouterTests {
         )
         let create = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 588)
@@ -1623,7 +1626,7 @@ struct TerminalToolRouterTests {
         await port.blockWaits(on: waitGate)
         let finish = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .finishTemporaryPane(
@@ -1679,7 +1682,7 @@ struct TerminalToolRouterTests {
 
         let create = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 60)
@@ -1693,7 +1696,7 @@ struct TerminalToolRouterTests {
         await port.setSnapshot(paneScreen)
         let finish = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .finishTemporaryPane(
@@ -1739,7 +1742,7 @@ struct TerminalToolRouterTests {
             )
         ) {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .sendInput(oversized)
@@ -1754,7 +1757,7 @@ struct TerminalToolRouterTests {
             )
         ) {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .waitForScreen(
@@ -1788,7 +1791,7 @@ struct TerminalToolRouterTests {
 
         await #expect(throws: TerminalToolRouterError.auditUnavailable) {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .sendInput(
@@ -1799,7 +1802,7 @@ struct TerminalToolRouterTests {
         await journal.failOnAppend(nil)
         await #expect(throws: TerminalToolRouterError.auditUnavailable) {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .sendInput(
@@ -1839,7 +1842,7 @@ struct TerminalToolRouterTests {
         )
         let create = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 90)
@@ -1853,7 +1856,7 @@ struct TerminalToolRouterTests {
         await port.setSnapshot(paneScreen)
         let finish = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .finishTemporaryPane(
@@ -1895,7 +1898,7 @@ struct TerminalToolRouterTests {
         )
         let selection = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .selectVisibleSurface(
@@ -1935,7 +1938,7 @@ struct TerminalToolRouterTests {
         )
         let create = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 110)
@@ -1950,13 +1953,13 @@ struct TerminalToolRouterTests {
 
         await #expect(throws: TerminalToolRouterError.liveLeaseExists) {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 111)
             )
         }
-        try await router.interruptTurn(threadID: threadID, turnID: turnID)
+        try await router.interruptTurn(handle: threadID, turnID: turnID)
 
         #expect(await port.counts().send == 0)
         let calls = await surfaces.recordedCalls()
@@ -1994,7 +1997,7 @@ struct TerminalToolRouterTests {
         )
         let create = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 115)
@@ -2023,7 +2026,7 @@ struct TerminalToolRouterTests {
         let first = Task {
             do {
                 try await router.interruptTurn(
-                    threadID: threadID,
+                    handle: threadID,
                     turnID: turnID
                 )
                 await firstProbe.complete(with: nil)
@@ -2039,7 +2042,7 @@ struct TerminalToolRouterTests {
         let second = Task {
             do {
                 try await router.crashTurn(
-                    threadID: threadID,
+                    handle: threadID,
                     turnID: turnID
                 )
                 await secondProbe.complete(with: nil)
@@ -2069,15 +2072,20 @@ struct TerminalToolRouterTests {
 
     @Test("same-turn activation survives cancellation and is joined exactly once")
     func sameTurnActivationIsSharedAndNonCancelling() async throws {
-        let codexGate = TerminalToolTestGate()
+        let activationGate = TerminalToolTestGate()
+        let activationValidation = TerminalBindingValidationGate(
+            blockedCall: 1,
+            gate: activationGate
+        )
         let port = FakeTerminalToolPort(
             snapshot: TerminalToolFixtures.screen(revision: 1161)
         )
-        await port.blockKeyboardOwner(.codex, on: codexGate)
         let surfaces = FakeTerminalSurfaceController(
             surface: TerminalToolFixtures.surface()
         )
-        let registry = TerminalEndpointRegistry()
+        let registry = TerminalEndpointRegistry(
+            claimPreparedTurnHook: { await activationValidation.validate() }
+        )
         try await registry.register(
             TerminalToolFixtures.endpoint(
                 id: TerminalToolFixtures.newID(),
@@ -2092,35 +2100,27 @@ struct TerminalToolRouterTests {
         )
         let threadID = AgentThreadID(rawValue: "shared-activation-thread")
         let turnID = AgentTurnID(rawValue: "shared-activation-turn")
-        let begin = Task {
-            try await router.beginTurn(
-                threadID: threadID,
-                conversationKey: TerminalToolFixtures.key
-            )
-        }
-        while await port.keyboardOwnerTransitionsStarted().isEmpty {
-            await Task.yield()
-        }
+        let handle = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
         let first = Task {
             try await router.confirmTurnID(
-                threadID: threadID,
+                handle: handle,
                 turnID: turnID
             )
         }
-        for _ in 0..<100 { await Task.yield() }
+        while await activationValidation.count() < 1 { await Task.yield() }
         let second = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: handle,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .observeScreen
             )
         }
-        for _ in 0..<100 { await Task.yield() }
         first.cancel()
-        await codexGate.open()
-
-        _ = try await begin.value
+        await activationGate.open()
         await #expect(throws: TerminalToolRouterError.interrupted) {
             try await first.value
         }
@@ -2129,17 +2129,18 @@ struct TerminalToolRouterTests {
                 TerminalToolFixtures.screen(revision: 1161)
             )
         )
+        #expect(await activationValidation.count() == 1)
         #expect(await port.keyboardOwners() == [.codex])
         await #expect(throws: TerminalToolRouterError.turnUnavailable) {
             _ = try await router.execute(
-                threadID: threadID,
+                handle: handle,
                 turnID: AgentTurnID(rawValue: "mismatched-turn"),
                 conversationKey: TerminalToolFixtures.key,
                 call: .observeScreen
             )
         }
 
-        try await router.endTurn(threadID: threadID, turnID: turnID)
+        try await router.endTurn(handle: handle, turnID: turnID)
         #expect(await port.keyboardOwners() == [.codex, .user])
     }
 
@@ -2197,7 +2198,6 @@ struct TerminalToolRouterTests {
         await unregister.value
         let failedSnapshot = await router.testingStateSnapshot()
         #expect(failedSnapshot.preparedTurnCount == 0)
-        #expect(failedSnapshot.replayProtectionBitCount == 0)
 
         let replacementPort = FakeTerminalToolPort(
             snapshot: TerminalToolFixtures.screen(revision: 1163)
@@ -2209,17 +2209,17 @@ struct TerminalToolRouterTests {
                 controller: surfaces
             )
         )
-        _ = try await router.beginTurn(
+        let replacementHandle = try await router.beginTurn(
             threadID: threadID,
             conversationKey: TerminalToolFixtures.key
         )
         let turnID = AgentTurnID(rawValue: "replacement-turn")
-        try await router.confirmTurnID(threadID: threadID, turnID: turnID)
-        try await router.endTurn(threadID: threadID, turnID: turnID)
+        try await router.confirmTurnID(handle: replacementHandle, turnID: turnID)
+        try await router.endTurn(handle: replacementHandle, turnID: turnID)
     }
 
-    @Test("cancelled begin preserves one usable prepared generation")
-    func cancelledBeginPreservesPreparedGeneration() async throws {
+    @Test("cancelled begin releases its exact preparation")
+    func cancelledBeginReleasesPreparation() async throws {
         let codexGate = TerminalToolTestGate()
         let port = FakeTerminalToolPort(
             snapshot: TerminalToolFixtures.screen(revision: 1164)
@@ -2255,58 +2255,57 @@ struct TerminalToolRouterTests {
         await #expect(throws: CancellationError.self) {
             _ = try await begin.value
         }
-
+        #expect(await port.keyboardOwners() == [.codex, .user])
+        let handle = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
         let turnID = AgentTurnID(rawValue: "after-cancelled-begin")
         #expect(
             try await router.execute(
-                threadID: threadID,
+                handle: handle,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .observeScreen
             ) == .screen(TerminalToolFixtures.screen(revision: 1164))
         )
-        try await router.endTurn(threadID: threadID, turnID: turnID)
+        try await router.endTurn(handle: handle, turnID: turnID)
         let snapshot = await router.testingStateSnapshot()
         #expect(snapshot.preparedTurnCount == 0)
         #expect(snapshot.activationTaskCount == 0)
         #expect(snapshot.turnLifecycleCount == 0)
-        #expect(snapshot.replayProtectionBitCount > 0)
-        #expect(
-            snapshot.replayProtectionBitCount
-                <= snapshot.replayProtectionCapacity
-        )
     }
 
     @Test("completed turn cannot claim a successor preparation")
     func completedTurnCannotClaimSuccessorPreparation() async throws {
         let (router, threadID, screen) = try await makeReplayRouter()
         let completedTurn = AgentTurnID(rawValue: "completed-turn")
-        _ = try await router.beginTurn(
+        let completedHandle = try await router.beginTurn(
             threadID: threadID,
             conversationKey: TerminalToolFixtures.key
         )
         try await router.confirmTurnID(
-            threadID: threadID,
+            handle: completedHandle,
             turnID: completedTurn
         )
         try await router.endTurn(
-            threadID: threadID,
+            handle: completedHandle,
             turnID: completedTurn
         )
 
-        _ = try await router.beginTurn(
+        let successorHandle = try await router.beginTurn(
             threadID: threadID,
             conversationKey: TerminalToolFixtures.key
         )
         await #expect(throws: TerminalToolRouterError.turnUnavailable) {
             try await router.confirmTurnID(
-                threadID: threadID,
+                handle: completedHandle,
                 turnID: completedTurn
             )
         }
         await #expect(throws: TerminalToolRouterError.turnUnavailable) {
             _ = try await router.execute(
-                threadID: threadID,
+                handle: completedHandle,
                 turnID: completedTurn,
                 conversationKey: TerminalToolFixtures.key,
                 call: .observeScreen
@@ -2316,15 +2315,93 @@ struct TerminalToolRouterTests {
         let successorTurn = AgentTurnID(rawValue: "successor-turn")
         #expect(
             try await router.execute(
-                threadID: threadID,
+                handle: successorHandle,
                 turnID: successorTurn,
                 conversationKey: TerminalToolFixtures.key,
                 call: .observeScreen
             ) == .screen(screen)
         )
         try await router.endTurn(
-            threadID: threadID,
+            handle: successorHandle,
             turnID: successorTurn
+        )
+    }
+
+    @Test("exact preparation handles isolate reused turn IDs across generations")
+    func exactPreparationHandlesIsolateReusedTurnIDs() async throws {
+        let (router, threadID, screen) = try await makeReplayRouter()
+        let reusedTurnID = AgentTurnID(rawValue: "deterministic-collision")
+        let firstHandle = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        try await router.confirmTurnID(
+            handle: firstHandle,
+            turnID: reusedTurnID
+        )
+        try await router.endTurn(
+            handle: firstHandle,
+            turnID: reusedTurnID
+        )
+
+        let successorHandle = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        await #expect(throws: TerminalToolRouterError.turnUnavailable) {
+            try await router.confirmTurnID(
+                handle: firstHandle,
+                turnID: reusedTurnID
+            )
+        }
+        await #expect(throws: TerminalToolRouterError.turnUnavailable) {
+            _ = try await router.execute(
+                handle: firstHandle,
+                turnID: reusedTurnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .observeScreen
+            )
+        }
+        try await router.interruptTurn(
+            handle: firstHandle,
+            turnID: reusedTurnID
+        )
+        try await router.endTurn(
+            handle: successorHandle,
+            turnID: reusedTurnID
+        )
+
+        let activeHandle = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        try await router.crashTurn(
+            handle: firstHandle,
+            turnID: reusedTurnID
+        )
+        #expect(
+            try await router.execute(
+                handle: activeHandle,
+                turnID: reusedTurnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .observeScreen
+            ) == .screen(screen)
+        )
+        try await router.interruptTurn(
+            handle: firstHandle,
+            turnID: reusedTurnID
+        )
+        #expect(
+            try await router.execute(
+                handle: activeHandle,
+                turnID: reusedTurnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .observeScreen
+            ) == .screen(screen)
+        )
+        try await router.endTurn(
+            handle: activeHandle,
+            turnID: reusedTurnID
         )
     }
 
@@ -2348,43 +2425,42 @@ struct TerminalToolRouterTests {
         )
         let threadID = AgentThreadID(rawValue: "failed-activation-thread")
         let failedTurn = AgentTurnID(rawValue: "failed-activation-turn")
-        let prepared = try await router.beginTurn(
+        let failedHandle = try await router.beginTurn(
             threadID: threadID,
             conversationKey: TerminalToolFixtures.key
         )
         await registry.releasePrepared(
             threadID: threadID,
-            conversationKey: TerminalToolFixtures.key,
-            token: prepared.token
+            conversationKey: TerminalToolFixtures.key
         )
         await #expect(throws: TerminalToolRouterError.turnUnavailable) {
             try await router.confirmTurnID(
-                threadID: threadID,
+                handle: failedHandle,
                 turnID: failedTurn
             )
         }
 
-        _ = try await router.beginTurn(
+        let successorHandle = try await router.beginTurn(
             threadID: threadID,
             conversationKey: TerminalToolFixtures.key
         )
         await #expect(throws: TerminalToolRouterError.turnUnavailable) {
             try await router.confirmTurnID(
-                threadID: threadID,
+                handle: failedHandle,
                 turnID: failedTurn
             )
         }
         let successorTurn = AgentTurnID(rawValue: "after-failed-activation")
         #expect(
             try await router.execute(
-                threadID: threadID,
+                handle: successorHandle,
                 turnID: successorTurn,
                 conversationKey: TerminalToolFixtures.key,
                 call: .observeScreen
             ) == .screen(screen)
         )
         try await router.endTurn(
-            threadID: threadID,
+            handle: successorHandle,
             turnID: successorTurn
         )
     }
@@ -2440,28 +2516,28 @@ struct TerminalToolRouterTests {
         )
         let threadID = AgentThreadID(rawValue: "conversation-replay-thread")
         let completedTurn = AgentTurnID(rawValue: "conversation-old-turn")
-        _ = try await router.beginTurn(
+        let completedHandle = try await router.beginTurn(
             threadID: threadID,
             conversationKey: TerminalToolFixtures.key
         )
         _ = try await router.execute(
-            threadID: threadID,
+            handle: completedHandle,
             turnID: completedTurn,
             conversationKey: TerminalToolFixtures.key,
             call: .observeScreen
         )
         try await router.endTurn(
-            threadID: threadID,
+            handle: completedHandle,
             turnID: completedTurn
         )
 
-        _ = try await router.beginTurn(
+        let successorHandle = try await router.beginTurn(
             threadID: threadID,
             conversationKey: successorKey
         )
         await #expect(throws: TerminalToolRouterError.turnUnavailable) {
             _ = try await router.execute(
-                threadID: threadID,
+                handle: completedHandle,
                 turnID: completedTurn,
                 conversationKey: TerminalToolFixtures.key,
                 call: .observeScreen
@@ -2469,21 +2545,21 @@ struct TerminalToolRouterTests {
         }
         await #expect(throws: TerminalToolRouterError.turnUnavailable) {
             try await router.confirmTurnID(
-                threadID: threadID,
+                handle: completedHandle,
                 turnID: completedTurn
             )
         }
         let successorTurn = AgentTurnID(rawValue: "conversation-successor-turn")
         #expect(
             try await router.execute(
-                threadID: threadID,
+                handle: successorHandle,
                 turnID: successorTurn,
                 conversationKey: successorKey,
                 call: .observeScreen
             ) == .screen(successorScreen)
         )
         try await router.endTurn(
-            threadID: threadID,
+            handle: successorHandle,
             turnID: successorTurn
         )
     }
@@ -2492,38 +2568,38 @@ struct TerminalToolRouterTests {
     func duplicateEndCannotReleaseSuccessorPreparation() async throws {
         let (router, threadID, screen) = try await makeReplayRouter()
         let completedTurn = AgentTurnID(rawValue: "duplicate-end-turn")
-        _ = try await router.beginTurn(
+        let completedHandle = try await router.beginTurn(
             threadID: threadID,
             conversationKey: TerminalToolFixtures.key
         )
         try await router.confirmTurnID(
-            threadID: threadID,
+            handle: completedHandle,
             turnID: completedTurn
         )
         try await router.endTurn(
-            threadID: threadID,
+            handle: completedHandle,
             turnID: completedTurn
         )
 
-        _ = try await router.beginTurn(
+        let successorHandle = try await router.beginTurn(
             threadID: threadID,
             conversationKey: TerminalToolFixtures.key
         )
         try await router.endTurn(
-            threadID: threadID,
+            handle: completedHandle,
             turnID: completedTurn
         )
         let successorTurn = AgentTurnID(rawValue: "after-duplicate-end")
         #expect(
             try await router.execute(
-                threadID: threadID,
+                handle: successorHandle,
                 turnID: successorTurn,
                 conversationKey: TerminalToolFixtures.key,
                 call: .observeScreen
             ) == .screen(screen)
         )
         try await router.endTurn(
-            threadID: threadID,
+            handle: successorHandle,
             turnID: successorTurn
         )
     }
@@ -2532,38 +2608,38 @@ struct TerminalToolRouterTests {
     func duplicateInterruptCannotReleaseSuccessorPreparation() async throws {
         let (router, threadID, screen) = try await makeReplayRouter()
         let completedTurn = AgentTurnID(rawValue: "duplicate-interrupt-turn")
-        _ = try await router.beginTurn(
+        let completedHandle = try await router.beginTurn(
             threadID: threadID,
             conversationKey: TerminalToolFixtures.key
         )
         try await router.confirmTurnID(
-            threadID: threadID,
+            handle: completedHandle,
             turnID: completedTurn
         )
         try await router.endTurn(
-            threadID: threadID,
+            handle: completedHandle,
             turnID: completedTurn
         )
 
-        _ = try await router.beginTurn(
+        let successorHandle = try await router.beginTurn(
             threadID: threadID,
             conversationKey: TerminalToolFixtures.key
         )
         try await router.interruptTurn(
-            threadID: threadID,
+            handle: completedHandle,
             turnID: completedTurn
         )
         let successorTurn = AgentTurnID(rawValue: "after-duplicate-interrupt")
         #expect(
             try await router.execute(
-                threadID: threadID,
+                handle: successorHandle,
                 turnID: successorTurn,
                 conversationKey: TerminalToolFixtures.key,
                 call: .observeScreen
             ) == .screen(screen)
         )
         try await router.endTurn(
-            threadID: threadID,
+            handle: successorHandle,
             turnID: successorTurn
         )
     }
@@ -2571,30 +2647,30 @@ struct TerminalToolRouterTests {
     @Test("never-seen termination releases the current preparation")
     func neverSeenTerminationReleasesCurrentPreparation() async throws {
         let (router, threadID, screen) = try await makeReplayRouter()
-        _ = try await router.beginTurn(
+        let cancelledHandle = try await router.beginTurn(
             threadID: threadID,
             conversationKey: TerminalToolFixtures.key
         )
         try await router.endTurn(
-            threadID: threadID,
+            handle: cancelledHandle,
             turnID: AgentTurnID(rawValue: "never-seen-turn")
         )
 
-        _ = try await router.beginTurn(
+        let replacementHandle = try await router.beginTurn(
             threadID: threadID,
             conversationKey: TerminalToolFixtures.key
         )
         let replacementTurn = AgentTurnID(rawValue: "replacement-after-cancel")
         #expect(
             try await router.execute(
-                threadID: threadID,
+                handle: replacementHandle,
                 turnID: replacementTurn,
                 conversationKey: TerminalToolFixtures.key,
                 call: .observeScreen
             ) == .screen(screen)
         )
         try await router.endTurn(
-            threadID: threadID,
+            handle: replacementHandle,
             turnID: replacementTurn
         )
     }
@@ -2629,13 +2705,13 @@ struct TerminalToolRouterTests {
         )
         let threadID = AgentThreadID(rawValue: "validation-cancel-thread")
         let turnID = AgentTurnID(rawValue: "validation-cancel-turn")
-        _ = try await router.beginTurn(
+        let handle = try await router.beginTurn(
             threadID: threadID,
             conversationKey: TerminalToolFixtures.key
         )
         let execute = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: handle,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .sendInput(
@@ -2689,13 +2765,13 @@ struct TerminalToolRouterTests {
         )
         let threadID = AgentThreadID(rawValue: "validation-live-thread")
         let turnID = AgentTurnID(rawValue: "validation-live-turn")
-        _ = try await router.beginTurn(
+        let handle = try await router.beginTurn(
             threadID: threadID,
             conversationKey: TerminalToolFixtures.key
         )
         let create = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: handle,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .createTemporaryPane(expectedRevision: 1163)
@@ -2710,7 +2786,7 @@ struct TerminalToolRouterTests {
         await port.setSnapshot(paneScreen)
         let finish = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: handle,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .finishTemporaryPane(
@@ -2759,7 +2835,7 @@ struct TerminalToolRouterTests {
         )
         let admitted = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .sendInput(
@@ -2777,7 +2853,7 @@ struct TerminalToolRouterTests {
         let first = Task {
             do {
                 try await router.interruptTurn(
-                    threadID: threadID,
+                    handle: threadID,
                     turnID: turnID
                 )
                 await firstProbe.complete(with: nil)
@@ -2790,7 +2866,7 @@ struct TerminalToolRouterTests {
         for _ in 0..<10 { await Task.yield() }
         let second = Task {
             do {
-                try await router.endTurn(threadID: threadID, turnID: turnID)
+                try await router.endTurn(handle: threadID, turnID: turnID)
                 await secondProbe.complete(with: nil)
             } catch let error as TerminalTurnTerminationError {
                 await secondProbe.complete(with: error)
@@ -2839,7 +2915,7 @@ struct TerminalToolRouterTests {
         )
         let admitted = Task {
             try await router.execute(
-                threadID: threadID,
+                handle: threadID,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .sendInput(
@@ -2854,7 +2930,7 @@ struct TerminalToolRouterTests {
         let admittedCounts = await port.counts()
 
         let termination = Task {
-            try await router.interruptTurn(threadID: threadID, turnID: turnID)
+            try await router.interruptTurn(handle: threadID, turnID: turnID)
         }
         for _ in 0..<100 { await Task.yield() }
 
@@ -2862,7 +2938,7 @@ struct TerminalToolRouterTests {
         let late = Task {
             do {
                 _ = try await router.execute(
-                    threadID: threadID,
+                    handle: threadID,
                     turnID: turnID,
                     conversationKey: TerminalToolFixtures.key,
                     call: .observeScreen
@@ -2885,7 +2961,7 @@ struct TerminalToolRouterTests {
         #expect(countsBeforeRelease.wait == admittedCounts.wait)
         await #expect(throws: TerminalEndpointRegistryError.threadAlreadyPrepared) {
             try await router.beginTurn(
-                threadID: threadID,
+                threadID: threadID.threadID,
                 conversationKey: TerminalToolFixtures.key
             )
         }
@@ -2898,7 +2974,7 @@ struct TerminalToolRouterTests {
         #expect(await port.keyboardOwners() == [.codex, .user])
 
         _ = try await router.beginTurn(
-            threadID: threadID,
+            threadID: threadID.threadID,
             conversationKey: TerminalToolFixtures.key
         )
     }
@@ -2958,11 +3034,11 @@ struct TerminalToolRouterTests {
         let firstTurn = AgentTurnID(rawValue: "b\u{1F}c")
         let secondThread = AgentThreadID(rawValue: "a\u{1F}b")
         let secondTurn = AgentTurnID(rawValue: "c")
-        _ = try await router.beginTurn(
+        let firstHandle = try await router.beginTurn(
             threadID: firstThread,
             conversationKey: TerminalToolFixtures.key
         )
-        _ = try await router.beginTurn(
+        let secondHandle = try await router.beginTurn(
             threadID: secondThread,
             conversationKey: otherKey
         )
@@ -2974,7 +3050,7 @@ struct TerminalToolRouterTests {
         )
         let first = Task {
             try await router.execute(
-                threadID: firstThread,
+                handle: firstHandle,
                 turnID: firstTurn,
                 conversationKey: TerminalToolFixtures.key,
                 call: .sendInput(action)
@@ -2982,7 +3058,7 @@ struct TerminalToolRouterTests {
         }
         let second = Task {
             try await router.execute(
-                threadID: secondThread,
+                handle: secondHandle,
                 turnID: secondTurn,
                 conversationKey: otherKey,
                 call: .sendInput(action)
@@ -2994,7 +3070,7 @@ struct TerminalToolRouterTests {
         }
         #expect(await router.pendingApprovals().count == 2)
 
-        try await router.interruptTurn(threadID: firstThread, turnID: firstTurn)
+        try await router.interruptTurn(handle: firstHandle, turnID: firstTurn)
         await #expect(throws: TerminalToolRouterError.interrupted) {
             try await first.value
         }
@@ -3031,39 +3107,31 @@ struct TerminalToolRouterTests {
         let threadID = AgentThreadID(rawValue: "router-churn")
         for index in 0..<25 {
             let turnID = AgentTurnID(rawValue: "turn-\(index)")
-            _ = try await router.beginTurn(
+            let handle = try await router.beginTurn(
                 threadID: threadID,
                 conversationKey: TerminalToolFixtures.key
             )
             _ = try await router.execute(
-                threadID: threadID,
+                handle: handle,
                 turnID: turnID,
                 conversationKey: TerminalToolFixtures.key,
                 call: .observeScreen
             )
-            try await router.endTurn(threadID: threadID, turnID: turnID)
+            try await router.endTurn(handle: handle, turnID: turnID)
         }
 
-        _ = try await router.beginTurn(
+        let finalHandle = try await router.beginTurn(
             threadID: threadID,
             conversationKey: TerminalToolFixtures.key
         )
-        await #expect(throws: TerminalToolRouterError.turnUnavailable) {
-            _ = try await router.execute(
-                threadID: threadID,
-                turnID: AgentTurnID(rawValue: "turn-0"),
-                conversationKey: TerminalToolFixtures.key,
-                call: .observeScreen
-            )
-        }
-        let finalTurn = AgentTurnID(rawValue: "turn-after-churn")
+        let finalTurn = AgentTurnID(rawValue: "turn-0")
         _ = try await router.execute(
-            threadID: threadID,
+            handle: finalHandle,
             turnID: finalTurn,
             conversationKey: TerminalToolFixtures.key,
             call: .observeScreen
         )
-        try await router.endTurn(threadID: threadID, turnID: finalTurn)
+        try await router.endTurn(handle: finalHandle, turnID: finalTurn)
 
         let snapshot = await router.testingStateSnapshot()
         #expect(snapshot.activeOperationCount == 0)
@@ -3073,11 +3141,6 @@ struct TerminalToolRouterTests {
         #expect(snapshot.turnLifecycleCount == 0)
         #expect(snapshot.terminationTaskCount == 0)
         #expect(snapshot.terminationReasonCount == 0)
-        #expect(snapshot.replayProtectionBitCount > 0)
-        #expect(
-            snapshot.replayProtectionBitCount
-                <= snapshot.replayProtectionCapacity
-        )
     }
 
     private func makeRouter(
@@ -3087,7 +3150,7 @@ struct TerminalToolRouterTests {
         nonce: String = "ABCD"
     ) async throws -> (
         TerminalToolRouter,
-        AgentThreadID,
+        AgentTurnHandle,
         AgentTurnID
     ) {
         let registry = TerminalEndpointRegistry()
@@ -3106,11 +3169,11 @@ struct TerminalToolRouterTests {
         )
         let threadID = AgentThreadID(rawValue: "thread")
         let turnID = AgentTurnID(rawValue: "turn")
-        _ = try await router.beginTurn(
+        let handle = try await router.beginTurn(
             threadID: threadID,
             conversationKey: TerminalToolFixtures.key
         )
-        return (router, threadID, turnID)
+        return (router, handle, turnID)
     }
 
     private func makeReplayRouter() async throws -> (
