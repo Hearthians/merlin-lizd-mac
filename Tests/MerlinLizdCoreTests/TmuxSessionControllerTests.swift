@@ -315,6 +315,42 @@ struct TmuxSessionControllerTests {
         ])
     }
 
+    @Test("Devbox relabel and tmux rename preserve one serialized route")
+    func devboxRelabelAndRenamePreserveSerialization() async throws {
+        try await expectStableRouteSerialization(
+            firstRoute: devboxRoute(
+                name: "old-devbox",
+                alias: "old_alias",
+                sessionName: "mlz-old"
+            ),
+            secondRoute: devboxRoute(
+                name: "renamed-devbox",
+                alias: "new_alias",
+                sessionName: "training-main"
+            ),
+            firstAlias: "old_alias",
+            secondAlias: "new_alias"
+        )
+    }
+
+    @Test("Worker relabel and tmux rename preserve one serialized route")
+    func workerRelabelAndRenamePreserveSerialization() async throws {
+        try await expectStableRouteSerialization(
+            firstRoute: workerRoute(
+                devboxName: "old-devbox",
+                alias: "old_alias",
+                sessionName: "mlz-old"
+            ),
+            secondRoute: workerRoute(
+                devboxName: "renamed-devbox",
+                alias: "new_alias",
+                sessionName: "training-main"
+            ),
+            firstAlias: "old_alias",
+            secondAlias: "new_alias"
+        )
+    }
+
     @Test("concurrent closes on one lease issue one kill and one ownership failure")
     func concurrentClosesKillOwnedPaneOnce() async throws {
         let gate = AsyncStartGate()
@@ -513,6 +549,53 @@ struct TmuxSessionControllerTests {
         #expect(try await first.value == surface(paneID: "%35"))
     }
 
+    @Test("different stable targets continue while one target is suspended")
+    func differentStableTargetsProceedConcurrently() async throws {
+        let gate = AsyncStartGate()
+        let firstRoute = devboxRoute(
+            sid: "dbx_135679",
+            name: "first-devbox",
+            alias: "first_alias",
+            sessionName: "mlz-shell"
+        )
+        let secondRoute = devboxRoute(
+            sid: "dbx_246810",
+            name: "second-devbox",
+            alias: "second_alias",
+            sessionName: "mlz-shell"
+        )
+        let runner = GatedSurfaceRunner(actions: [
+            .wait(gate, then: successfulOutput()),
+            .output(successfulOutput()),
+            .output(surfaceOutput(paneID: "%44")),
+            .output(surfaceOutput(paneID: "%35")),
+        ])
+        let controller = TmuxSessionController(processRunner: runner)
+        let first = Task {
+            try await controller.select(
+                .nextWindow,
+                from: surface(paneID: "%34"),
+                route: firstRoute
+            )
+        }
+        await gate.waitUntilEntered()
+
+        let second = try await controller.select(
+            .previousWindow,
+            from: surface(paneID: "%43"),
+            route: secondRoute
+        )
+
+        #expect(second == surface(paneID: "%44"))
+        let commands = await runner.commands()
+        #expect(commands.count == 3)
+        #expect(commands[0].arguments.contains("first_alias"))
+        #expect(commands[1].arguments.contains("second_alias"))
+        #expect(commands[2].arguments.contains("second_alias"))
+        await gate.open()
+        #expect(try await first.value == surface(paneID: "%35"))
+    }
+
     @Test("remote metadata reads replay once through the shared SSH master")
     func metadataReadUsesSharedControlPathWithReadOnlyReplay() async throws {
         let direct = SurfaceRecordingRunner(outputs: [])
@@ -627,8 +710,8 @@ struct TmuxSessionControllerTests {
         #expect(await runner.commands().isEmpty)
     }
 
-    @Test("an existing lease rejects a cross-route close without probing")
-    func existingLeaseRejectsCrossRouteClose() async throws {
+    @Test("an existing lease rejects another tmux identity without probing")
+    func existingLeaseRejectsDifferentTmuxIdentity() async throws {
         let runner = SurfaceRecordingRunner(outputs: [
             splitOutput(paneID: "%35"),
             surfaceOutput(paneID: "%35"),
@@ -658,6 +741,102 @@ struct TmuxSessionControllerTests {
                     paneID: "%44"
                 ),
                 route: otherRoute
+            )
+        }
+        #expect(await runner.commands().count == commandCount)
+    }
+
+    @Test("a lease survives Worker relabel and tmux rename")
+    func leaseSurvivesWorkerRelabelAndRename() async throws {
+        let runner = SurfaceRecordingRunner(outputs: successfulLeaseLifecycle())
+        let controller = TmuxSessionController(processRunner: runner)
+        let origin = surface(paneID: "%34")
+        _ = try await controller.createTemporaryPane(
+            from: origin,
+            route: workerRoute(
+                devboxName: "old-devbox",
+                alias: "old_alias",
+                sessionName: "mlz-old"
+            )
+        )
+
+        try await controller.closeTemporaryPane(
+            "%35",
+            restoring: origin,
+            route: workerRoute(
+                devboxName: "renamed-devbox",
+                alias: "new_alias",
+                sessionName: "training-main"
+            )
+        )
+
+        let commands = await runner.commands()
+        #expect(commands.count == 7)
+        #expect(commands.prefix(2).allSatisfy {
+            $0.arguments.contains("old_alias")
+        })
+        #expect(commands.suffix(5).allSatisfy {
+            $0.arguments.contains("new_alias")
+        })
+        #expect(commands.last?.arguments.last?.contains(
+            "tmux display-message -p -t training-main "
+        ) == true)
+    }
+
+    @Test("a relabeled lease still rejects a forged origin without probing")
+    func relabeledLeaseRejectsMismatchedOrigin() async throws {
+        let runner = SurfaceRecordingRunner(outputs: [
+            splitOutput(paneID: "%35"),
+            surfaceOutput(paneID: "%35"),
+        ])
+        let controller = TmuxSessionController(processRunner: runner)
+        _ = try await controller.createTemporaryPane(
+            from: surface(paneID: "%34"),
+            route: workerRoute(
+                devboxName: "old-devbox",
+                alias: "old_alias",
+                sessionName: "mlz-old"
+            )
+        )
+        let commandCount = await runner.commands().count
+
+        await #expect(throws: TmuxSurfaceControlError.paneNotOwned(
+            paneID: "%35"
+        )) {
+            try await controller.closeTemporaryPane(
+                "%35",
+                restoring: surface(paneID: "%33"),
+                route: workerRoute(
+                    devboxName: "renamed-devbox",
+                    alias: "new_alias",
+                    sessionName: "training-main"
+                )
+            )
+        }
+        #expect(await runner.commands().count == commandCount)
+    }
+
+    @Test("a lease rejects another stable target without probing")
+    func leaseRejectsDifferentStableTarget() async throws {
+        let runner = SurfaceRecordingRunner(outputs: [
+            splitOutput(paneID: "%35"),
+            surfaceOutput(paneID: "%35"),
+        ])
+        let controller = TmuxSessionController(processRunner: runner)
+        let origin = surface(paneID: "%34")
+        _ = try await controller.createTemporaryPane(
+            from: origin,
+            route: workerRoute(workerID: "3960209")
+        )
+        let commandCount = await runner.commands().count
+
+        await #expect(throws: TmuxSurfaceControlError.paneNotOwned(
+            paneID: "%35"
+        )) {
+            try await controller.closeTemporaryPane(
+                "%35",
+                restoring: origin,
+                route: workerRoute(workerID: "3966762")
             )
         }
         #expect(await runner.commands().count == commandCount)
@@ -831,6 +1010,95 @@ private func localRoute() -> TmuxRoute {
         sessionName: "mlz-shell",
         expectedIdentity: tmuxIdentity()
     )
+}
+
+private func devboxRoute(
+    sid: String = "dbx_135679",
+    name: String,
+    alias: String,
+    sessionName: String,
+    identity: TmuxSessionIdentity = tmuxIdentity()
+) -> TmuxRoute {
+    TmuxRoute(
+        target: .devbox(sid: sid, name: name, alias: alias),
+        sessionName: sessionName,
+        expectedIdentity: identity
+    )
+}
+
+private func workerRoute(
+    devboxSID: String = "dbx_135679",
+    devboxName: String = "worker-devbox",
+    alias: String = "worker_alias",
+    workerID: String = "3960209",
+    sessionName: String = "mlz-shell",
+    identity: TmuxSessionIdentity = tmuxIdentity()
+) -> TmuxRoute {
+    TmuxRoute(
+        target: .worker(
+            devboxSID: devboxSID,
+            devboxName: devboxName,
+            alias: alias,
+            workerID: workerID
+        ),
+        sessionName: sessionName,
+        expectedIdentity: identity
+    )
+}
+
+private func expectStableRouteSerialization(
+    firstRoute: TmuxRoute,
+    secondRoute: TmuxRoute,
+    firstAlias: String,
+    secondAlias: String
+) async throws {
+    let gate = AsyncStartGate()
+    let runner = GatedSurfaceRunner(actions: [
+        .wait(gate, then: successfulOutput()),
+        .output(surfaceOutput(paneID: "%35")),
+        .output(successfulOutput()),
+        .output(surfaceOutput(paneID: "%36")),
+    ])
+    let controller = TmuxSessionController(processRunner: runner)
+    let first = Task {
+        try await controller.select(
+            .nextWindow,
+            from: surface(paneID: "%34"),
+            route: firstRoute
+        )
+    }
+    await gate.waitUntilEntered()
+    let secondStarted = AsyncCompletionProbe()
+    let second = Task {
+        await secondStarted.complete()
+        return try await controller.select(
+            .previousWindow,
+            from: surface(paneID: "%34"),
+            route: secondRoute
+        )
+    }
+    await waitUntilStarted(secondStarted)
+    await settleSubmittedOperation()
+
+    #expect(await runner.commands().count == 1)
+
+    await gate.open()
+    #expect(try await first.value == surface(paneID: "%35"))
+    #expect(try await second.value == surface(paneID: "%36"))
+    let commands = await runner.commands()
+    #expect(commands.count == 4)
+    #expect(commands.prefix(2).allSatisfy {
+        $0.arguments.contains(firstAlias)
+    })
+    #expect(commands.suffix(2).allSatisfy {
+        $0.arguments.contains(secondAlias)
+    })
+    #expect(commands[1].arguments.last?.contains(
+        "-t \(firstRoute.sessionName) "
+    ) == true)
+    #expect(commands[3].arguments.last?.contains(
+        "-t \(secondRoute.sessionName) "
+    ) == true)
 }
 
 private func surface(
