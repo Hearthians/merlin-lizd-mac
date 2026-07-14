@@ -1,0 +1,371 @@
+import Foundation
+@testable import MerlinLizdCore
+
+actor TerminalToolTestGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        let current = waiters
+        waiters.removeAll()
+        current.forEach { $0.resume() }
+    }
+}
+
+actor TerminalToolTestLog {
+    private var values: [String] = []
+
+    func append(_ value: String) {
+        values.append(value)
+    }
+
+    func snapshot() -> [String] {
+        values
+    }
+}
+
+actor FakeTerminalToolPort: TerminalSessionPort {
+    enum Failure: Error, Equatable {
+        case send
+        case observe
+        case wait
+    }
+
+    private var snapshot: TerminalScreenSnapshot
+    private var waitResults: [TerminalScreenWaitResult] = []
+    private var waitFailures: [Failure?] = []
+    private var sendFailures: [Failure?] = []
+    private var sentBatches: [TerminalInputBatch] = []
+    private var owners: [TerminalKeyboardOwner] = []
+    private var observeCount = 0
+    private var waitCount = 0
+    private var sendCount = 0
+    private var sendGate: TerminalToolTestGate?
+    private let label: String
+    private let log: TerminalToolTestLog?
+
+    init(
+        snapshot: TerminalScreenSnapshot,
+        label: String = "port",
+        log: TerminalToolTestLog? = nil
+    ) {
+        self.snapshot = snapshot
+        self.label = label
+        self.log = log
+    }
+
+    func observeScreen() async throws -> TerminalScreenSnapshot {
+        observeCount += 1
+        await log?.append("\(label):observe")
+        return snapshot
+    }
+
+    func sendInput(_ batch: TerminalInputBatch) async throws -> TerminalInputReceipt {
+        sendCount += 1
+        sentBatches.append(batch)
+        await log?.append("\(label):send:\(batch.purpose)")
+        if !sendFailures.isEmpty, let failure = sendFailures.removeFirst() {
+            throw failure
+        }
+        if let sendGate {
+            await sendGate.wait()
+        }
+        return TerminalInputReceipt(
+            acceptedRevision: batch.expectedRevision,
+            byteCount: batch.events.count
+        )
+    }
+
+    func waitForScreen(
+        _ request: TerminalScreenWaitRequest
+    ) async throws -> TerminalScreenWaitResult {
+        waitCount += 1
+        await log?.append("\(label):wait")
+        if !waitFailures.isEmpty, let failure = waitFailures.removeFirst() {
+            throw failure
+        }
+        guard !waitResults.isEmpty else {
+            return TerminalScreenWaitResult(snapshot: snapshot, timedOut: false)
+        }
+        let result = waitResults.removeFirst()
+        snapshot = result.snapshot
+        return result
+    }
+
+    func setKeyboardOwner(_ owner: TerminalKeyboardOwner) async {
+        owners.append(owner)
+        await log?.append("\(label):owner:\(owner)")
+    }
+
+    func setSnapshot(_ snapshot: TerminalScreenSnapshot) {
+        self.snapshot = snapshot
+    }
+
+    func enqueueWait(_ result: TerminalScreenWaitResult) {
+        waitResults.append(result)
+    }
+
+    func enqueueWaitFailure(_ failure: Failure?) {
+        waitFailures.append(failure)
+    }
+
+    func enqueueSendFailure(_ failure: Failure?) {
+        sendFailures.append(failure)
+    }
+
+    func blockSends(on gate: TerminalToolTestGate?) {
+        sendGate = gate
+    }
+
+    func counts() -> (observe: Int, send: Int, wait: Int) {
+        (observeCount, sendCount, waitCount)
+    }
+
+    func batches() -> [TerminalInputBatch] {
+        sentBatches
+    }
+
+    func keyboardOwners() -> [TerminalKeyboardOwner] {
+        owners
+    }
+}
+
+actor FakeTerminalSurfaceController: TmuxSurfaceControlling {
+    enum Failure: Error, Equatable {
+        case current
+        case select
+        case create
+        case close
+    }
+
+    private var surface: TmuxSurface
+    private var createdSurface: TmuxSurface
+    private var failure: Failure?
+    private var calls: [String] = []
+    private let log: TerminalToolTestLog?
+
+    init(
+        surface: TmuxSurface,
+        createdSurface: TmuxSurface? = nil,
+        log: TerminalToolTestLog? = nil
+    ) {
+        self.surface = surface
+        self.createdSurface = createdSurface ?? surface
+        self.log = log
+    }
+
+    func currentSurface(route: TmuxRoute) async throws -> TmuxSurface {
+        calls.append("current")
+        await log?.append("surface:current")
+        if failure == .current { throw Failure.current }
+        return surface
+    }
+
+    func select(
+        _ selection: TmuxVisibleSelection,
+        from: TmuxSurface,
+        route: TmuxRoute
+    ) async throws -> TmuxSurface {
+        calls.append("select")
+        await log?.append("surface:select")
+        if failure == .select { throw Failure.select }
+        surface = createdSurface
+        return surface
+    }
+
+    func createTemporaryPane(
+        from: TmuxSurface,
+        route: TmuxRoute
+    ) async throws -> TmuxSurface {
+        calls.append("create")
+        await log?.append("surface:create")
+        if failure == .create { throw Failure.create }
+        surface = createdSurface
+        return surface
+    }
+
+    func closeTemporaryPane(
+        _ paneID: String,
+        restoring origin: TmuxSurface,
+        route: TmuxRoute
+    ) async throws {
+        calls.append("close:\(paneID)")
+        await log?.append("surface:close")
+        if failure == .close { throw Failure.close }
+        surface = origin
+    }
+
+    func setSurface(_ surface: TmuxSurface) {
+        self.surface = surface
+    }
+
+    func setCreatedSurface(_ surface: TmuxSurface) {
+        createdSurface = surface
+    }
+
+    func setFailure(_ failure: Failure?) {
+        self.failure = failure
+    }
+
+    func recordedCalls() -> [String] {
+        calls
+    }
+}
+
+actor MemoryTerminalToolJournal: TerminalOperationJournaling {
+    enum Failure: Error {
+        case append
+    }
+
+    private var events: [TerminalJournalEvent] = []
+    private var failAppend = false
+    private var failOnAppendNumber: Int?
+    private var appendCount = 0
+    private let log: TerminalToolTestLog?
+
+    init(log: TerminalToolTestLog? = nil) {
+        self.log = log
+    }
+
+    func append(_ event: TerminalJournalEvent) async throws {
+        appendCount += 1
+        if failAppend || appendCount == failOnAppendNumber {
+            throw Failure.append
+        }
+        events.append(event)
+        await log?.append("journal:\(event.kind.testName)")
+    }
+
+    func entries(
+        for key: TerminalConversationKey
+    ) async throws -> [TerminalJournalEvent] {
+        events.filter { $0.key == key }
+    }
+
+    func deleteJournal(for key: TerminalConversationKey) async throws {
+        events.removeAll { $0.key == key }
+    }
+
+    func setFailAppend(_ value: Bool) {
+        failAppend = value
+    }
+
+    func failOnAppend(_ number: Int?) {
+        failOnAppendNumber = number
+    }
+
+    func snapshot() -> [TerminalJournalEvent] {
+        events
+    }
+}
+
+private extension TerminalJournalEventKind {
+    var testName: String {
+        switch self {
+        case .request: "request"
+        case .screen: "screen"
+        case .risk: "risk"
+        case .approval: "approval"
+        case .endpoint: "endpoint"
+        case .emittedBatch: "batch"
+        case .result: "result"
+        case .temporaryPane: "temporary"
+        }
+    }
+}
+
+enum TerminalToolFixtures {
+    static func uuid(_ value: String) -> UUID {
+        UUID(uuidString: value)!
+    }
+
+    static func newID() -> UUID {
+        UUID()
+    }
+
+    static let identity = TmuxSessionIdentity(
+        serverSessionID: "$7",
+        createdAtEpoch: 1_784_000_102
+    )
+
+    static let key = TerminalConversationKey(
+        target: .local,
+        tmux: identity
+    )
+
+    static let route = TmuxRoute(
+        target: .local,
+        sessionName: "training",
+        expectedIdentity: identity
+    )
+
+    static func screen(
+        revision: UInt64,
+        text: String = "$ ",
+        columns: Int = 120,
+        cursorColumn: Int = 2
+    ) -> TerminalScreenSnapshot {
+        TerminalScreenSnapshot(
+            revision: revision,
+            columns: columns,
+            rows: 24,
+            cursor: TerminalCursor(
+                row: 0,
+                column: cursorColumn,
+                isVisible: true
+            ),
+            mode: .normal,
+            text: text,
+            significantRuns: [],
+            changedRows: [0]
+        )
+    }
+
+    static func surface(
+        paneID: String = "%1",
+        command: String = "zsh"
+    ) -> TmuxSurface {
+        TmuxSurface(
+            sessionIdentity: identity,
+            windowID: "@1",
+            paneID: paneID,
+            currentCommand: command
+        )
+    }
+
+    static func endpoint(
+        id: UUID,
+        key: TerminalConversationKey = key,
+        port: any TerminalSessionPort,
+        controller: any TmuxSurfaceControlling,
+        route: TmuxRoute = route
+    ) -> TerminalEndpoint {
+        TerminalEndpoint(
+            id: TerminalEndpointID(rawValue: id),
+            conversationKey: key,
+            terminal: port,
+            surfaces: controller,
+            route: route
+        )
+    }
+
+    static func input(
+        revision: UInt64,
+        text: String = "pwd",
+        purpose: String = "type command",
+        risk: TerminalRisk = .routine
+    ) -> TerminalInputBatch {
+        TerminalInputBatch(
+            expectedRevision: revision,
+            events: [.text(text)],
+            purpose: purpose,
+            declaredRisk: risk
+        )
+    }
+}
