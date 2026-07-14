@@ -55,8 +55,14 @@ public actor TerminalApprovalBroker {
         let turnID: String
     }
 
+    private struct PendingObserver {
+        let continuation: CheckedContinuation<Bool, Never>
+        let timeoutTask: Task<Void, Never>
+    }
+
     private var pending: [UUID: PendingApproval] = [:]
     private var grants: [UUID: UnconsumedGrant] = [:]
+    private var pendingObservers: [UUID: [UUID: PendingObserver]] = [:]
 
     public init() {}
 
@@ -95,6 +101,7 @@ public actor TerminalApprovalBroker {
                     cancellationState: cancellationState,
                     continuation: continuation
                 )
+                resolvePendingObservers(for: request.id, result: true)
             }
         } onCancel: {
             cancellationState.cancel()
@@ -194,6 +201,49 @@ public actor TerminalApprovalBroker {
         }
     }
 
+    func waitUntilPending(
+        _ requestID: UUID,
+        timeout: Duration
+    ) async -> Bool {
+        if pending[requestID] != nil { return true }
+        if Task.isCancelled { return false }
+        let observerID = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if pending[requestID] != nil {
+                    continuation.resume(returning: true)
+                    return
+                }
+                if Task.isCancelled {
+                    continuation.resume(returning: false)
+                    return
+                }
+                let timeoutTask = Task { [weak self] in
+                    try? await Task.sleep(for: timeout)
+                    guard !Task.isCancelled else { return }
+                    await self?.resolvePendingObserver(
+                        requestID: requestID,
+                        observerID: observerID,
+                        result: false
+                    )
+                }
+                pendingObservers[requestID, default: [:]][observerID]
+                    = PendingObserver(
+                        continuation: continuation,
+                        timeoutTask: timeoutTask
+                    )
+            }
+        } onCancel: {
+            Task {
+                await self.resolvePendingObserver(
+                    requestID: requestID,
+                    observerID: observerID,
+                    result: false
+                )
+            }
+        }
+    }
+
     private func cancelRequest(_ requestID: UUID) {
         guard let approval = pending.removeValue(forKey: requestID) else {
             grants = grants.filter { $0.value.requestID != requestID }
@@ -214,5 +264,32 @@ public actor TerminalApprovalBroker {
             }
             approval.continuation.resume(throwing: TerminalApprovalError.expired)
         }
+    }
+
+    private func resolvePendingObservers(
+        for requestID: UUID,
+        result: Bool
+    ) {
+        guard let observers = pendingObservers.removeValue(forKey: requestID)
+        else { return }
+        for observer in observers.values {
+            observer.timeoutTask.cancel()
+            observer.continuation.resume(returning: result)
+        }
+    }
+
+    private func resolvePendingObserver(
+        requestID: UUID,
+        observerID: UUID,
+        result: Bool
+    ) {
+        guard let observer = pendingObservers[requestID]?
+            .removeValue(forKey: observerID)
+        else { return }
+        if pendingObservers[requestID]?.isEmpty == true {
+            pendingObservers.removeValue(forKey: requestID)
+        }
+        observer.timeoutTask.cancel()
+        observer.continuation.resume(returning: result)
     }
 }

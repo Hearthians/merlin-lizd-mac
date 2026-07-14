@@ -209,15 +209,11 @@ public struct TerminalPermissionPolicy: Sendable {
         batch: TerminalInputBatch,
         screen: TerminalScreenSnapshot
     ) -> Classification {
-        let prompt = promptClassification(
-            events: batch.events,
-            screenText: screen.text
-        )
-        if let prompt, prompt.risk == .high {
-            return prompt
-        }
         guard var editable = editableCommand(from: screen) else {
-            if let prompt {
+            if let prompt = promptClassification(
+                events: batch.events,
+                screenText: screen.text
+            ) {
                 return prompt
             }
             if batch.events.allSatisfy(isNonMutatingNavigation) {
@@ -248,6 +244,11 @@ public struct TerminalPermissionPolicy: Sendable {
                 }
                 for character in text {
                     if character == "\n" || character == "\r" {
+                        if editable.characters.last == "\\" {
+                            return high(
+                                "The command contains unsupported shell line continuation"
+                            )
+                        }
                         result = maxClassification(
                             result,
                             classify(command: String(editable.characters))
@@ -259,6 +260,17 @@ public struct TerminalPermissionPolicy: Sendable {
                     }
                 }
             case let .key(.character(value), modifiers) where modifiers.isEmpty:
+                guard value.unicodeScalars.count == 1,
+                    let scalar = value.unicodeScalars.first,
+                    scalar.value >= 0x20,
+                    scalar.value != 0x7F
+                else {
+                    return Classification(
+                        risk: .high,
+                        reason: nil,
+                        denialReason: "Character input contains terminal controls or an ambiguous multi-scalar value"
+                    )
+                }
                 for character in value {
                     editable.characters.insert(character, at: editable.cursor)
                     editable.cursor += 1
@@ -327,7 +339,13 @@ public struct TerminalPermissionPolicy: Sendable {
         for start in 0..<max(0, characters.count - 1) {
             for marker in markers where start + marker.count <= characters.count {
                 if Array(characters[start..<(start + marker.count)]) == marker {
-                    promptEnd = start + marker.count
+                    let prefix = characters[..<start]
+                    if prefix.isEmpty
+                        || (prefix.contains("@")
+                            && !prefix.contains(where: \.isWhitespace))
+                    {
+                        promptEnd = start + marker.count
+                    }
                     break
                 }
             }
@@ -373,7 +391,8 @@ public struct TerminalPermissionPolicy: Sendable {
         let confirmationMarkers = [
             "[y/n]", "[y/n]?", "[y/n", "(y/n)", "yes/no",
             "are you sure", "confirm", "proceed?", "continue?",
-            "[ok]", "ok/cancel", "[cancel]", "apply ",
+            "[ok]", "ok/cancel", "[cancel]", "[accept]", "[decline]",
+            "accept/decline", "apply ",
         ]
         let isDestructive = destructiveMarkers.contains { prompt.contains($0) }
         let isConfirmation = isDestructive
@@ -498,8 +517,9 @@ public struct TerminalPermissionPolicy: Sendable {
             } else if character == "\"" {
                 quote = .double
             } else if character == "`"
-                || (character == "$" && ["(", "{"].contains(next))
+                || (character == "$" && ["(", "{", "'"].contains(next))
                 || ((character == "<" || character == ">") && next == "(")
+                || ["(", ")", "{", "}"].contains(character)
             {
                 result.isAmbiguous = true
                 word.append(character)
@@ -668,7 +688,7 @@ public struct TerminalPermissionPolicy: Sendable {
                     valueOptions: ["-C", "--chdir", "-u", "--unset"]
                 ) else { return (words, true) }
                 while words.first?.contains("=") == true { words.removeFirst() }
-            case "nohup":
+            case "nohup", "exec":
                 words.removeFirst()
             case "xargs":
                 return (words, true)

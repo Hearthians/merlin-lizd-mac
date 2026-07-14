@@ -297,6 +297,31 @@ struct TerminalPermissionPolicyTests {
         }
     }
 
+    @Test("character key controls and multi-scalar values fail closed")
+    func rejectsControlValuedCharacterKeys() throws {
+        let values = [
+            "\u{7F}", "\u{08}", "\r", "\n", "\t", "\u{1B}",
+            "e\u{301}",
+        ]
+
+        for value in values {
+            let evaluation = try TerminalPermissionPolicy().evaluate(
+                batch: terminalTestBatch(
+                    events: [.key(.character(value), modifiers: [])]
+                ),
+                endpointID: terminalTestEndpoint(),
+                screen: terminalTestScreen(
+                    text: "$ rXm -rf /tmp/cache",
+                    cursorColumn: 4
+                )
+            )
+            guard case .deny = evaluation.decision else {
+                Issue.record("control or multi-scalar character key must fail closed")
+                continue
+            }
+        }
+    }
+
     @Test("shell evaluation wrappers and option-prefixed subcommands escalate")
     func escalatesAmbiguousShellEvaluation() throws {
         let commands = [
@@ -308,6 +333,11 @@ struct TerminalPermissionPolicyTests {
             "bash -lc 'rm -rf /tmp/cache'",
             "eval 'rm -rf /tmp/cache'",
             "if true; then rm -rf /tmp/cache; fi",
+            "(rm -rf /tmp/cache)",
+            "{ rm -rf /tmp/cache; }",
+            "exec rm -rf /tmp/cache",
+            "r$'m' -rf /tmp/cache",
+            "r\\\nm -rf /tmp/cache",
             "git -C repo push origin main",
             "git --unknown-option push origin main",
             "tmux -L private kill-session -t training",
@@ -338,6 +368,9 @@ struct TerminalPermissionPolicyTests {
             "sudo echo rm",
             "tail -f log.txt",
             "grep -f patterns.txt input.txt",
+            "echo '(rm -rf /tmp/cache)'",
+            "printf '%s' '{ rm -rf /tmp/cache; }'",
+            "echo \\(not-a-subshell\\)",
         ]
 
         for command in commands {
@@ -406,5 +439,58 @@ struct TerminalPermissionPolicyTests {
             #expect(evaluation.deterministicRisk == .routine)
             #expect(evaluation.decision == .allow)
         }
+    }
+
+    @Test("unknown TUI accept prompts cannot masquerade as shell prompts")
+    func rejectsShellMarkerInsideUnknownPrompt() throws {
+        let text = "Authorize operation $ [Accept] [Decline]"
+        let evaluation = try TerminalPermissionPolicy().evaluate(
+            batch: terminalTestBatch(events: [.key(.enter, modifiers: [])]),
+            endpointID: terminalTestEndpoint(),
+            screen: terminalTestScreen(
+                text: text,
+                cursorColumn: text.count
+            )
+        )
+
+        #expect(evaluation.deterministicRisk == .high)
+        guard case .requireApproval = evaluation.decision else {
+            Issue.record("unknown action acceptance must require approval")
+            return
+        }
+    }
+
+    @Test("proven shell prompts do not turn question-mark arguments into confirmations")
+    func distinguishesShellQuestionMarksFromPrompts() throws {
+        let lines = [
+            "$ ls file?",
+            "user@host:/tmp$ ls file?",
+            "user@host:/tmp% ls file?",
+            "root@host:/tmp# ls file?",
+        ]
+
+        for line in lines {
+            let evaluation = try TerminalPermissionPolicy().evaluate(
+                batch: terminalTestBatch(events: [.key(.enter, modifiers: [])]),
+                endpointID: terminalTestEndpoint(),
+                screen: terminalTestScreen(
+                    text: line,
+                    cursorColumn: line.count
+                )
+            )
+            #expect(evaluation.deterministicRisk == .routine)
+            #expect(evaluation.decision == .allow)
+        }
+
+        let destructive = "user@host:/tmp$ rm -rf /tmp/cache"
+        let high = try TerminalPermissionPolicy().evaluate(
+            batch: terminalTestBatch(events: [.key(.enter, modifiers: [])]),
+            endpointID: terminalTestEndpoint(),
+            screen: terminalTestScreen(
+                text: destructive,
+                cursorColumn: destructive.count
+            )
+        )
+        #expect(high.deterministicRisk == .high)
     }
 }

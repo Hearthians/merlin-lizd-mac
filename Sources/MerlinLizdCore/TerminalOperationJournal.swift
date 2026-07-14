@@ -80,13 +80,34 @@ public enum TerminalOperationJournalError: Error, Equatable, Sendable {
     case corruptRecord(storageID: String, line: Int)
 }
 
+enum TerminalJournalOperation: Equatable, Sendable {
+    case append
+    case entries
+    case delete
+}
+
+enum TerminalConversationLockEvent: Equatable, Sendable {
+    case acquired(TerminalJournalOperation)
+    case contended(TerminalJournalOperation)
+}
+
 struct TerminalOperationJournalHooks: Sendable {
     let beforeMappingPublish: (@Sendable () async throws -> Void)?
+    let conversationLockEvent: (
+        @Sendable (TerminalConversationLockEvent) async throws -> Void
+    )?
+    let directorySync: (@Sendable (Int32, String) throws -> Void)?
 
     init(
-        beforeMappingPublish: (@Sendable () async throws -> Void)? = nil
+        beforeMappingPublish: (@Sendable () async throws -> Void)? = nil,
+        conversationLockEvent: (
+            @Sendable (TerminalConversationLockEvent) async throws -> Void
+        )? = nil,
+        directorySync: (@Sendable (Int32, String) throws -> Void)? = nil
     ) {
         self.beforeMappingPublish = beforeMappingPublish
+        self.conversationLockEvent = conversationLockEvent
+        self.directorySync = directorySync
     }
 }
 
@@ -115,7 +136,10 @@ public actor FileTerminalOperationJournal: TerminalOperationJournaling {
         let locations = Self.locations(
             applicationSupportDirectory: applicationSupportDirectory
         )
-        let descriptors = try Self.openDirectoryTree(locations: locations)
+        let descriptors = try Self.openDirectoryTree(
+            locations: locations,
+            hooks: hooks
+        )
         rootDirectory = locations.root
         mappingsDirectory = locations.mappings
         journalsDirectory = locations.journals
@@ -163,6 +187,11 @@ public actor FileTerminalOperationJournal: TerminalOperationJournaling {
 
     public func append(_ event: TerminalJournalEvent) async throws {
         let storageID = try Self.storageID(for: event.key)
+        let conversationLock = try await acquireConversationLock(
+            storageID: storageID,
+            operation: .append
+        )
+        defer { Self.releaseLock(conversationLock) }
         try await ensureMapping(for: event.key, storageID: storageID)
 
         var record: Data
@@ -209,6 +238,11 @@ public actor FileTerminalOperationJournal: TerminalOperationJournaling {
         for key: TerminalConversationKey
     ) async throws -> [TerminalJournalEvent] {
         let storageID = try Self.storageID(for: key)
+        let conversationLock = try await acquireConversationLock(
+            storageID: storageID,
+            operation: .entries
+        )
+        defer { Self.releaseLock(conversationLock) }
         let name = "\(storageID).jsonl"
         let path = journalURL(for: key).path
         let descriptor = openat(
@@ -236,6 +270,11 @@ public actor FileTerminalOperationJournal: TerminalOperationJournaling {
 
     public func deleteJournal(for key: TerminalConversationKey) async throws {
         let storageID = try Self.storageID(for: key)
+        let conversationLock = try await acquireConversationLock(
+            storageID: storageID,
+            operation: .delete
+        )
+        defer { Self.releaseLock(conversationLock) }
         try Self.removeIfPresent(
             name: "\(storageID).jsonl",
             directoryDescriptor: journalsDescriptor,
@@ -254,6 +293,65 @@ public actor FileTerminalOperationJournal: TerminalOperationJournaling {
             descriptor: mappingsDescriptor,
             path: mappingsDirectory.path
         )
+    }
+
+    /// Lock files are intentionally retained so every process always coordinates
+    /// on the same inode, including while a journal and its mapping are absent.
+    private func acquireConversationLock(
+        storageID: String,
+        operation: TerminalJournalOperation
+    ) async throws -> Int32 {
+        let name = "\(storageID).lock"
+        let path = mappingsDirectory.appendingPathComponent(name).path
+        var created = true
+        var descriptor = openat(
+            mappingsDescriptor,
+            name,
+            O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+            S_IRUSR | S_IWUSR
+        )
+        if descriptor < 0, errno == EEXIST {
+            created = false
+            descriptor = openat(
+                mappingsDescriptor,
+                name,
+                O_RDWR | O_CLOEXEC | O_NOFOLLOW
+            )
+        }
+        guard descriptor >= 0 else { throw Self.posixError("openat", path) }
+
+        do {
+            try Self.validatePrivateFile(descriptor, path: path)
+            let contended = try Self.lockNonBlocking(
+                descriptor,
+                operation: LOCK_EX,
+                path: path
+            )
+            if contended {
+                try await hooks.conversationLockEvent?(.contended(operation))
+                try Self.lock(descriptor, operation: LOCK_EX, path: path)
+            }
+            try Self.validateAnchoredFileIdentity(
+                descriptor,
+                name: name,
+                directoryDescriptor: mappingsDescriptor,
+                path: path
+            )
+            if created {
+                guard fsync(descriptor) == 0 else {
+                    throw Self.posixError("fsync", path)
+                }
+                try Self.syncDirectory(
+                    descriptor: mappingsDescriptor,
+                    path: mappingsDirectory.path
+                )
+            }
+            try await hooks.conversationLockEvent?(.acquired(operation))
+            return descriptor
+        } catch {
+            Self.releaseLock(descriptor)
+            throw error
+        }
     }
 
     private func ensureMapping(
@@ -393,7 +491,8 @@ public actor FileTerminalOperationJournal: TerminalOperationJournaling {
     }
 
     private static func openDirectoryTree(
-        locations: Locations
+        locations: Locations,
+        hooks: TerminalOperationJournalHooks
     ) throws -> (mappings: Int32, journals: Int32) {
         let supportPath = locations.application.deletingLastPathComponent().path
         let support = open(
@@ -407,25 +506,33 @@ public actor FileTerminalOperationJournal: TerminalOperationJournaling {
         let application = try openPrivateDirectory(
             parent: support,
             name: locations.application.lastPathComponent,
-            path: locations.application.path
+            path: locations.application.path,
+            parentPath: supportPath,
+            hooks: hooks
         )
         defer { close(application) }
         let root = try openPrivateDirectory(
             parent: application,
             name: locations.root.lastPathComponent,
-            path: locations.root.path
+            path: locations.root.path,
+            parentPath: locations.application.path,
+            hooks: hooks
         )
         defer { close(root) }
         let mappings = try openPrivateDirectory(
             parent: root,
             name: locations.mappings.lastPathComponent,
-            path: locations.mappings.path
+            path: locations.mappings.path,
+            parentPath: locations.root.path,
+            hooks: hooks
         )
         do {
             let journals = try openPrivateDirectory(
                 parent: root,
                 name: locations.journals.lastPathComponent,
-                path: locations.journals.path
+                path: locations.journals.path,
+                parentPath: locations.root.path,
+                hooks: hooks
             )
             return (mappings, journals)
         } catch {
@@ -437,9 +544,16 @@ public actor FileTerminalOperationJournal: TerminalOperationJournaling {
     private static func openPrivateDirectory(
         parent: Int32,
         name: String,
-        path: String
+        path: String,
+        parentPath: String,
+        hooks: TerminalOperationJournalHooks
     ) throws -> Int32 {
-        if mkdirat(parent, name, S_IRWXU) != 0, errno != EEXIST {
+        let created: Bool
+        if mkdirat(parent, name, S_IRWXU) == 0 {
+            created = true
+        } else if errno == EEXIST {
+            created = false
+        } else {
             throw posixError("mkdirat", path)
         }
         let descriptor = openat(
@@ -450,6 +564,13 @@ public actor FileTerminalOperationJournal: TerminalOperationJournaling {
         guard descriptor >= 0 else { throw posixError("openat", path) }
         do {
             try validateDirectory(descriptor, path: path, makePrivate: true)
+            if created {
+                if let directorySync = hooks.directorySync {
+                    try directorySync(parent, parentPath)
+                } else {
+                    try syncDirectory(descriptor: parent, path: parentPath)
+                }
+            }
             return descriptor
         } catch {
             close(descriptor)
@@ -492,6 +613,35 @@ public actor FileTerminalOperationJournal: TerminalOperationJournaling {
         }
         guard fchmod(descriptor, S_IRUSR | S_IWUSR) == 0 else {
             throw posixError("fchmod", path)
+        }
+    }
+
+    private static func validateAnchoredFileIdentity(
+        _ descriptor: Int32,
+        name: String,
+        directoryDescriptor: Int32,
+        path: String
+    ) throws {
+        var openedInformation = stat()
+        guard fstat(descriptor, &openedInformation) == 0 else {
+            throw posixError("fstat", path)
+        }
+        var anchoredInformation = stat()
+        guard fstatat(
+            directoryDescriptor,
+            name,
+            &anchoredInformation,
+            AT_SYMLINK_NOFOLLOW
+        ) == 0 else {
+            throw posixError("fstatat", path)
+        }
+        guard anchoredInformation.st_mode & S_IFMT == S_IFREG,
+            anchoredInformation.st_uid == geteuid(),
+            anchoredInformation.st_nlink == 1,
+            openedInformation.st_dev == anchoredInformation.st_dev,
+            openedInformation.st_ino == anchoredInformation.st_ino
+        else {
+            throw TerminalOperationJournalError.insecurePath(path: path)
         }
     }
 
@@ -617,6 +767,24 @@ public actor FileTerminalOperationJournal: TerminalOperationJournaling {
         }
     }
 
+    private static func lockNonBlocking(
+        _ descriptor: Int32,
+        operation: Int32,
+        path: String
+    ) throws -> Bool {
+        while flock(descriptor, operation | LOCK_NB) != 0 {
+            if errno == EINTR { continue }
+            if errno == EWOULDBLOCK || errno == EAGAIN { return true }
+            throw posixError("flock", path)
+        }
+        return false
+    }
+
+    private static func releaseLock(_ descriptor: Int32) {
+        flock(descriptor, LOCK_UN)
+        close(descriptor)
+    }
+
     private static func posixError(
         _ operation: String,
         _ path: String
@@ -725,7 +893,7 @@ public actor TerminalMutationAuditor {
         }
 
         guard case let .request(_, purpose) = events[0].kind,
-            case let .screen(revision, _, _) = events[1].kind,
+            case let .screen(revision, changedRows, screenText) = events[1].kind,
             case let .risk(agentDeclared, deterministic, effective) = events[2].kind,
             effective == max(agentDeclared, deterministic)
         else { return false }
@@ -752,6 +920,35 @@ public actor TerminalMutationAuditor {
             agentDeclared == batch.declaredRisk,
             revision == batch.expectedRevision
         else { return false }
+
+        let rows = screenText.split(
+            separator: "\n",
+            omittingEmptySubsequences: false
+        )
+        let cursorRow = max(0, rows.count - 1)
+        let cursorColumn = rows.last.map { Array($0).count } ?? 0
+        let screen = TerminalScreenSnapshot(
+            revision: revision,
+            columns: max(1, rows.map { Array($0).count }.max() ?? 0),
+            rows: max(1, rows.count),
+            cursor: TerminalCursor(
+                row: cursorRow,
+                column: cursorColumn,
+                isVisible: true
+            ),
+            mode: .normal,
+            text: screenText,
+            significantRuns: [],
+            changedRows: changedRows
+        )
+        guard let recomputed = try? TerminalPermissionPolicy().evaluate(
+            batch: batch,
+            endpointID: endpointID,
+            screen: screen
+        ), recomputed.deterministicRisk == deterministic,
+            recomputed.effectiveRisk == effective
+        else { return false }
+        if case .deny = recomputed.decision { return false }
 
         if let approval {
             guard approval.outcome == .approvedOnce,

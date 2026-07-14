@@ -113,6 +113,57 @@ struct TerminalOperationJournalTests {
         #expect(try terminalPOSIXMode(at: journalURL) == 0o600)
     }
 
+    @Test("first directory creation durably syncs each parent in dependency order")
+    func syncsParentsForNewDirectoryEntries() throws {
+        let fixture = try TerminalPersistenceFixture()
+        defer { fixture.remove() }
+        let recorder = TerminalDirectorySyncRecorder()
+
+        _ = try FileTerminalOperationJournal(
+            applicationSupportDirectory: fixture.applicationSupportDirectory,
+            hooks: TerminalOperationJournalHooks(
+                directorySync: recorder.sync
+            )
+        )
+
+        let application = fixture.applicationSupportDirectory
+            .appendingPathComponent("MerlinLizd", isDirectory: true)
+        let root = application
+            .appendingPathComponent("TerminalOperations", isDirectory: true)
+        #expect(
+            recorder.paths() == [
+                fixture.applicationSupportDirectory.path,
+                application.path,
+                root.path,
+                root.path,
+            ]
+        )
+    }
+
+    @Test("a parent directory sync failure aborts initialization unchanged")
+    func propagatesDirectorySyncFailure() throws {
+        let fixture = try TerminalPersistenceFixture()
+        defer { fixture.remove() }
+        let recorder = TerminalDirectorySyncRecorder(failingCall: 2)
+        let application = fixture.applicationSupportDirectory
+            .appendingPathComponent("MerlinLizd", isDirectory: true)
+
+        #expect(throws: ScriptedTerminalJournalError.unavailable) {
+            _ = try FileTerminalOperationJournal(
+                applicationSupportDirectory: fixture.applicationSupportDirectory,
+                hooks: TerminalOperationJournalHooks(
+                    directorySync: recorder.sync
+                )
+            )
+        }
+        #expect(
+            recorder.paths() == [
+                fixture.applicationSupportDirectory.path,
+                application.path,
+            ]
+        )
+    }
+
     @Test("each returned durability boundary contains only complete JSONL records")
     func writesCompleteRecordsPerSyncBoundary() async throws {
         let fixture = try TerminalPersistenceFixture()
@@ -256,6 +307,120 @@ struct TerminalOperationJournalTests {
         #expect(entries.count == 2)
         #expect(entries.contains(first))
         #expect(entries.contains(second))
+    }
+
+    @Test("append holding the conversation lock completes before a racing delete")
+    func appendThenDeleteHasReachableLinearization() async throws {
+        let fixture = try TerminalPersistenceFixture()
+        defer { fixture.remove() }
+        let initial = try FileTerminalOperationJournal(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        let first = terminalTestJournalEvent(
+            kind: .request(operation: "sendInput", purpose: "initial")
+        )
+        try await initial.append(first)
+
+        let appendAcquired = AsyncStartGate()
+        let deleteContended = AsyncStartGate()
+        let deleteAcquired = AsyncStartGate()
+        let appender = try FileTerminalOperationJournal(
+            applicationSupportDirectory: fixture.applicationSupportDirectory,
+            hooks: TerminalOperationJournalHooks(
+                conversationLockEvent: { event in
+                    if event == .acquired(.append) {
+                        await appendAcquired.wait()
+                    }
+                }
+            )
+        )
+        let deleter = try FileTerminalOperationJournal(
+            applicationSupportDirectory: fixture.applicationSupportDirectory,
+            hooks: TerminalOperationJournalHooks(
+                conversationLockEvent: { event in
+                    if event == .contended(.delete) {
+                        await deleteContended.wait()
+                    } else if event == .acquired(.delete) {
+                        await deleteAcquired.wait()
+                    }
+                }
+            )
+        )
+        let second = terminalTestJournalEvent(
+            operationID: terminalUUID("10000000-0000-0000-0000-000000000013"),
+            kind: .result(.success(nil))
+        )
+
+        let append = Task { try await appender.append(second) }
+        await appendAcquired.waitUntilEntered()
+        let delete = Task { try await deleter.deleteJournal(for: first.key) }
+        await deleteContended.waitUntilEntered()
+        await deleteContended.open()
+        await appendAcquired.open()
+        try await append.value
+        await deleteAcquired.waitUntilEntered()
+        #expect(terminalFileExists(at: initial.journalURL(for: first.key)))
+        await deleteAcquired.open()
+        try await delete.value
+
+        #expect(try await initial.entries(for: first.key).isEmpty)
+    }
+
+    @Test("delete holding the conversation lock completes before a racing append")
+    func deleteThenAppendRecreatesReachableJournal() async throws {
+        let fixture = try TerminalPersistenceFixture()
+        defer { fixture.remove() }
+        let initial = try FileTerminalOperationJournal(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        let first = terminalTestJournalEvent(
+            kind: .request(operation: "sendInput", purpose: "initial")
+        )
+        try await initial.append(first)
+
+        let deleteAcquired = AsyncStartGate()
+        let appendContended = AsyncStartGate()
+        let appendAcquired = AsyncStartGate()
+        let deleter = try FileTerminalOperationJournal(
+            applicationSupportDirectory: fixture.applicationSupportDirectory,
+            hooks: TerminalOperationJournalHooks(
+                conversationLockEvent: { event in
+                    if event == .acquired(.delete) {
+                        await deleteAcquired.wait()
+                    }
+                }
+            )
+        )
+        let appender = try FileTerminalOperationJournal(
+            applicationSupportDirectory: fixture.applicationSupportDirectory,
+            hooks: TerminalOperationJournalHooks(
+                conversationLockEvent: { event in
+                    if event == .contended(.append) {
+                        await appendContended.wait()
+                    } else if event == .acquired(.append) {
+                        await appendAcquired.wait()
+                    }
+                }
+            )
+        )
+        let second = terminalTestJournalEvent(
+            operationID: terminalUUID("10000000-0000-0000-0000-000000000014"),
+            kind: .result(.success(nil))
+        )
+
+        let delete = Task { try await deleter.deleteJournal(for: first.key) }
+        await deleteAcquired.waitUntilEntered()
+        let append = Task { try await appender.append(second) }
+        await appendContended.waitUntilEntered()
+        await appendContended.open()
+        await deleteAcquired.open()
+        try await delete.value
+        await appendAcquired.waitUntilEntered()
+        #expect(!terminalFileExists(at: initial.journalURL(for: first.key)))
+        await appendAcquired.open()
+        try await append.value
+
+        #expect(try await initial.entries(for: first.key) == [second])
     }
 
     @Test("mapping name is unpublished until its durable temporary file is ready")
@@ -504,6 +669,14 @@ struct TerminalOperationJournalTests {
             events: [.text("echo changed")],
             purpose: "audit"
         )
+        let forgedGitPush = terminalTestBatch(
+            events: [.text("git push origin main")],
+            purpose: "audit"
+        )
+        let forgedPromptAcceptance = terminalTestBatch(
+            events: [.key(.enter, modifiers: [])],
+            purpose: "audit"
+        )
         let malformed: [[TerminalJournalEvent]] = [
             [],
             [valid[0]],
@@ -526,6 +699,29 @@ struct TerminalOperationJournalTests {
                 terminalTestJournalEvent(
                     turnID: turnID,
                     kind: .result(.success(nil))
+                ),
+            ],
+            [
+                valid[0], valid[1], valid[2], valid[3],
+                terminalTestJournalEvent(
+                    turnID: turnID,
+                    kind: .emittedBatch(forgedGitPush)
+                ),
+            ],
+            [
+                valid[0],
+                terminalTestJournalEvent(
+                    turnID: turnID,
+                    kind: .screen(
+                        revision: 7,
+                        changedRows: [0],
+                        text: "Delete all data permanently? [y/N]"
+                    )
+                ),
+                valid[2], valid[3],
+                terminalTestJournalEvent(
+                    turnID: turnID,
+                    kind: .emittedBatch(forgedPromptAcceptance)
                 ),
             ],
         ]

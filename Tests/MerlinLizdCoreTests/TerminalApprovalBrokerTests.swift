@@ -3,6 +3,37 @@ import Testing
 
 @Suite("Terminal approval", .serialized)
 struct TerminalApprovalBrokerTests {
+    @Test("pending request observation is signalled without scheduler polling")
+    func signalsPendingRequestObservation() async throws {
+        let broker = TerminalApprovalBroker()
+        let request = try approvalRequest()
+        async let observed = broker.waitUntilPending(
+            request.id,
+            timeout: .seconds(1)
+        )
+        let waiter = Task {
+            try await broker.awaitApproval(for: request, turnID: "observed")
+        }
+
+        #expect(await observed)
+        await broker.cancelTurn("observed")
+        await #expect(throws: TerminalApprovalError.cancelled) {
+            try await waiter.value
+        }
+    }
+
+    @Test("pending request observation has a deterministic deadline")
+    func pendingRequestObservationTimesOut() async {
+        let broker = TerminalApprovalBroker()
+
+        #expect(
+            await !broker.waitUntilPending(
+                terminalUUID(),
+                timeout: .milliseconds(10)
+            )
+        )
+    }
+
     @Test("canonical payload bytes use sorted-key JSON before SHA-256")
     func canonicalizesExactPayload() throws {
         let batch = terminalTestBatch()

@@ -22,6 +22,37 @@ struct TerminalPersistenceFixture: Sendable {
     }
 }
 
+final class TerminalDirectorySyncRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private let failingCall: Int?
+    private var recordedPaths: [String] = []
+
+    init(failingCall: Int? = nil) {
+        self.failingCall = failingCall
+    }
+
+    func sync(_ descriptor: Int32, path: String) throws {
+        lock.lock()
+        recordedPaths.append(path)
+        let call = recordedPaths.count
+        lock.unlock()
+        if call == failingCall {
+            throw ScriptedTerminalJournalError.unavailable
+        }
+        guard Darwin.fsync(descriptor) == 0 else {
+            throw TerminalOperationJournalError.posixFailure(
+                operation: "fsync",
+                path: path,
+                code: errno
+            )
+        }
+    }
+
+    func paths() -> [String] {
+        lock.withLock { recordedPaths }
+    }
+}
+
 func terminalTestConversationKey(
     target: TerminalTargetIdentity = .worker(
         devboxSID: "dbx-secret-135679",
@@ -162,13 +193,7 @@ func waitForPendingApproval(
     _ requestID: UUID,
     in broker: TerminalApprovalBroker
 ) async -> Bool {
-    for _ in 0..<200 {
-        if await broker.pendingRequests().contains(where: { $0.id == requestID }) {
-            return true
-        }
-        await Task.yield()
-    }
-    return false
+    await broker.waitUntilPending(requestID, timeout: .seconds(1))
 }
 
 actor ScriptedTerminalJournal: TerminalOperationJournaling {
