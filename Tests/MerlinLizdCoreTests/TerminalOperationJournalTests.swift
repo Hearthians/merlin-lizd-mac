@@ -715,8 +715,8 @@ struct TerminalOperationJournalTests {
             events: [.text("echo changed")],
             purpose: "audit"
         )
-        let forgedGitPush = terminalTestBatch(
-            events: [.text("git push origin main")],
+        let forgedSubmission = terminalTestBatch(
+            events: [.text("submit\r\n")],
             purpose: "audit"
         )
         let forgedPromptAcceptance = terminalTestBatch(
@@ -751,7 +751,7 @@ struct TerminalOperationJournalTests {
                 valid[0], valid[1], valid[2], valid[3],
                 terminalTestJournalEvent(
                     turnID: turnID,
-                    kind: .emittedBatch(forgedGitPush)
+                    kind: .emittedBatch(forgedSubmission)
                 ),
             ],
             [
@@ -815,7 +815,7 @@ struct TerminalOperationJournalTests {
                 turnID: turnID,
                 kind: .risk(
                     agentDeclared: .high,
-                    deterministic: .high,
+                    deterministic: .routine,
                     effective: .high
                 )
             ),
@@ -863,11 +863,11 @@ struct TerminalOperationJournalTests {
         #expect(await forgedJournal.appendCount() == 0)
     }
 
-    @Test("auditor recomputes policy from the exact recorded cursor")
-    func rejectsForgedRoutineRiskAtMidLineCursor() async throws {
-        let turnID = "exact-cursor"
+    @Test("auditor recomputes structural policy from the exact recorded screen")
+    func rejectsForgedRoutineRiskOnAlternateScreen() async throws {
+        let turnID = "exact-screen"
         let batch = terminalTestBatch(
-            events: [.key(.backspace, modifiers: [])],
+            events: [.text("y")],
             purpose: "audit"
         )
         let operationID = terminalUUID(
@@ -882,12 +882,16 @@ struct TerminalOperationJournalTests {
             terminalTestJournalEvent(
                 operationID: operationID,
                 turnID: turnID,
-                kind: .screen(
-                    terminalTestScreen(
-                        text: "$ rXm -rf /tmp/cache",
-                        cursorColumn: 4
+                    kind: .screen(
+                        terminalTestScreen(
+                            text: "Delete selected item? [y/N]",
+                            cursorColumn: 27,
+                            mode: TerminalScreenMode(
+                                isAlternateScreen: true,
+                                keyboardMode: .applicationCursor
+                            )
+                        )
                     )
-                )
             ),
             terminalTestJournalEvent(
                 operationID: operationID,

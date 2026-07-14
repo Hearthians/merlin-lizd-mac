@@ -112,13 +112,6 @@ public struct TerminalPermissionPolicy: Sendable {
         }
 
         let classification = classify(batch: batch, screen: screen)
-        if let denialReason = classification.denialReason {
-            return TerminalPermissionEvaluation(
-                deterministicRisk: .high,
-                effectiveRisk: .high,
-                decision: .deny(reason: denialReason)
-            )
-        }
         let effectiveRisk = max(batch.declaredRisk, classification.risk)
         let decision: TerminalPermissionDecision
         if effectiveRisk == .high {
@@ -138,6 +131,7 @@ public struct TerminalPermissionPolicy: Sendable {
         } else {
             decision = .allow
         }
+
         return TerminalPermissionEvaluation(
             deterministicRisk: classification.risk,
             effectiveRisk: effectiveRisk,
@@ -158,6 +152,11 @@ public struct TerminalPermissionPolicy: Sendable {
         guard batch.purpose.unicodeScalars.count <= Self.maximumPurposeScalarCount else {
             return "Input purpose exceeds 500 Unicode scalars"
         }
+        for event in batch.events {
+            if let reason = validateRawEvent(event) {
+                return reason
+            }
+        }
         do {
             let encoded = try TerminalInputEncoder.encode(
                 events: batch.events,
@@ -172,813 +171,111 @@ public struct TerminalPermissionPolicy: Sendable {
         return nil
     }
 
+    private func validateRawEvent(_ event: TerminalInputEvent) -> String? {
+        switch event {
+        case let .text(value):
+            if value.unicodeScalars.contains(where: isForbiddenRawTextScalar) {
+                return "Text input contains an unsupported terminal control scalar"
+            }
+        case let .key(.character(value), _):
+            guard value.unicodeScalars.count == 1,
+                let scalar = value.unicodeScalars.first,
+                isPrintableCharacterKeyScalar(scalar)
+            else {
+                return "Character input must contain exactly one printable Unicode scalar"
+            }
+        case .key:
+            break
+        }
+        return nil
+    }
+
+    private func isForbiddenRawTextScalar(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.value {
+        case 0x0D, 0x0A:
+            false
+        case 0x00...0x1F, 0x7F...0x9F:
+            true
+        default:
+            false
+        }
+    }
+
+    private func isPrintableCharacterKeyScalar(_ scalar: Unicode.Scalar) -> Bool {
+        if isForbiddenRawTextScalar(scalar) || scalar.value == 0x0A
+            || scalar.value == 0x0D
+        {
+            return false
+        }
+        return switch scalar.properties.generalCategory {
+        case .control, .format, .lineSeparator, .paragraphSeparator,
+            .surrogate, .nonspacingMark, .spacingMark, .enclosingMark,
+            .unassigned:
+            false
+        default:
+            true
+        }
+    }
+
     private struct Classification {
         let risk: TerminalRisk
         let reason: String?
-        let denialReason: String?
-
-        static let routine = Classification(
-            risk: .routine,
-            reason: nil,
-            denialReason: nil
-        )
-    }
-
-    private struct EditableCommand {
-        var characters: [Character]
-        var cursor: Int
-    }
-
-    private struct LexedCommand {
-        var segments: [[String]] = [[]]
-        var hasOverwriteRedirection = false
-        var isAmbiguous = false
-    }
-
-    private enum Quote {
-        case single
-        case double
-    }
-
-    private enum SubcommandResolution {
-        case resolved(String?)
-        case ambiguous
-    }
-
-    private enum SubmissionBoundary {
-        case submit
-        case lineContinuation
-        case ambiguous
-    }
-
-    private struct ExecutableResolution {
-        var words: [String]
-        var isAmbiguous: Bool
-        var highRiskReason: String?
     }
 
     private func classify(
         batch: TerminalInputBatch,
         screen: TerminalScreenSnapshot
     ) -> Classification {
-        if let prompt = promptClassification(
-            events: batch.events,
-            screenText: screen.text
-        ), prompt.risk == .high,
-            hasExplicitConfirmationEvidence(screen.text)
-        {
-            return prompt
-        }
-        guard var editable = editableCommand(from: screen) else {
-            if let prompt = promptClassification(
-                events: batch.events,
-                screenText: screen.text
-            ) {
-                return prompt
-            }
-            if batch.events.allSatisfy(isNonMutatingNavigation) {
-                return .routine
-            }
-            return Classification(
-                risk: .high,
-                reason: nil,
-                denialReason: "The visible editable command could not be reconstructed safely"
-            )
+        guard !batch.events.isEmpty else {
+            return Classification(risk: .observation, reason: nil)
         }
 
-        var result = classify(command: String(editable.characters))
         for event in batch.events {
-            switch event {
-            case let .text(text):
-                if text.unicodeScalars.contains(where: { scalar in
-                    scalar.value != 0x0A
-                        && scalar.value != 0x0D
-                        && isUnsafeTerminalScalar(scalar)
-                }) {
-                    return Classification(
-                        risk: .high,
-                        reason: nil,
-                        denialReason: "Text input contains terminal control bytes that cannot be reconstructed safely"
-                    )
-                }
-                for character in text {
-                    if character == "\n" || character == "\r" {
-                        if let failure = applySubmissionBoundary(
-                            editable: &editable,
-                            result: &result
-                        ) { return failure }
-                    } else {
-                        editable.characters.insert(character, at: editable.cursor)
-                        editable.cursor += 1
-                    }
-                }
-            case let .key(.character(value), modifiers) where modifiers.isEmpty:
-                guard value.unicodeScalars.count == 1,
-                    let scalar = value.unicodeScalars.first,
-                    isValidCharacterKeyScalar(scalar)
-                else {
-                    return Classification(
-                        risk: .high,
-                        reason: nil,
-                        denialReason: "Character input contains terminal controls or an ambiguous multi-scalar value"
-                    )
-                }
-                for character in value {
-                    editable.characters.insert(character, at: editable.cursor)
-                    editable.cursor += 1
-                }
-            case .key(.backspace, modifiers: []):
-                if editable.cursor > 0 {
-                    editable.cursor -= 1
-                    editable.characters.remove(at: editable.cursor)
-                }
-            case .key(.delete, modifiers: []):
-                if editable.cursor < editable.characters.count {
-                    editable.characters.remove(at: editable.cursor)
-                }
-            case .key(.left, modifiers: []):
-                editable.cursor = max(0, editable.cursor - 1)
-            case .key(.right, modifiers: []):
-                editable.cursor = min(editable.characters.count, editable.cursor + 1)
-            case .key(.home, modifiers: []):
-                editable.cursor = 0
-            case .key(.end, modifiers: []):
-                editable.cursor = editable.characters.count
-            case .key(.enter, modifiers: []):
-                if let failure = applySubmissionBoundary(
-                    editable: &editable,
-                    result: &result
-                ) { return failure }
-            case .key(.escape, modifiers: []):
+            if isUnmodifiedNavigation(event) {
                 continue
-            default:
+            }
+            if screen.mode.isAlternateScreen {
                 return Classification(
                     risk: .high,
-                    reason: nil,
-                    denialReason: "The input can change command state in a way that cannot be reconstructed safely"
+                    reason: "Alternate-screen actions require explicit approval"
                 )
             }
-            result = maxClassification(
-                result,
-                classify(command: String(editable.characters))
+            if isRoutineNormalScreenEvent(event) {
+                continue
+            }
+            return Classification(
+                risk: .high,
+                reason: "The input contains an execution or action boundary"
             )
         }
-        return result
+
+        return Classification(risk: .routine, reason: nil)
     }
 
-    private func applySubmissionBoundary(
-        editable: inout EditableCommand,
-        result: inout Classification
-    ) -> Classification? {
-        switch submissionBoundary(in: editable.characters) {
-        case .submit:
-            result = maxClassification(
-                result,
-                classify(command: String(editable.characters))
-            )
-            editable = EditableCommand(characters: [], cursor: 0)
-        case .lineContinuation:
-            editable.characters.removeLast()
-            editable.cursor = min(editable.cursor, editable.characters.count)
-        case .ambiguous:
-            return high("The command submission boundary cannot be reconstructed safely")
-        }
-        return nil
-    }
-
-    private func submissionBoundary(
-        in characters: [Character]
-    ) -> SubmissionBoundary {
-        var quote: Quote?
-        var escaped = false
-        for character in characters {
-            if quote == .single {
-                if character == "'" { quote = nil }
-                continue
-            }
-            if escaped {
-                escaped = false
-                continue
-            }
-            if character == "\\" {
-                escaped = true
-            } else if quote == .double {
-                if character == "\"" { quote = nil }
-            } else if character == "'" {
-                quote = .single
-            } else if character == "\"" {
-                quote = .double
-            }
-        }
-        if escaped, quote != .single { return .lineContinuation }
-        if quote != nil { return .ambiguous }
-        return .submit
-    }
-
-    private func editableCommand(
-        from screen: TerminalScreenSnapshot
-    ) -> EditableCommand? {
-        guard screen.cursor.isVisible, screen.cursor.row >= 0,
-            screen.cursor.column >= 0
-        else { return nil }
-        let rows = screen.text.split(
-            separator: "\n",
-            omittingEmptySubsequences: false
-        )
-        guard screen.cursor.row < rows.count else { return nil }
-        var characters = Array(rows[screen.cursor.row])
-        guard characters.allSatisfy({ screenColumnWidth($0) != nil }) else {
-            return nil
-        }
-        var renderedColumns = characters.reduce(into: 0) { total, character in
-            total += screenColumnWidth(character) ?? 0
-        }
-        while renderedColumns < screen.cursor.column {
-            characters.append(" ")
-            renderedColumns += 1
-        }
-        guard let cursorIndex = characterIndex(
-            atColumn: screen.cursor.column,
-            in: characters
-        ) else { return nil }
-        let markers: [[Character]] = [Array("$ "), Array("% "), Array("# ")]
-        var promptEnd: Int?
-        for start in 0..<max(0, characters.count - 1) {
-            for marker in markers where start + marker.count <= characters.count {
-                if Array(characters[start..<(start + marker.count)]) == marker {
-                    let prefix = characters[..<start]
-                    if prefix.isEmpty
-                        || (prefix.contains("@")
-                            && !prefix.contains(where: \.isWhitespace))
-                    {
-                        promptEnd = start + marker.count
-                    }
-                    break
-                }
-            }
-            if promptEnd != nil { break }
-        }
-        guard let promptEnd, promptEnd <= cursorIndex else { return nil }
-        return EditableCommand(
-            characters: Array(characters.dropFirst(promptEnd)),
-            cursor: cursorIndex - promptEnd
-        )
-    }
-
-    private func characterIndex(
-        atColumn targetColumn: Int,
-        in characters: [Character]
-    ) -> Int? {
-        var column = 0
-        for (index, character) in characters.enumerated() {
-            if column == targetColumn { return index }
-            guard let width = screenColumnWidth(character),
-                column + width <= targetColumn
-            else { return nil }
-            column += width
-        }
-        return column == targetColumn ? characters.count : nil
-    }
-
-    private func screenColumnWidth(_ character: Character) -> Int? {
-        var width = 0
-        for scalar in character.unicodeScalars {
-            if isUnsafeTerminalScalar(scalar) { return nil }
-            switch scalar.properties.generalCategory {
-            case .nonspacingMark, .enclosingMark:
-                continue
-            default:
-                width = max(width, isWideTerminalScalar(scalar) ? 2 : 1)
-            }
-        }
-        return max(1, width)
-    }
-
-    private func isUnsafeTerminalScalar(_ scalar: Unicode.Scalar) -> Bool {
-        switch scalar.properties.generalCategory {
-        case .control, .format, .lineSeparator, .paragraphSeparator,
-            .surrogate:
-            true
-        default:
-            false
-        }
-    }
-
-    private func isValidCharacterKeyScalar(_ scalar: Unicode.Scalar) -> Bool {
-        guard !isUnsafeTerminalScalar(scalar) else { return false }
-        return switch scalar.properties.generalCategory {
-        case .nonspacingMark, .spacingMark, .enclosingMark:
-            false
-        default:
-            true
-        }
-    }
-
-    private func isWideTerminalScalar(_ scalar: Unicode.Scalar) -> Bool {
-        switch scalar.value {
-        case 0x1100...0x115F, 0x2329...0x232A, 0x2E80...0xA4CF,
-            0xAC00...0xD7A3, 0xF900...0xFAFF, 0xFE10...0xFE19,
-            0xFE30...0xFE6F, 0xFF00...0xFF60, 0xFFE0...0xFFE6,
-            0x1F300...0x1FAFF, 0x20000...0x3FFFD:
-            true
-        default:
-            false
-        }
-    }
-
-    private func isNonMutatingNavigation(_ event: TerminalInputEvent) -> Bool {
+    private func isUnmodifiedNavigation(_ event: TerminalInputEvent) -> Bool {
         switch event {
-        case .key(.left, modifiers: []), .key(.right, modifiers: []),
+        case .key(.up, modifiers: []), .key(.down, modifiers: []),
+            .key(.left, modifiers: []), .key(.right, modifiers: []),
             .key(.home, modifiers: []), .key(.end, modifiers: []),
-            .key(.escape, modifiers: []), .key(.pageUp, modifiers: []),
-            .key(.pageDown, modifiers: []):
-            return true
+            .key(.pageUp, modifiers: []), .key(.pageDown, modifiers: []):
+            true
         default:
-            return false
+            false
         }
     }
 
-    private func promptClassification(
-        events: [TerminalInputEvent],
-        screenText: String
-    ) -> Classification? {
-        let response = promptResponse(events)
-        guard response != nil else { return nil }
-        let prompt = screenText.lowercased()
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .suffix(4)
-            .joined(separator: " ")
-        let passiveMarkers = [
-            "press enter to continue", "hit enter to continue",
-            "press return to continue",
-        ]
-        let destructiveMarkers = [
-            "delete", "overwrite", "remove", "terminate", "erase",
-            "destroy", "permanent", "all data", "kill", "revoke",
-        ]
-        let confirmationMarkers = [
-            "[y/n]", "[y/n]?", "[y/n", "(y/n)", "yes/no",
-            "are you sure", "confirm", "proceed?", "continue?",
-            "[ok]", "ok/cancel", "[cancel]", "[accept]", "[decline]",
-            "accept/decline", "apply ",
-        ]
-        let isDestructive = destructiveMarkers.contains { prompt.contains($0) }
-        let isConfirmation = isDestructive
-            || confirmationMarkers.contains { prompt.contains($0) }
-            || prompt.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?")
-        let isPassive = passiveMarkers.contains { prompt.contains($0) }
-
-        if response == false, isConfirmation {
-            return .routine
-        }
-        if response == true, isConfirmation {
-            return Classification(
-                risk: .high,
-                reason: "The input accepts a confirmation prompt whose effect may be destructive",
-                denialReason: nil
-            )
-        }
-        if response == true, isPassive, !isDestructive {
-            return .routine
-        }
-        return nil
-    }
-
-    private func hasExplicitConfirmationEvidence(_ screenText: String) -> Bool {
-        let prompt = screenText.lowercased()
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .suffix(4)
-            .joined(separator: " ")
-        let markers = [
-            "[accept]", "[decline]", "[ok]", "[cancel]", "[y/n]",
-            "(y/n)", "yes/no", "are you sure",
-        ]
-        return markers.contains { prompt.contains($0) }
-    }
-
-    private func promptResponse(_ events: [TerminalInputEvent]) -> Bool? {
-        guard !events.isEmpty else { return nil }
-        var text = ""
-        var hasEnter = false
-        for event in events {
-            switch event {
-            case let .text(value):
-                text += value
-            case let .key(.character(value), modifiers) where modifiers.isEmpty:
-                text += value
-            case .key(.enter, modifiers: []):
-                hasEnter = true
-            case .key(.escape, modifiers: []):
-                return false
-            default:
-                return nil
+    private func isRoutineNormalScreenEvent(_ event: TerminalInputEvent) -> Bool {
+        switch event {
+        case let .text(value):
+            !value.unicodeScalars.contains { scalar in
+                scalar.value == 0x0A || scalar.value == 0x0D
             }
+        case .key(.character, modifiers: []),
+            .key(.backspace, modifiers: []),
+            .key(.delete, modifiers: []):
+            true
+        default:
+            false
         }
-        let answer = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        if ["n", "no", "cancel"].contains(answer) { return false }
-        if ["y", "yes", "ok"].contains(answer) { return true }
-        return answer.isEmpty && hasEnter ? true : nil
-    }
-
-    private func classify(command: String) -> Classification {
-        guard !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return .routine
-        }
-        let lexed = lex(command)
-        if lexed.isAmbiguous {
-            return Classification(
-                risk: .high,
-                reason: "The shell expression cannot be analyzed safely",
-                denialReason: nil
-            )
-        }
-        if lexed.hasOverwriteRedirection {
-            return Classification(
-                risk: .high,
-                reason: "The command can overwrite file contents",
-                denialReason: nil
-            )
-        }
-        for segment in lexed.segments {
-            let classification = classify(segment: segment)
-            if classification.risk == .high { return classification }
-        }
-        return .routine
-    }
-
-    private func lex(_ command: String) -> LexedCommand {
-        let characters = Array(command)
-        var result = LexedCommand()
-        var word = ""
-        var quote: Quote?
-        var index = 0
-
-        func appendWord() {
-            guard !word.isEmpty else { return }
-            result.segments[result.segments.count - 1].append(word.lowercased())
-            word = ""
-        }
-        func appendSeparator() {
-            appendWord()
-            if !result.segments[result.segments.count - 1].isEmpty {
-                result.segments.append([])
-            }
-        }
-
-        while index < characters.count {
-            let character = characters[index]
-            let next = index + 1 < characters.count ? characters[index + 1] : nil
-            if quote == .single {
-                if character == "'" { quote = nil } else { word.append(character) }
-                index += 1
-                continue
-            }
-            if quote == .double {
-                if character == "\"" {
-                    quote = nil
-                } else if character == "`"
-                    || (character == "$" && ["(", "{"].contains(next))
-                {
-                    result.isAmbiguous = true
-                    word.append(character)
-                } else if character == "\\", let next {
-                    word.append(next)
-                    index += 1
-                } else {
-                    word.append(character)
-                }
-                index += 1
-                continue
-            }
-
-            if character == "'" {
-                quote = .single
-            } else if character == "\"" {
-                quote = .double
-            } else if character == "`"
-                || (character == "$" && ["(", "{", "'"].contains(next))
-                || ((character == "<" || character == ">") && next == "(")
-                || ["(", ")", "{", "}"].contains(character)
-            {
-                result.isAmbiguous = true
-                word.append(character)
-            } else if character == "\\", let next {
-                word.append(next)
-                index += 1
-            } else if character.isWhitespace {
-                appendWord()
-            } else if character == ";" || character == "|" || character == "&" {
-                appendSeparator()
-                if next == character { index += 1 }
-            } else if character == ">" {
-                if next == ">" {
-                    appendWord()
-                    index += 1
-                } else if next == "&" {
-                    if word.allSatisfy(\.isNumber) { word = "" }
-                    appendWord()
-                    index += 1
-                    while index + 1 < characters.count,
-                        characters[index + 1].isNumber
-                    {
-                        index += 1
-                    }
-                } else {
-                    if word.allSatisfy(\.isNumber) { word = "" }
-                    appendWord()
-                    result.hasOverwriteRedirection = true
-                }
-            } else {
-                word.append(character)
-            }
-            index += 1
-        }
-        appendWord()
-        if quote != nil { result.isAmbiguous = true }
-        if result.segments.last?.isEmpty == true { result.segments.removeLast() }
-        return result
-    }
-
-    private func classify(segment originalWords: [String]) -> Classification {
-        guard !originalWords.isEmpty else { return .routine }
-        let resolved = resolveExecutable(originalWords)
-        if let reason = resolved.highRiskReason { return high(reason) }
-        if resolved.isAmbiguous {
-            return Classification(
-                risk: .high,
-                reason: "The command wrapper cannot be analyzed safely",
-                denialReason: nil
-            )
-        }
-        guard let executable = resolved.words.first else { return .routine }
-        let arguments = Array(resolved.words.dropFirst())
-        let name = executable.split(separator: "/").last.map(String.init) ?? executable
-
-        if [
-            "if", "then", "else", "elif", "fi", "for", "while", "until",
-            "do", "done", "case", "esac", "function", "eval", "source", ".",
-        ].contains(name) {
-            return high("The shell expression cannot be analyzed safely")
-        }
-        if ["bash", "sh", "zsh", "fish", "dash", "ksh"].contains(name),
-            arguments.contains(where: { argument in
-                argument == "-c"
-                    || (argument.hasPrefix("-")
-                        && !argument.hasPrefix("--")
-                        && argument.dropFirst().contains("c"))
-            })
-        {
-            return high("The command invokes a shell expression")
-        }
-        if ["rm", "rmdir", "unlink", "truncate"].contains(name)
-            || (name == "find" && arguments.contains("-delete"))
-        {
-            return high("The command can destructively delete data")
-        }
-        if name == "git" {
-            switch gitSubcommand(arguments) {
-            case .ambiguous:
-                return high("The git invocation cannot be analyzed safely")
-            case .resolved("push"):
-                return high("git push changes a remote repository")
-            case .resolved("clean"), .resolved("credential"):
-                return high("The git command can destructively change state")
-            case .resolved:
-                break
-            }
-        }
-        if ["dd", "fdisk", "gpt"].contains(name) || name.hasPrefix("mkfs") {
-            return high("The command can modify or erase disk state")
-        }
-        if name == "diskutil" {
-            let lowered = arguments.map { $0.lowercased() }
-            if lowered.contains(where: { $0.hasPrefix("erase") || $0.hasPrefix("partition") })
-                || lowered.containsSequence(["apfs", "delete"])
-            {
-                return high("The command can modify or erase disk state")
-            }
-        }
-        if [
-            "kill", "pkill", "killall", "shutdown", "reboot", "poweroff", "halt",
-        ].contains(name) {
-            return high("The command can terminate a process or terminal session")
-        }
-        if name == "tmux" {
-            switch tmuxSubcommand(arguments) {
-            case .ambiguous:
-                return high("The tmux invocation cannot be analyzed safely")
-            case let .resolved(subcommand?) where
-                ["kill-session", "kill-server", "kill-pane"].contains(subcommand):
-                return high("The command can terminate a terminal session")
-            case .resolved:
-                break
-            }
-        }
-        if ["passwd", "chpasswd", "ssh-keygen", "security"].contains(name)
-            || matches(arguments, after: name, pairs: [
-                ("aws", "configure"), ("gcloud", "auth"), ("gh", "auth"),
-                ("npm", "login"), ("docker", "login"),
-            ])
-        {
-            return high("The command can change credentials or authentication state")
-        }
-        let benignForceConsumers = ["tail", "grep", "fgrep", "egrep"]
-        if !benignForceConsumers.contains(name), arguments.contains(where: {
-            $0 == "-f" || $0 == "--force" || $0.hasPrefix("--force=")
-        }) {
-            return high("The command contains a force flag")
-        }
-        return .routine
-    }
-
-    private func resolveExecutable(
-        _ originalWords: [String]
-    ) -> ExecutableResolution {
-        var words = originalWords
-        while let first = words.first {
-            if first.contains("=") {
-                words.removeFirst()
-                continue
-            }
-            let wrapper = first.split(separator: "/").last.map(String.init) ?? first
-            switch wrapper {
-            case "sudo":
-                words.removeFirst()
-                guard consumeOptions(
-                    in: &words,
-                    flags: ["-A", "-b", "-E", "-H", "-K", "-k", "-n", "-S", "-V"],
-                    valueOptions: [
-                        "-C", "-D", "-g", "-h", "-p", "-R", "-r", "-T", "-t", "-U", "-u",
-                        "--chdir", "--close-from", "--command-timeout", "--group", "--host",
-                        "--prompt", "--role", "--type", "--user",
-                    ]
-                ) else { return ExecutableResolution(
-                    words: words,
-                    isAmbiguous: true,
-                    highRiskReason: nil
-                ) }
-            case "command", "builtin":
-                words.removeFirst()
-                guard consumeOptions(
-                    in: &words,
-                    flags: ["-p", "-v", "-V"],
-                    valueOptions: []
-                ) else { return ExecutableResolution(
-                    words: words,
-                    isAmbiguous: true,
-                    highRiskReason: nil
-                ) }
-            case "env":
-                words.removeFirst()
-                guard consumeOptions(
-                    in: &words,
-                    flags: ["-i", "--ignore-environment", "-0", "--null"],
-                    valueOptions: ["-C", "--chdir", "-u", "--unset"]
-                ) else { return ExecutableResolution(
-                    words: words,
-                    isAmbiguous: true,
-                    highRiskReason: nil
-                ) }
-                while words.first?.contains("=") == true { words.removeFirst() }
-            case "nohup":
-                words.removeFirst()
-            case "exec":
-                return ExecutableResolution(
-                    words: words,
-                    isAmbiguous: false,
-                    highRiskReason: "exec replaces the current terminal shell session"
-                )
-            case "time":
-                words.removeFirst()
-                guard consumeOptions(
-                    in: &words,
-                    flags: ["-p", "--portability"],
-                    valueOptions: []
-                ) else { return ExecutableResolution(
-                    words: words,
-                    isAmbiguous: true,
-                    highRiskReason: nil
-                ) }
-            case "nice":
-                words.removeFirst()
-                guard consumeOptions(
-                    in: &words,
-                    flags: [],
-                    valueOptions: ["-n", "--adjustment"]
-                ) else { return ExecutableResolution(
-                    words: words,
-                    isAmbiguous: true,
-                    highRiskReason: nil
-                ) }
-            case "xargs":
-                return ExecutableResolution(
-                    words: words,
-                    isAmbiguous: true,
-                    highRiskReason: nil
-                )
-            default:
-                return ExecutableResolution(
-                    words: words,
-                    isAmbiguous: false,
-                    highRiskReason: nil
-                )
-            }
-        }
-        return ExecutableResolution(
-            words: words,
-            isAmbiguous: false,
-            highRiskReason: nil
-        )
-    }
-
-    private func consumeOptions(
-        in words: inout [String],
-        flags: Set<String>,
-        valueOptions: Set<String>
-    ) -> Bool {
-        while let option = words.first, option.hasPrefix("-") {
-            if option == "--" {
-                words.removeFirst()
-                return true
-            }
-            if flags.contains(option) {
-                words.removeFirst()
-                continue
-            }
-            if valueOptions.contains(option) {
-                guard words.count >= 2 else { return false }
-                words.removeFirst(2)
-                continue
-            }
-            if valueOptions.contains(where: { option.hasPrefix($0 + "=") })
-                || valueOptions.contains(where: {
-                    $0.count == 2 && option.hasPrefix($0) && option.count > 2
-                })
-            {
-                words.removeFirst()
-                continue
-            }
-            return false
-        }
-        return true
-    }
-
-    private func gitSubcommand(
-        _ arguments: [String]
-    ) -> SubcommandResolution {
-        var arguments = arguments
-        let valueOptions: Set<String> = ["-C", "-c", "--git-dir", "--work-tree", "--namespace"]
-        guard consumeOptions(
-            in: &arguments,
-            flags: ["--bare", "--no-pager", "--paginate", "--literal-pathspecs"],
-            valueOptions: valueOptions
-        ) else { return .ambiguous }
-        return .resolved(arguments.first)
-    }
-
-    private func tmuxSubcommand(
-        _ arguments: [String]
-    ) -> SubcommandResolution {
-        var arguments = arguments
-        guard consumeOptions(
-            in: &arguments,
-            flags: ["-2", "-c", "-cc", "-d", "-u", "-v"],
-            valueOptions: ["-f", "-l", "-s", "-t"]
-        ) else { return .ambiguous }
-        return .resolved(arguments.first)
-    }
-
-    private func matches(
-        _ arguments: [String],
-        after name: String,
-        pairs: [(String, String)]
-    ) -> Bool {
-        pairs.contains { pair in
-            name == pair.0 && arguments.first == pair.1
-        }
-    }
-
-    private func maxClassification(
-        _ lhs: Classification,
-        _ rhs: Classification
-    ) -> Classification {
-        lhs.risk >= rhs.risk ? lhs : rhs
-    }
-
-    private func high(_ reason: String) -> Classification {
-        Classification(risk: .high, reason: reason, denialReason: nil)
-    }
-}
-
-private extension Array where Element == String {
-    func containsSequence(_ sequence: [String]) -> Bool {
-        guard count >= sequence.count else { return false }
-        for start in 0...(count - sequence.count) {
-            if Array(self[start..<(start + sequence.count)]) == sequence {
-                return true
-            }
-        }
-        return false
     }
 }

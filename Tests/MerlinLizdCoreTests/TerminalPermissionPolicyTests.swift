@@ -3,173 +3,331 @@ import Testing
 
 @Suite("Terminal permission", .serialized)
 struct TerminalPermissionPolicyTests {
-    @Test("routine typing and navigation are allowed")
-    func allowsRoutineTypingAndNavigation() throws {
-        let policy = TerminalPermissionPolicy()
-        let screen = terminalTestScreen()
-        let batches = [
-            terminalTestBatch(events: [.text("echo hello")]),
-            terminalTestBatch(events: [.text("echo git push")]),
-            terminalTestBatch(events: [.text("printf rm")]),
-            terminalTestBatch(events: [
+    @Test("normal screens allow only printable text local edits and navigation")
+    func allowsFiniteNormalScreenShapes() throws {
+        let allowed: [[TerminalInputEvent]] = [
+            [],
+            [.text("")],
+            [.text("rm -rf /tmp/cache && git push")],
+            [.text("你好 👩‍💻 e\u{301}")],
+            [.key(.character("é"), modifiers: [])],
+            [.key(.character("你"), modifiers: [])],
+            [.key(.backspace, modifiers: [])],
+            [.key(.delete, modifiers: [])],
+            [.key(.up, modifiers: [])],
+            [.key(.down, modifiers: [])],
+            [.key(.left, modifiers: [])],
+            [.key(.right, modifiers: [])],
+            [.key(.home, modifiers: [])],
+            [.key(.end, modifiers: [])],
+            [.key(.pageUp, modifiers: [])],
+            [.key(.pageDown, modifiers: [])],
+            [
+                .text("draft"),
                 .key(.left, modifiers: []),
-                .key(.right, modifiers: []),
-                .key(.enter, modifiers: []),
-            ]),
-            terminalTestBatch(events: [.text("printf '%s\\n' hello >> log")]),
+                .key(.backspace, modifiers: []),
+                .key(.end, modifiers: []),
+                .key(.delete, modifiers: []),
+            ],
         ]
 
-        for batch in batches {
-            let evaluation = try policy.evaluate(
-                batch: batch,
-                endpointID: terminalTestEndpoint(),
-                screen: screen
+        for events in allowed {
+            let evaluation = try evaluate(events: events)
+            #expect(evaluation.decision == .allow)
+            #expect(
+                evaluation.deterministicRisk
+                    == (events.isEmpty ? .observation : .routine)
             )
+        }
+    }
+
+    @Test("every terminal key category has one explicit normal-screen outcome")
+    func classifiesEveryKeyCategory() throws {
+        let routineKeys: [TerminalKey] = [
+            .character("x"), .backspace, .delete,
+            .up, .down, .left, .right, .home, .end, .pageUp, .pageDown,
+        ]
+        let approvalKeys: [TerminalKey] = [
+            .enter, .escape, .tab, .insert,
+        ] + (1...12).map(TerminalKey.function)
+
+        for key in routineKeys {
+            let evaluation = try evaluate(events: [.key(key, modifiers: [])])
             #expect(evaluation.deterministicRisk == .routine)
-            #expect(evaluation.effectiveRisk == .routine)
             #expect(evaluation.decision == .allow)
         }
-    }
-
-    @Test("destructive commands require approval")
-    func escalatesHighRiskSignals() throws {
-        let commands = [
-            "rm -rf /tmp/cache",
-            "cat source > ~/.config/tool/config",
-            "diskutil eraseDisk APFS Scratch /dev/disk9",
-            "kill -9 1234",
-            "tmux kill-session -t training",
-            "deploy --force production",
-            "git push origin main",
-            "passwd",
-            "gh auth logout",
-        ]
-
-        for command in commands {
-            let evaluation = try TerminalPermissionPolicy().evaluate(
-                batch: terminalTestBatch(events: [.text(command)]),
-                endpointID: terminalTestEndpoint(),
-                screen: terminalTestScreen()
-            )
-
-            #expect(evaluation.deterministicRisk == .high)
-            #expect(evaluation.effectiveRisk == .high)
-            guard case let .requireApproval(request) = evaluation.decision else {
-                Issue.record("expected exact allow-once approval request for \(command)")
-                continue
-            }
-            #expect(request.batch.events == [.text(command)])
-            #expect(request.scope.endpointID == terminalTestEndpoint())
-            #expect(request.scope.screenRevision == 7)
-            #expect(!request.reason.isEmpty)
+        for key in approvalKeys {
+            let evaluation = try evaluate(events: [.key(key, modifiers: [])])
+            assertRequiresApproval(evaluation, context: "normal key \(key)")
         }
     }
 
-    @Test("shell wrappers and command chains cannot hide high-risk commands")
-    func escalatesWrappedAndChainedCommands() throws {
-        let commands = [
-            "sudo rm -rf /tmp/cache",
-            "sudo -u root rm -rf /tmp/cache",
-            "/bin/rm -rf /tmp/cache",
-            "echo ready && rm -rf /tmp/cache",
-            "sudo diskutil eraseDisk APFS Scratch /dev/disk9",
-            "command kill -9 1234",
-            "sudo git push origin main",
-            "sudo passwd",
+    @Test("screen and keyboard modes preserve the finite structural policy")
+    func classifiesEveryScreenMode() throws {
+        let modes = [
+            TerminalScreenMode(
+                isAlternateScreen: false,
+                keyboardMode: .normal
+            ),
+            TerminalScreenMode(
+                isAlternateScreen: false,
+                keyboardMode: .applicationCursor
+            ),
+            TerminalScreenMode(
+                isAlternateScreen: true,
+                keyboardMode: .normal
+            ),
+            TerminalScreenMode(
+                isAlternateScreen: true,
+                keyboardMode: .applicationCursor
+            ),
         ]
 
-        for command in commands {
-            let evaluation = try TerminalPermissionPolicy().evaluate(
-                batch: terminalTestBatch(events: [.text(command)]),
-                endpointID: terminalTestEndpoint(),
-                screen: terminalTestScreen()
-            )
+        for mode in modes {
+            let screen = terminalTestScreen(mode: mode)
+            let empty = try evaluate(events: [], screen: screen)
+            #expect(empty.deterministicRisk == .observation)
+            #expect(empty.decision == .allow)
 
-            #expect(evaluation.deterministicRisk == .high)
-            guard case .requireApproval = evaluation.decision else {
-                Issue.record("wrapped high-risk command must require approval: \(command)")
-                continue
-            }
-        }
-    }
-
-    @Test("effective risk is the maximum of declared and deterministic risk")
-    func takesMaximumRisk() throws {
-        let declaredHigh = try TerminalPermissionPolicy().evaluate(
-            batch: terminalTestBatch(
-                events: [.text("echo safe")],
-                risk: .high
-            ),
-            endpointID: terminalTestEndpoint(),
-            screen: terminalTestScreen()
-        )
-        let deterministicHigh = try TerminalPermissionPolicy().evaluate(
-            batch: terminalTestBatch(
-                events: [.text("git push origin main")],
-                risk: .observation
-            ),
-            endpointID: terminalTestEndpoint(),
-            screen: terminalTestScreen()
-        )
-
-        #expect(declaredHigh.deterministicRisk == .routine)
-        #expect(declaredHigh.effectiveRisk == .high)
-        #expect(deterministicHigh.deterministicRisk == .high)
-        #expect(deterministicHigh.effectiveRisk == .high)
-    }
-
-    @Test("Enter and Y acceptances inherit destructive prompt risk")
-    func escalatesDestructivePromptAcceptance() throws {
-        let screen = terminalTestScreen(
-            text: "Delete all snapshots permanently? [y/N]"
-        )
-        let batches = [
-            terminalTestBatch(events: [.key(.enter, modifiers: [])]),
-            terminalTestBatch(events: [
-                .text("Y"),
-                .key(.enter, modifiers: []),
-            ]),
-        ]
-
-        for batch in batches {
-            let evaluation = try TerminalPermissionPolicy().evaluate(
-                batch: batch,
-                endpointID: terminalTestEndpoint(),
+            let navigation = try evaluate(
+                events: [.key(.left, modifiers: [])],
                 screen: screen
             )
-            #expect(evaluation.deterministicRisk == .high)
-            guard case .requireApproval = evaluation.decision else {
-                Issue.record("destructive prompt acceptance must require approval")
-                return
+            #expect(navigation.deterministicRisk == .routine)
+            #expect(navigation.decision == .allow)
+
+            let text = try evaluate(events: [.text("x")], screen: screen)
+            if mode.isAlternateScreen {
+                assertRequiresApproval(text, context: "alternate text")
+            } else {
+                #expect(text.deterministicRisk == .routine)
+                #expect(text.decision == .allow)
+            }
+
+            assertRequiresApproval(
+                try evaluate(
+                    events: [.key(.enter, modifiers: [])],
+                    screen: screen
+                ),
+                context: "Enter in mode \(mode)"
+            )
+        }
+    }
+
+    @Test("alternate screens allow navigation only")
+    func alternateScreensAllowNavigationOnly() throws {
+        let alternate = terminalTestScreen(
+            mode: TerminalScreenMode(
+                isAlternateScreen: true,
+                keyboardMode: .applicationCursor
+            )
+        )
+        let navigation: [TerminalKey] = [
+            .up, .down, .left, .right, .home, .end, .pageUp, .pageDown,
+        ]
+        for key in navigation {
+            let evaluation = try evaluate(
+                events: [.key(key, modifiers: [])],
+                screen: alternate
+            )
+            #expect(evaluation.decision == .allow)
+        }
+
+        let actions: [TerminalInputEvent] = [
+            .text("y"),
+            .text("harmless printable text"),
+            .key(.character("Y"), modifiers: []),
+            .key(.backspace, modifiers: []),
+            .key(.delete, modifiers: []),
+            .key(.enter, modifiers: []),
+            .key(.escape, modifiers: []),
+            .key(.tab, modifiers: []),
+            .key(.insert, modifiers: []),
+            .key(.function(12), modifiers: []),
+        ]
+        for event in actions {
+            let evaluation = try evaluate(events: [event], screen: alternate)
+            assertRequiresApproval(evaluation, context: "alternate event \(event)")
+        }
+    }
+
+    @Test("CR LF and CRLF are execution boundaries at every text position")
+    func classifiesEveryTextSubmissionBoundary() throws {
+        let boundaries = ["\r", "\n", "\r\n"]
+        var values: [String] = []
+        for boundary in boundaries {
+            values += [
+                boundary,
+                boundary + "after",
+                "before" + boundary,
+                "before" + boundary + "after",
+                "one" + boundary + "two" + boundary,
+            ]
+        }
+        values += ["one\r\ntwo\nthree\rfour"]
+
+        for value in values {
+            let evaluation = try evaluate(events: [.text(value)])
+            assertRequiresApproval(evaluation, context: value.debugDescription)
+        }
+
+        let semanticEnter = try evaluate(
+            events: [.key(.enter, modifiers: [])]
+        )
+        assertRequiresApproval(semanticEnter, context: "semantic Enter")
+    }
+
+    @Test("raw controls and malformed character keys deny before approval")
+    func deniesMalformedInputShapes() throws {
+        let forbiddenValues = Array(0x00...0x1F).filter {
+            $0 != 0x0A && $0 != 0x0D
+        } + [0x7F] + Array(0x80...0x9F)
+        let rawControls = forbiddenValues.compactMap(Unicode.Scalar.init)
+            .map(String.init) + ["safe\u{1B}unsafe"]
+        for value in rawControls {
+            assertDenied(try evaluate(events: [.text(value)]), context: value)
+        }
+
+        let malformedCharacters = [
+            "", "ab", "e\u{301}", "\u{301}", "\u{0378}",
+        ] + (forbiddenValues + [0x0A, 0x0D])
+            .compactMap(Unicode.Scalar.init)
+            .map(String.init)
+        for value in malformedCharacters {
+            assertDenied(
+                try evaluate(events: [
+                    .key(.character(value), modifiers: []),
+                ]),
+                context: value
+            )
+        }
+
+        for number in [0, 13, Int.max] {
+            assertDenied(
+                try evaluate(events: [
+                    .key(.function(number), modifiers: []),
+                ]),
+                context: "invalid function key \(number)"
+            )
+        }
+    }
+
+    @Test("every modifier category requires approval or denies if unencodable")
+    func classifiesModifierCategories() throws {
+        let knownModifiers: [TerminalKeyModifiers] = [
+            .shift, .control, .option, .command,
+            [.control, .option],
+        ]
+        let unsupportedModifiers: [TerminalKeyModifiers] = [
+            .command, TerminalKeyModifiers(rawValue: 1 << 7),
+        ]
+
+        for modifier in knownModifiers where modifier != .command {
+            for key in [TerminalKey.left, .function(1)] {
+                assertRequiresApproval(
+                    try evaluate(events: [
+                        .key(key, modifiers: modifier),
+                    ]),
+                    context: "modified encodable key \(key), \(modifier)"
+                )
+            }
+        }
+        for modifier in [
+            TerminalKeyModifiers.control,
+            .option,
+            [.control, .option],
+        ] {
+            assertRequiresApproval(
+                try evaluate(events: [
+                    .key(.character("c"), modifiers: modifier),
+                ]),
+                context: "modified encodable character, \(modifier)"
+            )
+        }
+        assertDenied(
+            try evaluate(events: [
+                .key(.character("c"), modifiers: .shift),
+            ]),
+            context: "shifted character must be represented by its scalar"
+        )
+
+        for modifier in [
+            TerminalKeyModifiers.shift,
+            .control,
+            [.control, .option],
+        ] {
+            for key in [TerminalKey.backspace, .enter] {
+                assertDenied(
+                    try evaluate(events: [
+                        .key(key, modifiers: modifier),
+                    ]),
+                    context: "unencodable modified key \(key), \(modifier)"
+                )
+            }
+        }
+        for key in [TerminalKey.backspace, .enter] {
+            assertRequiresApproval(
+                try evaluate(events: [
+                    .key(key, modifiers: .option),
+                ]),
+                context: "option-prefixed key \(key)"
+            )
+        }
+        for modifier in unsupportedModifiers {
+            for key in [TerminalKey.character("c"), .left, .function(1)] {
+                assertDenied(
+                    try evaluate(events: [
+                        .key(key, modifiers: modifier),
+                    ]),
+                    context: "unsupported modifier \(key), \(modifier)"
+                )
             }
         }
     }
 
-    @Test("unknown confirmation prompts fail closed while passive Enter does not")
-    func unknownConfirmationsEscalate() throws {
-        let unknown = try TerminalPermissionPolicy().evaluate(
-            batch: terminalTestBatch(
-                events: [.key(.enter, modifiers: [])]
-            ),
-            endpointID: terminalTestEndpoint(),
-            screen: terminalTestScreen(
-                text: "Apply the requested changes now? [y/N]"
-            )
+    @Test("declared risk is combined with structural risk and exact scope")
+    func combinesDeclaredAndStructuralRisk() throws {
+        let endpoint = terminalTestEndpoint()
+        let screen = terminalTestScreen()
+        let declaredBatch = terminalTestBatch(
+            events: [.text("plain UTF-8")],
+            risk: .high
         )
-        let passive = try TerminalPermissionPolicy().evaluate(
-            batch: terminalTestBatch(
-                events: [.key(.enter, modifiers: [])]
-            ),
-            endpointID: terminalTestEndpoint(),
-            screen: terminalTestScreen(text: "Press Enter to continue")
+        let declared = try TerminalPermissionPolicy().evaluate(
+            batch: declaredBatch,
+            endpointID: endpoint,
+            screen: screen
         )
+        #expect(declared.deterministicRisk == .routine)
+        #expect(declared.effectiveRisk == .high)
+        guard case let .requireApproval(request) = declared.decision else {
+            Issue.record("declared high risk must require approval")
+            return
+        }
+        #expect(request.batch == declaredBatch)
+        #expect(request.scope == (try TerminalApprovalScope(
+            batch: declaredBatch,
+            endpointID: endpoint,
+            screenRevision: screen.revision
+        )))
 
-        #expect(unknown.deterministicRisk == .high)
-        #expect(passive.deterministicRisk == .routine)
+        let structural = try evaluate(
+            events: [.key(.enter, modifiers: [])],
+            declaredRisk: .observation
+        )
+        #expect(structural.deterministicRisk == .high)
+        #expect(structural.effectiveRisk == .high)
+        assertRequiresApproval(structural, context: "structural boundary")
     }
 
-    @Test("oversized or unencodable mutations are denied before approval")
-    func deniesInvalidMutationPayloads() throws {
+    @Test("stale oversized and unencodable batches deny")
+    func deniesInvalidBatchEnvelope() throws {
+        let stale = TerminalInputBatch(
+            expectedRevision: 6,
+            events: [.text("safe")],
+            purpose: "stale",
+            declaredRisk: .routine
+        )
         let tooManyEvents = TerminalInputBatch(
             expectedRevision: 7,
             events: Array(repeating: .key(.left, modifiers: []), count: 257),
@@ -182,445 +340,99 @@ struct TerminalPermissionPolicyTests {
         let tooManyBytes = terminalTestBatch(
             events: [.text(String(repeating: "x", count: 32 * 1024 + 1))]
         )
-        let impossible = terminalTestBatch(
-            events: [.key(.enter, modifiers: .command)]
+        let commandModifier = terminalTestBatch(
+            events: [.key(.left, modifiers: .command)]
         )
 
-        for batch in [tooManyEvents, tooLongPurpose, tooManyBytes, impossible] {
+        for batch in [
+            stale, tooManyEvents, tooLongPurpose, tooManyBytes, commandModifier,
+        ] {
             let evaluation = try TerminalPermissionPolicy().evaluate(
                 batch: batch,
                 endpointID: terminalTestEndpoint(),
                 screen: terminalTestScreen()
             )
-            guard case .deny = evaluation.decision else {
-                Issue.record("invalid mutation payload must be denied")
-                return
-            }
+            assertDenied(evaluation, context: batch.purpose)
         }
     }
 
-    @Test("reconstructs split typing and the final Enter from the visible editable line")
-    func reconstructsEffectiveCommandAcrossBatches() throws {
-        let policy = TerminalPermissionPolicy()
-        let endpoint = terminalTestEndpoint()
-        let first = try policy.evaluate(
-            batch: terminalTestBatch(events: [.text("r")]),
-            endpointID: endpoint,
-            screen: terminalTestScreen()
-        )
-        let second = try policy.evaluate(
-            batch: terminalTestBatch(events: [.text("m -rf /tmp/cache")]),
-            endpointID: endpoint,
-            screen: terminalTestScreen(
-                text: "$ r",
-                cursorColumn: 3
+    @Test("only the finite allow shapes ever return allow")
+    func enforcesClosedWorldAllowInvariant() throws {
+        let normal = terminalTestScreen()
+        let alternate = terminalTestScreen(
+            mode: TerminalScreenMode(
+                isAlternateScreen: true,
+                keyboardMode: .applicationCursor
             )
         )
-        let submitted = try policy.evaluate(
-            batch: terminalTestBatch(events: [.key(.enter, modifiers: [])]),
-            endpointID: endpoint,
-            screen: terminalTestScreen(
-                text: "$ rm -rf /tmp/cache",
-                cursorColumn: 19
-            )
-        )
+        let samples: [(TerminalInputEvent, Bool, Bool)] = [
+            (.text("printable rm -rf /"), true, false),
+            (.text("printable 👩‍💻"), true, false),
+            (.text("submit\r\n"), false, false),
+            (.text("control\u{85}"), false, false),
+            (.key(.character("x"), modifiers: []), true, false),
+            (.key(.character("xy"), modifiers: []), false, false),
+            (.key(.backspace, modifiers: []), true, false),
+            (.key(.delete, modifiers: []), true, false),
+            (.key(.left, modifiers: []), true, true),
+            (.key(.right, modifiers: []), true, true),
+            (.key(.home, modifiers: []), true, true),
+            (.key(.end, modifiers: []), true, true),
+            (.key(.pageUp, modifiers: []), true, true),
+            (.key(.pageDown, modifiers: []), true, true),
+            (.key(.enter, modifiers: []), false, false),
+            (.key(.escape, modifiers: []), false, false),
+            (.key(.tab, modifiers: []), false, false),
+            (.key(.up, modifiers: .control), false, false),
+            (.key(.insert, modifiers: []), false, false),
+            (.key(.function(1), modifiers: []), false, false),
+        ]
 
-        #expect(first.deterministicRisk == .routine)
-        #expect(second.deterministicRisk == .high)
-        #expect(submitted.deterministicRisk == .high)
+        for (event, normalAllows, alternateAllows) in samples {
+            let normalEvaluation = try evaluate(events: [event], screen: normal)
+            #expect((normalEvaluation.decision == .allow) == normalAllows)
+            let alternateEvaluation = try evaluate(
+                events: [event],
+                screen: alternate
+            )
+            #expect((alternateEvaluation.decision == .allow) == alternateAllows)
+        }
     }
 
-    @Test("applies cursor navigation Backspace and Delete before classification")
-    func reconstructsSameBatchEditing() throws {
-        let backspace = try TerminalPermissionPolicy().evaluate(
+    private func evaluate(
+        events: [TerminalInputEvent],
+        declaredRisk: TerminalRisk = .routine,
+        screen: TerminalScreenSnapshot = terminalTestScreen()
+    ) throws -> TerminalPermissionEvaluation {
+        try TerminalPermissionPolicy().evaluate(
             batch: terminalTestBatch(
-                events: [.key(.backspace, modifiers: [])]
+                revision: screen.revision,
+                events: events,
+                risk: declaredRisk
             ),
             endpointID: terminalTestEndpoint(),
-            screen: terminalTestScreen(
-                text: "$ rXm -rf /tmp/cache",
-                cursorColumn: 4
-            )
+            screen: screen
         )
-        let delete = try TerminalPermissionPolicy().evaluate(
-            batch: terminalTestBatch(
-                events: [
-                    .key(.left, modifiers: []),
-                    .key(.delete, modifiers: []),
-                ]
-            ),
-            endpointID: terminalTestEndpoint(),
-            screen: terminalTestScreen(
-                text: "$ rmx -rf /tmp/cache",
-                cursorColumn: 5
-            )
-        )
-
-        #expect(backspace.deterministicRisk == .high)
-        #expect(delete.deterministicRisk == .high)
     }
 
-    @Test("denies command input when the visible editable line cannot be reconstructed")
-    func failsClosedOnUnknownEditableSurface() throws {
-        let evaluation = try TerminalPermissionPolicy().evaluate(
-            batch: terminalTestBatch(events: [.text("rm -rf /tmp/cache")]),
-            endpointID: terminalTestEndpoint(),
-            screen: terminalTestScreen(
-                text: "unstructured terminal content",
-                cursorColumn: 8
-            )
-        )
+    private func assertRequiresApproval(
+        _ evaluation: TerminalPermissionEvaluation,
+        context: String
+    ) {
+        #expect(evaluation.deterministicRisk == .high)
+        guard case .requireApproval = evaluation.decision else {
+            Issue.record("expected approval for \(context)")
+            return
+        }
+    }
 
+    private func assertDenied(
+        _ evaluation: TerminalPermissionEvaluation,
+        context: String
+    ) {
         guard case .deny = evaluation.decision else {
-            Issue.record("unknown editable surface must deny mutation")
+            Issue.record("expected denial for \(context)")
             return
         }
-    }
-
-    @Test("denies control bytes hidden inside text events")
-    func rejectsRawTextEditingControls() throws {
-        let controls = ["\u{7F}", "\t", "\u{1B}[D"]
-
-        for control in controls {
-            let evaluation = try TerminalPermissionPolicy().evaluate(
-                batch: terminalTestBatch(events: [.text(control)]),
-                endpointID: terminalTestEndpoint(),
-                screen: terminalTestScreen(
-                    text: "$ rXm -rf /tmp/cache",
-                    cursorColumn: 4
-                )
-            )
-            guard case .deny = evaluation.decision else {
-                Issue.record("raw text control must fail closed")
-                continue
-            }
-        }
-    }
-
-    @Test("character key controls and multi-scalar values fail closed")
-    func rejectsControlValuedCharacterKeys() throws {
-        let values = [
-            "\u{7F}", "\u{08}", "\r", "\n", "\t", "\u{1B}",
-            "\u{85}", "\u{9F}", "\u{301}", "e\u{301}",
-        ]
-
-        for value in values {
-            let evaluation = try TerminalPermissionPolicy().evaluate(
-                batch: terminalTestBatch(
-                    events: [.key(.character(value), modifiers: [])]
-                ),
-                endpointID: terminalTestEndpoint(),
-                screen: terminalTestScreen(
-                    text: "$ rXm -rf /tmp/cache",
-                    cursorColumn: 4
-                )
-            )
-            guard case .deny = evaluation.decision else {
-                Issue.record("control or multi-scalar character key must fail closed")
-                continue
-            }
-        }
-    }
-
-    @Test("semantic Enter preserves shell continuation while even escapes submit")
-    func reconstructsSemanticEnterLineContinuation() throws {
-        let continued = try TerminalPermissionPolicy().evaluate(
-            batch: terminalTestBatch(events: [
-                .key(.enter, modifiers: []),
-                .text("m -rf /tmp/cache"),
-                .key(.enter, modifiers: []),
-            ]),
-            endpointID: terminalTestEndpoint(),
-            screen: terminalTestScreen(
-                text: "$ r\\",
-                cursorColumn: 4
-            )
-        )
-        #expect(continued.deterministicRisk == .high)
-        guard case .requireApproval = continued.decision else {
-            Issue.record("semantic Enter must not split an escaped shell newline")
-            return
-        }
-
-        let literalBackslash = try TerminalPermissionPolicy().evaluate(
-            batch: terminalTestBatch(events: [
-                .key(.enter, modifiers: []),
-                .text("m -rf /tmp/cache"),
-                .key(.enter, modifiers: []),
-            ]),
-            endpointID: terminalTestEndpoint(),
-            screen: terminalTestScreen(
-                text: "$ r\\\\",
-                cursorColumn: 5
-            )
-        )
-        #expect(literalBackslash.deterministicRisk == .routine)
-        #expect(literalBackslash.decision == .allow)
-
-        let textLiteralBackslash = try TerminalPermissionPolicy().evaluate(
-            batch: terminalTestBatch(
-                events: [.text("r\\\\\nm -rf /tmp/cache\n")]
-            ),
-            endpointID: terminalTestEndpoint(),
-            screen: terminalTestScreen()
-        )
-        #expect(textLiteralBackslash.deterministicRisk == .routine)
-        #expect(textLiteralBackslash.decision == .allow)
-
-        let ambiguousQuote = try TerminalPermissionPolicy().evaluate(
-            batch: terminalTestBatch(
-                events: [.key(.enter, modifiers: [])]
-            ),
-            endpointID: terminalTestEndpoint(),
-            screen: terminalTestScreen(
-                text: "$ echo 'literal\\",
-                cursorColumn: 16
-            )
-        )
-        #expect(ambiguousQuote.deterministicRisk == .high)
-
-        let quotedLiteral = try TerminalPermissionPolicy().evaluate(
-            batch: terminalTestBatch(
-                events: [.key(.enter, modifiers: [])]
-            ),
-            endpointID: terminalTestEndpoint(),
-            screen: terminalTestScreen(
-                text: "$ echo '\\\\'",
-                cursorColumn: 11
-            )
-        )
-        #expect(quotedLiteral.deterministicRisk == .routine)
-        #expect(quotedLiteral.decision == .allow)
-    }
-
-    @Test("session and executable wrappers cannot hide their effects")
-    func classifiesExecAndExecutableWrappers() throws {
-        let highCommands = [
-            "exec echo ok",
-            "exec -a replacement rm -rf /tmp/cache",
-            "time rm -rf /tmp/cache",
-            "nice rm -rf /tmp/cache",
-            "sudo time rm -rf /tmp/cache",
-        ]
-        for command in highCommands {
-            let evaluation = try TerminalPermissionPolicy().evaluate(
-                batch: terminalTestBatch(events: [.text(command)]),
-                endpointID: terminalTestEndpoint(),
-                screen: terminalTestScreen()
-            )
-            #expect(evaluation.deterministicRisk == .high)
-            guard case .requireApproval = evaluation.decision else {
-                Issue.record("wrapper must preserve high-risk semantics: \(command)")
-                continue
-            }
-        }
-
-        for command in ["time echo ok", "time -p echo ok", "nice echo ok"] {
-            let evaluation = try TerminalPermissionPolicy().evaluate(
-                batch: terminalTestBatch(events: [.text(command)]),
-                endpointID: terminalTestEndpoint(),
-                screen: terminalTestScreen()
-            )
-            #expect(evaluation.deterministicRisk == .routine)
-            #expect(evaluation.decision == .allow)
-        }
-    }
-
-    @Test("visible non-ASCII scalar editing remains reconstructable")
-    func reconstructsVisibleUnicodeEditing() throws {
-        let cases = [
-            (text: "$ é", cursorColumn: 3, suffix: "cho ok"),
-            (text: "$ 你", cursorColumn: 4, suffix: "好"),
-        ]
-
-        for value in cases {
-            let evaluation = try TerminalPermissionPolicy().evaluate(
-                batch: terminalTestBatch(events: [.text(value.suffix)]),
-                endpointID: terminalTestEndpoint(),
-                screen: terminalTestScreen(
-                    text: value.text,
-                    cursorColumn: value.cursorColumn
-                )
-            )
-            #expect(evaluation.deterministicRisk == .routine)
-            #expect(evaluation.decision == .allow)
-        }
-    }
-
-    @Test("shell evaluation wrappers and option-prefixed subcommands escalate")
-    func escalatesAmbiguousShellEvaluation() throws {
-        let commands = [
-            "bash -c 'rm -rf /tmp/cache'",
-            "echo $(rm -rf /tmp/cache)",
-            "echo `rm -rf /tmp/cache`",
-            "'rm' -rf /tmp/cache",
-            "TARGET=/tmp rm -rf /tmp/cache",
-            "bash -lc 'rm -rf /tmp/cache'",
-            "eval 'rm -rf /tmp/cache'",
-            "if true; then rm -rf /tmp/cache; fi",
-            "(rm -rf /tmp/cache)",
-            "{ rm -rf /tmp/cache; }",
-            "exec rm -rf /tmp/cache",
-            "r$'m' -rf /tmp/cache",
-            "r\\\nm -rf /tmp/cache",
-            "git -C repo push origin main",
-            "git --unknown-option push origin main",
-            "tmux -L private kill-session -t training",
-            "tmux --unknown-option kill-session -t training",
-        ]
-
-        for command in commands {
-            let evaluation = try TerminalPermissionPolicy().evaluate(
-                batch: terminalTestBatch(events: [.text(command)]),
-                endpointID: terminalTestEndpoint(),
-                screen: terminalTestScreen()
-            )
-            #expect(evaluation.deterministicRisk == .high)
-            guard case .requireApproval = evaluation.decision else {
-                Issue.record("ambiguous or destructive shell input must escalate: \(command)")
-                continue
-            }
-        }
-    }
-
-    @Test("proven quoted text descriptor duplication and benign force options stay routine")
-    func avoidsProvableShellFalsePositives() throws {
-        let commands = [
-            "echo 'git push'",
-            "echo '>'",
-            "printf '2>&1'",
-            "tool 2>&1",
-            "sudo echo rm",
-            "tail -f log.txt",
-            "grep -f patterns.txt input.txt",
-            "echo '(rm -rf /tmp/cache)'",
-            "printf '%s' '{ rm -rf /tmp/cache; }'",
-            "echo \\(not-a-subshell\\)",
-        ]
-
-        for command in commands {
-            let evaluation = try TerminalPermissionPolicy().evaluate(
-                batch: terminalTestBatch(events: [.text(command)]),
-                endpointID: terminalTestEndpoint(),
-                screen: terminalTestScreen()
-            )
-            #expect(evaluation.deterministicRisk == .routine)
-            #expect(evaluation.decision == .allow)
-        }
-    }
-
-    @Test("destructive and unknown action evidence overrides passive prompt text")
-    func escalatesMixedAndUnknownPrompts() throws {
-        let screens = [
-            "Press Enter to continue\nDelete all data permanently? [y/N]",
-            "Apply the selected migration now? [OK] [Cancel]",
-            "Perform the selected action now?",
-        ]
-        let affirmatives: [[TerminalInputEvent]] = [
-            [.key(.enter, modifiers: [])],
-            [.text("OK"), .key(.enter, modifiers: [])],
-        ]
-
-        for text in screens {
-            for events in affirmatives {
-                let evaluation = try TerminalPermissionPolicy().evaluate(
-                    batch: terminalTestBatch(events: events),
-                    endpointID: terminalTestEndpoint(),
-                    screen: terminalTestScreen(text: text)
-                )
-                #expect(evaluation.deterministicRisk == .high)
-            }
-        }
-
-        let promptContainingShellMarker = "Delete $ all data permanently? [y/N]"
-        let markerEvaluation = try TerminalPermissionPolicy().evaluate(
-            batch: terminalTestBatch(events: [.key(.enter, modifiers: [])]),
-            endpointID: terminalTestEndpoint(),
-            screen: terminalTestScreen(
-                text: promptContainingShellMarker,
-                cursorColumn: promptContainingShellMarker.count
-            )
-        )
-        #expect(markerEvaluation.deterministicRisk == .high)
-    }
-
-    @Test("negative or cancel input does not approve a destructive prompt")
-    func permitsNegativePromptResponses() throws {
-        let screen = terminalTestScreen(
-            text: "Delete all data permanently? [OK] [Cancel]"
-        )
-        let responses: [[TerminalInputEvent]] = [
-            [.text("n"), .key(.enter, modifiers: [])],
-            [.text("no"), .key(.enter, modifiers: [])],
-            [.key(.escape, modifiers: [])],
-        ]
-
-        for events in responses {
-            let evaluation = try TerminalPermissionPolicy().evaluate(
-                batch: terminalTestBatch(events: events),
-                endpointID: terminalTestEndpoint(),
-                screen: screen
-            )
-            #expect(evaluation.deterministicRisk == .routine)
-            #expect(evaluation.decision == .allow)
-        }
-    }
-
-    @Test("unknown TUI accept prompts cannot masquerade as shell prompts")
-    func rejectsShellMarkerInsideUnknownPrompt() throws {
-        let prompts = [
-            "Authorize operation $ [Accept] [Decline]",
-            "user@host$ [Accept] [Decline]",
-        ]
-        for text in prompts {
-            let evaluation = try TerminalPermissionPolicy().evaluate(
-                batch: terminalTestBatch(events: [.key(.enter, modifiers: [])]),
-                endpointID: terminalTestEndpoint(),
-                screen: terminalTestScreen(
-                    text: text,
-                    cursorColumn: text.count
-                )
-            )
-            #expect(evaluation.deterministicRisk == .high)
-            guard case .requireApproval = evaluation.decision else {
-                Issue.record("unknown action acceptance must require approval")
-                continue
-            }
-        }
-    }
-
-    @Test("proven shell prompts do not turn question-mark arguments into confirmations")
-    func distinguishesShellQuestionMarksFromPrompts() throws {
-        let lines = [
-            "$ ls file?",
-            "user@host:/tmp$ ls file?",
-            "user@host:/tmp% ls file?",
-            "root@host:/tmp# ls file?",
-            "user@host:/tmp$ echo kill",
-        ]
-
-        for line in lines {
-            let evaluation = try TerminalPermissionPolicy().evaluate(
-                batch: terminalTestBatch(events: [.key(.enter, modifiers: [])]),
-                endpointID: terminalTestEndpoint(),
-                screen: terminalTestScreen(
-                    text: line,
-                    cursorColumn: line.count
-                )
-            )
-            #expect(evaluation.deterministicRisk == .routine)
-            #expect(evaluation.decision == .allow)
-        }
-
-        let destructive = "user@host:/tmp$ rm -rf /tmp/cache"
-        let high = try TerminalPermissionPolicy().evaluate(
-            batch: terminalTestBatch(events: [.key(.enter, modifiers: [])]),
-            endpointID: terminalTestEndpoint(),
-            screen: terminalTestScreen(
-                text: destructive,
-                cursorColumn: destructive.count
-            )
-        )
-        #expect(high.deterministicRisk == .high)
     }
 }
