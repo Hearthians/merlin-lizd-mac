@@ -205,10 +205,30 @@ public struct TerminalPermissionPolicy: Sendable {
         case ambiguous
     }
 
+    private enum SubmissionBoundary {
+        case submit
+        case lineContinuation
+        case ambiguous
+    }
+
+    private struct ExecutableResolution {
+        var words: [String]
+        var isAmbiguous: Bool
+        var highRiskReason: String?
+    }
+
     private func classify(
         batch: TerminalInputBatch,
         screen: TerminalScreenSnapshot
     ) -> Classification {
+        if let prompt = promptClassification(
+            events: batch.events,
+            screenText: screen.text
+        ), prompt.risk == .high,
+            hasExplicitConfirmationEvidence(screen.text)
+        {
+            return prompt
+        }
         guard var editable = editableCommand(from: screen) else {
             if let prompt = promptClassification(
                 events: batch.events,
@@ -231,10 +251,9 @@ public struct TerminalPermissionPolicy: Sendable {
             switch event {
             case let .text(text):
                 if text.unicodeScalars.contains(where: { scalar in
-                    (scalar.value < 0x20
-                        && scalar.value != 0x0A
-                        && scalar.value != 0x0D)
-                        || scalar.value == 0x7F
+                    scalar.value != 0x0A
+                        && scalar.value != 0x0D
+                        && isUnsafeTerminalScalar(scalar)
                 }) {
                     return Classification(
                         risk: .high,
@@ -244,16 +263,10 @@ public struct TerminalPermissionPolicy: Sendable {
                 }
                 for character in text {
                     if character == "\n" || character == "\r" {
-                        if editable.characters.last == "\\" {
-                            return high(
-                                "The command contains unsupported shell line continuation"
-                            )
-                        }
-                        result = maxClassification(
-                            result,
-                            classify(command: String(editable.characters))
-                        )
-                        editable = EditableCommand(characters: [], cursor: 0)
+                        if let failure = applySubmissionBoundary(
+                            editable: &editable,
+                            result: &result
+                        ) { return failure }
                     } else {
                         editable.characters.insert(character, at: editable.cursor)
                         editable.cursor += 1
@@ -262,8 +275,7 @@ public struct TerminalPermissionPolicy: Sendable {
             case let .key(.character(value), modifiers) where modifiers.isEmpty:
                 guard value.unicodeScalars.count == 1,
                     let scalar = value.unicodeScalars.first,
-                    scalar.value >= 0x20,
-                    scalar.value != 0x7F
+                    isValidCharacterKeyScalar(scalar)
                 else {
                     return Classification(
                         risk: .high,
@@ -293,11 +305,10 @@ public struct TerminalPermissionPolicy: Sendable {
             case .key(.end, modifiers: []):
                 editable.cursor = editable.characters.count
             case .key(.enter, modifiers: []):
-                result = maxClassification(
-                    result,
-                    classify(command: String(editable.characters))
-                )
-                editable = EditableCommand(characters: [], cursor: 0)
+                if let failure = applySubmissionBoundary(
+                    editable: &editable,
+                    result: &result
+                ) { return failure }
             case .key(.escape, modifiers: []):
                 continue
             default:
@@ -315,6 +326,55 @@ public struct TerminalPermissionPolicy: Sendable {
         return result
     }
 
+    private func applySubmissionBoundary(
+        editable: inout EditableCommand,
+        result: inout Classification
+    ) -> Classification? {
+        switch submissionBoundary(in: editable.characters) {
+        case .submit:
+            result = maxClassification(
+                result,
+                classify(command: String(editable.characters))
+            )
+            editable = EditableCommand(characters: [], cursor: 0)
+        case .lineContinuation:
+            editable.characters.removeLast()
+            editable.cursor = min(editable.cursor, editable.characters.count)
+        case .ambiguous:
+            return high("The command submission boundary cannot be reconstructed safely")
+        }
+        return nil
+    }
+
+    private func submissionBoundary(
+        in characters: [Character]
+    ) -> SubmissionBoundary {
+        var quote: Quote?
+        var escaped = false
+        for character in characters {
+            if quote == .single {
+                if character == "'" { quote = nil }
+                continue
+            }
+            if escaped {
+                escaped = false
+                continue
+            }
+            if character == "\\" {
+                escaped = true
+            } else if quote == .double {
+                if character == "\"" { quote = nil }
+            } else if character == "'" {
+                quote = .single
+            } else if character == "\"" {
+                quote = .double
+            }
+        }
+        if escaped, quote != .single { return .lineContinuation }
+        if quote != nil { return .ambiguous }
+        return .submit
+    }
+
     private func editableCommand(
         from screen: TerminalScreenSnapshot
     ) -> EditableCommand? {
@@ -327,13 +387,20 @@ public struct TerminalPermissionPolicy: Sendable {
         )
         guard screen.cursor.row < rows.count else { return nil }
         var characters = Array(rows[screen.cursor.row])
-        guard characters.allSatisfy({ character in
-            character.unicodeScalars.count == 1
-                && character.unicodeScalars.first?.isASCII == true
-        }) else { return nil }
-        while characters.count < screen.cursor.column {
-            characters.append(" ")
+        guard characters.allSatisfy({ screenColumnWidth($0) != nil }) else {
+            return nil
         }
+        var renderedColumns = characters.reduce(into: 0) { total, character in
+            total += screenColumnWidth(character) ?? 0
+        }
+        while renderedColumns < screen.cursor.column {
+            characters.append(" ")
+            renderedColumns += 1
+        }
+        guard let cursorIndex = characterIndex(
+            atColumn: screen.cursor.column,
+            in: characters
+        ) else { return nil }
         let markers: [[Character]] = [Array("$ "), Array("% "), Array("# ")]
         var promptEnd: Int?
         for start in 0..<max(0, characters.count - 1) {
@@ -351,11 +418,72 @@ public struct TerminalPermissionPolicy: Sendable {
             }
             if promptEnd != nil { break }
         }
-        guard let promptEnd, promptEnd <= screen.cursor.column else { return nil }
+        guard let promptEnd, promptEnd <= cursorIndex else { return nil }
         return EditableCommand(
             characters: Array(characters.dropFirst(promptEnd)),
-            cursor: screen.cursor.column - promptEnd
+            cursor: cursorIndex - promptEnd
         )
+    }
+
+    private func characterIndex(
+        atColumn targetColumn: Int,
+        in characters: [Character]
+    ) -> Int? {
+        var column = 0
+        for (index, character) in characters.enumerated() {
+            if column == targetColumn { return index }
+            guard let width = screenColumnWidth(character),
+                column + width <= targetColumn
+            else { return nil }
+            column += width
+        }
+        return column == targetColumn ? characters.count : nil
+    }
+
+    private func screenColumnWidth(_ character: Character) -> Int? {
+        var width = 0
+        for scalar in character.unicodeScalars {
+            if isUnsafeTerminalScalar(scalar) { return nil }
+            switch scalar.properties.generalCategory {
+            case .nonspacingMark, .enclosingMark:
+                continue
+            default:
+                width = max(width, isWideTerminalScalar(scalar) ? 2 : 1)
+            }
+        }
+        return max(1, width)
+    }
+
+    private func isUnsafeTerminalScalar(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.properties.generalCategory {
+        case .control, .format, .lineSeparator, .paragraphSeparator,
+            .surrogate:
+            true
+        default:
+            false
+        }
+    }
+
+    private func isValidCharacterKeyScalar(_ scalar: Unicode.Scalar) -> Bool {
+        guard !isUnsafeTerminalScalar(scalar) else { return false }
+        return switch scalar.properties.generalCategory {
+        case .nonspacingMark, .spacingMark, .enclosingMark:
+            false
+        default:
+            true
+        }
+    }
+
+    private func isWideTerminalScalar(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.value {
+        case 0x1100...0x115F, 0x2329...0x232A, 0x2E80...0xA4CF,
+            0xAC00...0xD7A3, 0xF900...0xFAFF, 0xFE10...0xFE19,
+            0xFE30...0xFE6F, 0xFF00...0xFF60, 0xFFE0...0xFFE6,
+            0x1F300...0x1FAFF, 0x20000...0x3FFFD:
+            true
+        default:
+            false
+        }
     }
 
     private func isNonMutatingNavigation(_ event: TerminalInputEvent) -> Bool {
@@ -414,6 +542,18 @@ public struct TerminalPermissionPolicy: Sendable {
             return .routine
         }
         return nil
+    }
+
+    private func hasExplicitConfirmationEvidence(_ screenText: String) -> Bool {
+        let prompt = screenText.lowercased()
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .suffix(4)
+            .joined(separator: " ")
+        let markers = [
+            "[accept]", "[decline]", "[ok]", "[cancel]", "[y/n]",
+            "(y/n)", "yes/no", "are you sure",
+        ]
+        return markers.contains { prompt.contains($0) }
     }
 
     private func promptResponse(_ events: [TerminalInputEvent]) -> Bool? {
@@ -563,6 +703,7 @@ public struct TerminalPermissionPolicy: Sendable {
     private func classify(segment originalWords: [String]) -> Classification {
         guard !originalWords.isEmpty else { return .routine }
         let resolved = resolveExecutable(originalWords)
+        if let reason = resolved.highRiskReason { return high(reason) }
         if resolved.isAmbiguous {
             return Classification(
                 risk: .high,
@@ -653,7 +794,7 @@ public struct TerminalPermissionPolicy: Sendable {
 
     private func resolveExecutable(
         _ originalWords: [String]
-    ) -> (words: [String], isAmbiguous: Bool) {
+    ) -> ExecutableResolution {
         var words = originalWords
         while let first = words.first {
             if first.contains("=") {
@@ -672,31 +813,83 @@ public struct TerminalPermissionPolicy: Sendable {
                         "--chdir", "--close-from", "--command-timeout", "--group", "--host",
                         "--prompt", "--role", "--type", "--user",
                     ]
-                ) else { return (words, true) }
+                ) else { return ExecutableResolution(
+                    words: words,
+                    isAmbiguous: true,
+                    highRiskReason: nil
+                ) }
             case "command", "builtin":
                 words.removeFirst()
                 guard consumeOptions(
                     in: &words,
                     flags: ["-p", "-v", "-V"],
                     valueOptions: []
-                ) else { return (words, true) }
+                ) else { return ExecutableResolution(
+                    words: words,
+                    isAmbiguous: true,
+                    highRiskReason: nil
+                ) }
             case "env":
                 words.removeFirst()
                 guard consumeOptions(
                     in: &words,
                     flags: ["-i", "--ignore-environment", "-0", "--null"],
                     valueOptions: ["-C", "--chdir", "-u", "--unset"]
-                ) else { return (words, true) }
+                ) else { return ExecutableResolution(
+                    words: words,
+                    isAmbiguous: true,
+                    highRiskReason: nil
+                ) }
                 while words.first?.contains("=") == true { words.removeFirst() }
-            case "nohup", "exec":
+            case "nohup":
                 words.removeFirst()
+            case "exec":
+                return ExecutableResolution(
+                    words: words,
+                    isAmbiguous: false,
+                    highRiskReason: "exec replaces the current terminal shell session"
+                )
+            case "time":
+                words.removeFirst()
+                guard consumeOptions(
+                    in: &words,
+                    flags: ["-p", "--portability"],
+                    valueOptions: []
+                ) else { return ExecutableResolution(
+                    words: words,
+                    isAmbiguous: true,
+                    highRiskReason: nil
+                ) }
+            case "nice":
+                words.removeFirst()
+                guard consumeOptions(
+                    in: &words,
+                    flags: [],
+                    valueOptions: ["-n", "--adjustment"]
+                ) else { return ExecutableResolution(
+                    words: words,
+                    isAmbiguous: true,
+                    highRiskReason: nil
+                ) }
             case "xargs":
-                return (words, true)
+                return ExecutableResolution(
+                    words: words,
+                    isAmbiguous: true,
+                    highRiskReason: nil
+                )
             default:
-                return (words, false)
+                return ExecutableResolution(
+                    words: words,
+                    isAmbiguous: false,
+                    highRiskReason: nil
+                )
             }
         }
-        return (words, false)
+        return ExecutableResolution(
+            words: words,
+            isAmbiguous: false,
+            highRiskReason: nil
+        )
     }
 
     private func consumeOptions(

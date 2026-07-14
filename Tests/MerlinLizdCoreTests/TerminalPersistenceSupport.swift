@@ -53,6 +53,32 @@ final class TerminalDirectorySyncRecorder: @unchecked Sendable {
     }
 }
 
+final class TerminalAuditQueueProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var reached = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func markQueued() {
+        let continuations = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            reached = true
+            defer { waiters.removeAll() }
+            return waiters
+        }
+        continuations.forEach { $0.resume() }
+    }
+
+    func waitUntilQueued() async {
+        await withCheckedContinuation { continuation in
+            let shouldResume = lock.withLock {
+                if reached { return true }
+                waiters.append(continuation)
+                return false
+            }
+            if shouldResume { continuation.resume() }
+        }
+    }
+}
+
 func terminalTestConversationKey(
     target: TerminalTargetIdentity = .worker(
         devboxSID: "dbx-secret-135679",
@@ -99,20 +125,25 @@ func terminalTestScreen(
     text: String = "$ ",
     changedRows: [Int] = [0],
     cursorRow: Int = 0,
-    cursorColumn: Int = 2
+    cursorColumn: Int = 2,
+    columns: Int = 80,
+    rows: Int = 24,
+    cursorIsVisible: Bool = true,
+    mode: TerminalScreenMode = .normal,
+    significantRuns: [TerminalAttributeRun] = []
 ) -> TerminalScreenSnapshot {
     TerminalScreenSnapshot(
         revision: revision,
-        columns: 80,
-        rows: 24,
+        columns: columns,
+        rows: rows,
         cursor: TerminalCursor(
             row: cursorRow,
             column: cursorColumn,
-            isVisible: true
+            isVisible: cursorIsVisible
         ),
-        mode: .normal,
+        mode: mode,
         text: text,
-        significantRuns: [],
+        significantRuns: significantRuns,
         changedRows: changedRows
     )
 }

@@ -25,9 +25,13 @@ struct TerminalOperationJournalTests {
             ),
             terminalTestJournalEvent(
                 kind: .screen(
-                    revision: 7,
-                    changedRows: [2, 3],
-                    text: "git push origin main\\nProceed? [y/N]"
+                    terminalTestScreen(
+                        revision: 7,
+                        text: "git push origin main\\nProceed? [y/N]",
+                        changedRows: [2, 3],
+                        cursorRow: 1,
+                        cursorColumn: 14
+                    )
                 )
             ),
             terminalTestJournalEvent(
@@ -78,6 +82,48 @@ struct TerminalOperationJournalTests {
             try await journal.entries(for: terminalTestConversationKey())
                 == events
         )
+    }
+
+    @Test("screen evidence round-trips exact cursor mode dimensions and diff")
+    func roundTripsExactScreenEvidence() async throws {
+        let fixture = try TerminalPersistenceFixture()
+        defer { fixture.remove() }
+        let journal = try FileTerminalOperationJournal(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        let snapshot = terminalTestScreen(
+            revision: 19,
+            text: "first\n$ rXm -rf /tmp/cache",
+            changedRows: [0, 1],
+            cursorRow: 1,
+            cursorColumn: 4,
+            columns: 132,
+            rows: 40,
+            cursorIsVisible: false,
+            mode: TerminalScreenMode(
+                isAlternateScreen: true,
+                keyboardMode: .applicationCursor
+            ),
+            significantRuns: [
+                TerminalAttributeRun(
+                    row: 1,
+                    startColumn: 2,
+                    endColumn: 5,
+                    style: [.bold, .inverse]
+                ),
+            ]
+        )
+        let event = terminalTestJournalEvent(kind: .screen(snapshot))
+
+        try await journal.append(event)
+
+        let stored = try await journal.entries(for: event.key)
+        #expect(stored == [event])
+        guard case let .screen(recorded) = stored.first?.kind else {
+            Issue.record("expected exact typed screen evidence")
+            return
+        }
+        #expect(recorded == snapshot)
     }
 
     @Test("uses user-only directories and files with SHA-256 storage IDs")
@@ -713,9 +759,10 @@ struct TerminalOperationJournalTests {
                 terminalTestJournalEvent(
                     turnID: turnID,
                     kind: .screen(
-                        revision: 7,
-                        changedRows: [0],
-                        text: "Delete all data permanently? [y/N]"
+                        terminalTestScreen(
+                            text: "Delete all data permanently? [y/N]",
+                            cursorColumn: 34
+                        )
                     )
                 ),
                 valid[2], valid[3],
@@ -761,7 +808,7 @@ struct TerminalOperationJournalTests {
             terminalTestJournalEvent(
                 operationID: operationID,
                 turnID: turnID,
-                kind: .screen(revision: 7, changedRows: [0], text: "$ ")
+                kind: .screen(terminalTestScreen())
             ),
             terminalTestJournalEvent(
                 operationID: operationID,
@@ -816,11 +863,74 @@ struct TerminalOperationJournalTests {
         #expect(await forgedJournal.appendCount() == 0)
     }
 
+    @Test("auditor recomputes policy from the exact recorded cursor")
+    func rejectsForgedRoutineRiskAtMidLineCursor() async throws {
+        let turnID = "exact-cursor"
+        let batch = terminalTestBatch(
+            events: [.key(.backspace, modifiers: [])],
+            purpose: "audit"
+        )
+        let operationID = terminalUUID(
+            "10000000-0000-0000-0000-000000000015"
+        )
+        let events: [TerminalJournalEvent] = [
+            terminalTestJournalEvent(
+                operationID: operationID,
+                turnID: turnID,
+                kind: .request(operation: "sendInput", purpose: "audit")
+            ),
+            terminalTestJournalEvent(
+                operationID: operationID,
+                turnID: turnID,
+                kind: .screen(
+                    terminalTestScreen(
+                        text: "$ rXm -rf /tmp/cache",
+                        cursorColumn: 4
+                    )
+                )
+            ),
+            terminalTestJournalEvent(
+                operationID: operationID,
+                turnID: turnID,
+                kind: .risk(
+                    agentDeclared: .routine,
+                    deterministic: .routine,
+                    effective: .routine
+                )
+            ),
+            terminalTestJournalEvent(
+                operationID: operationID,
+                turnID: turnID,
+                kind: .endpoint(terminalTestEndpoint())
+            ),
+            terminalTestJournalEvent(
+                operationID: operationID,
+                turnID: turnID,
+                kind: .emittedBatch(batch)
+            ),
+        ]
+        let journal = ScriptedTerminalJournal(failingAppendNumbers: [])
+        let auditor = TerminalMutationAuditor(journal: journal)
+
+        await #expect(throws: TerminalMutationAuditError.denied(
+            reason: "Required pre-action audit events are missing or out of order"
+        )) {
+            try await auditor.appendBeforeSideEffect(events, turnID: turnID)
+        }
+        #expect(await journal.appendCount() == 0)
+    }
+
     @Test("a failing pre-action write serializes concurrent audit attempts")
     func serializesAuditFailureAcrossActorReentrancy() async throws {
         let gate = AsyncStartGate()
         let journal = GatedFailingTerminalJournal(gate: gate)
-        let auditor = TerminalMutationAuditor(journal: journal)
+        let queued = TerminalAuditQueueProbe()
+        let auditor = TerminalMutationAuditor(
+            journal: journal,
+            hooks: TerminalMutationAuditorHooks(
+                didQueueForSerialAccess: queued.markQueued
+            )
+        )
         let events = terminalRoutinePreActionEvents(turnID: "reentrant")
 
         let first = Task {
@@ -830,7 +940,7 @@ struct TerminalOperationJournalTests {
         let second = Task {
             try await auditor.appendBeforeSideEffect(events, turnID: "reentrant")
         }
-        await Task.yield()
+        await queued.waitUntilQueued()
         await gate.open()
 
         await #expect(throws: TerminalMutationAuditError.denied(
@@ -855,7 +965,7 @@ struct TerminalOperationJournalTests {
             ),
             terminalTestJournalEvent(
                 turnID: turnID,
-                kind: .screen(revision: 7, changedRows: [0], text: "$ ")
+                kind: .screen(terminalTestScreen())
             ),
             terminalTestJournalEvent(
                 turnID: turnID,

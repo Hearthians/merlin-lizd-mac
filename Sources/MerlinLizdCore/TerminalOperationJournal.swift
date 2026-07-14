@@ -23,7 +23,7 @@ public enum TerminalJournalTemporaryPaneEvent: Codable, Equatable, Sendable {
 
 public enum TerminalJournalEventKind: Codable, Equatable, Sendable {
     case request(operation: String, purpose: String)
-    case screen(revision: UInt64, changedRows: [Int], text: String)
+    case screen(TerminalScreenSnapshot)
     case risk(
         agentDeclared: TerminalRisk,
         deterministic: TerminalRisk,
@@ -802,8 +802,17 @@ public enum TerminalMutationAuditError: Error, Equatable, Sendable {
     case auditUnavailable
 }
 
+struct TerminalMutationAuditorHooks: Sendable {
+    let didQueueForSerialAccess: (@Sendable () -> Void)?
+
+    init(didQueueForSerialAccess: (@Sendable () -> Void)? = nil) {
+        self.didQueueForSerialAccess = didQueueForSerialAccess
+    }
+}
+
 public actor TerminalMutationAuditor {
     private let journal: any TerminalOperationJournaling
+    private let hooks: TerminalMutationAuditorHooks
     private var blockedTurns: Set<String> = []
     private var preparedOperations: [
         String: [UUID: TerminalConversationKey]
@@ -813,6 +822,15 @@ public actor TerminalMutationAuditor {
 
     public init(journal: any TerminalOperationJournaling) {
         self.journal = journal
+        hooks = TerminalMutationAuditorHooks()
+    }
+
+    init(
+        journal: any TerminalOperationJournaling,
+        hooks: TerminalMutationAuditorHooks
+    ) {
+        self.journal = journal
+        self.hooks = hooks
     }
 
     public func appendBeforeSideEffect(
@@ -893,7 +911,7 @@ public actor TerminalMutationAuditor {
         }
 
         guard case let .request(_, purpose) = events[0].kind,
-            case let .screen(revision, changedRows, screenText) = events[1].kind,
+            case let .screen(screen) = events[1].kind,
             case let .risk(agentDeclared, deterministic, effective) = events[2].kind,
             effective == max(agentDeclared, deterministic)
         else { return false }
@@ -918,29 +936,9 @@ public actor TerminalMutationAuditor {
             case let .emittedBatch(batch) = events[emittedIndex].kind,
             purpose == batch.purpose,
             agentDeclared == batch.declaredRisk,
-            revision == batch.expectedRevision
+            screen.revision == batch.expectedRevision
         else { return false }
 
-        let rows = screenText.split(
-            separator: "\n",
-            omittingEmptySubsequences: false
-        )
-        let cursorRow = max(0, rows.count - 1)
-        let cursorColumn = rows.last.map { Array($0).count } ?? 0
-        let screen = TerminalScreenSnapshot(
-            revision: revision,
-            columns: max(1, rows.map { Array($0).count }.max() ?? 0),
-            rows: max(1, rows.count),
-            cursor: TerminalCursor(
-                row: cursorRow,
-                column: cursorColumn,
-                isVisible: true
-            ),
-            mode: .normal,
-            text: screenText,
-            significantRuns: [],
-            changedRows: changedRows
-        )
         guard let recomputed = try? TerminalPermissionPolicy().evaluate(
             batch: batch,
             endpointID: endpointID,
@@ -953,11 +951,11 @@ public actor TerminalMutationAuditor {
         if let approval {
             guard approval.outcome == .approvedOnce,
                 approval.scope.endpointID == endpointID,
-                approval.scope.screenRevision == revision,
+                approval.scope.screenRevision == screen.revision,
                 let expectedScope = try? TerminalApprovalScope(
                     batch: batch,
                     endpointID: endpointID,
-                    screenRevision: revision
+                    screenRevision: screen.revision
                 ),
                 approval.scope == expectedScope
             else { return false }
@@ -972,6 +970,7 @@ public actor TerminalMutationAuditor {
         }
         await withCheckedContinuation { continuation in
             accessWaiters.append(continuation)
+            hooks.didQueueForSerialAccess?()
         }
     }
 
