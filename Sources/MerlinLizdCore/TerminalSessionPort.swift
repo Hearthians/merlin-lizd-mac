@@ -75,11 +75,29 @@ where ChannelClock.Duration == Duration {
 
     private var snapshot: TerminalScreenSnapshot
     private let clock: ChannelClock
+    private let timerTaskStarter: @Sendable (
+        @escaping @Sendable () async -> Void
+    ) -> Task<Void, Never>
     private var waiters: [UUID: Waiter] = [:]
 
     public init(initial: TerminalScreenSnapshot, clock: ChannelClock) {
         snapshot = initial
         self.clock = clock
+        timerTaskStarter = { operation in
+            Task { await operation() }
+        }
+    }
+
+    init(
+        initial: TerminalScreenSnapshot,
+        clock: ChannelClock,
+        timerTaskStarter: @escaping @Sendable (
+            @escaping @Sendable () async -> Void
+        ) -> Task<Void, Never>
+    ) {
+        snapshot = initial
+        self.clock = clock
+        self.timerTaskStarter = timerTaskStarter
     }
 
     public func publish(_ newSnapshot: TerminalScreenSnapshot) {
@@ -153,32 +171,38 @@ where ChannelClock.Duration == Duration {
 
     private func startTimeoutTimer(id: UUID, duration: Duration) {
         let clock = clock
-        let task = Task {
+        let deadline = clock.now.advanced(by: duration)
+        let task = timerTaskStarter {
             do {
-                try await clock.sleep(for: duration)
+                try await clock.sleep(until: deadline, tolerance: nil)
             } catch {
                 return
             }
             guard !Task.isCancelled else { return }
-            self.timeout(id: id)
+            await self.timeout(id: id)
         }
         waiters[id]?.timeoutTask = task
     }
 
     private func startStableTimer(id: UUID, duration: Duration) {
+        guard duration > .zero else {
+            complete(id: id, timedOut: false)
+            return
+        }
         guard var waiter = waiters[id] else { return }
         waiter.stableTask?.cancel()
         waiter.stableGeneration += 1
         let generation = waiter.stableGeneration
         let clock = clock
-        waiter.stableTask = Task {
+        let deadline = clock.now.advanced(by: duration)
+        waiter.stableTask = timerTaskStarter {
             do {
-                try await clock.sleep(for: duration)
+                try await clock.sleep(until: deadline, tolerance: nil)
             } catch {
                 return
             }
             guard !Task.isCancelled else { return }
-            self.stableTimerFired(id: id, generation: generation)
+            await self.stableTimerFired(id: id, generation: generation)
         }
         waiters[id] = waiter
     }

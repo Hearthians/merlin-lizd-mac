@@ -19,7 +19,14 @@ struct TerminalScreenChannelTests {
                 )
             )
         }
-        await clock.waitForPendingSleeps(1)
+        guard await requireEventually(
+            "changed-wait timeout registration",
+            { clock.pendingSleepCount == 1 }
+        ) else {
+            waiter.cancel()
+            _ = try? await waiter.value
+            return
+        }
 
         await channel.publish(snapshot(revision: 2, text: "two"))
         let result = try await waiter.value
@@ -48,13 +55,34 @@ struct TerminalScreenChannelTests {
             await completion.finish()
             return result
         }
-        await clock.waitForPendingSleeps(1)
+        guard await requireEventually(
+            "stable-wait timeout registration",
+            { clock.pendingSleepCount == 1 }
+        ) else {
+            waiter.cancel()
+            _ = try? await waiter.value
+            return
+        }
 
         await channel.publish(snapshot(revision: 2, text: "two"))
-        await clock.waitForPendingSleeps(2)
+        guard await requireEventually(
+            "first stability registration",
+            { clock.pendingSleepCount == 2 }
+        ) else {
+            waiter.cancel()
+            _ = try? await waiter.value
+            return
+        }
         clock.advance(by: .seconds(4))
         await channel.publish(snapshot(revision: 3, text: "three"))
-        await clock.waitForPendingSleeps(2)
+        guard await requireEventually(
+            "restarted stability registration",
+            { clock.pendingSleepCount == 2 }
+        ) else {
+            waiter.cancel()
+            _ = try? await waiter.value
+            return
+        }
         clock.advance(by: .seconds(1))
         await settleTasks()
 
@@ -83,7 +111,14 @@ struct TerminalScreenChannelTests {
                 )
             )
         }
-        await clock.waitForPendingSleeps(1)
+        guard await requireEventually(
+            "timeout registration",
+            { clock.pendingSleepCount == 1 }
+        ) else {
+            waiter.cancel()
+            _ = try? await waiter.value
+            return
+        }
         await channel.publish(snapshot(revision: 2, text: "latest"))
 
         clock.advance(by: .seconds(3))
@@ -109,13 +144,25 @@ struct TerminalScreenChannelTests {
                 )
             )
         }
-        await clock.waitForPendingSleeps(1)
+        guard await requireEventually(
+            "cancelled-wait timeout registration",
+            { clock.pendingSleepCount == 1 }
+        ) else {
+            cancelled.cancel()
+            _ = try? await cancelled.value
+            return
+        }
 
         cancelled.cancel()
         await #expect(throws: CancellationError.self) {
             try await cancelled.value
         }
-        await clock.waitForPendingSleeps(0)
+        guard await requireEventually(
+            "cancelled-wait timer cleanup",
+            { clock.pendingSleepCount == 0 }
+        ) else {
+            return
+        }
 
         let active = Task {
             try await channel.wait(
@@ -125,12 +172,172 @@ struct TerminalScreenChannelTests {
                 )
             )
         }
-        await clock.waitForPendingSleeps(1)
+        guard await requireEventually(
+            "replacement-wait timeout registration",
+            { clock.pendingSleepCount == 1 }
+        ) else {
+            active.cancel()
+            _ = try? await active.value
+            return
+        }
         await channel.publish(snapshot(revision: 2, text: "two"))
         let result = try? await active.value
 
         #expect(result?.snapshot.revision == 2)
         #expect(result?.timedOut == false)
+    }
+
+    @Test("timeout deadline starts when the wait is registered")
+    func timeoutDeadlineStartsAtRegistration() async throws {
+        let clock = ManualTerminalClock()
+        let gate = TimerTaskGate()
+        let completion = WaitCompletionProbe()
+        let channel = gatedChannel(clock: clock, gate: gate)
+        let waiter = Task {
+            let result = try await channel.wait(
+                .init(
+                    condition: .changed(after: 5),
+                    timeout: .seconds(3)
+                )
+            )
+            await completion.finish()
+            return result
+        }
+        guard await requireEventually(
+            "gated timeout task",
+            { await gate.waitingCount == 1 }
+        ) else {
+            waiter.cancel()
+            _ = try? await waiter.value
+            return
+        }
+
+        clock.advance(by: .seconds(3))
+        await gate.releaseAll()
+        let completed = await eventually {
+            await completion.isFinished
+        }
+
+        #expect(completed)
+        guard completed else {
+            waiter.cancel()
+            _ = try? await waiter.value
+            return
+        }
+        let result = try await waiter.value
+        #expect(result.timedOut)
+        #expect(result.snapshot.revision == 1)
+    }
+
+    @Test("stability deadline starts at the qualifying publication")
+    func stabilityDeadlineStartsAtPublication() async throws {
+        let clock = ManualTerminalClock()
+        let gate = TimerTaskGate()
+        let completion = WaitCompletionProbe()
+        let channel = gatedChannel(clock: clock, gate: gate)
+        let waiter = Task {
+            let result = try await channel.wait(
+                .init(
+                    condition: .stable(after: 1, for: .seconds(5)),
+                    timeout: .seconds(100)
+                )
+            )
+            await completion.finish()
+            return result
+        }
+        guard await requireEventually(
+            "gated timeout task",
+            { await gate.waitingCount == 1 }
+        ) else {
+            waiter.cancel()
+            _ = try? await waiter.value
+            return
+        }
+
+        await channel.publish(snapshot(revision: 2, text: "two"))
+        guard await requireEventually(
+            "gated stability task",
+            { await gate.waitingCount == 2 }
+        ) else {
+            await gate.releaseAll()
+            waiter.cancel()
+            _ = try? await waiter.value
+            return
+        }
+        clock.advance(by: .seconds(5))
+        await gate.releaseAll()
+        let completed = await eventually {
+            await completion.isFinished
+        }
+
+        #expect(completed)
+        guard completed else {
+            waiter.cancel()
+            _ = try? await waiter.value
+            return
+        }
+        let result = try await waiter.value
+        #expect(!result.timedOut)
+        #expect(result.snapshot.revision == 2)
+    }
+
+    @Test("zero stability completes before an expired timeout task")
+    func zeroStabilityBeatsExpiredTimeout() async throws {
+        let clock = ManualTerminalClock()
+        let gate = TimerTaskGate()
+        let completion = WaitCompletionProbe()
+        let channel = gatedChannel(clock: clock, gate: gate)
+        let waiter = Task {
+            let result = try await channel.wait(
+                .init(
+                    condition: .stable(after: 1, for: .zero),
+                    timeout: .seconds(5)
+                )
+            )
+            await completion.finish()
+            return result
+        }
+        guard await requireEventually(
+            "gated timeout task",
+            { await gate.waitingCount == 1 }
+        ) else {
+            waiter.cancel()
+            _ = try? await waiter.value
+            return
+        }
+
+        clock.advance(by: .seconds(5))
+        await channel.publish(snapshot(revision: 2, text: "two"))
+        await gate.releaseNext()
+        guard await requireEventually(
+            "released timeout registration or completion",
+            {
+                await completion.isFinished || clock.pendingSleepCount > 0
+            }
+        ) else {
+            await gate.releaseAll()
+            waiter.cancel()
+            _ = try? await waiter.value
+            return
+        }
+        if !(await completion.isFinished) {
+            clock.advance(by: .seconds(5))
+        }
+        let completed = await eventually {
+            await completion.isFinished
+        }
+
+        #expect(completed)
+        guard completed else {
+            await gate.releaseAll()
+            waiter.cancel()
+            _ = try? await waiter.value
+            return
+        }
+        let result = try await waiter.value
+        #expect(!result.timedOut)
+        #expect(result.snapshot.revision == 2)
+        await gate.releaseAll()
     }
 }
 
@@ -158,10 +365,96 @@ private actor WaitCompletionProbe {
     }
 }
 
+private actor TimerTaskGate {
+    private struct Waiter {
+        let id: Int
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
+    private var nextID = 0
+    private var waiters: [Waiter] = []
+
+    var waitingCount: Int { waiters.count }
+
+    func wait() async {
+        let id = nextID
+        nextID += 1
+        await withTaskCancellationHandler {
+            if Task.isCancelled { return }
+            await withCheckedContinuation { continuation in
+                waiters.append(.init(id: id, continuation: continuation))
+            }
+        } onCancel: {
+            Task { await self.cancel(id: id) }
+        }
+    }
+
+    func releaseNext() {
+        guard !waiters.isEmpty else { return }
+        waiters.removeFirst().continuation.resume()
+    }
+
+    func releaseAll() {
+        let current = waiters
+        waiters.removeAll()
+        for waiter in current {
+            waiter.continuation.resume()
+        }
+    }
+
+    private func cancel(id: Int) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        waiters.remove(at: index).continuation.resume()
+    }
+}
+
+private func gatedChannel(
+    clock: ManualTerminalClock,
+    gate: TimerTaskGate
+) -> TerminalScreenChannel<ManualTerminalClock> {
+    TerminalScreenChannel(
+        initial: snapshot(revision: 1, text: "one"),
+        clock: clock,
+        timerTaskStarter: { operation in
+            Task {
+                await gate.wait()
+                guard !Task.isCancelled else { return }
+                await operation()
+            }
+        }
+    )
+}
+
 private func settleTasks() async {
     for _ in 0..<20 {
         await Task.yield()
     }
+}
+
+@discardableResult
+private func eventually(
+    attempts: Int = 1_000,
+    _ condition: () async -> Bool
+) async -> Bool {
+    for _ in 0..<attempts {
+        if await condition() { return true }
+        await Task.yield()
+    }
+    return false
+}
+
+private func requireEventually(
+    _ description: String,
+    attempts: Int = 1_000,
+    _ condition: () async -> Bool
+) async -> Bool {
+    guard await eventually(attempts: attempts, condition) else {
+        Issue.record("Timed out waiting for \(description)")
+        return false
+    }
+    return true
 }
 
 private struct ManualTerminalInstant: InstantProtocol {
@@ -205,6 +498,10 @@ private final class ManualTerminalClock: Clock, @unchecked Sendable {
     }
 
     var minimumResolution: Duration { .nanoseconds(1) }
+
+    var pendingSleepCount: Int {
+        state.withLock { $0.sleeps.count }
+    }
 
     func sleep(
         until deadline: Instant,
@@ -251,9 +548,4 @@ private final class ManualTerminalClock: Clock, @unchecked Sendable {
         }
     }
 
-    func waitForPendingSleeps(_ expected: Int) async {
-        while state.withLock({ $0.sleeps.count }) != expected {
-            await Task.yield()
-        }
-    }
 }
