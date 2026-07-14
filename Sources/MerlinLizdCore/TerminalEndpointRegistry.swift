@@ -100,6 +100,7 @@ struct TerminalEndpointRegistryStateSnapshot: Equatable, Sendable {
     let bindingCount: Int
     let conversationOwnerCount: Int
     let keyboardTransitionCount: Int
+    let pinLossHistoryCount: Int
 }
 
 public actor TerminalEndpointRegistry {
@@ -149,7 +150,6 @@ public actor TerminalEndpointRegistry {
     private var focusOrder: UInt64 = 0
     private var keyboardTransitions: [TerminalEndpointID: KeyboardTransition]
         = [:]
-    private var losses: [TerminalEndpointPinLoss] = []
     private var eventSubscribers: [
         UUID: AsyncStream<TerminalEndpointRegistryEvent>.Continuation
     ] = [:]
@@ -211,7 +211,6 @@ public actor TerminalEndpointRegistry {
                 conversationKey: binding.conversationKey,
                 endpointID: endpointID
             )
-            losses.append(loss)
             eventSubscribers.values.forEach {
                 $0.yield(.pinLost(loss))
             }
@@ -485,16 +484,13 @@ public actor TerminalEndpointRegistry {
         removeBinding(threadID: threadID, token: stored.token)
     }
 
-    public func pinLossEvents() -> [TerminalEndpointPinLoss] {
-        losses
-    }
-
     func testingStateSnapshot() -> TerminalEndpointRegistryStateSnapshot {
         TerminalEndpointRegistryStateSnapshot(
             endpointCount: endpoints.count,
             bindingCount: bindings.count,
             conversationOwnerCount: conversationOwners.count,
-            keyboardTransitionCount: keyboardTransitions.count
+            keyboardTransitionCount: keyboardTransitions.count,
+            pinLossHistoryCount: 0
         )
     }
 

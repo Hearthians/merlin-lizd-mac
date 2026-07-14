@@ -70,6 +70,8 @@ struct TerminalToolRouterStateSnapshot: Equatable, Sendable {
     let turnLifecycleCount: Int
     let terminationTaskCount: Int
     let terminationReasonCount: Int
+    let replayProtectionBitCount: Int
+    let replayProtectionCapacity: Int
 }
 
 public actor TerminalToolRouter {
@@ -78,31 +80,77 @@ public actor TerminalToolRouter {
         let turnID: AgentTurnID
     }
 
+    private struct TurnReplayFilter: Sendable {
+        private static let wordCount = 1_024
+        private static let hashCount = 4
+        static let capacity = wordCount * UInt64.bitWidth
+
+        private var words = [UInt64](repeating: 0, count: wordCount)
+
+        var bitCount: Int {
+            words.reduce(into: 0) { count, word in
+                count += word.nonzeroBitCount
+            }
+        }
+
+        func contains(_ turn: TurnKey) -> Bool {
+            bitIndexes(for: turn).allSatisfy { index in
+                let word = index / UInt64.bitWidth
+                let bit = index % UInt64.bitWidth
+                return words[word] & (UInt64(1) << UInt64(bit)) != 0
+            }
+        }
+
+        mutating func insert(_ turn: TurnKey) {
+            for index in bitIndexes(for: turn) {
+                let word = index / UInt64.bitWidth
+                let bit = index % UInt64.bitWidth
+                words[word] |= UInt64(1) << UInt64(bit)
+            }
+        }
+
+        private func bitIndexes(for turn: TurnKey) -> [Int] {
+            (0..<Self.hashCount).map { salt in
+                var hasher = Hasher()
+                hasher.combine(salt)
+                hasher.combine(turn.threadID)
+                hasher.combine(turn.turnID)
+                return Int(
+                    UInt(bitPattern: hasher.finalize())
+                        % UInt(Self.capacity)
+                )
+            }
+        }
+    }
+
     private struct ActiveOperation {
         let turn: TurnKey
         let task: Task<TerminalToolResult, any Error>
     }
 
     private enum TurnLifecycle: Sendable {
-        case activating
-        case active
-        case terminating
+        case activating(generation: UInt64)
+        case active(generation: UInt64)
+        case terminating(generation: UInt64)
     }
 
     private struct PreparedTurn: Sendable {
         let token: UUID
+        let generation: UInt64
         let conversationKey: TerminalConversationKey
         let task: Task<TerminalEndpointBinding, any Error>
     }
 
     private struct ActivationTask: Sendable {
         let token: UUID
+        let generation: UInt64
         let conversationKey: TerminalConversationKey
         let task: Task<TerminalEndpointBinding, any Error>
     }
 
     private struct TerminationTask: Sendable {
         let token: UUID
+        let generation: UInt64
         let task: Task<Void, any Error>
     }
 
@@ -151,6 +199,8 @@ public actor TerminalToolRouter {
     private var activeBindings: [TurnKey: TerminalEndpointBinding] = [:]
     private var terminationTasks: [TurnKey: TerminationTask] = [:]
     private var terminationReasons: [TurnKey: TemporaryPaneRetentionReason] = [:]
+    private var nextGeneration: UInt64 = 0
+    private var replayProtection = TurnReplayFilter()
 
     public init(
         registry: TerminalEndpointRegistry,
@@ -186,6 +236,8 @@ public actor TerminalToolRouter {
             throw TerminalEndpointRegistryError.threadAlreadyPrepared
         }
         let token = UUID()
+        nextGeneration &+= 1
+        let generation = nextGeneration
         let registry = self.registry
         let task = Task.detached {
             try await registry.prepareTurn(
@@ -195,6 +247,7 @@ public actor TerminalToolRouter {
         }
         preparedTurns[threadID] = PreparedTurn(
             token: token,
+            generation: generation,
             conversationKey: conversationKey,
             task: task
         )
@@ -202,7 +255,9 @@ public actor TerminalToolRouter {
         do {
             binding = try await task.value
         } catch {
-            if preparedTurns[threadID]?.token == token {
+            if preparedTurns[threadID]?.token == token,
+                preparedTurns[threadID]?.generation == generation
+            {
                 preparedTurns.removeValue(forKey: threadID)
             }
             throw error
@@ -283,7 +338,9 @@ public actor TerminalToolRouter {
             activeBindingCount: activeBindings.count,
             turnLifecycleCount: turnLifecycles.count,
             terminationTaskCount: terminationTasks.count,
-            terminationReasonCount: terminationReasons.count
+            terminationReasonCount: terminationReasons.count,
+            replayProtectionBitCount: replayProtection.bitCount,
+            replayProtectionCapacity: TurnReplayFilter.capacity
         )
     }
 
@@ -1650,12 +1707,59 @@ public actor TerminalToolRouter {
         if let existing = terminationTasks[turn] {
             do {
                 try await existing.task.value
-                cleanupTerminationWaiter(turn: turn, token: existing.token)
+                cleanupTerminationWaiter(
+                    turn: turn,
+                    token: existing.token,
+                    generation: existing.generation
+                )
                 return
             } catch {
-                cleanupTerminationWaiter(turn: turn, token: existing.token)
+                cleanupTerminationWaiter(
+                    turn: turn,
+                    token: existing.token,
+                    generation: existing.generation
+                )
                 throw error
             }
+        }
+        guard !replayProtection.contains(turn) else { return }
+
+        let generation: UInt64
+        let prepared: PreparedTurn?
+        let activationTask: Task<TerminalEndpointBinding, any Error>?
+        switch turnLifecycles[turn] {
+        case let .activating(currentGeneration):
+            guard let activation = activationTasks[turn],
+                activation.generation == currentGeneration
+            else {
+                throw TerminalToolRouterError.turnUnavailable
+            }
+            generation = currentGeneration
+            prepared = nil
+            activationTask = activation.task
+            turnLifecycles[turn] = .terminating(generation: generation)
+        case let .active(currentGeneration):
+            generation = currentGeneration
+            prepared = nil
+            activationTask = nil
+            turnLifecycles[turn] = .terminating(generation: generation)
+        case .terminating:
+            if let existing = terminationTasks[turn] {
+                return try await existing.task.value
+            }
+            return
+        case nil:
+            guard let currentPrepared = preparedTurns[turn.threadID],
+                takePreparedTurn(
+                    threadID: turn.threadID,
+                    token: currentPrepared.token,
+                    generation: currentPrepared.generation
+                ) != nil
+            else { return }
+            generation = currentPrepared.generation
+            prepared = currentPrepared
+            activationTask = nil
+            turnLifecycles[turn] = .terminating(generation: generation)
         }
 
         let preexistingReasons: [LeaseKey: TemporaryPaneRetentionReason]
@@ -1668,51 +1772,44 @@ public actor TerminalToolRouter {
             }
         )
         terminationReasons[turn] = reason
-
-        let preparedKey: TerminalConversationKey?
-        let activationTask = activationTasks[turn]?.task
-        switch turnLifecycles[turn] {
-        case .activating:
-            turnLifecycles[turn] = .terminating
-            preparedKey = nil
-        case .active:
-            turnLifecycles[turn] = .terminating
-            preparedKey = nil
-        case .terminating:
-            if let existing = terminationTasks[turn] {
-                return try await existing.task.value
-            }
-            return
-        case nil:
-            preparedKey = preparedTurns
-                .removeValue(forKey: turn.threadID)?
-                .conversationKey
-            turnLifecycles[turn] = .terminating
-        }
         let token = UUID()
         let task = Task.detached {
             try await self.performTermination(
                 turn,
+                generation: generation,
                 reason: reason,
-                preparedKey: preparedKey,
+                prepared: prepared,
                 preexistingReasons: preexistingReasons,
                 activationTask: activationTask
             )
         }
-        terminationTasks[turn] = TerminationTask(token: token, task: task)
+        terminationTasks[turn] = TerminationTask(
+            token: token,
+            generation: generation,
+            task: task
+        )
         do {
             try await task.value
-            cleanupTerminationWaiter(turn: turn, token: token)
+            cleanupTerminationWaiter(
+                turn: turn,
+                token: token,
+                generation: generation
+            )
         } catch {
-            cleanupTerminationWaiter(turn: turn, token: token)
+            cleanupTerminationWaiter(
+                turn: turn,
+                token: token,
+                generation: generation
+            )
             throw error
         }
     }
 
     private func performTermination(
         _ turn: TurnKey,
+        generation: UInt64,
         reason: TemporaryPaneRetentionReason,
-        preparedKey: TerminalConversationKey?,
+        prepared: PreparedTurn?,
         preexistingReasons: [LeaseKey: TemporaryPaneRetentionReason],
         activationTask: Task<TerminalEndpointBinding, any Error>?
     ) async throws {
@@ -1764,20 +1861,28 @@ public actor TerminalToolRouter {
             }
         }
         blockedTurns.remove(turn)
-        if let preparedKey {
-            await registry.releasePrepared(
-                threadID: turn.threadID,
-                conversationKey: preparedKey
-            )
+        if let prepared {
+            if case let .success(binding) = await prepared.task.result {
+                await registry.releasePrepared(
+                    threadID: turn.threadID,
+                    conversationKey: prepared.conversationKey,
+                    token: binding.token
+                )
+            }
         } else {
             await registry.releaseTurn(
                 threadID: turn.threadID,
                 turnID: turn.turnID
             )
         }
+        replayProtection.insert(turn)
         activeBindings.removeValue(forKey: turn)
-        activationTasks.removeValue(forKey: turn)
-        turnLifecycles.removeValue(forKey: turn)
+        if activationTasks[turn]?.generation == generation {
+            activationTasks.removeValue(forKey: turn)
+        }
+        if lifecycleGeneration(for: turn) == generation {
+            turnLifecycles.removeValue(forKey: turn)
+        }
         terminationReasons.removeValue(forKey: turn)
         if !auditFailures.isEmpty {
             throw TerminalTurnTerminationError.auditUnavailable(auditFailures)
@@ -2384,14 +2489,17 @@ public actor TerminalToolRouter {
         conversationKey: TerminalConversationKey? = nil
     ) async throws -> TerminalEndpointBinding {
         let task: Task<TerminalEndpointBinding, any Error>
+        let generation: UInt64
         switch turnLifecycles[turn] {
-        case .activating:
+        case let .activating(currentGeneration):
             guard let activation = activationTasks[turn],
+                activation.generation == currentGeneration,
                 conversationKey == nil
                     || activation.conversationKey == conversationKey
             else {
                 throw TerminalToolRouterError.turnUnavailable
             }
+            generation = currentGeneration
             task = activation.task
         case .active:
             guard let binding = activeBindings[turn],
@@ -2405,14 +2513,20 @@ public actor TerminalToolRouter {
         case .terminating:
             throw TerminalToolRouterError.turnUnavailable
         case nil:
-            guard let prepared = preparedTurns[turn.threadID],
+            guard !replayProtection.contains(turn),
+                let prepared = preparedTurns[turn.threadID],
                 conversationKey == nil
-                    || prepared.conversationKey == conversationKey
+                    || prepared.conversationKey == conversationKey,
+                takePreparedTurn(
+                    threadID: turn.threadID,
+                    token: prepared.token,
+                    generation: prepared.generation
+                ) != nil
             else {
                 throw TerminalToolRouterError.turnUnavailable
             }
-            preparedTurns.removeValue(forKey: turn.threadID)
-            turnLifecycles[turn] = .activating
+            generation = prepared.generation
+            turnLifecycles[turn] = .activating(generation: generation)
             let token = UUID()
             let activationTask = Task.detached {
                 try await self.performActivation(
@@ -2423,6 +2537,7 @@ public actor TerminalToolRouter {
             }
             activationTasks[turn] = ActivationTask(
                 token: token,
+                generation: generation,
                 conversationKey: prepared.conversationKey,
                 task: activationTask
             )
@@ -2430,7 +2545,9 @@ public actor TerminalToolRouter {
         }
         let binding = try await task.value
         try Task.checkCancellation()
-        guard case .active = turnLifecycles[turn] else {
+        guard lifecycleGeneration(for: turn) == generation,
+            case .active = turnLifecycles[turn]
+        else {
             throw TerminalToolRouterError.turnUnavailable
         }
         guard conversationKey == nil
@@ -2458,16 +2575,23 @@ public actor TerminalToolRouter {
             guard binding.token == preparedValue.token else {
                 throw TerminalEndpointRegistryError.bindingMismatch
             }
-            guard activationTasks[turn]?.token == activationToken else {
+            guard activationTasks[turn]?.token == activationToken,
+                activationTasks[turn]?.generation == prepared.generation
+            else {
                 throw TerminalToolRouterError.turnUnavailable
             }
             activeBindings[turn] = binding
-            if case .activating = turnLifecycles[turn] {
-                turnLifecycles[turn] = .active
+            if case let .activating(currentGeneration) = turnLifecycles[turn],
+                currentGeneration == prepared.generation
+            {
+                turnLifecycles[turn] = .active(
+                    generation: prepared.generation
+                )
             }
             activationTasks.removeValue(forKey: turn)
             return binding
         } catch {
+            replayProtection.insert(turn)
             if let preparedBinding {
                 await registry.releasePrepared(
                     threadID: turn.threadID,
@@ -2475,10 +2599,17 @@ public actor TerminalToolRouter {
                     token: preparedBinding.token
                 )
             }
-            if activationTasks[turn]?.token == activationToken {
+            if activationTasks[turn]?.token == activationToken,
+                activationTasks[turn]?.generation == prepared.generation
+            {
                 activationTasks.removeValue(forKey: turn)
                 activeBindings.removeValue(forKey: turn)
-                turnLifecycles.removeValue(forKey: turn)
+                if case let .activating(currentGeneration)
+                    = turnLifecycles[turn],
+                    currentGeneration == prepared.generation
+                {
+                    turnLifecycles.removeValue(forKey: turn)
+                }
             }
             if let error = error as? TerminalToolRouterError {
                 throw error
@@ -2487,8 +2618,38 @@ public actor TerminalToolRouter {
         }
     }
 
-    private func cleanupTerminationWaiter(turn: TurnKey, token: UUID) {
-        guard terminationTasks[turn]?.token == token else { return }
+    private func takePreparedTurn(
+        threadID: AgentThreadID,
+        token: UUID,
+        generation: UInt64
+    ) -> PreparedTurn? {
+        guard let prepared = preparedTurns[threadID],
+            prepared.token == token,
+            prepared.generation == generation
+        else { return nil }
+        preparedTurns.removeValue(forKey: threadID)
+        return prepared
+    }
+
+    private func lifecycleGeneration(for turn: TurnKey) -> UInt64? {
+        switch turnLifecycles[turn] {
+        case let .activating(generation),
+            let .active(generation),
+            let .terminating(generation):
+            generation
+        case nil:
+            nil
+        }
+    }
+
+    private func cleanupTerminationWaiter(
+        turn: TurnKey,
+        token: UUID,
+        generation: UInt64
+    ) {
+        guard terminationTasks[turn]?.token == token,
+            terminationTasks[turn]?.generation == generation
+        else { return }
         terminationTasks.removeValue(forKey: turn)
     }
 

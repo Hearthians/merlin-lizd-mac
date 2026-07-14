@@ -102,11 +102,16 @@ struct TerminalEndpointRegistryTests {
             conversationKey: TerminalToolFixtures.key,
             turnID: turnID
         )
+        let stream = await registry.events()
+        let eventTask = Task {
+            var iterator = stream.makeAsyncIterator()
+            return await iterator.next()
+        }
 
         await registry.unregister(endpointID)
 
         #expect(
-            await registry.pinLossEvents() == [
+            await eventTask.value == .pinLost(
                 TerminalEndpointPinLoss(
                     threadID: threadID,
                     turnID: turnID,
@@ -114,7 +119,7 @@ struct TerminalEndpointRegistryTests {
                     conversationKey: TerminalToolFixtures.key,
                     endpointID: endpointID
                 )
-            ]
+            )
         )
         await #expect(throws: TerminalEndpointRegistryError.pinLost) {
             try await registry.binding(
@@ -336,11 +341,6 @@ struct TerminalEndpointRegistryTests {
             phase: .prepared,
             conversationKey: TerminalToolFixtures.key,
             endpointID: endpointID
-        )
-        #expect(
-            await registry.pinLossEvents() == [
-                expected
-            ]
         )
         #expect(await eventTask.value == .pinLost(expected))
     }
@@ -592,6 +592,16 @@ struct TerminalEndpointRegistryTests {
     @Test("endpoint churn leaves no keyboard transition or ownership tombstones")
     func endpointChurnPrunesTransientState() async throws {
         let registry = TerminalEndpointRegistry()
+        let stream = await registry.events()
+        let eventTask = Task {
+            var iterator = stream.makeAsyncIterator()
+            var events: [TerminalEndpointRegistryEvent] = []
+            for _ in 0..<25 {
+                guard let event = await iterator.next() else { break }
+                events.append(event)
+            }
+            return events
+        }
         for index in 0..<25 {
             let port = FakeTerminalToolPort(
                 snapshot: TerminalToolFixtures.screen(revision: UInt64(index))
@@ -613,17 +623,20 @@ struct TerminalEndpointRegistryTests {
                 threadID: threadID,
                 conversationKey: TerminalToolFixtures.key
             )
-            await registry.releasePrepared(
-                threadID: threadID,
-                conversationKey: TerminalToolFixtures.key
-            )
             await registry.unregister(endpointID)
         }
 
+        let events = await eventTask.value
+        #expect(events.count == 25)
+        #expect(events.allSatisfy { event in
+            guard case let .pinLost(loss) = event else { return false }
+            return loss.phase == .prepared && loss.turnID == nil
+        })
         let snapshot = await registry.testingStateSnapshot()
         #expect(snapshot.endpointCount == 0)
         #expect(snapshot.bindingCount == 0)
         #expect(snapshot.conversationOwnerCount == 0)
         #expect(snapshot.keyboardTransitionCount == 0)
+        #expect(snapshot.pinLossHistoryCount == 0)
     }
 }

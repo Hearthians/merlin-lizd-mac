@@ -2195,6 +2195,9 @@ struct TerminalToolRouterTests {
             _ = try await begin.value
         }
         await unregister.value
+        let failedSnapshot = await router.testingStateSnapshot()
+        #expect(failedSnapshot.preparedTurnCount == 0)
+        #expect(failedSnapshot.replayProtectionBitCount == 0)
 
         let replacementPort = FakeTerminalToolPort(
             snapshot: TerminalToolFixtures.screen(revision: 1163)
@@ -2213,6 +2216,387 @@ struct TerminalToolRouterTests {
         let turnID = AgentTurnID(rawValue: "replacement-turn")
         try await router.confirmTurnID(threadID: threadID, turnID: turnID)
         try await router.endTurn(threadID: threadID, turnID: turnID)
+    }
+
+    @Test("cancelled begin preserves one usable prepared generation")
+    func cancelledBeginPreservesPreparedGeneration() async throws {
+        let codexGate = TerminalToolTestGate()
+        let port = FakeTerminalToolPort(
+            snapshot: TerminalToolFixtures.screen(revision: 1164)
+        )
+        await port.blockKeyboardOwner(.codex, on: codexGate)
+        let registry = TerminalEndpointRegistry()
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: TerminalToolFixtures.newID(),
+                port: port,
+                controller: FakeTerminalSurfaceController(
+                    surface: TerminalToolFixtures.surface()
+                )
+            )
+        )
+        let router = TerminalToolRouter(
+            registry: registry,
+            approvalBroker: TerminalApprovalBroker(),
+            journal: MemoryTerminalToolJournal()
+        )
+        let threadID = AgentThreadID(rawValue: "cancelled-begin-thread")
+        let begin = Task {
+            try await router.beginTurn(
+                threadID: threadID,
+                conversationKey: TerminalToolFixtures.key
+            )
+        }
+        while await port.keyboardOwnerTransitionsStarted().isEmpty {
+            await Task.yield()
+        }
+        begin.cancel()
+        await codexGate.open()
+        await #expect(throws: CancellationError.self) {
+            _ = try await begin.value
+        }
+
+        let turnID = AgentTurnID(rawValue: "after-cancelled-begin")
+        #expect(
+            try await router.execute(
+                threadID: threadID,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .observeScreen
+            ) == .screen(TerminalToolFixtures.screen(revision: 1164))
+        )
+        try await router.endTurn(threadID: threadID, turnID: turnID)
+        let snapshot = await router.testingStateSnapshot()
+        #expect(snapshot.preparedTurnCount == 0)
+        #expect(snapshot.activationTaskCount == 0)
+        #expect(snapshot.turnLifecycleCount == 0)
+        #expect(snapshot.replayProtectionBitCount > 0)
+        #expect(
+            snapshot.replayProtectionBitCount
+                <= snapshot.replayProtectionCapacity
+        )
+    }
+
+    @Test("completed turn cannot claim a successor preparation")
+    func completedTurnCannotClaimSuccessorPreparation() async throws {
+        let (router, threadID, screen) = try await makeReplayRouter()
+        let completedTurn = AgentTurnID(rawValue: "completed-turn")
+        _ = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        try await router.confirmTurnID(
+            threadID: threadID,
+            turnID: completedTurn
+        )
+        try await router.endTurn(
+            threadID: threadID,
+            turnID: completedTurn
+        )
+
+        _ = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        await #expect(throws: TerminalToolRouterError.turnUnavailable) {
+            try await router.confirmTurnID(
+                threadID: threadID,
+                turnID: completedTurn
+            )
+        }
+        await #expect(throws: TerminalToolRouterError.turnUnavailable) {
+            _ = try await router.execute(
+                threadID: threadID,
+                turnID: completedTurn,
+                conversationKey: TerminalToolFixtures.key,
+                call: .observeScreen
+            )
+        }
+
+        let successorTurn = AgentTurnID(rawValue: "successor-turn")
+        #expect(
+            try await router.execute(
+                threadID: threadID,
+                turnID: successorTurn,
+                conversationKey: TerminalToolFixtures.key,
+                call: .observeScreen
+            ) == .screen(screen)
+        )
+        try await router.endTurn(
+            threadID: threadID,
+            turnID: successorTurn
+        )
+    }
+
+    @Test("failed activation turn cannot claim a later preparation")
+    func failedActivationCannotClaimLaterPreparation() async throws {
+        let screen = TerminalToolFixtures.screen(revision: 1501)
+        let registry = TerminalEndpointRegistry()
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: TerminalToolFixtures.newID(),
+                port: FakeTerminalToolPort(snapshot: screen),
+                controller: FakeTerminalSurfaceController(
+                    surface: TerminalToolFixtures.surface()
+                )
+            )
+        )
+        let router = TerminalToolRouter(
+            registry: registry,
+            approvalBroker: TerminalApprovalBroker(),
+            journal: MemoryTerminalToolJournal()
+        )
+        let threadID = AgentThreadID(rawValue: "failed-activation-thread")
+        let failedTurn = AgentTurnID(rawValue: "failed-activation-turn")
+        let prepared = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        await registry.releasePrepared(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key,
+            token: prepared.token
+        )
+        await #expect(throws: TerminalToolRouterError.turnUnavailable) {
+            try await router.confirmTurnID(
+                threadID: threadID,
+                turnID: failedTurn
+            )
+        }
+
+        _ = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        await #expect(throws: TerminalToolRouterError.turnUnavailable) {
+            try await router.confirmTurnID(
+                threadID: threadID,
+                turnID: failedTurn
+            )
+        }
+        let successorTurn = AgentTurnID(rawValue: "after-failed-activation")
+        #expect(
+            try await router.execute(
+                threadID: threadID,
+                turnID: successorTurn,
+                conversationKey: TerminalToolFixtures.key,
+                call: .observeScreen
+            ) == .screen(screen)
+        )
+        try await router.endTurn(
+            threadID: threadID,
+            turnID: successorTurn
+        )
+    }
+
+    @Test("stale turn and conversation mismatch preserve successor preparation")
+    func staleTurnConversationMismatchPreservesSuccessor() async throws {
+        let successorIdentity = TmuxSessionIdentity(
+            serverSessionID: "$successor",
+            createdAtEpoch: 1_784_000_200
+        )
+        let successorKey = TerminalConversationKey(
+            target: .local,
+            tmux: successorIdentity
+        )
+        let successorRoute = TmuxRoute(
+            target: .local,
+            sessionName: "successor",
+            expectedIdentity: successorIdentity
+        )
+        let successorSurface = TmuxSurface(
+            sessionIdentity: successorIdentity,
+            windowID: "@successor",
+            paneID: "%successor",
+            currentCommand: "zsh"
+        )
+        let firstScreen = TerminalToolFixtures.screen(revision: 151)
+        let successorScreen = TerminalToolFixtures.screen(revision: 152)
+        let registry = TerminalEndpointRegistry()
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: TerminalToolFixtures.newID(),
+                port: FakeTerminalToolPort(snapshot: firstScreen),
+                controller: FakeTerminalSurfaceController(
+                    surface: TerminalToolFixtures.surface()
+                )
+            )
+        )
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: TerminalToolFixtures.newID(),
+                key: successorKey,
+                port: FakeTerminalToolPort(snapshot: successorScreen),
+                controller: FakeTerminalSurfaceController(
+                    surface: successorSurface
+                ),
+                route: successorRoute
+            )
+        )
+        let router = TerminalToolRouter(
+            registry: registry,
+            approvalBroker: TerminalApprovalBroker(),
+            journal: MemoryTerminalToolJournal()
+        )
+        let threadID = AgentThreadID(rawValue: "conversation-replay-thread")
+        let completedTurn = AgentTurnID(rawValue: "conversation-old-turn")
+        _ = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        _ = try await router.execute(
+            threadID: threadID,
+            turnID: completedTurn,
+            conversationKey: TerminalToolFixtures.key,
+            call: .observeScreen
+        )
+        try await router.endTurn(
+            threadID: threadID,
+            turnID: completedTurn
+        )
+
+        _ = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: successorKey
+        )
+        await #expect(throws: TerminalToolRouterError.turnUnavailable) {
+            _ = try await router.execute(
+                threadID: threadID,
+                turnID: completedTurn,
+                conversationKey: TerminalToolFixtures.key,
+                call: .observeScreen
+            )
+        }
+        await #expect(throws: TerminalToolRouterError.turnUnavailable) {
+            try await router.confirmTurnID(
+                threadID: threadID,
+                turnID: completedTurn
+            )
+        }
+        let successorTurn = AgentTurnID(rawValue: "conversation-successor-turn")
+        #expect(
+            try await router.execute(
+                threadID: threadID,
+                turnID: successorTurn,
+                conversationKey: successorKey,
+                call: .observeScreen
+            ) == .screen(successorScreen)
+        )
+        try await router.endTurn(
+            threadID: threadID,
+            turnID: successorTurn
+        )
+    }
+
+    @Test("duplicate end cannot release a successor preparation")
+    func duplicateEndCannotReleaseSuccessorPreparation() async throws {
+        let (router, threadID, screen) = try await makeReplayRouter()
+        let completedTurn = AgentTurnID(rawValue: "duplicate-end-turn")
+        _ = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        try await router.confirmTurnID(
+            threadID: threadID,
+            turnID: completedTurn
+        )
+        try await router.endTurn(
+            threadID: threadID,
+            turnID: completedTurn
+        )
+
+        _ = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        try await router.endTurn(
+            threadID: threadID,
+            turnID: completedTurn
+        )
+        let successorTurn = AgentTurnID(rawValue: "after-duplicate-end")
+        #expect(
+            try await router.execute(
+                threadID: threadID,
+                turnID: successorTurn,
+                conversationKey: TerminalToolFixtures.key,
+                call: .observeScreen
+            ) == .screen(screen)
+        )
+        try await router.endTurn(
+            threadID: threadID,
+            turnID: successorTurn
+        )
+    }
+
+    @Test("duplicate interrupt cannot release a successor preparation")
+    func duplicateInterruptCannotReleaseSuccessorPreparation() async throws {
+        let (router, threadID, screen) = try await makeReplayRouter()
+        let completedTurn = AgentTurnID(rawValue: "duplicate-interrupt-turn")
+        _ = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        try await router.confirmTurnID(
+            threadID: threadID,
+            turnID: completedTurn
+        )
+        try await router.endTurn(
+            threadID: threadID,
+            turnID: completedTurn
+        )
+
+        _ = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        try await router.interruptTurn(
+            threadID: threadID,
+            turnID: completedTurn
+        )
+        let successorTurn = AgentTurnID(rawValue: "after-duplicate-interrupt")
+        #expect(
+            try await router.execute(
+                threadID: threadID,
+                turnID: successorTurn,
+                conversationKey: TerminalToolFixtures.key,
+                call: .observeScreen
+            ) == .screen(screen)
+        )
+        try await router.endTurn(
+            threadID: threadID,
+            turnID: successorTurn
+        )
+    }
+
+    @Test("never-seen termination releases the current preparation")
+    func neverSeenTerminationReleasesCurrentPreparation() async throws {
+        let (router, threadID, screen) = try await makeReplayRouter()
+        _ = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        try await router.endTurn(
+            threadID: threadID,
+            turnID: AgentTurnID(rawValue: "never-seen-turn")
+        )
+
+        _ = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        let replacementTurn = AgentTurnID(rawValue: "replacement-after-cancel")
+        #expect(
+            try await router.execute(
+                threadID: threadID,
+                turnID: replacementTurn,
+                conversationKey: TerminalToolFixtures.key,
+                call: .observeScreen
+            ) == .screen(screen)
+        )
+        try await router.endTurn(
+            threadID: threadID,
+            turnID: replacementTurn
+        )
     }
 
     @Test("cancellation during binding validation prevents unsent terminal input")
@@ -2660,6 +3044,27 @@ struct TerminalToolRouterTests {
             try await router.endTurn(threadID: threadID, turnID: turnID)
         }
 
+        _ = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        await #expect(throws: TerminalToolRouterError.turnUnavailable) {
+            _ = try await router.execute(
+                threadID: threadID,
+                turnID: AgentTurnID(rawValue: "turn-0"),
+                conversationKey: TerminalToolFixtures.key,
+                call: .observeScreen
+            )
+        }
+        let finalTurn = AgentTurnID(rawValue: "turn-after-churn")
+        _ = try await router.execute(
+            threadID: threadID,
+            turnID: finalTurn,
+            conversationKey: TerminalToolFixtures.key,
+            call: .observeScreen
+        )
+        try await router.endTurn(threadID: threadID, turnID: finalTurn)
+
         let snapshot = await router.testingStateSnapshot()
         #expect(snapshot.activeOperationCount == 0)
         #expect(snapshot.preparedTurnCount == 0)
@@ -2668,6 +3073,11 @@ struct TerminalToolRouterTests {
         #expect(snapshot.turnLifecycleCount == 0)
         #expect(snapshot.terminationTaskCount == 0)
         #expect(snapshot.terminationReasonCount == 0)
+        #expect(snapshot.replayProtectionBitCount > 0)
+        #expect(
+            snapshot.replayProtectionBitCount
+                <= snapshot.replayProtectionCapacity
+        )
     }
 
     private func makeRouter(
@@ -2701,6 +3111,33 @@ struct TerminalToolRouterTests {
             conversationKey: TerminalToolFixtures.key
         )
         return (router, threadID, turnID)
+    }
+
+    private func makeReplayRouter() async throws -> (
+        TerminalToolRouter,
+        AgentThreadID,
+        TerminalScreenSnapshot
+    ) {
+        let screen = TerminalToolFixtures.screen(revision: 150)
+        let registry = TerminalEndpointRegistry()
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: TerminalToolFixtures.newID(),
+                port: FakeTerminalToolPort(snapshot: screen),
+                controller: FakeTerminalSurfaceController(
+                    surface: TerminalToolFixtures.surface()
+                )
+            )
+        )
+        return (
+            TerminalToolRouter(
+                registry: registry,
+                approvalBroker: TerminalApprovalBroker(),
+                journal: MemoryTerminalToolJournal()
+            ),
+            AgentThreadID(rawValue: "turn-replay-thread"),
+            screen
+        )
     }
 
     private func pendingRequest(
