@@ -181,7 +181,8 @@ struct TerminalPermissionPolicyTests {
     func validatesPrintableTextGraphemes() throws {
         let printable = [
             "", "ASCII 09 !?[]", " ", "é", "e\u{301}", "你好",
-            "😀", "👩‍💻", "✈️", "👍🏽", "1️⃣",
+            "😀", "👩‍💻", "👩🏽‍💻", "👨‍👩‍👧‍👦", "✈️", "✈︎",
+            "👍🏽", "🇨🇳", "1️⃣",
         ]
         for value in printable {
             let evaluation = try evaluate(events: [.text(value)])
@@ -208,11 +209,45 @@ struct TerminalPermissionPolicyTests {
             "字\u{E0100}",
             "safe\u{202E}txt",
             "x\u{200D}",
+            "✈️️",
+            "A🏽",
+            "🏽",
+            "👍🏽🏽",
+            "👍️🏽",
+            "👍🏽️",
+            "👩‍‍💻",
+            "\u{200D}👩",
+            "👩\u{200D}",
+            "🇨",
+            "🇨🇳🇺",
         ]
         for value in nonPrintable {
             assertDenied(
                 try evaluate(events: [.text(value)]),
                 context: value.debugDescription
+            )
+        }
+    }
+
+    @Test("private-use character keys deny in normal and alternate screens")
+    func deniesPrivateUseCharacterKeysInEveryScreenMode() throws {
+        let modes = [
+            TerminalScreenMode.normal,
+            TerminalScreenMode(
+                isAlternateScreen: true,
+                keyboardMode: .applicationCursor
+            ),
+        ]
+
+        for mode in modes {
+            assertDenied(
+                try evaluate(
+                    events: [
+                        .key(.character("\u{E000}"), modifiers: []),
+                    ],
+                    screen: terminalTestScreen(mode: mode)
+                ),
+                context: "private-use character in mode \(mode)"
             )
         }
     }
@@ -432,10 +467,14 @@ struct TerminalPermissionPolicyTests {
             ("private\u{E000}", false),
             ("\u{301}", false),
             ("\u{200D}", false),
+            ("✈️️", false),
+            ("A🏽", false),
+            ("🏽", false),
         ]
         var keyCases: [(TerminalKey, Bool, Bool)] = [
             (.character("x"), true, false),
             (.character("xy"), false, false),
+            (.character("\u{E000}"), false, false),
             (.enter, false, false),
             (.escape, false, false),
             (.backspace, true, false),

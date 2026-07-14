@@ -195,22 +195,15 @@ public struct TerminalPermissionPolicy: Sendable {
         if scalars.allSatisfy(isSubmissionBoundaryScalar) {
             return true
         }
+        if scalars.contains(where: isEmojiSequenceSyntax) {
+            return isPrintableEmojiSequence(scalars)
+        }
 
         var hasVisibleBase = false
         var hasSpace = false
         var hasMark = false
-        var hasEmojiVariationSelector = false
-        var joinerIndices: [Int] = []
 
-        for (index, scalar) in scalars.enumerated() {
-            if isEmojiVariationSelector(scalar) {
-                hasEmojiVariationSelector = true
-                continue
-            }
-            if scalar.value == 0x200D {
-                joinerIndices.append(index)
-                continue
-            }
+        for scalar in scalars {
             if scalar.properties.isDefaultIgnorableCodePoint {
                 return false
             }
@@ -228,17 +221,105 @@ public struct TerminalPermissionPolicy: Sendable {
             }
         }
 
-        guard hasVisibleBase || (hasSpace && !hasMark) else { return false }
-        if hasMark, !hasVisibleBase { return false }
-        if hasEmojiVariationSelector,
-            !scalars.contains(where: isEmojiTextBaseScalar)
+        return hasVisibleBase || (hasSpace && !hasMark)
+    }
+
+    private enum EmojiSequenceState {
+        case component
+        case separatorOrEnd
+    }
+
+    private func isPrintableEmojiSequence(
+        _ scalars: [Unicode.Scalar]
+    ) -> Bool {
+        if scalars.contains(where: isRegionalIndicator) {
+            return scalars.count == 2
+                && scalars.allSatisfy(isRegionalIndicator)
+        }
+        if isKeycapSequence(scalars) { return true }
+
+        var index = 0
+        var state = EmojiSequenceState.component
+        while index < scalars.count {
+            switch state {
+            case .component:
+                guard let nextIndex = nextIndexAfterEmojiComponent(
+                    at: index,
+                    in: scalars
+                ) else { return false }
+                index = nextIndex
+                state = .separatorOrEnd
+            case .separatorOrEnd:
+                guard scalars[index].value == 0x200D else { return false }
+                index += 1
+                state = .component
+            }
+        }
+        return switch state {
+        case .component: false
+        case .separatorOrEnd: true
+        }
+    }
+
+    private func nextIndexAfterEmojiComponent(
+        at index: Int,
+        in scalars: [Unicode.Scalar]
+    ) -> Int? {
+        guard index < scalars.count,
+            isEmojiSequenceBase(scalars[index])
+        else { return nil }
+        let base = scalars[index]
+        var nextIndex = index + 1
+        var hasVariationSelector = false
+        if nextIndex < scalars.count,
+            isEmojiVariationSelector(scalars[nextIndex])
         {
-            return false
+            hasVariationSelector = true
+            nextIndex += 1
         }
-        return joinerIndices.allSatisfy { index in
-            hasEmojiTextBase(before: index, in: scalars)
-                && hasEmojiTextBase(after: index, in: scalars)
+        if nextIndex < scalars.count,
+            scalars[nextIndex].properties.isEmojiModifier
+        {
+            guard !hasVariationSelector,
+                base.properties.isEmojiModifierBase
+            else { return nil }
+            nextIndex += 1
         }
+        return nextIndex
+    }
+
+    private func isEmojiSequenceSyntax(_ scalar: Unicode.Scalar) -> Bool {
+        isEmojiVariationSelector(scalar)
+            || scalar.value == 0x200D
+            || scalar.value == 0x20E3
+            || scalar.properties.isEmojiModifier
+            || isRegionalIndicator(scalar)
+    }
+
+    private func isEmojiSequenceBase(_ scalar: Unicode.Scalar) -> Bool {
+        isVisibleTextBaseScalar(scalar)
+            && scalar.properties.isEmoji
+            && !scalar.properties.isEmojiModifier
+            && !isRegionalIndicator(scalar)
+    }
+
+    private func isKeycapSequence(_ scalars: [Unicode.Scalar]) -> Bool {
+        guard let base = scalars.first, isKeycapBase(base) else { return false }
+        if scalars.count == 2 {
+            return scalars[1].value == 0x20E3
+        }
+        return scalars.count == 3
+            && scalars[1].value == 0xFE0F
+            && scalars[2].value == 0x20E3
+    }
+
+    private func isKeycapBase(_ scalar: Unicode.Scalar) -> Bool {
+        scalar.value == 0x23 || scalar.value == 0x2A
+            || (0x30...0x39).contains(scalar.value)
+    }
+
+    private func isRegionalIndicator(_ scalar: Unicode.Scalar) -> Bool {
+        (0x1F1E6...0x1F1FF).contains(scalar.value)
     }
 
     private func isSubmissionBoundaryScalar(_ scalar: Unicode.Scalar) -> Bool {
@@ -263,26 +344,6 @@ public struct TerminalPermissionPolicy: Sendable {
         }
     }
 
-    private func isEmojiTextBaseScalar(_ scalar: Unicode.Scalar) -> Bool {
-        isVisibleTextBaseScalar(scalar) && scalar.properties.isEmoji
-    }
-
-    private func hasEmojiTextBase(
-        before index: Int,
-        in scalars: [Unicode.Scalar]
-    ) -> Bool {
-        scalars[..<index].last(where: isVisibleTextBaseScalar)
-            .map(isEmojiTextBaseScalar) ?? false
-    }
-
-    private func hasEmojiTextBase(
-        after index: Int,
-        in scalars: [Unicode.Scalar]
-    ) -> Bool {
-        scalars[(index + 1)...].first(where: isVisibleTextBaseScalar)
-            .map(isEmojiTextBaseScalar) ?? false
-    }
-
     private func isForbiddenRawTextScalar(_ scalar: Unicode.Scalar) -> Bool {
         switch scalar.value {
         case 0x0D, 0x0A:
@@ -303,7 +364,7 @@ public struct TerminalPermissionPolicy: Sendable {
         return switch scalar.properties.generalCategory {
         case .control, .format, .lineSeparator, .paragraphSeparator,
             .surrogate, .nonspacingMark, .spacingMark, .enclosingMark,
-            .unassigned:
+            .privateUse, .unassigned:
             false
         default:
             true
