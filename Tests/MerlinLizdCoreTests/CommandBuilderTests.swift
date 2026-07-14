@@ -603,4 +603,230 @@ struct CommandBuilderTests {
             )
         }
     }
+
+    @Test("builds exact current active tmux metadata commands for every route")
+    func buildsCurrentTmuxSurfaceCommands() throws {
+        let format = "#{session_id},#{session_created},#{window_id},#{pane_id},#{pane_current_command}"
+        let local = try MerlinCommands.currentTmuxSurface(
+            target: .local,
+            sessionName: "mlz-shell"
+        )
+        let devbox = try MerlinCommands.currentTmuxSurface(
+            target: .devbox(
+                sid: "dbx_135679", name: "wt_hl", alias: "hl_gpu_2"
+            ),
+            sessionName: "mlz-shell"
+        )
+        let worker = try MerlinCommands.currentTmuxSurface(
+            target: .worker(
+                devboxSID: "dbx_135679", devboxName: "wt_hl",
+                alias: "hl_gpu_2", workerID: "3960209"
+            ),
+            sessionName: "mlz-shell"
+        )
+
+        #expect(local == CommandSpec(
+            executable: "/opt/homebrew/bin/tmux",
+            arguments: [
+                "display-message", "-p", "-t", "mlz-shell", "-F\(format)",
+            ]
+        ))
+        #expect(devbox.arguments.last ==
+            "tmux display-message -p -t mlz-shell -F\(format)")
+        #expect(worker.arguments.last ==
+            "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- tmux display-message -p -t mlz-shell -F\(format)")
+    }
+
+    @Test("targets window navigation to the validated session")
+    func buildsTmuxWindowSelectionCommands() throws {
+        let target = TerminalTarget.devbox(
+            sid: "dbx_135679", name: "wt_hl", alias: "hl_gpu_2"
+        )
+
+        let next = try MerlinCommands.selectTmuxWindow(
+            target: target,
+            sessionName: "mlz-shell",
+            selection: .nextWindow
+        )
+        let previous = try MerlinCommands.selectTmuxWindow(
+            target: target,
+            sessionName: "mlz-shell",
+            selection: .previousWindow
+        )
+        let indexed = try MerlinCommands.selectTmuxWindow(
+            target: .local,
+            sessionName: "mlz-shell",
+            selection: .windowIndex(2)
+        )
+
+        #expect(next.arguments.last == "tmux next-window -t mlz-shell")
+        #expect(previous.arguments.last == "tmux previous-window -t mlz-shell")
+        #expect(indexed.arguments == [
+            "select-window", "-t", "mlz-shell:2",
+        ])
+    }
+
+    @Test("targets directional and cyclic pane navigation from the verified pane")
+    func buildsTmuxPaneSelectionCommands() throws {
+        let directions: [(TmuxVisibleSelection, String)] = [
+            (.paneLeft, "-L"),
+            (.paneRight, "-R"),
+            (.paneUp, "-U"),
+            (.paneDown, "-D"),
+        ]
+        for (selection, flag) in directions {
+            let command = try MerlinCommands.selectTmuxPane(
+                target: .local,
+                paneID: "%456",
+                selection: selection
+            )
+            #expect(command.arguments == [
+                "select-pane", "-t", "%456", flag,
+            ])
+        }
+
+        let next = try MerlinCommands.selectTmuxPane(
+            target: .local,
+            paneID: "%456",
+            selection: .nextPane
+        )
+        let previousWorker = try MerlinCommands.selectTmuxPane(
+            target: .worker(
+                devboxSID: "dbx_135679", devboxName: "wt_hl",
+                alias: "hl_gpu_2", workerID: "3960209"
+            ),
+            paneID: "%456",
+            selection: .previousPane
+        )
+
+        #expect(next.arguments == [
+            "select-pane", "-t", "%456",
+            ";", "select-pane", "-t", ":.+",
+        ])
+        #expect(previousWorker.arguments.last ==
+            "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- tmux select-pane -t %456 '\\;' select-pane -t :.-")
+    }
+
+    @Test("builds exact visible split inspection kill and restore commands")
+    func buildsTemporaryTmuxPaneCommands() throws {
+        let split = try MerlinCommands.splitTmuxPane(
+            target: .local,
+            paneID: "%456"
+        )
+        let inspect = try MerlinCommands.tmuxPaneSurface(
+            target: .local,
+            paneID: "%789"
+        )
+        let kill = try MerlinCommands.killTmuxPane(
+            target: .devbox(
+                sid: "dbx_135679", name: "wt_hl", alias: "hl_gpu_2"
+            ),
+            paneID: "%789"
+        )
+        let restoreWindow = try MerlinCommands.restoreTmuxWindow(
+            target: .local,
+            windowID: "@123"
+        )
+        let restorePane = try MerlinCommands.restoreTmuxPane(
+            target: .local,
+            paneID: "%456"
+        )
+
+        #expect(split.arguments == [
+            "split-window", "-t", "%456", "-P", "-F#{window_id},#{pane_id}",
+        ])
+        #expect(inspect.arguments == [
+            "display-message", "-p", "-t", "%789",
+            "-F#{session_id},#{session_created},#{window_id},#{pane_id},#{pane_current_command}",
+        ])
+        #expect(kill.arguments.last == "tmux kill-pane -t %789")
+        #expect(restoreWindow.arguments == [
+            "select-window", "-t", "@123",
+        ])
+        #expect(restorePane.arguments == [
+            "select-pane", "-t", "%456",
+        ])
+        #expect(!kill.arguments.contains("-a"))
+    }
+
+    @Test("Worker structural formats and selectors survive both shell hops")
+    func workerTmuxSurfaceCommandsSurviveTwoShellHops() async throws {
+        let commands = [
+            try MerlinCommands.currentTmuxSurface(
+                target: workerTarget(), sessionName: "mlz-shell"
+            ),
+            try MerlinCommands.splitTmuxPane(
+                target: workerTarget(), paneID: "%456"
+            ),
+            try MerlinCommands.selectTmuxPane(
+                target: workerTarget(), paneID: "%456", selection: .nextPane
+            ),
+        ]
+        let runner = FoundationInventoryProcessRunner()
+        var reconstructed: [String] = []
+
+        for command in commands {
+            let remote = try #require(command.arguments.last)
+            let output = try await runner.run(.init(
+                executable: "/bin/sh",
+                arguments: ["-c", """
+                mlx() {
+                    while [ "$1" != "--" ]; do shift; done
+                    shift
+                    printf "%s\\n" "$*"
+                }
+                \(remote)
+                """]
+            ))
+            reconstructed.append(output.stdout.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ))
+        }
+
+        #expect(reconstructed == [
+            "tmux display-message -p -t mlz-shell -F#{session_id},#{session_created},#{window_id},#{pane_id},#{pane_current_command}",
+            "tmux split-window -t %456 -P -F#{window_id},#{pane_id}",
+            #"tmux select-pane -t %456 \; select-pane -t :.+"#,
+        ])
+    }
+
+    @Test("rejects untyped tmux selectors and invalid selection families")
+    func rejectsUnsafeTmuxSurfaceCommands() {
+        #expect(throws: CommandValidationError.invalidSessionName) {
+            try MerlinCommands.currentTmuxSurface(
+                target: .local, sessionName: "mlz;id"
+            )
+        }
+        #expect(throws: CommandValidationError.invalidTmuxPaneID) {
+            try MerlinCommands.killTmuxPane(
+                target: .local, paneID: "%2;kill"
+            )
+        }
+        #expect(throws: CommandValidationError.invalidTmuxWindowID) {
+            try MerlinCommands.restoreTmuxWindow(
+                target: .local, windowID: "@2;kill"
+            )
+        }
+        #expect(throws: CommandValidationError.invalidTmuxWindowIndex) {
+            try MerlinCommands.selectTmuxWindow(
+                target: .local,
+                sessionName: "mlz-shell",
+                selection: .windowIndex(-1)
+            )
+        }
+        #expect(throws: CommandValidationError.invalidTmuxSelection) {
+            try MerlinCommands.selectTmuxPane(
+                target: .local,
+                paneID: "%2",
+                selection: .nextWindow
+            )
+        }
+    }
+
+    private func workerTarget() -> TerminalTarget {
+        .worker(
+            devboxSID: "dbx_135679", devboxName: "wt_hl",
+            alias: "hl_gpu_2", workerID: "3960209"
+        )
+    }
 }

@@ -15,6 +15,10 @@ public enum CommandValidationError: Error, Equatable, Sendable {
     case invalidWorkerID
     case invalidSessionName
     case invalidTmuxSessionID
+    case invalidTmuxWindowID
+    case invalidTmuxPaneID
+    case invalidTmuxWindowIndex
+    case invalidTmuxSelection
     case invalidExecutablePath
     case invalidSID
     case workerTargetRequired
@@ -216,6 +220,161 @@ public enum MerlinCommands {
         }
     }
 
+    public static func currentTmuxSurface(
+        target: TerminalTarget,
+        sessionName: String,
+        localTmuxPath: String = "/opt/homebrew/bin/tmux"
+    ) throws -> CommandSpec {
+        try validateSessionName(sessionName)
+        return try tmuxCommand(
+            target: target,
+            arguments: [
+                "display-message", "-p", "-t", sessionName,
+                "-F#{session_id},#{session_created},#{window_id},#{pane_id},#{pane_current_command}",
+            ],
+            localTmuxPath: localTmuxPath
+        )
+    }
+
+    public static func tmuxPaneSurface(
+        target: TerminalTarget,
+        paneID: String,
+        localTmuxPath: String = "/opt/homebrew/bin/tmux"
+    ) throws -> CommandSpec {
+        try validateTmuxPaneID(paneID)
+        return try tmuxCommand(
+            target: target,
+            arguments: [
+                "display-message", "-p", "-t", paneID,
+                "-F#{session_id},#{session_created},#{window_id},#{pane_id},#{pane_current_command}",
+            ],
+            localTmuxPath: localTmuxPath
+        )
+    }
+
+    public static func selectTmuxWindow(
+        target: TerminalTarget,
+        sessionName: String,
+        selection: TmuxVisibleSelection,
+        localTmuxPath: String = "/opt/homebrew/bin/tmux"
+    ) throws -> CommandSpec {
+        try validateSessionName(sessionName)
+        let arguments: [String]
+        switch selection {
+        case .nextWindow:
+            arguments = ["next-window", "-t", sessionName]
+        case .previousWindow:
+            arguments = ["previous-window", "-t", sessionName]
+        case let .windowIndex(index):
+            guard MerlinIdentifierValidator.isTmuxWindowIndex(index) else {
+                throw CommandValidationError.invalidTmuxWindowIndex
+            }
+            arguments = ["select-window", "-t", "\(sessionName):\(index)"]
+        case .paneLeft, .paneRight, .paneUp, .paneDown,
+            .nextPane, .previousPane:
+            throw CommandValidationError.invalidTmuxSelection
+        }
+        return try tmuxCommand(
+            target: target,
+            arguments: arguments,
+            localTmuxPath: localTmuxPath
+        )
+    }
+
+    public static func selectTmuxPane(
+        target: TerminalTarget,
+        paneID: String,
+        selection: TmuxVisibleSelection,
+        localTmuxPath: String = "/opt/homebrew/bin/tmux"
+    ) throws -> CommandSpec {
+        try validateTmuxPaneID(paneID)
+        let arguments: [String]
+        switch selection {
+        case .paneLeft:
+            arguments = ["select-pane", "-t", paneID, "-L"]
+        case .paneRight:
+            arguments = ["select-pane", "-t", paneID, "-R"]
+        case .paneUp:
+            arguments = ["select-pane", "-t", paneID, "-U"]
+        case .paneDown:
+            arguments = ["select-pane", "-t", paneID, "-D"]
+        case .nextPane:
+            arguments = [
+                "select-pane", "-t", paneID,
+                ";", "select-pane", "-t", ":.+",
+            ]
+        case .previousPane:
+            arguments = [
+                "select-pane", "-t", paneID,
+                ";", "select-pane", "-t", ":.-",
+            ]
+        case .nextWindow, .previousWindow, .windowIndex:
+            throw CommandValidationError.invalidTmuxSelection
+        }
+        return try tmuxCommand(
+            target: target,
+            arguments: arguments,
+            localTmuxPath: localTmuxPath
+        )
+    }
+
+    public static func splitTmuxPane(
+        target: TerminalTarget,
+        paneID: String,
+        localTmuxPath: String = "/opt/homebrew/bin/tmux"
+    ) throws -> CommandSpec {
+        try validateTmuxPaneID(paneID)
+        return try tmuxCommand(
+            target: target,
+            arguments: [
+                "split-window", "-t", paneID, "-P",
+                "-F#{window_id},#{pane_id}",
+            ],
+            localTmuxPath: localTmuxPath
+        )
+    }
+
+    public static func killTmuxPane(
+        target: TerminalTarget,
+        paneID: String,
+        localTmuxPath: String = "/opt/homebrew/bin/tmux"
+    ) throws -> CommandSpec {
+        try validateTmuxPaneID(paneID)
+        return try tmuxCommand(
+            target: target,
+            arguments: ["kill-pane", "-t", paneID],
+            localTmuxPath: localTmuxPath
+        )
+    }
+
+    public static func restoreTmuxWindow(
+        target: TerminalTarget,
+        windowID: String,
+        localTmuxPath: String = "/opt/homebrew/bin/tmux"
+    ) throws -> CommandSpec {
+        guard MerlinIdentifierValidator.isTmuxWindowID(windowID) else {
+            throw CommandValidationError.invalidTmuxWindowID
+        }
+        return try tmuxCommand(
+            target: target,
+            arguments: ["select-window", "-t", windowID],
+            localTmuxPath: localTmuxPath
+        )
+    }
+
+    public static func restoreTmuxPane(
+        target: TerminalTarget,
+        paneID: String,
+        localTmuxPath: String = "/opt/homebrew/bin/tmux"
+    ) throws -> CommandSpec {
+        try validateTmuxPaneID(paneID)
+        return try tmuxCommand(
+            target: target,
+            arguments: ["select-pane", "-t", paneID],
+            localTmuxPath: localTmuxPath
+        )
+    }
+
     public static func warmWorker(target: TerminalTarget) throws -> CommandSpec {
         let (alias, workerID) = try validatedWorkerRoute(target)
         return workerCommand(
@@ -382,6 +541,46 @@ public enum MerlinCommands {
         )
     }
 
+    private static func tmuxCommand(
+        target: TerminalTarget,
+        arguments: [String],
+        localTmuxPath: String
+    ) throws -> CommandSpec {
+        switch target {
+        case .local:
+            guard localTmuxPath.hasPrefix("/") else {
+                throw CommandValidationError.invalidExecutablePath
+            }
+            return CommandSpec(
+                executable: localTmuxPath,
+                arguments: arguments
+            )
+        case let .devbox(_, _, alias):
+            try validateAlias(alias)
+            let remoteArguments = arguments.map {
+                $0 == ";" ? #"\;"# : $0
+            }
+            return CommandSpec(
+                executable: "/usr/bin/ssh",
+                arguments: nonInteractiveSSHArguments(
+                    alias: alias,
+                    remoteCommand: "tmux \(remoteArguments.joined(separator: " "))"
+                )
+            )
+        case let .worker(_, _, alias, workerID):
+            try validateAlias(alias)
+            try validateWorkerID(workerID)
+            let remoteArguments = arguments.map {
+                $0 == ";" ? #"'\;'"# : $0
+            }
+            return workerCommand(
+                alias: alias,
+                workerID: workerID,
+                remoteCommands: "tmux \(remoteArguments.joined(separator: " "))"
+            )
+        }
+    }
+
     private static func streamingWorkerCommand(
         alias: String,
         workerID: String,
@@ -467,17 +666,19 @@ public enum MerlinCommands {
         }
     }
 
+    private static func validateTmuxPaneID(_ value: String) throws {
+        guard MerlinIdentifierValidator.isTmuxPaneID(value) else {
+            throw CommandValidationError.invalidTmuxPaneID
+        }
+    }
+
     private static func validateTmuxSessionIdentity(
         _ identity: TmuxSessionIdentity
     ) throws {
         let serverSessionID = identity.serverSessionID
         guard
             identity.createdAtEpoch >= 0,
-            serverSessionID.first == "$",
-            serverSessionID.count > 1,
-            serverSessionID.dropFirst().allSatisfy({
-                $0.isASCII && $0.isNumber
-            })
+            MerlinIdentifierValidator.isTmuxSessionID(serverSessionID)
         else {
             throw CommandValidationError.invalidTmuxSessionID
         }

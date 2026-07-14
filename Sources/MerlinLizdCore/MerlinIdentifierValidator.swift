@@ -20,6 +20,22 @@ public enum MerlinIdentifierValidator {
         matches(value, pattern: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"#)
     }
 
+    public static func isTmuxSessionID(_ value: String) -> Bool {
+        matches(value, pattern: #"^\$[0-9]+$"#)
+    }
+
+    public static func isTmuxWindowID(_ value: String) -> Bool {
+        matches(value, pattern: #"^@[0-9]+$"#)
+    }
+
+    public static func isTmuxPaneID(_ value: String) -> Bool {
+        matches(value, pattern: #"^%[0-9]+$"#)
+    }
+
+    public static func isTmuxWindowIndex(_ value: Int) -> Bool {
+        value >= 0
+    }
+
     private static func matches(_ value: String, pattern: String) -> Bool {
         guard let range = value.range(of: pattern, options: .regularExpression) else {
             return false
