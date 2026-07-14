@@ -45,7 +45,11 @@ public struct TmuxSessionSnapshot: Equatable, Sendable {
 
 public actor TmuxSessionDiscovery {
     private enum SnapshotMutation: Sendable {
-        case rename(from: String, to: String)
+        case rename(
+            from: String,
+            to: String,
+            identity: TmuxSessionIdentity?
+        )
         case terminate(Set<String>)
     }
 
@@ -174,21 +178,25 @@ public actor TmuxSessionDiscovery {
     public func recordRename(
         target: TerminalTarget,
         from currentName: String,
-        to newName: String
+        to newName: String,
+        identity: TmuxSessionIdentity? = nil
     ) {
         recordMutation(
-            .rename(from: currentName, to: newName),
+            .rename(
+                from: currentName,
+                to: newName,
+                identity: identity
+            ),
             target: target
         )
         guard let snapshot = snapshots[target] else { return }
-        guard snapshot.sessions.contains(where: { $0.name == currentName }) else {
-            return
-        }
         let sessions = renamingSessions(
             snapshot.sessions,
             from: currentName,
-            to: newName
+            to: newName,
+            identity: identity
         )
+        guard sessions != snapshot.sessions else { return }
         snapshots[target] = replacingSessions(in: snapshot, with: sessions)
     }
 
@@ -307,11 +315,12 @@ public actor TmuxSessionDiscovery {
     ) -> [TmuxSessionRecord] {
         mutations.reduce(sessions) { current, mutation in
             switch mutation {
-            case let .rename(oldName, newName):
+            case let .rename(oldName, newName, identity):
                 return renamingSessions(
                     current,
                     from: oldName,
-                    to: newName
+                    to: newName,
+                    identity: identity
                 )
             case let .terminate(names):
                 return current.filter { !names.contains($0.name) }
@@ -322,10 +331,18 @@ public actor TmuxSessionDiscovery {
     private func renamingSessions(
         _ sessions: [TmuxSessionRecord],
         from currentName: String,
-        to newName: String
+        to newName: String,
+        identity: TmuxSessionIdentity?
     ) -> [TmuxSessionRecord] {
         sessions.map { session in
-            session.name == currentName
+            let matches = if let identity {
+                session.identity == identity
+            } else {
+                // A name-only mutation can update legacy evidence, but must
+                // never claim a structured same-name replacement.
+                session.identity == nil && session.name == currentName
+            }
+            return matches
                 ? TmuxSessionRecord(
                     name: newName,
                     identity: session.identity

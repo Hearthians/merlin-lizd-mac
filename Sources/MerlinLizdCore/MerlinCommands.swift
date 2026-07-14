@@ -14,6 +14,7 @@ public enum CommandValidationError: Error, Equatable, Sendable {
     case invalidAlias
     case invalidWorkerID
     case invalidSessionName
+    case invalidTmuxSessionID
     case invalidExecutablePath
     case invalidSID
     case workerTargetRequired
@@ -122,13 +123,30 @@ public enum MerlinCommands {
         target: TerminalTarget,
         from currentName: String,
         to newName: String,
+        identity: TmuxSessionIdentity? = nil,
         localTmuxPath: String = "/opt/homebrew/bin/tmux"
     ) throws -> CommandSpec {
         try validateSessionName(currentName)
         try validateSessionName(newName)
 
+        let selector: String
+        let devboxSelector: String
+        let workerSelector: String
+        if let identity {
+            try validateTmuxSessionIdentity(identity)
+            selector = identity.serverSessionID
+            devboxSelector = "'\(identity.serverSessionID)'"
+            // Preserve literal single quotes in mlx's argv. mlx rejoins that
+            // argv for the Worker shell, where they protect the leading `$`.
+            workerSelector = "\"'\\\(identity.serverSessionID)'\""
+        } else {
+            selector = currentName
+            devboxSelector = currentName
+            workerSelector = currentName
+        }
+
         let tmuxArguments = [
-            "rename-session", "-t", currentName, newName,
+            "rename-session", "-t", selector, newName,
         ]
         switch target {
         case .local:
@@ -145,7 +163,7 @@ public enum MerlinCommands {
                 executable: "/usr/bin/ssh",
                 arguments: nonInteractiveSSHArguments(
                     alias: alias,
-                    remoteCommand: "tmux rename-session -t \(currentName) \(newName)"
+                    remoteCommand: "tmux rename-session -t \(devboxSelector) \(newName)"
                 )
             )
         case let .worker(_, _, alias, workerID):
@@ -155,7 +173,7 @@ public enum MerlinCommands {
                 executable: "/usr/bin/ssh",
                 arguments: nonInteractiveSSHArguments(
                     alias: alias,
-                    remoteCommand: "NO_COLOR=1 TERM=dumb mlx worker login \(workerID) -- tmux rename-session -t \(currentName) \(newName)"
+                    remoteCommand: "NO_COLOR=1 TERM=dumb mlx worker login \(workerID) -- tmux rename-session -t \(workerSelector) \(newName)"
                 )
             )
         }
@@ -446,6 +464,22 @@ public enum MerlinCommands {
     private static func validateSessionName(_ value: String) throws {
         guard MerlinIdentifierValidator.isTmuxSessionName(value) else {
             throw CommandValidationError.invalidSessionName
+        }
+    }
+
+    private static func validateTmuxSessionIdentity(
+        _ identity: TmuxSessionIdentity
+    ) throws {
+        let serverSessionID = identity.serverSessionID
+        guard
+            identity.createdAtEpoch >= 0,
+            serverSessionID.first == "$",
+            serverSessionID.count > 1,
+            serverSessionID.dropFirst().allSatisfy({
+                $0.isASCII && $0.isNumber
+            })
+        else {
+            throw CommandValidationError.invalidTmuxSessionID
         }
     }
 

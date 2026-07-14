@@ -47,7 +47,8 @@ public actor TmuxSessionController {
     public func rename(
         target: TerminalTarget,
         from currentName: String,
-        to newName: String
+        to newName: String,
+        identity: TmuxSessionIdentity? = nil
     ) async throws {
         let localPath: String
         if case .local = target {
@@ -63,6 +64,7 @@ public actor TmuxSessionController {
             target: target,
             from: currentName,
             to: newName,
+            identity: identity,
             localTmuxPath: localPath
         )
         let output = try await run(command, target: target)

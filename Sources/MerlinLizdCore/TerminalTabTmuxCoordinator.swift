@@ -78,29 +78,60 @@ public enum TerminalTabTmuxCoordinator {
             throw TerminalTabTmuxCoordinationError.sessionUnavailable
         }
 
+        // Capture provenance before mutation. The same identity selects the
+        // remote session, scopes cache replay, and drives tab propagation.
+        let observedIdentity = await probeIdentity(
+            named: currentName,
+            target: initiatingTab.target,
+            discovery: discovery
+        )
+        var preMutationTabs = state.terminalTabsSnapshot()
+        guard
+            let preMutationIndex = preMutationTabs.firstIndex(where: {
+                $0.id == tabID
+            }),
+            preMutationTabs[preMutationIndex].target == initiatingTab.target,
+            preMutationTabs[preMutationIndex].sessionName == currentName
+        else {
+            throw TerminalTabTmuxCoordinationError.sessionUnavailable
+        }
+        let storedIdentity = preMutationTabs[preMutationIndex].tmuxIdentity
+        if let storedIdentity, let observedIdentity,
+            storedIdentity != observedIdentity
+        {
+            throw TerminalTabTmuxCoordinationError.sessionUnavailable
+        }
+        let renamedIdentity = observedIdentity ?? storedIdentity
+        if preMutationTabs[preMutationIndex].tmuxIdentity == nil,
+            let renamedIdentity
+        {
+            preMutationTabs[preMutationIndex].tmuxIdentity = renamedIdentity
+            state.replaceTerminalTabs(preMutationTabs)
+            state.persistTerminalTabs()
+        }
+
         try await controller.rename(
             target: initiatingTab.target,
             from: currentName,
-            to: newName
+            to: newName,
+            identity: renamedIdentity
         )
         await discovery.recordRename(
             target: initiatingTab.target,
             from: currentName,
-            to: newName
+            to: newName,
+            identity: renamedIdentity
         )
 
         var latestTabs = state.terminalTabsSnapshot()
-        let initiatingIdentity = latestTabs.first(where: {
-            $0.id == tabID
-        })?.tmuxIdentity ?? initiatingTab.tmuxIdentity
         let stableTarget = TerminalTargetIdentity(initiatingTab.target)
         var changed = false
 
         for index in latestTabs.indices {
             let candidate = latestTabs[index]
-            let matchesIdentity = initiatingIdentity != nil
+            let matchesIdentity = renamedIdentity != nil
                 && TerminalTargetIdentity(candidate.target) == stableTarget
-                && candidate.tmuxIdentity == initiatingIdentity
+                && candidate.tmuxIdentity == renamedIdentity
             let matchesLegacyName = candidate.tmuxIdentity == nil
                 && candidate.target == initiatingTab.target
                 && candidate.sessionName == currentName
@@ -113,5 +144,24 @@ public enum TerminalTabTmuxCoordinator {
             state.replaceTerminalTabs(latestTabs)
             state.persistTerminalTabs()
         }
+    }
+
+    private static func probeIdentity(
+        named sessionName: String,
+        target: TerminalTarget,
+        discovery: TmuxSessionDiscovery
+    ) async -> TmuxSessionIdentity? {
+        let snapshot = await discovery.refresh(
+            target: target,
+            lane: .foreground
+        )
+        guard snapshot.readiness == .ready, snapshot.lastError == nil else {
+            return nil
+        }
+        let identities = Set(snapshot.sessions.compactMap { session in
+            session.name == sessionName ? session.identity : nil
+        })
+        guard identities.count == 1 else { return nil }
+        return identities.first
     }
 }

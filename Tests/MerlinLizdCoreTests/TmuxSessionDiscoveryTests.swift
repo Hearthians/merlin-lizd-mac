@@ -230,6 +230,83 @@ struct TmuxSessionDiscoveryTests {
         #expect(await refresh.value.sessions.map(\.name) == ["renamed", "other"])
     }
 
+    @Test("identity-aware rename replay ignores a same-name recreation")
+    func identityRenameReplayIgnoresRecreation() async {
+        let originalIdentity = TmuxSessionIdentity(
+            serverSessionID: "$3",
+            createdAtEpoch: 100
+        )
+        let replacementIdentity = TmuxSessionIdentity(
+            serverSessionID: "$9",
+            createdAtEpoch: 200
+        )
+        let runner = TmuxSnapshotRunner(steps: [
+            .output(.init(
+                stdout: "training,$3,100\n",
+                stderr: "",
+                exitCode: 0
+            )),
+            .gated(.init(
+                stdout: "training,$9,200\n",
+                stderr: "",
+                exitCode: 0
+            )),
+        ])
+        let discovery = TmuxSessionDiscovery(processRunner: runner)
+
+        _ = await discovery.refresh(target: tmuxTestTarget)
+        let refresh = Task { await discovery.refresh(target: tmuxTestTarget) }
+        await runner.waitUntilRunCount(2)
+        await discovery.recordRename(
+            target: tmuxTestTarget,
+            from: "training",
+            to: "renamed",
+            identity: originalIdentity
+        )
+        await runner.releaseGate()
+
+        #expect(await refresh.value.sessions == [
+            TmuxSessionRecord(
+                name: "training",
+                identity: replacementIdentity
+            )
+        ])
+    }
+
+    @Test("legacy rename replay does not claim a structured replacement")
+    func legacyRenameReplayIgnoresStructuredReplacement() async {
+        let replacementIdentity = TmuxSessionIdentity(
+            serverSessionID: "$9",
+            createdAtEpoch: 200
+        )
+        let runner = TmuxSnapshotRunner(steps: [
+            .output(.init(stdout: "training\n", stderr: "", exitCode: 0)),
+            .gated(.init(
+                stdout: "training,$9,200\n",
+                stderr: "",
+                exitCode: 0
+            )),
+        ])
+        let discovery = TmuxSessionDiscovery(processRunner: runner)
+
+        _ = await discovery.refresh(target: tmuxTestTarget)
+        let refresh = Task { await discovery.refresh(target: tmuxTestTarget) }
+        await runner.waitUntilRunCount(2)
+        await discovery.recordRename(
+            target: tmuxTestTarget,
+            from: "training",
+            to: "renamed"
+        )
+        await runner.releaseGate()
+
+        #expect(await refresh.value.sessions == [
+            TmuxSessionRecord(
+                name: "training",
+                identity: replacementIdentity
+            )
+        ])
+    }
+
     @Test("successful in-flight refresh preserves a concurrent termination")
     func successfulRefreshPreservesConcurrentTermination() async {
         let runner = TmuxSnapshotRunner(steps: [
@@ -697,7 +774,8 @@ struct TmuxSessionDiscoveryTests {
         await discovery.recordRename(
             target: target,
             from: "old-name",
-            to: "new-name"
+            to: "new-name",
+            identity: .init(serverSessionID: "$3", createdAtEpoch: 100)
         )
 
         let sessions = await discovery.snapshot(target: target)?.sessions

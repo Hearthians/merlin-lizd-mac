@@ -332,6 +332,109 @@ struct CommandBuilderTests {
             "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- tmux rename-session -t mlz-old training-main")
     }
 
+    @Test("renames a known Worker tmux session by its stable server ID")
+    func buildsIdentityTargetedWorkerTmuxRenameCommand() throws {
+        let command = try MerlinCommands.renameTmuxSession(
+            target: .worker(
+                devboxSID: "dbx_135679",
+                devboxName: "wt_hl",
+                alias: "hl_gpu_2",
+                workerID: "3960209"
+            ),
+            from: "mlz-old",
+            to: "training-main",
+            identity: TmuxSessionIdentity(
+                serverSessionID: "$3",
+                createdAtEpoch: 100
+            )
+        )
+
+        #expect(command.arguments.last ==
+            "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- tmux rename-session -t \"'\\$3'\" training-main")
+    }
+
+    @Test("Worker identity rename preserves the server ID through both shells")
+    func identityRenameSurvivesWorkerShellHops() async throws {
+        let command = try MerlinCommands.renameTmuxSession(
+            target: .worker(
+                devboxSID: "dbx_135679",
+                devboxName: "wt_hl",
+                alias: "hl_gpu_2",
+                workerID: "3960209"
+            ),
+            from: "mlz-old",
+            to: "training-main",
+            identity: TmuxSessionIdentity(
+                serverSessionID: "$3",
+                createdAtEpoch: 100
+            )
+        )
+        let remote = try #require(command.arguments.last)
+        let runner = FoundationInventoryProcessRunner()
+        let devboxShell = """
+        mlx() {
+            while [ "$1" != "--" ]; do shift; done
+            shift
+            printf "%s\\n" "$*"
+        }
+        \(remote)
+        """
+        let devboxOutput = try await runner.run(.init(
+            executable: "/bin/sh",
+            arguments: ["-c", devboxShell]
+        ))
+        let reconstructed = devboxOutput.stdout.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+
+        let directory = temporarySSHDirectory()
+        _ = try await runner.run(.init(
+            executable: "/bin/mkdir",
+            arguments: [directory.path]
+        ))
+        let fakeTmux = """
+        #!/bin/sh
+        printf "__TMUX_ARGS__:%s\\n" "$*"
+        """
+        let installFakeTmux = """
+        printf "%s" '\(fakeTmux)' > \(directory.path)/tmux
+        chmod 700 \(directory.path)/tmux
+        """
+        _ = try await runner.run(.init(
+            executable: "/bin/sh",
+            arguments: ["-c", installFakeTmux]
+        ))
+        let workerOutput = try await runner.run(.init(
+            executable: "/usr/bin/env",
+            arguments: [
+                "PATH=\(directory.path):/usr/bin:/bin",
+                "/bin/sh", "-c", reconstructed,
+            ]
+        ))
+        _ = try await runner.run(.init(
+            executable: "/bin/rm",
+            arguments: ["-rf", directory.path]
+        ))
+
+        #expect(workerOutput.stdout ==
+            "__TMUX_ARGS__:rename-session -t $3 training-main\n")
+    }
+
+    @Test("rejects an unsafe tmux server ID in a rename selector")
+    func rejectsUnsafeTmuxRenameIdentity() {
+        #expect(throws: CommandValidationError.invalidTmuxSessionID) {
+            try MerlinCommands.renameTmuxSession(
+                target: .local,
+                from: "mlz-old",
+                to: "training-main",
+                identity: TmuxSessionIdentity(
+                    serverSessionID: "$3;touch-pwned",
+                    createdAtEpoch: 100
+                )
+            )
+        }
+    }
+
     @Test("terminates one Worker tmux session through its parent Devbox")
     func buildsWorkerTmuxTerminationCommand() throws {
         let command = try MerlinCommands.terminateTmuxSession(
