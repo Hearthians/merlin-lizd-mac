@@ -107,6 +107,7 @@ actor FakeTerminalToolPort: TerminalSessionPort {
 
     private var snapshot: TerminalScreenSnapshot
     private var waitResults: [TerminalScreenWaitResult] = []
+    private var observeFailures: [Failure?] = []
     private var waitFailures: [Failure?] = []
     private var sendFailures: [Failure?] = []
     private var sentBatches: [TerminalInputBatch] = []
@@ -142,6 +143,11 @@ actor FakeTerminalToolPort: TerminalSessionPort {
             if checkCancellationAfterObserveGate {
                 try Task.checkCancellation()
             }
+        }
+        if !observeFailures.isEmpty,
+            let failure = observeFailures.removeFirst()
+        {
+            throw failure
         }
         return snapshot
     }
@@ -200,6 +206,10 @@ actor FakeTerminalToolPort: TerminalSessionPort {
 
     func enqueueWait(_ result: TerminalScreenWaitResult) {
         waitResults.append(result)
+    }
+
+    func enqueueObserveFailure(_ failure: Failure?) {
+        observeFailures.append(failure)
     }
 
     func enqueueWaitFailure(_ failure: Failure?) {

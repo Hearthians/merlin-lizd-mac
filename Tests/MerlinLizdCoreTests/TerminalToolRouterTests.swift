@@ -1,6 +1,53 @@
 import Testing
 @testable import MerlinLizdCore
 
+private struct IndeterminateAuditShape: Equatable {
+    let requestCount: Int
+    let indeterminateCount: Int
+    let requestPrecedesIndeterminate: Bool
+
+    static let complete = IndeterminateAuditShape(
+        requestCount: 1,
+        indeterminateCount: 1,
+        requestPrecedesIndeterminate: true
+    )
+}
+
+private func indeterminateAuditShapes(
+    journal: MemoryTerminalToolJournal,
+    lease: TemporaryPaneLease
+) async -> [IndeterminateAuditShape] {
+    let events = await journal.snapshot()
+    return events.indices.compactMap { indeterminateIndex -> IndeterminateAuditShape? in
+        let event = events[indeterminateIndex]
+        guard case let .temporaryPane(.indeterminate(id, _, _)) = event.kind,
+            id == lease.id
+        else { return nil }
+        let matchingIndexes = events.indices.filter {
+            events[$0].operationID == event.operationID
+        }
+        let requestIndexes = matchingIndexes.filter { index in
+            guard case .request(operation: "finishTemporaryPane", _) =
+                events[index].kind
+            else { return false }
+            return true
+        }
+        let indeterminateIndexes = matchingIndexes.filter { index in
+            guard case let .temporaryPane(.indeterminate(id, _, _)) =
+                events[index].kind,
+                id == lease.id
+            else { return false }
+            return true
+        }
+        return IndeterminateAuditShape(
+            requestCount: requestIndexes.count,
+            indeterminateCount: indeterminateIndexes.count,
+            requestPrecedesIndeterminate: requestIndexes.count == 1
+                && requestIndexes[0] < indeterminateIndex
+        )
+    }
+}
+
 @Suite("Terminal tool router", .serialized)
 struct TerminalToolRouterTests {
     @Test("all six tools use the pinned endpoint and journal before each action")
@@ -1132,7 +1179,7 @@ struct TerminalToolRouterTests {
         }
 
         await journal.failOnAppend(nil)
-        await #expect(throws: TerminalToolRouterError.liveLeaseExists) {
+        await #expect(throws: TerminalToolRouterError.auditUnavailable) {
             try await router.execute(
                 handle: threadID,
                 turnID: turnID,
@@ -1690,7 +1737,7 @@ struct TerminalToolRouterTests {
             _ = try await finish.value
         }
         await journal.failOnAppend(nil)
-        await #expect(throws: TerminalToolRouterError.leaseNotFound) {
+        await #expect(throws: TerminalToolRouterError.auditUnavailable) {
             _ = try await router.execute(
                 handle: handle,
                 turnID: turnID,
@@ -1815,7 +1862,7 @@ struct TerminalToolRouterTests {
             case .created, .indeterminate: false
             }
         })
-        await #expect(throws: TerminalToolRouterError.liveLeaseExists) {
+        await #expect(throws: TerminalToolRouterError.auditUnavailable) {
             _ = try await fixture.router.execute(
                 handle: fixture.handle,
                 turnID: fixture.turnID,
@@ -1826,6 +1873,99 @@ struct TerminalToolRouterTests {
         #expect(await fixture.surfaces.recordedCalls().filter {
             $0 == "close:\(fixture.lease.temporary.paneID)"
         }.count == 1)
+    }
+
+    @Test("every indeterminate finish operation journals one request first")
+    func indeterminateFinishAuditGrammarIsComplete() async throws {
+        let reason = TmuxTemporaryPaneCloseIndeterminateReason(
+            mutationFailure: .transportUnavailable,
+            reconciliationFailure: .unavailable
+        )
+        let fixture = try await finishFixture(
+            closeOutcome: .indeterminate(reason: reason),
+            revision: 5_921,
+            paneID: "%indeterminate-grammar",
+            nonce: "DC1D"
+        )
+        #expect(
+            await indeterminateAuditShapes(
+                journal: fixture.journal,
+                lease: fixture.lease
+            ) == [.complete]
+        )
+
+        await fixture.port.enqueueObserveFailure(.observe)
+        #expect(
+            try await fixture.router.execute(
+                handle: fixture.handle,
+                turnID: fixture.turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .finishTemporaryPane(
+                    leaseID: fixture.lease.id,
+                    expectedRevision: 5_923
+                )
+            ) == .temporaryPaneFinished(
+                .indeterminate(fixture.lease, reason: reason)
+            )
+        )
+        #expect(
+            await indeterminateAuditShapes(
+                journal: fixture.journal,
+                lease: fixture.lease
+            ) == [.complete, .complete]
+        )
+
+        await fixture.port.enqueueWait(.init(
+            snapshot: TerminalToolFixtures.screen(
+                revision: 5_924,
+                text: "BDC1D\nEDC1D\n$ "
+            ),
+            timedOut: false
+        ))
+        let retry = Task {
+            try await fixture.router.execute(
+                handle: fixture.handle,
+                turnID: fixture.turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .finishTemporaryPane(
+                    leaseID: fixture.lease.id,
+                    expectedRevision: 5_923
+                )
+            )
+        }
+        try await approveNextRequest(router: fixture.router)
+        #expect(
+            try await retry.value == .temporaryPaneFinished(
+                .indeterminate(fixture.lease, reason: reason)
+            )
+        )
+        #expect(
+            await indeterminateAuditShapes(
+                journal: fixture.journal,
+                lease: fixture.lease
+            ) == [.complete, .complete, .complete]
+        )
+
+        await fixture.registry.unregister(fixture.endpointID)
+        #expect(
+            try await fixture.router.execute(
+                handle: fixture.handle,
+                turnID: fixture.turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .finishTemporaryPane(
+                    leaseID: fixture.lease.id,
+                    expectedRevision: 5_923
+                )
+            ) == .temporaryPaneFinished(
+                .indeterminate(fixture.lease, reason: reason)
+            )
+        )
+        #expect(
+            await indeterminateAuditShapes(
+                journal: fixture.journal,
+                lease: fixture.lease
+            ) == [.complete, .complete, .complete, .complete]
+        )
     }
 
     @Test("indeterminate audit failure preserves quarantine for explicit retry")
@@ -1899,7 +2039,60 @@ struct TerminalToolRouterTests {
         ) {
             _ = try await finish.value
         }
-        await #expect(throws: TerminalToolRouterError.liveLeaseExists) {
+        await journal.failOnAppend(nil)
+        let countsBeforeBlockedCalls = await port.counts()
+        let surfaceCallsBeforeBlockedCalls = await surfaces.recordedCalls()
+
+        await #expect(throws: TerminalToolRouterError.auditUnavailable) {
+            _ = try await router.execute(
+                handle: handle,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .sendInput(
+                    TerminalToolFixtures.input(revision: revision + 2)
+                )
+            )
+        }
+        let selectionCompletion = TerminalToolCompletionProbe()
+        let selection = Task {
+            do {
+                _ = try await router.execute(
+                    handle: handle,
+                    turnID: turnID,
+                    conversationKey: TerminalToolFixtures.key,
+                    call: .selectVisibleSurface(
+                        .nextPane,
+                        expectedRevision: revision + 2
+                    )
+                )
+                await selectionCompletion.complete(with: nil)
+            } catch let error as TerminalToolRouterError {
+                await selectionCompletion.complete(with: error)
+            } catch {
+                await selectionCompletion.complete(with: .surfaceFailure)
+            }
+        }
+        for _ in 0..<100 {
+            let completion = await selectionCompletion.snapshot()
+            let hasPendingApproval = !(await router.pendingApprovals()).isEmpty
+            if completion.didComplete
+                || hasPendingApproval
+            {
+                break
+            }
+            await Task.yield()
+        }
+        let selectionSnapshot = await selectionCompletion.snapshot()
+        let unexpectedApprovals = await router.pendingApprovals()
+        #expect(selectionSnapshot.didComplete)
+        #expect(selectionSnapshot.error == .auditUnavailable)
+        #expect(unexpectedApprovals.isEmpty)
+        for request in unexpectedApprovals {
+            _ = await router.denyApproval(request.id)
+        }
+        await selection.value
+
+        await #expect(throws: TerminalToolRouterError.auditUnavailable) {
             _ = try await router.execute(
                 handle: handle,
                 turnID: turnID,
@@ -1907,8 +2100,50 @@ struct TerminalToolRouterTests {
                 call: .createTemporaryPane(expectedRevision: revision + 2)
             )
         }
+        await #expect(throws: TerminalToolRouterError.auditUnavailable) {
+            _ = try await router.execute(
+                handle: handle,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .finishTemporaryPane(
+                    leaseID: TerminalToolFixtures.newID(),
+                    expectedRevision: revision + 2
+                )
+            )
+        }
+        #expect(await port.counts().send == countsBeforeBlockedCalls.send)
+        #expect(await surfaces.recordedCalls() == surfaceCallsBeforeBlockedCalls)
 
-        await journal.failOnAppend(nil)
+        await journal.setFailAppend(true)
+        await #expect(
+            throws: TerminalToolRouterError
+                .temporaryPaneCloseIndeterminateAuditUnavailable(
+                    lease,
+                    reason: reason
+                )
+        ) {
+            _ = try await router.execute(
+                handle: handle,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .finishTemporaryPane(
+                    leaseID: lease.id,
+                    expectedRevision: revision + 2
+                )
+            )
+        }
+        await journal.setFailAppend(false)
+        await #expect(throws: TerminalToolRouterError.auditUnavailable) {
+            _ = try await router.execute(
+                handle: handle,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .sendInput(
+                    TerminalToolFixtures.input(revision: revision + 2)
+                )
+            )
+        }
+
         await port.enqueueWait(.init(
             snapshot: TerminalToolFixtures.screen(
                 revision: revision + 3,
@@ -1935,6 +2170,19 @@ struct TerminalToolRouterTests {
         #expect(await surfaces.recordedCalls().filter {
             $0 == "close:\(temporary.paneID)"
         }.count == 2)
+        #expect(
+            try await router.execute(
+                handle: handle,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .sendInput(
+                    TerminalToolFixtures.input(revision: revision + 3)
+                )
+            ) == .inputAccepted(.init(
+                acceptedRevision: revision + 3,
+                byteCount: 1
+            ))
+        )
     }
 
     @Test("turn termination preserves indeterminate audit semantics")
@@ -4047,8 +4295,11 @@ struct TerminalToolRouterTests {
         router: TerminalToolRouter,
         handle: AgentTurnHandle,
         turnID: AgentTurnID,
+        port: FakeTerminalToolPort,
         journal: MemoryTerminalToolJournal,
-        surfaces: FakeTerminalSurfaceController
+        surfaces: FakeTerminalSurfaceController,
+        registry: TerminalEndpointRegistry,
+        endpointID: TerminalEndpointID
     ) {
         let initial = TerminalToolFixtures.screen(revision: revision)
         let paneScreen = TerminalToolFixtures.screen(revision: revision + 1)
@@ -4066,11 +4317,27 @@ struct TerminalToolRouterTests {
         )
         await surfaces.setCloseOutcome(closeOutcome)
         let journal = MemoryTerminalToolJournal()
-        let (router, handle, turnID) = try await makeRouter(
-            port: port,
-            surfaces: surfaces,
+        let registry = TerminalEndpointRegistry()
+        let endpointID = TerminalEndpointID(
+            rawValue: TerminalToolFixtures.newID()
+        )
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: endpointID.rawValue,
+                port: port,
+                controller: surfaces
+            )
+        )
+        let router = TerminalToolRouter(
+            registry: registry,
+            approvalBroker: TerminalApprovalBroker(),
             journal: journal,
-            nonce: nonce
+            nonce: { _ in nonce }
+        )
+        let turnID = AgentTurnID(rawValue: "turn")
+        let handle = try await router.beginTurn(
+            threadID: AgentThreadID(rawValue: "thread"),
+            conversationKey: TerminalToolFixtures.key
         )
         let create = Task {
             try await router.execute(
@@ -4117,8 +4384,11 @@ struct TerminalToolRouterTests {
             router,
             handle,
             turnID,
+            port,
             journal,
-            surfaces
+            surfaces,
+            registry,
+            endpointID
         )
     }
 

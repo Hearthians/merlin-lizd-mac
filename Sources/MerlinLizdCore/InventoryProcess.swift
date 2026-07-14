@@ -219,11 +219,14 @@ actor BoundedInventoryProcessRunner: InventoryProcessRunning {
 }
 
 final class FoundationInventoryProcessRunner: InventoryProcessRunning, @unchecked Sendable {
+    private let processExitBoundaryHook: @Sendable () async -> Void
     private let completionBoundaryHook: @Sendable () async -> Void
 
     init(
+        processExitBoundaryHook: @escaping @Sendable () async -> Void = {},
         completionBoundaryHook: @escaping @Sendable () async -> Void = {}
     ) {
+        self.processExitBoundaryHook = processExitBoundaryHook
         self.completionBoundaryHook = completionBoundaryHook
     }
 
@@ -256,6 +259,7 @@ final class FoundationInventoryProcessRunner: InventoryProcessRunning, @unchecke
             async let stdoutData = Task.detached { stdout.readToEnd() }.value
             async let stderrData = Task.detached { stderr.readToEnd() }.value
             let exitCode = await processBox.waitForExit()
+            await processExitBoundaryHook()
 
             let output = await InventoryProcessOutput(
                 stdout: String(decoding: stdoutData, as: UTF8.self),
@@ -263,8 +267,9 @@ final class FoundationInventoryProcessRunner: InventoryProcessRunning, @unchecke
                 exitCode: exitCode
             )
             await processBox.reap()
+            let completionFinalized = processBox.finalizeCompletion()
             await completionBoundaryHook()
-            guard processBox.completionPrecededCancellation else {
+            guard completionFinalized else {
                 throw CancellationError()
             }
             return output
@@ -530,7 +535,7 @@ private final class RunningProcessBox: @unchecked Sendable {
     private var processID: pid_t?
     private var processGroupID: pid_t?
     private var observedExitCode: Int32?
-    private var didCompletionPrecedeCancellation: Bool?
+    private var completionFinalized = false
     private var exitWaiter: CheckedContinuation<Int32, Never>?
     private var reapWaiter: CheckedContinuation<pid_t?, Never>?
 
@@ -608,10 +613,12 @@ private final class RunningProcessBox: @unchecked Sendable {
         } while waitResult == -1 && errno == EINTR
     }
 
-    var completionPrecededCancellation: Bool {
+    func finalizeCompletion() -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        return didCompletionPrecedeCancellation == true
+        guard !cancellationRequested else { return false }
+        completionFinalized = true
+        return true
     }
 
     @discardableResult
@@ -619,7 +626,7 @@ private final class RunningProcessBox: @unchecked Sendable {
         var groupToTerminate: pid_t?
 
         lock.lock()
-        guard observedExitCode == nil, !reapCommitted else {
+        guard !completionFinalized else {
             lock.unlock()
             return false
         }
@@ -793,7 +800,6 @@ private final class RunningProcessBox: @unchecked Sendable {
             return
         }
         observedExitCode = status
-        didCompletionPrecedeCancellation = !cancellationRequested
         let waiter = exitWaiter
         exitWaiter = nil
         lock.unlock()

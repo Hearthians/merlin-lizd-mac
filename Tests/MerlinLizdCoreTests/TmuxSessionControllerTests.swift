@@ -288,10 +288,12 @@ struct TmuxSessionControllerTests {
             .output(splitOutput(paneID: "%36")),
             .output(surfaceOutput(paneID: "%36")),
             .output(surfaceOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%35")),
             .output(successfulOutput()),
             .output(successfulOutput()),
             .output(successfulOutput()),
             .output(surfaceOutput(paneID: "%34")),
+            .output(surfaceOutput(paneID: "%36")),
             .output(surfaceOutput(paneID: "%36")),
             .output(successfulOutput()),
             .output(successfulOutput()),
@@ -382,6 +384,7 @@ struct TmuxSessionControllerTests {
             .output(splitOutput(paneID: "%35")),
             .output(surfaceOutput(paneID: "%35")),
             .wait(gate, then: surfaceOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%35")),
             .output(successfulOutput()),
             .output(successfulOutput()),
             .output(successfulOutput()),
@@ -436,6 +439,7 @@ struct TmuxSessionControllerTests {
             .output(surfaceOutput(paneID: "%35")),
             .wait(probeGate, then: surfaceOutput(paneID: "%35")),
             .output(surfaceOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%35")),
             .output(successfulOutput()),
             .output(successfulOutput()),
             .output(successfulOutput()),
@@ -480,7 +484,7 @@ struct TmuxSessionControllerTests {
         #expect(try await controller.currentSurface(
             route: localRoute()
         ) == surface(paneID: "%34"))
-        #expect(await runner.commands().count == 9)
+        #expect(await runner.commands().count == 10)
     }
 
     @Test("cancellation after kill reports committed close and consumes ownership")
@@ -488,6 +492,7 @@ struct TmuxSessionControllerTests {
         let killGate = AsyncStartGate()
         let runner = GatedSurfaceRunner(actions: [
             .output(splitOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%35")),
             .output(surfaceOutput(paneID: "%35")),
             .output(surfaceOutput(paneID: "%35")),
             .wait(killGate, then: successfulOutput()),
@@ -514,7 +519,7 @@ struct TmuxSessionControllerTests {
             try await close.value
                 == .closed(restoration: .failed(.cancelled))
         )
-        #expect(await runner.commands().count == 4)
+        #expect(await runner.commands().count == 5)
         #expect(
             try await controller.closeTemporaryPane(
                 "%35",
@@ -529,7 +534,7 @@ struct TmuxSessionControllerTests {
         #expect(try await controller.currentSurface(
             route: localRoute()
         ) == surface(paneID: "%34"))
-        #expect(await runner.commands().count == 5)
+        #expect(await runner.commands().count == 6)
     }
 
     @Test("a failed same-route operation releases the next FIFO waiter")
@@ -1251,11 +1256,11 @@ struct TmuxSessionControllerTests {
         )
 
         let commands = await runner.commands()
-        #expect(commands.count == 7)
+        #expect(commands.count == 8)
         #expect(commands.prefix(2).allSatisfy {
             $0.arguments.contains("old_alias")
         })
-        #expect(commands.suffix(5).allSatisfy {
+        #expect(commands.suffix(6).allSatisfy {
             $0.arguments.contains("new_alias")
         })
         #expect(commands.last?.arguments.last?.contains(
@@ -1360,11 +1365,12 @@ struct TmuxSessionControllerTests {
         #expect(close == .closed(restoration: .restored))
 
         let arguments = await runner.commands().map(\.arguments)
-        #expect(arguments.suffix(5) == [
+        #expect(arguments.suffix(6) == [
             [
                 "display-message", "-p", "-t", "%35",
                 "-F#{session_id},#{session_created},#{window_id},#{pane_id},#{pane_current_command}",
             ],
+            currentSurfaceArguments(sessionName: "mlz-shell"),
             ["kill-pane", "-t", "%35"],
             ["select-window", "-t", "@12"],
             ["select-pane", "-t", "%34"],
@@ -1372,7 +1378,7 @@ struct TmuxSessionControllerTests {
                 "display-message", "-p", "-t", "mlz-shell",
                 "-F#{session_id},#{session_created},#{window_id},#{pane_id},#{pane_current_command}",
             ],
-        ].suffix(5))
+        ].suffix(6))
         let killCommands = arguments.filter { $0.first == "kill-pane" }
         #expect(killCommands == [["kill-pane", "-t", "%35"]])
         #expect(!arguments.flatMap { $0 }.contains("-a"))
@@ -1419,6 +1425,7 @@ struct TmuxSessionControllerTests {
             ),
             surfaceOutput(paneID: "%35"),
             surfaceOutput(paneID: "%35"),
+            surfaceOutput(paneID: "%35"),
             successfulOutput(),
             InventoryProcessOutput(
                 stdout: "", stderr: "can't find window: @12", exitCode: 1
@@ -1457,6 +1464,7 @@ struct TmuxSessionControllerTests {
             .output(splitOutput(paneID: "%35")),
             .output(surfaceOutput(paneID: "%35")),
             .output(surfaceOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%35")),
             .transportUnavailable,
             .output(surfaceOutput(paneID: "%35")),
         ])
@@ -1478,13 +1486,14 @@ struct TmuxSessionControllerTests {
         #expect(arguments.filter { $0.first == "kill-pane" } == [[
             "kill-pane", "-t", "%35",
         ]])
-        #expect(arguments.filter { $0.first == "display-message" }.count == 3)
+        #expect(arguments.filter { $0.first == "display-message" }.count == 4)
     }
 
     @Test("failed kill reconciles an absent exact pane as committed")
     func failedKillWithAbsentPaneIsClosed() async throws {
         let runner = GatedSurfaceRunner(actions: [
             .output(splitOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%35")),
             .output(surfaceOutput(paneID: "%35")),
             .output(surfaceOutput(paneID: "%35")),
             .transportUnavailable,
@@ -1532,9 +1541,11 @@ struct TmuxSessionControllerTests {
             .output(splitOutput(paneID: "%35")),
             .output(surfaceOutput(paneID: "%35")),
             .output(surfaceOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%35")),
             .transportUnavailable,
             .sensitiveFailure("first reconciliation secret"),
             .sensitiveFailure("second reconciliation secret"),
+            .output(surfaceOutput(paneID: "%35")),
             .output(surfaceOutput(paneID: "%35")),
             .output(successfulOutput()),
             .output(successfulOutput()),
@@ -1578,6 +1589,154 @@ struct TmuxSessionControllerTests {
         #expect(!commands.flatMap(\.arguments).contains {
             $0.contains("secret")
         })
+    }
+
+    @Test("a same-window user switch before kill preserves ownership")
+    func visiblePaneSwitchBeforeKillDoesNotClose() async throws {
+        let runner = GatedSurfaceRunner(actions: [
+            .output(splitOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%36")),
+            .output(surfaceOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%35")),
+            .output(successfulOutput()),
+            .output(successfulOutput()),
+            .output(successfulOutput()),
+            .output(surfaceOutput(paneID: "%34")),
+        ])
+        let controller = TmuxSessionController(processRunner: runner)
+        let origin = surface(paneID: "%34")
+        _ = try await controller.createTemporaryPane(
+            from: origin,
+            route: localRoute()
+        )
+
+        #expect(
+            try await controller.closeTemporaryPane(
+                "%35",
+                restoring: origin,
+                route: localRoute()
+            ) == .notCommitted(reason: .visibleSurfaceChanged)
+        )
+        #expect(await runner.commands().filter {
+            $0.arguments.first == "kill-pane"
+        }.isEmpty)
+
+        #expect(
+            try await controller.closeTemporaryPane(
+                "%35",
+                restoring: origin,
+                route: localRoute()
+            ) == .closed(restoration: .restored)
+        )
+        #expect(await runner.commands().filter {
+            $0.arguments.first == "kill-pane"
+        }.count == 1)
+    }
+
+    @Test("a leased pane moved to another window is not authorized for kill")
+    func movedLeasePaneBeforeKillDoesNotClose() async throws {
+        let runner = GatedSurfaceRunner(actions: [
+            .output(splitOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%35")),
+            .output(surfaceOutput(windowID: "@13", paneID: "%35")),
+            .output(surfaceOutput(windowID: "@13", paneID: "%35")),
+            .output(surfaceOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%35")),
+            .output(successfulOutput()),
+            .output(successfulOutput()),
+            .output(successfulOutput()),
+            .output(surfaceOutput(paneID: "%34")),
+        ])
+        let controller = TmuxSessionController(processRunner: runner)
+        let origin = surface(paneID: "%34")
+        _ = try await controller.createTemporaryPane(
+            from: origin,
+            route: localRoute()
+        )
+
+        #expect(
+            try await controller.closeTemporaryPane(
+                "%35",
+                restoring: origin,
+                route: localRoute()
+            ) == .notCommitted(reason: .visibleSurfaceChanged)
+        )
+        #expect(await runner.commands().filter {
+            $0.arguments.first == "kill-pane"
+        }.isEmpty)
+
+        #expect(
+            try await controller.closeTemporaryPane(
+                "%35",
+                restoring: origin,
+                route: localRoute()
+            ) == .closed(restoration: .restored)
+        )
+    }
+
+    @Test("quarantine retry stays indeterminate while the leased pane is hidden")
+    func quarantineRetryRequiresCurrentVisibleLease() async throws {
+        let unavailable = TmuxTemporaryPaneCloseIndeterminateReason(
+            mutationFailure: .transportUnavailable,
+            reconciliationFailure: .unavailable
+        )
+        let hidden = TmuxTemporaryPaneCloseIndeterminateReason(
+            mutationFailure: .transportUnavailable,
+            reconciliationFailure: .visibleSurfaceChanged
+        )
+        let runner = GatedSurfaceRunner(actions: [
+            .output(splitOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%35")),
+            .transportUnavailable,
+            .sensitiveFailure("reconciliation unavailable"),
+            .output(surfaceOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%36")),
+            .output(surfaceOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%35")),
+            .output(successfulOutput()),
+            .output(successfulOutput()),
+            .output(successfulOutput()),
+            .output(surfaceOutput(paneID: "%34")),
+        ])
+        let controller = TmuxSessionController(processRunner: runner)
+        let origin = surface(paneID: "%34")
+        _ = try await controller.createTemporaryPane(
+            from: origin,
+            route: localRoute()
+        )
+
+        #expect(
+            try await controller.closeTemporaryPane(
+                "%35",
+                restoring: origin,
+                route: localRoute()
+            ) == .indeterminate(reason: unavailable)
+        )
+        #expect(
+            try await controller.closeTemporaryPane(
+                "%35",
+                restoring: origin,
+                route: localRoute()
+            ) == .indeterminate(reason: hidden)
+        )
+        #expect(await runner.commands().filter {
+            $0.arguments.first == "kill-pane"
+        }.count == 1)
+
+        #expect(
+            try await controller.closeTemporaryPane(
+                "%35",
+                restoring: origin,
+                route: localRoute()
+            ) == .closed(restoration: .restored)
+        )
+        #expect(await runner.commands().filter {
+            $0.arguments.first == "kill-pane"
+        }.count == 2)
     }
 }
 
@@ -1729,6 +1888,7 @@ private func retainedPaneActions(
 private func closeLifecycleActions() -> [GatedSurfaceRunner.Action] {
     [
         .output(surfaceOutput(paneID: "%35")),
+        .output(surfaceOutput(paneID: "%35")),
         .output(successfulOutput()),
         .output(successfulOutput()),
         .output(successfulOutput()),
@@ -1806,12 +1966,13 @@ private func expectRetainedPaneRecovery(
     )
 
     let commands = await runner.commands().map(\.arguments)
-    #expect(commands.count == creationCommandCount + 5)
-    #expect(Array(commands.suffix(5)) == [
+    #expect(commands.count == creationCommandCount + 6)
+    #expect(Array(commands.suffix(6)) == [
         [
             "display-message", "-p", "-t", "%35",
             "-F#{session_id},#{session_created},#{window_id},#{pane_id},#{pane_current_command}",
         ],
+        currentSurfaceArguments(sessionName: "mlz-shell"),
         ["kill-pane", "-t", "%35"],
         ["select-window", "-t", "@12"],
         ["select-pane", "-t", "%34"],
@@ -1829,7 +1990,7 @@ private func expectRetainedPaneRecovery(
         )
             == .notCommitted(reason: .paneNotOwned)
     )
-    #expect(await runner.commands().count == creationCommandCount + 5)
+    #expect(await runner.commands().count == creationCommandCount + 6)
 }
 
 private func surface(
@@ -1919,6 +2080,7 @@ private func successfulLeaseLifecycle() -> [InventoryProcessOutput] {
         InventoryProcessOutput(
             stdout: "@12,%35\n", stderr: "", exitCode: 0
         ),
+        surfaceOutput(paneID: "%35"),
         surfaceOutput(paneID: "%35"),
         surfaceOutput(paneID: "%35"),
         successfulOutput(),

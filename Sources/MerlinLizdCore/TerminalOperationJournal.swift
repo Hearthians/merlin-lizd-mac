@@ -52,6 +52,7 @@ public enum TerminalJournalRetentionReasonCode: String, Codable, Equatable, Send
     case controllerCommandFailed
     case controllerInvalidSurfaceOutput
     case controllerSessionIdentityMismatch
+    case controllerVisibleSurfaceChanged
     case controllerCreatedPaneNotCurrent
     case controllerUnavailable
     case controllerPaneNotOwned
@@ -105,6 +106,8 @@ public enum TerminalJournalRetentionReasonCode: String, Codable, Equatable, Send
                 self = .controllerInvalidSurfaceOutput
             case .sessionIdentityMismatch:
                 self = .controllerSessionIdentityMismatch
+            case .visibleSurfaceChanged:
+                self = .controllerVisibleSurfaceChanged
             case .unavailable: self = .controllerUnavailable
             }
         }
@@ -146,6 +149,7 @@ public enum TerminalJournalRetentionReasonCode: String, Codable, Equatable, Send
             ("commandFailed", .controllerCommandFailed),
             ("invalidSurfaceOutput", .controllerInvalidSurfaceOutput),
             ("sessionIdentityMismatch", .controllerSessionIdentityMismatch),
+            ("visibleSurfaceChanged", .controllerVisibleSurfaceChanged),
             ("createdPaneNotCurrent", .controllerCreatedPaneNotCurrent),
             ("unavailable", .controllerUnavailable),
         ]

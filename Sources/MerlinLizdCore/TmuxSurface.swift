@@ -77,6 +77,7 @@ public enum TmuxTemporaryPaneCloseFailureReason: String, Codable, Equatable,
     case commandFailed
     case invalidSurfaceOutput
     case sessionIdentityMismatch
+    case visibleSurfaceChanged
     case unavailable
 }
 
