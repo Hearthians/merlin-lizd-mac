@@ -1045,7 +1045,13 @@ public actor TerminalToolRouter {
         do {
             screen = try await binding.endpoint.terminal.observeScreen()
         } catch is CancellationError {
-            throw TerminalToolRouterError.interrupted
+            return try await retainExistingLease(
+                record,
+                reason: .interrupted,
+                operationID: UUID(),
+                turn: turn,
+                binding: binding
+            )
         } catch {
             return try await retainExistingLease(
                 record,
@@ -1142,6 +1148,14 @@ public actor TerminalToolRouter {
             throw TerminalToolRouterError.temporaryPaneAuditUnavailable(
                 record.provenance,
                 reason: .auditUnavailable
+            )
+        } catch TerminalToolRouterError.interrupted {
+            return try await retainExistingLease(
+                record,
+                reason: .interrupted,
+                operationID: UUID(),
+                turn: turn,
+                binding: record.binding
             )
         } catch is CancellationError {
             return try await retainExistingLease(

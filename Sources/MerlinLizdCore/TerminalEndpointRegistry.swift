@@ -61,14 +61,30 @@ public enum TerminalEndpointPinPhase: Hashable, Sendable {
     case active
 }
 
-public struct TerminalEndpointPin: Hashable, Sendable {
+public struct TerminalEndpointPinID: Hashable, Sendable {
     public let handle: AgentTurnHandle
     public let bindingToken: TerminalEndpointBindingToken
+
+    public init(
+        handle: AgentTurnHandle,
+        bindingToken: TerminalEndpointBindingToken
+    ) {
+        self.handle = handle
+        self.bindingToken = bindingToken
+    }
+}
+
+public struct TerminalEndpointPin: Hashable, Sendable {
+    public let id: TerminalEndpointPinID
     public let turnID: AgentTurnID?
     public let phase: TerminalEndpointPinPhase
     public let conversationKey: TerminalConversationKey
     public let endpointID: TerminalEndpointID
 
+    public var handle: AgentTurnHandle { id.handle }
+    public var bindingToken: TerminalEndpointBindingToken {
+        id.bindingToken
+    }
     public var threadID: AgentThreadID {
         handle.threadID
     }
@@ -81,8 +97,10 @@ public struct TerminalEndpointPin: Hashable, Sendable {
         conversationKey: TerminalConversationKey,
         endpointID: TerminalEndpointID
     ) {
-        self.handle = handle
-        self.bindingToken = bindingToken
+        self.id = TerminalEndpointPinID(
+            handle: handle,
+            bindingToken: bindingToken
+        )
         self.turnID = turnID
         self.phase = phase
         self.conversationKey = conversationKey
@@ -111,12 +129,16 @@ public struct TerminalEndpointPinLoss: Equatable, Sendable {
 }
 
 public enum TerminalEndpointRegistryEvent: Equatable, Sendable {
+    case upsert(TerminalEndpointPin, revision: UInt64)
+    case removed(TerminalEndpointPinID, revision: UInt64)
     case pinLost(TerminalEndpointPinLoss, revision: UInt64)
     case reconciliationRequired(revision: UInt64)
 
     public var revision: UInt64 {
         switch self {
-        case let .pinLost(_, revision),
+        case let .upsert(_, revision),
+            let .removed(_, revision),
+            let .pinLost(_, revision),
             let .reconciliationRequired(revision):
             revision
         }
@@ -125,9 +147,12 @@ public enum TerminalEndpointRegistryEvent: Equatable, Sendable {
 
 public struct TerminalEndpointRegistrySnapshot: Equatable, Sendable {
     public let revision: UInt64
-    public let pins: Set<TerminalEndpointPin>
+    public let pins: [TerminalEndpointPinID: TerminalEndpointPin]
 
-    public init(revision: UInt64, pins: Set<TerminalEndpointPin>) {
+    public init(
+        revision: UInt64,
+        pins: [TerminalEndpointPinID: TerminalEndpointPin]
+    ) {
         self.revision = revision
         self.pins = pins
     }
@@ -223,7 +248,7 @@ public actor TerminalEndpointRegistry {
     private var eventSubscribers: [
         UUID: AsyncStream<TerminalEndpointRegistryEvent>.Continuation
     ] = [:]
-    private var pinLossRevision: UInt64 = 0
+    private var pinRevision: UInt64 = 0
     private let bindingValidationHook: (@Sendable () async -> Void)?
     private let claimPreparedTurnHook: (@Sendable () async -> Void)?
 
@@ -301,13 +326,12 @@ public actor TerminalEndpointRegistry {
                     transition
                 )
             )
-            pinLossRevision += 1
-            publish(
+            publishPinMutation { revision in
                 .pinLost(
                     TerminalEndpointPinLoss(pin: lostPin),
-                    revision: pinLossRevision
+                    revision: revision
                 )
-            )
+            }
         }
         for item in cleanup {
             await item.transition.task.value
@@ -360,6 +384,7 @@ public actor TerminalEndpointRegistry {
         )
         bindings[threadID] = stored
         conversationOwners[conversationKey] = handle
+        publishPinUpsert(stored)
         await stored.preparationTransition.task.value
         guard var current = exactBinding(
             handle: handle,
@@ -384,6 +409,7 @@ public actor TerminalEndpointRegistry {
                 )
                 current.releaseTransition = transition
                 bindings[threadID] = current
+                publishPinRemoval(current)
                 await transition.task.value
                 removeBinding(handle: handle, token: current.token)
                 throw CancellationError()
@@ -437,6 +463,7 @@ public actor TerminalEndpointRegistry {
         stored.phase = .claimed
         stored.turnID = turnID
         bindings[handle.threadID] = stored
+        publishPinUpsert(stored)
         return stored.value
     }
 
@@ -473,6 +500,7 @@ public actor TerminalEndpointRegistry {
         stored.phase = .claimed
         stored.turnID = turnID
         bindings[handle.threadID] = stored
+        publishPinUpsert(stored)
     }
 
     func binding(
@@ -528,6 +556,7 @@ public actor TerminalEndpointRegistry {
             transition = enqueueKeyboardOwner(.user, for: stored.endpoint)
             stored.releaseTransition = transition
             bindings[handle.threadID] = stored
+            publishPinRemoval(stored)
         }
         await transition.task.value
         removeBinding(handle: handle, token: token)
@@ -558,6 +587,7 @@ public actor TerminalEndpointRegistry {
             transition = enqueueKeyboardOwner(.user, for: stored.endpoint)
             stored.releaseTransition = transition
             bindings[handle.threadID] = stored
+            publishPinRemoval(stored)
         }
         await transition.task.value
         removeBinding(handle: handle, token: token)
@@ -578,8 +608,8 @@ public actor TerminalEndpointRegistry {
 
     /// Atomically captures the authoritative pin set and starts a bounded
     /// event stream. Consumers should initialize their known pins from the
-    /// returned snapshot, ignore events at or below its revision, and replace
-    /// their known pins with `pinSnapshot()` after reconciliation is required.
+    /// returned snapshot, apply newer upserts and removals by stable pin ID,
+    /// and replace their pins with `pinSnapshot()` after reconciliation.
     public func subscribe() -> TerminalEndpointRegistrySubscription {
         let subscriberID = UUID()
         let pair = AsyncStream<TerminalEndpointRegistryEvent>.makeStream(
@@ -595,7 +625,7 @@ public actor TerminalEndpointRegistry {
         )
     }
 
-    /// Returns the current authoritative exact pins at the latest pin-loss
+    /// Returns the current authoritative exact pins at the latest registry
     /// revision. Use this to replace local state after a reconciliation event.
     public func pinSnapshot() -> TerminalEndpointRegistrySnapshot {
         makePinSnapshot()
@@ -609,7 +639,7 @@ public actor TerminalEndpointRegistry {
                 break
             case .dropped:
                 _ = subscriber.yield(
-                    .reconciliationRequired(revision: pinLossRevision)
+                    .reconciliationRequired(revision: pinRevision)
                 )
             case .terminated:
                 terminatedSubscriberIDs.append(subscriberID)
@@ -627,10 +657,37 @@ public actor TerminalEndpointRegistry {
     }
 
     private func makePinSnapshot() -> TerminalEndpointRegistrySnapshot {
-        TerminalEndpointRegistrySnapshot(
-            revision: pinLossRevision,
-            pins: Set(bindings.values.compactMap(makePin))
+        let pins = bindings.values.compactMap(makePin)
+        return TerminalEndpointRegistrySnapshot(
+            revision: pinRevision,
+            pins: Dictionary(
+                uniqueKeysWithValues: pins.map { ($0.id, $0) }
+            )
         )
+    }
+
+    private func publishPinMutation(
+        _ makeEvent: (UInt64) -> TerminalEndpointRegistryEvent
+    ) {
+        pinRevision += 1
+        publish(makeEvent(pinRevision))
+    }
+
+    private func publishPinUpsert(_ binding: StoredBinding) {
+        guard let pin = makePin(binding) else { return }
+        publishPinMutation { revision in
+            .upsert(pin, revision: revision)
+        }
+    }
+
+    private func publishPinRemoval(_ binding: StoredBinding) {
+        let id = TerminalEndpointPinID(
+            handle: binding.handle,
+            bindingToken: binding.token
+        )
+        publishPinMutation { revision in
+            .removed(id, revision: revision)
+        }
     }
 
     private func makePin(_ binding: StoredBinding) -> TerminalEndpointPin? {

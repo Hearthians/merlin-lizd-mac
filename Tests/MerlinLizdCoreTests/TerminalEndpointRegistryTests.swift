@@ -906,18 +906,25 @@ struct TerminalEndpointRegistryTests {
                 token: TerminalEndpointBindingToken(),
                 conversationKey: TerminalToolFixtures.key
             )
+            if let event = await iterator.next() {
+                events.append(event)
+            }
             await registry.unregister(endpointID)
             if let event = await iterator.next() {
                 events.append(event)
             }
         }
 
-        #expect(events.count == 25)
-        #expect(events.allSatisfy { event in
+        #expect(events.count == 50)
+        #expect(events.enumerated().allSatisfy { index, event in
+            if index.isMultiple(of: 2) {
+                guard case let .upsert(pin, _) = event else { return false }
+                return pin.phase == .prepared && pin.turnID == nil
+            }
             guard case let .pinLost(loss, _) = event else { return false }
             return loss.phase == .prepared && loss.turnID == nil
         })
-        #expect(events.map(\.revision) == Array(1...25).map(UInt64.init))
+        #expect(events.map(\.revision) == Array(1...50).map(UInt64.init))
         let snapshot = await registry.testingStateSnapshot()
         #expect(snapshot.endpointCount == 0)
         #expect(snapshot.bindingCount == 0)
@@ -1016,7 +1023,7 @@ struct TerminalEndpointRegistryTests {
         )
 
         let subscription = await registry.subscribe()
-        #expect(subscription.snapshot.pins == [expectedPin])
+        #expect(subscription.snapshot.pins == [expectedPin.id: expectedPin])
         let eventTask = Task {
             var iterator = subscription.events.makeAsyncIterator()
             return await iterator.next()
@@ -1070,7 +1077,7 @@ struct TerminalEndpointRegistryTests {
         }
 
         let subscription = await registry.subscribe()
-        #expect(subscription.snapshot.revision == 1)
+        #expect(subscription.snapshot.revision == 2)
         #expect(subscription.snapshot.pins.isEmpty)
 
         await userGate.open()
@@ -1143,23 +1150,25 @@ struct TerminalEndpointRegistryTests {
             token: TerminalEndpointBindingToken(),
             conversationKey: secondKey
         )
-        let expectedPins: Set<TerminalEndpointPin> = [
-            TerminalEndpointPin(
-                handle: firstHandle,
-                bindingToken: first.token,
-                turnID: nil,
-                phase: .prepared,
-                conversationKey: TerminalToolFixtures.key,
-                endpointID: firstID
-            ),
-            TerminalEndpointPin(
-                handle: secondHandle,
-                bindingToken: second.token,
-                turnID: nil,
-                phase: .prepared,
-                conversationKey: secondKey,
-                endpointID: secondID
-            ),
+        let firstPin = TerminalEndpointPin(
+            handle: firstHandle,
+            bindingToken: first.token,
+            turnID: nil,
+            phase: .prepared,
+            conversationKey: TerminalToolFixtures.key,
+            endpointID: firstID
+        )
+        let secondPin = TerminalEndpointPin(
+            handle: secondHandle,
+            bindingToken: second.token,
+            turnID: nil,
+            phase: .prepared,
+            conversationKey: secondKey,
+            endpointID: secondID
+        )
+        let expectedPins = [
+            firstPin.id: firstPin,
+            secondPin.id: secondPin,
         ]
         let subscription = await registry.subscribe()
         #expect(subscription.snapshot.pins == expectedPins)
@@ -1180,7 +1189,9 @@ struct TerminalEndpointRegistryTests {
             return
         }
         let authoritative = await registry.pinSnapshot()
-        let lostPins = consumerPins.subtracting(authoritative.pins)
+        let lostPins = consumerPins.filter {
+            authoritative.pins[$0.key] == nil
+        }
         consumerPins = authoritative.pins
         consumerRevision = authoritative.revision
 
@@ -1208,5 +1219,237 @@ struct TerminalEndpointRegistryTests {
         }
 
         #expect(await registry.testingStateSnapshot().eventSubscriberCount == 0)
+    }
+
+    @Test("empty subscription receives prepare active and loss deltas by stable pin ID")
+    func subscriptionReceivesCompletePinLifecycleDeltas() async throws {
+        let registry = TerminalEndpointRegistry()
+        let endpointID = TerminalEndpointID(
+            rawValue: TerminalToolFixtures.newID()
+        )
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: endpointID.rawValue,
+                port: FakeTerminalToolPort(
+                    snapshot: TerminalToolFixtures.screen(revision: 1701)
+                ),
+                controller: FakeTerminalSurfaceController(
+                    surface: TerminalToolFixtures.surface()
+                )
+            )
+        )
+        let handle = AgentTurnHandle(
+            threadID: AgentThreadID(rawValue: "complete-deltas")
+        )
+        let token = TerminalEndpointBindingToken()
+        let turnID = AgentTurnID(rawValue: "complete-deltas-turn")
+        let pinID = TerminalEndpointPinID(
+            handle: handle,
+            bindingToken: token
+        )
+        let subscription = await registry.subscribe()
+        var consumerPins = subscription.snapshot.pins
+        var consumerRevision = subscription.snapshot.revision
+        var iterator = subscription.events.makeAsyncIterator()
+        #expect(consumerPins.isEmpty)
+
+        _ = try await registry.prepareTurn(
+            handle: handle,
+            token: token,
+            conversationKey: TerminalToolFixtures.key
+        )
+        guard case let .upsert(prepared, preparedRevision) = await iterator.next()
+        else {
+            Issue.record("expected prepared pin upsert")
+            return
+        }
+        consumerPins[prepared.id] = prepared
+        consumerRevision = preparedRevision
+        #expect(prepared.id == pinID)
+        #expect(prepared.phase == .prepared)
+        #expect(prepared.turnID == nil)
+
+        _ = try await registry.claimPreparedTurn(
+            handle: handle,
+            token: token,
+            conversationKey: TerminalToolFixtures.key,
+            turnID: turnID
+        )
+        guard case let .upsert(active, activeRevision) = await iterator.next()
+        else {
+            Issue.record("expected active pin upsert")
+            return
+        }
+        consumerPins[active.id] = active
+        consumerRevision = activeRevision
+        #expect(active.id == pinID)
+        #expect(active.phase == .active)
+        #expect(active.turnID == turnID)
+        #expect(activeRevision == preparedRevision + 1)
+        try await registry.confirmTurnID(
+            handle: handle,
+            token: token,
+            turnID: turnID
+        )
+        #expect(await registry.pinSnapshot().revision == activeRevision)
+
+        await registry.unregister(endpointID)
+        guard case let .pinLost(loss, lossRevision) = await iterator.next()
+        else {
+            Issue.record("expected exact pin loss")
+            return
+        }
+        consumerPins.removeValue(forKey: loss.pin.id)
+        consumerRevision = lossRevision
+        #expect(loss.pin.id == pinID)
+        #expect(loss.pin == active)
+        #expect(lossRevision == activeRevision + 1)
+        #expect(consumerPins.isEmpty)
+        let authoritativeRevision = await registry.pinSnapshot().revision
+        #expect(consumerRevision == authoritativeRevision)
+    }
+
+    @Test("prepared snapshot active update and loss never leave a ghost pin")
+    func preparedSnapshotDoesNotLeaveActiveLossGhost() async throws {
+        let registry = TerminalEndpointRegistry()
+        let endpointID = TerminalEndpointID(
+            rawValue: TerminalToolFixtures.newID()
+        )
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: endpointID.rawValue,
+                port: FakeTerminalToolPort(
+                    snapshot: TerminalToolFixtures.screen(revision: 1702)
+                ),
+                controller: FakeTerminalSurfaceController(
+                    surface: TerminalToolFixtures.surface()
+                )
+            )
+        )
+        let handle = AgentTurnHandle(
+            threadID: AgentThreadID(rawValue: "prepared-ghost")
+        )
+        let token = TerminalEndpointBindingToken()
+        let turnID = AgentTurnID(rawValue: "prepared-ghost-turn")
+        _ = try await registry.prepareTurn(
+            handle: handle,
+            token: token,
+            conversationKey: TerminalToolFixtures.key
+        )
+        let subscription = await registry.subscribe()
+        var consumerPins = subscription.snapshot.pins
+        var iterator = subscription.events.makeAsyncIterator()
+        let pinID = TerminalEndpointPinID(
+            handle: handle,
+            bindingToken: token
+        )
+        #expect(consumerPins[pinID]?.phase == .prepared)
+
+        try await registry.confirmTurnID(
+            handle: handle,
+            token: token,
+            turnID: turnID
+        )
+        guard case let .upsert(active, _) = await iterator.next() else {
+            Issue.record("expected direct-confirm active upsert")
+            return
+        }
+        consumerPins[active.id] = active
+        #expect(consumerPins.count == 1)
+        #expect(consumerPins[pinID]?.turnID == turnID)
+
+        await registry.unregister(endpointID)
+        guard case let .pinLost(loss, _) = await iterator.next() else {
+            Issue.record("expected active loss")
+            return
+        }
+        consumerPins.removeValue(forKey: loss.pin.id)
+        #expect(loss.pin.id == pinID)
+        #expect(consumerPins.isEmpty)
+    }
+
+    @Test("normal prepared and active releases publish stable-ID removals")
+    func normalReleasesPublishStableIDRemovals() async throws {
+        let registry = TerminalEndpointRegistry()
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: TerminalToolFixtures.newID(),
+                port: FakeTerminalToolPort(
+                    snapshot: TerminalToolFixtures.screen(revision: 1703)
+                ),
+                controller: FakeTerminalSurfaceController(
+                    surface: TerminalToolFixtures.surface()
+                )
+            )
+        )
+        let threadID = AgentThreadID(rawValue: "normal-removals")
+        let preparedHandle = AgentTurnHandle(threadID: threadID)
+        let preparedToken = TerminalEndpointBindingToken()
+        let preparedID = TerminalEndpointPinID(
+            handle: preparedHandle,
+            bindingToken: preparedToken
+        )
+        let subscription = await registry.subscribe()
+        var iterator = subscription.events.makeAsyncIterator()
+
+        _ = try await registry.prepareTurn(
+            handle: preparedHandle,
+            token: preparedToken,
+            conversationKey: TerminalToolFixtures.key
+        )
+        guard case .upsert = await iterator.next() else {
+            Issue.record("expected prepared upsert")
+            return
+        }
+        await registry.releasePrepared(
+            handle: preparedHandle,
+            token: preparedToken,
+            conversationKey: TerminalToolFixtures.key
+        )
+        guard case let .removed(removedPreparedID, _) = await iterator.next()
+        else {
+            Issue.record("expected prepared removal")
+            return
+        }
+        #expect(removedPreparedID == preparedID)
+
+        let activeHandle = AgentTurnHandle(threadID: threadID)
+        let activeToken = TerminalEndpointBindingToken()
+        let activeTurnID = AgentTurnID(rawValue: "normal-removals-active")
+        let activeID = TerminalEndpointPinID(
+            handle: activeHandle,
+            bindingToken: activeToken
+        )
+        _ = try await registry.prepareTurn(
+            handle: activeHandle,
+            token: activeToken,
+            conversationKey: TerminalToolFixtures.key
+        )
+        guard case .upsert = await iterator.next() else {
+            Issue.record("expected successor prepared upsert")
+            return
+        }
+        _ = try await registry.claimPreparedTurn(
+            handle: activeHandle,
+            token: activeToken,
+            conversationKey: TerminalToolFixtures.key,
+            turnID: activeTurnID
+        )
+        guard case .upsert = await iterator.next() else {
+            Issue.record("expected successor active upsert")
+            return
+        }
+        await registry.releaseTurn(
+            handle: activeHandle,
+            token: activeToken,
+            turnID: activeTurnID
+        )
+        guard case let .removed(removedActiveID, _) = await iterator.next()
+        else {
+            Issue.record("expected active removal")
+            return
+        }
+        #expect(removedActiveID == activeID)
+        #expect(await registry.pinSnapshot().pins.isEmpty)
     }
 }

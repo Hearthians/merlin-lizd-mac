@@ -116,6 +116,8 @@ actor FakeTerminalToolPort: TerminalSessionPort {
     private var observeCount = 0
     private var waitCount = 0
     private var sendCount = 0
+    private var observeGate: TerminalToolTestGate?
+    private var checkCancellationAfterObserveGate = false
     private var sendGate: TerminalToolTestGate?
     private var waitGate: TerminalToolTestGate?
     private var checkCancellationAfterWaitGate = false
@@ -135,6 +137,12 @@ actor FakeTerminalToolPort: TerminalSessionPort {
     func observeScreen() async throws -> TerminalScreenSnapshot {
         observeCount += 1
         await log?.append("\(label):observe")
+        if let observeGate {
+            await observeGate.wait()
+            if checkCancellationAfterObserveGate {
+                try Task.checkCancellation()
+            }
+        }
         return snapshot
     }
 
@@ -202,6 +210,14 @@ actor FakeTerminalToolPort: TerminalSessionPort {
         sendFailures.append(failure)
     }
 
+    func blockObserves(
+        on gate: TerminalToolTestGate?,
+        checkCancellationAfterGate: Bool = false
+    ) {
+        observeGate = gate
+        checkCancellationAfterObserveGate = checkCancellationAfterGate
+    }
+
     func blockSends(on gate: TerminalToolTestGate?) {
         sendGate = gate
     }
@@ -256,6 +272,8 @@ actor FakeTerminalSurfaceController: TmuxSurfaceControlling {
     )?
     private var currentGate: TerminalToolTestGate?
     private var checkCancellationAfterCurrentGate = false
+    private var closeGate: TerminalToolTestGate?
+    private var checkCancellationAfterCloseGate = false
     private var calls: [String] = []
     private let log: TerminalToolTestLog?
 
@@ -319,6 +337,12 @@ actor FakeTerminalSurfaceController: TmuxSurfaceControlling {
     ) async throws {
         calls.append("close:\(paneID)")
         await log?.append("surface:close")
+        if let closeGate {
+            await closeGate.wait()
+            if checkCancellationAfterCloseGate {
+                try Task.checkCancellation()
+            }
+        }
         if failure == .close { throw Failure.close }
         surface = origin
     }
@@ -341,6 +365,14 @@ actor FakeTerminalSurfaceController: TmuxSurfaceControlling {
     ) {
         currentGate = gate
         checkCancellationAfterCurrentGate = checkCancellationAfterGate
+    }
+
+    func blockClose(
+        on gate: TerminalToolTestGate?,
+        checkCancellationAfterGate: Bool = false
+    ) {
+        closeGate = gate
+        checkCancellationAfterCloseGate = checkCancellationAfterGate
     }
 
     func setRetainedCreateError(

@@ -1266,6 +1266,297 @@ struct TerminalToolRouterTests {
         }
     }
 
+    @Test("finish cancellation during initial observe retains and audits interrupted")
+    func finishInitialObserveCancellationRetainsAndAudits() async throws {
+        let initial = TerminalToolFixtures.screen(revision: 5801)
+        let paneScreen = TerminalToolFixtures.screen(revision: 5802)
+        let port = FakeTerminalToolPort(snapshot: initial)
+        await port.enqueueWait(.init(snapshot: paneScreen, timedOut: false))
+        let origin = TerminalToolFixtures.surface()
+        let temporary = TerminalToolFixtures.surface(
+            paneID: "%initial-observe-cancel"
+        )
+        let surfaces = FakeTerminalSurfaceController(
+            surface: origin,
+            createdSurface: temporary
+        )
+        let journal = MemoryTerminalToolJournal()
+        let (router, handle, turnID) = try await makeRouter(
+            port: port,
+            surfaces: surfaces,
+            journal: journal
+        )
+        let create = Task {
+            try await router.execute(
+                handle: handle,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .createTemporaryPane(expectedRevision: 5801)
+            )
+        }
+        try await approveNextRequest(router: router)
+        guard case let .temporaryPaneCreated(lease, _) = try await create.value
+        else {
+            Issue.record("expected temporary pane lease")
+            return
+        }
+        await port.setSnapshot(paneScreen)
+        let eventsBeforeFinish = await journal.snapshot().count
+        let callsBeforeFinish = await surfaces.recordedCalls()
+        let countsBeforeFinish = await port.counts()
+        let observeGate = TerminalToolTestGate()
+        await port.blockObserves(
+            on: observeGate,
+            checkCancellationAfterGate: true
+        )
+        let finish = Task {
+            try await router.execute(
+                handle: handle,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .finishTemporaryPane(
+                    leaseID: lease.id,
+                    expectedRevision: 5802
+                )
+            )
+        }
+        while await port.counts().observe == countsBeforeFinish.observe {
+            await Task.yield()
+        }
+        finish.cancel()
+        await observeGate.open()
+
+        do {
+            #expect(
+                try await finish.value == .temporaryPaneFinished(
+                    .retained(lease, reason: .interrupted)
+                )
+            )
+        } catch {
+            Issue.record("expected retained result, got \(error)")
+        }
+        #expect(await surfaces.recordedCalls() == callsBeforeFinish)
+        let countsAfterFinish = await port.counts()
+        #expect(countsAfterFinish.observe == countsBeforeFinish.observe + 1)
+        #expect(countsAfterFinish.send == countsBeforeFinish.send)
+        #expect(!(await surfaces.recordedCalls()).contains { $0.hasPrefix("close:") })
+        let finishEvents = Array(
+            (await journal.snapshot()).dropFirst(eventsBeforeFinish)
+        )
+        #expect(finishEvents.count == 2)
+        guard finishEvents.count == 2 else { return }
+        #expect(finishEvents[0].operationID == finishEvents[1].operationID)
+        guard case .request(
+            operation: "finishTemporaryPane",
+            purpose: "retain temporary pane after uncertainty"
+        ) = finishEvents[0].kind else {
+            Issue.record("expected structured retention request")
+            return
+        }
+        guard case let .temporaryPane(.retained(id, pane, reason))
+            = finishEvents[1].kind
+        else {
+            Issue.record("expected structured retained event")
+            return
+        }
+        #expect(id == lease.id)
+        #expect(pane.windowID == temporary.windowID)
+        #expect(pane.paneID == temporary.paneID)
+        #expect(reason == .interrupted)
+    }
+
+    @Test("finish cancellation during pending approval retains and audits interrupted")
+    func finishPendingApprovalCancellationRetainsAndAudits() async throws {
+        let initial = TerminalToolFixtures.screen(revision: 5803)
+        let paneScreen = TerminalToolFixtures.screen(revision: 5804)
+        let port = FakeTerminalToolPort(snapshot: initial)
+        await port.enqueueWait(.init(snapshot: paneScreen, timedOut: false))
+        let origin = TerminalToolFixtures.surface()
+        let temporary = TerminalToolFixtures.surface(
+            paneID: "%approval-cancel"
+        )
+        let surfaces = FakeTerminalSurfaceController(
+            surface: origin,
+            createdSurface: temporary
+        )
+        let journal = MemoryTerminalToolJournal()
+        let (router, handle, turnID) = try await makeRouter(
+            port: port,
+            surfaces: surfaces,
+            journal: journal
+        )
+        let create = Task {
+            try await router.execute(
+                handle: handle,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .createTemporaryPane(expectedRevision: 5803)
+            )
+        }
+        try await approveNextRequest(router: router)
+        guard case let .temporaryPaneCreated(lease, _) = try await create.value
+        else {
+            Issue.record("expected temporary pane lease")
+            return
+        }
+        await port.setSnapshot(paneScreen)
+        let eventsBeforeFinish = await journal.snapshot().count
+        let callsBeforeFinish = await surfaces.recordedCalls()
+        let countsBeforeFinish = await port.counts()
+        let finish = Task {
+            try await router.execute(
+                handle: handle,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .finishTemporaryPane(
+                    leaseID: lease.id,
+                    expectedRevision: 5804
+                )
+            )
+        }
+        let request = try await pendingRequest(router: router)
+        finish.cancel()
+
+        do {
+            #expect(
+                try await finish.value == .temporaryPaneFinished(
+                    .retained(lease, reason: .interrupted)
+                )
+            )
+        } catch {
+            Issue.record("expected retained result, got \(error)")
+        }
+        #expect(!(await surfaces.recordedCalls()).contains { $0.hasPrefix("close:") })
+        #expect(await surfaces.recordedCalls() == callsBeforeFinish + ["current"])
+        let countsAfterFinish = await port.counts()
+        #expect(countsAfterFinish.send == countsBeforeFinish.send)
+        let finishEvents = Array(
+            (await journal.snapshot()).dropFirst(eventsBeforeFinish)
+        )
+        #expect(finishEvents.count == 7)
+        guard finishEvents.count == 7 else { return }
+        let approvalOperationID = finishEvents[0].operationID
+        #expect(finishEvents.prefix(5).allSatisfy {
+            $0.operationID == approvalOperationID
+        })
+        #expect(finishEvents[5].operationID == finishEvents[6].operationID)
+        #expect(finishEvents[5].operationID != approvalOperationID)
+        guard case .request(operation: "finishTemporaryPane", _) =
+            finishEvents[0].kind,
+            case .screen(paneScreen) = finishEvents[1].kind,
+            case .risk = finishEvents[2].kind,
+            case let .approval(requestID, _, outcome) = finishEvents[3].kind,
+            case .result(.failure(reason: "approval cancelled")) =
+                finishEvents[4].kind,
+            case .request(
+                operation: "finishTemporaryPane",
+                purpose: "retain temporary pane after uncertainty"
+            ) = finishEvents[5].kind,
+            case let .temporaryPane(.retained(id, pane, reason)) =
+                finishEvents[6].kind
+        else {
+            Issue.record("unexpected finish cancellation audit order")
+            return
+        }
+        #expect(requestID == request.id)
+        #expect(outcome == .cancelled)
+        #expect(id == lease.id)
+        #expect(pane.windowID == temporary.windowID)
+        #expect(pane.paneID == temporary.paneID)
+        #expect(reason == .interrupted)
+    }
+
+    @Test("finish cancellation during close retains when the pane is still live")
+    func finishCloseCancellationRetainsLivePane() async throws {
+        let initial = TerminalToolFixtures.screen(revision: 5805)
+        let paneScreen = TerminalToolFixtures.screen(revision: 5806)
+        let probed = TerminalToolFixtures.screen(
+            revision: 5807,
+            text: "BC10C\nEC10C\n$ "
+        )
+        let port = FakeTerminalToolPort(snapshot: initial)
+        await port.enqueueWait(.init(snapshot: paneScreen, timedOut: false))
+        let origin = TerminalToolFixtures.surface()
+        let temporary = TerminalToolFixtures.surface(
+            paneID: "%close-cancel"
+        )
+        let surfaces = FakeTerminalSurfaceController(
+            surface: origin,
+            createdSurface: temporary
+        )
+        let journal = MemoryTerminalToolJournal()
+        let (router, handle, turnID) = try await makeRouter(
+            port: port,
+            surfaces: surfaces,
+            journal: journal,
+            nonce: "C10C"
+        )
+        let create = Task {
+            try await router.execute(
+                handle: handle,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .createTemporaryPane(expectedRevision: 5805)
+            )
+        }
+        try await approveNextRequest(router: router)
+        guard case let .temporaryPaneCreated(lease, _) = try await create.value
+        else {
+            Issue.record("expected temporary pane lease")
+            return
+        }
+        await port.setSnapshot(paneScreen)
+        await port.enqueueWait(.init(snapshot: probed, timedOut: false))
+        let closeGate = TerminalToolTestGate()
+        await surfaces.blockClose(
+            on: closeGate,
+            checkCancellationAfterGate: true
+        )
+        let finish = Task {
+            try await router.execute(
+                handle: handle,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .finishTemporaryPane(
+                    leaseID: lease.id,
+                    expectedRevision: 5806
+                )
+            )
+        }
+        try await approveNextRequest(router: router)
+        while !(await surfaces.recordedCalls()).contains(
+            "close:\(temporary.paneID)"
+        ) {
+            await Task.yield()
+        }
+        finish.cancel()
+        await closeGate.open()
+
+        #expect(
+            try await finish.value == .temporaryPaneFinished(
+                .retained(lease, reason: .interrupted)
+            )
+        )
+        #expect(
+            try await surfaces.currentSurface(
+                route: TerminalToolFixtures.route
+            ) == temporary
+        )
+        #expect(!(await journal.snapshot()).contains { event in
+            guard case .temporaryPane(.closed) = event.kind else { return false }
+            return true
+        })
+        #expect((await journal.snapshot()).contains { event in
+            guard case let .temporaryPane(.retained(id, pane, reason)) =
+                event.kind
+            else { return false }
+            return id == lease.id
+                && pane.windowID == temporary.windowID
+                && pane.paneID == temporary.paneID
+                && reason == .interrupted
+        })
+    }
+
     @Test("finish preserves a live lease after pre-existing endpoint pin loss")
     func finishAfterPinLossRetainsWithoutAccess() async throws {
         let initial = TerminalToolFixtures.screen(revision: 581)
