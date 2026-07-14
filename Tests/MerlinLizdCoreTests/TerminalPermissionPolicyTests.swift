@@ -198,4 +198,213 @@ struct TerminalPermissionPolicyTests {
             }
         }
     }
+
+    @Test("reconstructs split typing and the final Enter from the visible editable line")
+    func reconstructsEffectiveCommandAcrossBatches() throws {
+        let policy = TerminalPermissionPolicy()
+        let endpoint = terminalTestEndpoint()
+        let first = try policy.evaluate(
+            batch: terminalTestBatch(events: [.text("r")]),
+            endpointID: endpoint,
+            screen: terminalTestScreen()
+        )
+        let second = try policy.evaluate(
+            batch: terminalTestBatch(events: [.text("m -rf /tmp/cache")]),
+            endpointID: endpoint,
+            screen: terminalTestScreen(
+                text: "$ r",
+                cursorColumn: 3
+            )
+        )
+        let submitted = try policy.evaluate(
+            batch: terminalTestBatch(events: [.key(.enter, modifiers: [])]),
+            endpointID: endpoint,
+            screen: terminalTestScreen(
+                text: "$ rm -rf /tmp/cache",
+                cursorColumn: 19
+            )
+        )
+
+        #expect(first.deterministicRisk == .routine)
+        #expect(second.deterministicRisk == .high)
+        #expect(submitted.deterministicRisk == .high)
+    }
+
+    @Test("applies cursor navigation Backspace and Delete before classification")
+    func reconstructsSameBatchEditing() throws {
+        let backspace = try TerminalPermissionPolicy().evaluate(
+            batch: terminalTestBatch(
+                events: [.key(.backspace, modifiers: [])]
+            ),
+            endpointID: terminalTestEndpoint(),
+            screen: terminalTestScreen(
+                text: "$ rXm -rf /tmp/cache",
+                cursorColumn: 4
+            )
+        )
+        let delete = try TerminalPermissionPolicy().evaluate(
+            batch: terminalTestBatch(
+                events: [
+                    .key(.left, modifiers: []),
+                    .key(.delete, modifiers: []),
+                ]
+            ),
+            endpointID: terminalTestEndpoint(),
+            screen: terminalTestScreen(
+                text: "$ rmx -rf /tmp/cache",
+                cursorColumn: 5
+            )
+        )
+
+        #expect(backspace.deterministicRisk == .high)
+        #expect(delete.deterministicRisk == .high)
+    }
+
+    @Test("denies command input when the visible editable line cannot be reconstructed")
+    func failsClosedOnUnknownEditableSurface() throws {
+        let evaluation = try TerminalPermissionPolicy().evaluate(
+            batch: terminalTestBatch(events: [.text("rm -rf /tmp/cache")]),
+            endpointID: terminalTestEndpoint(),
+            screen: terminalTestScreen(
+                text: "unstructured terminal content",
+                cursorColumn: 8
+            )
+        )
+
+        guard case .deny = evaluation.decision else {
+            Issue.record("unknown editable surface must deny mutation")
+            return
+        }
+    }
+
+    @Test("denies control bytes hidden inside text events")
+    func rejectsRawTextEditingControls() throws {
+        let controls = ["\u{7F}", "\t", "\u{1B}[D"]
+
+        for control in controls {
+            let evaluation = try TerminalPermissionPolicy().evaluate(
+                batch: terminalTestBatch(events: [.text(control)]),
+                endpointID: terminalTestEndpoint(),
+                screen: terminalTestScreen(
+                    text: "$ rXm -rf /tmp/cache",
+                    cursorColumn: 4
+                )
+            )
+            guard case .deny = evaluation.decision else {
+                Issue.record("raw text control must fail closed")
+                continue
+            }
+        }
+    }
+
+    @Test("shell evaluation wrappers and option-prefixed subcommands escalate")
+    func escalatesAmbiguousShellEvaluation() throws {
+        let commands = [
+            "bash -c 'rm -rf /tmp/cache'",
+            "echo $(rm -rf /tmp/cache)",
+            "echo `rm -rf /tmp/cache`",
+            "'rm' -rf /tmp/cache",
+            "TARGET=/tmp rm -rf /tmp/cache",
+            "bash -lc 'rm -rf /tmp/cache'",
+            "eval 'rm -rf /tmp/cache'",
+            "if true; then rm -rf /tmp/cache; fi",
+            "git -C repo push origin main",
+            "git --unknown-option push origin main",
+            "tmux -L private kill-session -t training",
+            "tmux --unknown-option kill-session -t training",
+        ]
+
+        for command in commands {
+            let evaluation = try TerminalPermissionPolicy().evaluate(
+                batch: terminalTestBatch(events: [.text(command)]),
+                endpointID: terminalTestEndpoint(),
+                screen: terminalTestScreen()
+            )
+            #expect(evaluation.deterministicRisk == .high)
+            guard case .requireApproval = evaluation.decision else {
+                Issue.record("ambiguous or destructive shell input must escalate: \(command)")
+                continue
+            }
+        }
+    }
+
+    @Test("proven quoted text descriptor duplication and benign force options stay routine")
+    func avoidsProvableShellFalsePositives() throws {
+        let commands = [
+            "echo 'git push'",
+            "echo '>'",
+            "printf '2>&1'",
+            "tool 2>&1",
+            "sudo echo rm",
+            "tail -f log.txt",
+            "grep -f patterns.txt input.txt",
+        ]
+
+        for command in commands {
+            let evaluation = try TerminalPermissionPolicy().evaluate(
+                batch: terminalTestBatch(events: [.text(command)]),
+                endpointID: terminalTestEndpoint(),
+                screen: terminalTestScreen()
+            )
+            #expect(evaluation.deterministicRisk == .routine)
+            #expect(evaluation.decision == .allow)
+        }
+    }
+
+    @Test("destructive and unknown action evidence overrides passive prompt text")
+    func escalatesMixedAndUnknownPrompts() throws {
+        let screens = [
+            "Press Enter to continue\nDelete all data permanently? [y/N]",
+            "Apply the selected migration now? [OK] [Cancel]",
+            "Perform the selected action now?",
+        ]
+        let affirmatives: [[TerminalInputEvent]] = [
+            [.key(.enter, modifiers: [])],
+            [.text("OK"), .key(.enter, modifiers: [])],
+        ]
+
+        for text in screens {
+            for events in affirmatives {
+                let evaluation = try TerminalPermissionPolicy().evaluate(
+                    batch: terminalTestBatch(events: events),
+                    endpointID: terminalTestEndpoint(),
+                    screen: terminalTestScreen(text: text)
+                )
+                #expect(evaluation.deterministicRisk == .high)
+            }
+        }
+
+        let promptContainingShellMarker = "Delete $ all data permanently? [y/N]"
+        let markerEvaluation = try TerminalPermissionPolicy().evaluate(
+            batch: terminalTestBatch(events: [.key(.enter, modifiers: [])]),
+            endpointID: terminalTestEndpoint(),
+            screen: terminalTestScreen(
+                text: promptContainingShellMarker,
+                cursorColumn: promptContainingShellMarker.count
+            )
+        )
+        #expect(markerEvaluation.deterministicRisk == .high)
+    }
+
+    @Test("negative or cancel input does not approve a destructive prompt")
+    func permitsNegativePromptResponses() throws {
+        let screen = terminalTestScreen(
+            text: "Delete all data permanently? [OK] [Cancel]"
+        )
+        let responses: [[TerminalInputEvent]] = [
+            [.text("n"), .key(.enter, modifiers: [])],
+            [.text("no"), .key(.enter, modifiers: [])],
+            [.key(.escape, modifiers: [])],
+        ]
+
+        for events in responses {
+            let evaluation = try TerminalPermissionPolicy().evaluate(
+                batch: terminalTestBatch(events: events),
+                endpointID: terminalTestEndpoint(),
+                screen: screen
+            )
+            #expect(evaluation.deterministicRisk == .routine)
+            #expect(evaluation.decision == .allow)
+        }
+    }
 }

@@ -183,6 +183,48 @@ struct TerminalApprovalBrokerTests {
         }
     }
 
+    @Test("mismatched request scope is rejected before becoming pending")
+    func rejectsForgedRequestScope() async throws {
+        let broker = TerminalApprovalBroker()
+        let valid = try approvalRequest()
+        let forged = TerminalApprovalRequest(
+            id: terminalUUID("20000000-0000-0000-0000-000000000007"),
+            scope: valid.scope,
+            batch: terminalTestBatch(
+                events: [.text("echo substituted payload")],
+                risk: .high
+            ),
+            reason: "forged"
+        )
+
+        await #expect(throws: TerminalApprovalError.invalidRequest) {
+            try await broker.awaitApproval(for: forged, turnID: "forged")
+        }
+        #expect(await broker.pendingRequests().isEmpty)
+        #expect(await !broker.approveOnce(forged.id))
+    }
+
+    @Test("direct task cancellation revokes a racing allow-once grant")
+    func cancellationWinsBeforeApprovalDelivery() async throws {
+        let broker = TerminalApprovalBroker()
+        let request = try approvalRequest(
+            id: "20000000-0000-0000-0000-000000000008"
+        )
+        let waiter = Task {
+            try await broker.awaitApproval(for: request, turnID: "race")
+        }
+        #expect(await waitForPendingApproval(request.id, in: broker))
+
+        waiter.cancel()
+        let didApprove = await broker.approveOnce(request.id)
+
+        #expect(!didApprove)
+        await #expect(throws: TerminalApprovalError.cancelled) {
+            try await waiter.value
+        }
+        #expect(await broker.pendingRequests().isEmpty)
+    }
+
     private func approvalRequest(
         id: String = "20000000-0000-0000-0000-000000000001"
     ) throws -> TerminalApprovalRequest {

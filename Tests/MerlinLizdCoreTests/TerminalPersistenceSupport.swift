@@ -66,13 +66,19 @@ func terminalTestBatch(
 func terminalTestScreen(
     revision: UInt64 = 7,
     text: String = "$ ",
-    changedRows: [Int] = [0]
+    changedRows: [Int] = [0],
+    cursorRow: Int = 0,
+    cursorColumn: Int = 2
 ) -> TerminalScreenSnapshot {
     TerminalScreenSnapshot(
         revision: revision,
         columns: 80,
         rows: 24,
-        cursor: TerminalCursor(row: 0, column: 2, isVisible: true),
+        cursor: TerminalCursor(
+            row: cursorRow,
+            column: cursorColumn,
+            isVisible: true
+        ),
         mode: .normal,
         text: text,
         significantRuns: [],
@@ -130,6 +136,28 @@ func terminalFileExists(at url: URL) -> Bool {
     FileManager.default.fileExists(atPath: url.path)
 }
 
+func createTerminalDirectory(at url: URL) throws {
+    try FileManager.default.createDirectory(
+        at: url,
+        withIntermediateDirectories: false
+    )
+}
+
+func moveTerminalItem(at source: URL, to destination: URL) throws {
+    try FileManager.default.moveItem(at: source, to: destination)
+}
+
+func createTerminalSymbolicLink(at url: URL, destination: URL) throws {
+    try FileManager.default.createSymbolicLink(
+        at: url,
+        withDestinationURL: destination
+    )
+}
+
+func terminalDirectoryIsEmpty(_ url: URL) throws -> Bool {
+    try FileManager.default.contentsOfDirectory(atPath: url.path).isEmpty
+}
+
 func waitForPendingApproval(
     _ requestID: UUID,
     in broker: TerminalApprovalBroker
@@ -177,4 +205,33 @@ actor ScriptedTerminalJournal: TerminalOperationJournaling {
 
 enum ScriptedTerminalJournalError: Error {
     case unavailable
+}
+
+actor GatedFailingTerminalJournal: TerminalOperationJournaling {
+    private let gate: AsyncStartGate
+    private var count = 0
+
+    init(gate: AsyncStartGate) {
+        self.gate = gate
+    }
+
+    func append(_ event: TerminalJournalEvent) async throws {
+        count += 1
+        if count == 1 {
+            await gate.wait()
+            throw ScriptedTerminalJournalError.unavailable
+        }
+    }
+
+    func entries(
+        for key: TerminalConversationKey
+    ) async throws -> [TerminalJournalEvent] {
+        []
+    }
+
+    func deleteJournal(for key: TerminalConversationKey) async throws {}
+
+    func appendCount() -> Int {
+        count
+    }
 }

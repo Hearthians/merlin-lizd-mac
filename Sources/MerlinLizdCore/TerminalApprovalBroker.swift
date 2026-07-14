@@ -17,6 +17,7 @@ public struct TerminalApprovalGrant: Hashable, Sendable {
 }
 
 public enum TerminalApprovalError: Error, Equatable, Sendable {
+    case invalidRequest
     case duplicateRequest
     case denied
     case expired
@@ -24,9 +25,27 @@ public enum TerminalApprovalError: Error, Equatable, Sendable {
 }
 
 public actor TerminalApprovalBroker {
+    private final class CancellationState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cancelled = false
+
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            lock.unlock()
+        }
+
+        func isCancelled() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return cancelled
+        }
+    }
+
     private struct PendingApproval {
         let request: TerminalApprovalRequest
         let turnID: String
+        let cancellationState: CancellationState
         let continuation: CheckedContinuation<TerminalApprovalGrant, any Error>
     }
 
@@ -45,6 +64,15 @@ public actor TerminalApprovalBroker {
         for request: TerminalApprovalRequest,
         turnID: String
     ) async throws -> TerminalApprovalGrant {
+        guard let canonicalScope = try? TerminalApprovalScope(
+            batch: request.batch,
+            endpointID: request.scope.endpointID,
+            screenRevision: request.scope.screenRevision
+        ), canonicalScope == request.scope,
+            request.batch.expectedRevision == request.scope.screenRevision
+        else {
+            throw TerminalApprovalError.invalidRequest
+        }
         guard pending[request.id] == nil,
             !grants.values.contains(where: { $0.requestID == request.id })
         else {
@@ -54,26 +82,40 @@ public actor TerminalApprovalBroker {
             throw TerminalApprovalError.cancelled
         }
 
-        return try await withTaskCancellationHandler {
+        let cancellationState = CancellationState()
+        let grant: TerminalApprovalGrant = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                if Task.isCancelled {
+                if Task.isCancelled || cancellationState.isCancelled() {
                     continuation.resume(throwing: TerminalApprovalError.cancelled)
                     return
                 }
                 pending[request.id] = PendingApproval(
                     request: request,
                     turnID: turnID,
+                    cancellationState: cancellationState,
                     continuation: continuation
                 )
             }
         } onCancel: {
+            cancellationState.cancel()
             Task { await self.cancelRequest(request.id) }
         }
+        if Task.isCancelled || cancellationState.isCancelled() {
+            grants.removeValue(forKey: grant.token)
+            throw TerminalApprovalError.cancelled
+        }
+        return grant
     }
 
     @discardableResult
     public func approveOnce(_ requestID: UUID) -> Bool {
         guard let approval = pending.removeValue(forKey: requestID) else {
+            return false
+        }
+        if approval.cancellationState.isCancelled() {
+            approval.continuation.resume(
+                throwing: TerminalApprovalError.cancelled
+            )
             return false
         }
         let token = UUID()
@@ -154,6 +196,7 @@ public actor TerminalApprovalBroker {
 
     private func cancelRequest(_ requestID: UUID) {
         guard let approval = pending.removeValue(forKey: requestID) else {
+            grants = grants.filter { $0.value.requestID != requestID }
             return
         }
         approval.continuation.resume(throwing: TerminalApprovalError.cancelled)
