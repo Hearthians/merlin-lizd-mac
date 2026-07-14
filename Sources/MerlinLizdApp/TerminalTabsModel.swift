@@ -3,7 +3,7 @@ import MerlinLizdCore
 import SwiftUI
 
 @MainActor
-final class TerminalTabsModel: ObservableObject {
+final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     @Published private(set) var tabs: [TerminalTabRecord]
     @Published var selectedTabID: String? {
         didSet {
@@ -131,46 +131,11 @@ final class TerminalTabsModel: ObservableObject {
     func resolveTmuxIdentity(
         for tab: TerminalTabRecord
     ) async -> TmuxSessionIdentity? {
-        guard let current = tabs.first(where: { $0.id == tab.id }) else {
-            return nil
-        }
-        if let identity = current.tmuxIdentity {
-            return identity
-        }
-        guard
-            let sessionName = current.sessionName,
-            TmuxSessionParser.isAttachable(sessionName)
-        else {
-            return nil
-        }
-
-        let snapshot = await tmuxSessionDiscovery.refresh(
-            target: current.target,
-            lane: .foreground
+        await TerminalTabTmuxCoordinator.resolveIdentity(
+            for: tab.id,
+            state: self,
+            discovery: tmuxSessionDiscovery
         )
-        guard snapshot.readiness == .ready, snapshot.lastError == nil else {
-            return nil
-        }
-        let identities = Set(snapshot.sessions.compactMap { session in
-            session.name == sessionName ? session.identity : nil
-        })
-        guard identities.count == 1, let identity = identities.first else {
-            return nil
-        }
-
-        guard
-            let index = tabs.firstIndex(where: { $0.id == tab.id }),
-            tabs[index].target == current.target,
-            tabs[index].sessionName == sessionName
-        else {
-            return nil
-        }
-        if let existing = tabs[index].tmuxIdentity {
-            return existing
-        }
-        tabs[index].tmuxIdentity = identity
-        persist()
-        return identity
     }
 
     func prioritize(_ target: TerminalTarget) {
@@ -278,35 +243,17 @@ final class TerminalTabsModel: ObservableObject {
         guard currentName != newName else { return }
 
         do {
-            try await tmuxSessionController.rename(
-                target: tab.target,
-                from: currentName,
-                to: newName
+            try await TerminalTabTmuxCoordinator.rename(
+                tabID: id,
+                to: newName,
+                state: self,
+                controller: tmuxSessionController,
+                discovery: tmuxSessionDiscovery
             )
         } catch let error as TmuxSessionMutationError {
             throw terminalOperationError(error)
-        }
-
-        await tmuxSessionDiscovery.recordRename(
-            target: tab.target,
-            from: currentName,
-            to: newName
-        )
-
-        // The remote operation is authoritative. Stable identities follow a
-        // rename; unresolved legacy tabs can only be matched by target/name.
-        var changed = false
-        for index in tabs.indices where tabs[index].target == tab.target {
-            let matchesIdentity = tab.tmuxIdentity != nil
-                && tabs[index].tmuxIdentity == tab.tmuxIdentity
-            let matchesLegacyName = tabs[index].tmuxIdentity == nil
-                && tabs[index].sessionName == currentName
-            guard matchesIdentity || matchesLegacyName else { continue }
-            tabs[index].sessionName = newName
-            changed = true
-        }
-        if changed {
-            persist()
+        } catch is TerminalTabTmuxCoordinationError {
+            throw TerminalTabOperationError.sessionUnavailable
         }
     }
 
@@ -518,6 +465,18 @@ final class TerminalTabsModel: ObservableObject {
         if let encoded = try? TerminalStateCodec.encode(state) {
             defaults.set(encoded, forKey: persistenceKey)
         }
+    }
+
+    func terminalTabsSnapshot() -> [TerminalTabRecord] {
+        tabs
+    }
+
+    func replaceTerminalTabs(_ tabs: [TerminalTabRecord]) {
+        self.tabs = tabs
+    }
+
+    func persistTerminalTabs() {
+        persist()
     }
 
     private func seedWarmupPriorities() {

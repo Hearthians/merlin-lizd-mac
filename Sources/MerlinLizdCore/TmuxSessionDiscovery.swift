@@ -184,14 +184,11 @@ public actor TmuxSessionDiscovery {
         guard snapshot.sessions.contains(where: { $0.name == currentName }) else {
             return
         }
-        let sessions = snapshot.sessions.map { session in
-            session.name == currentName
-                ? TmuxSessionRecord(
-                    name: newName,
-                    identity: session.identity
-                )
-                : session
-        }
+        let sessions = renamingSessions(
+            snapshot.sessions,
+            from: currentName,
+            to: newName
+        )
         snapshots[target] = replacingSessions(in: snapshot, with: sessions)
     }
 
@@ -311,17 +308,29 @@ public actor TmuxSessionDiscovery {
         mutations.reduce(sessions) { current, mutation in
             switch mutation {
             case let .rename(oldName, newName):
-                return current.map { session in
-                    session.name == oldName
-                        ? TmuxSessionRecord(
-                            name: newName,
-                            identity: session.identity
-                        )
-                        : session
-                }
+                return renamingSessions(
+                    current,
+                    from: oldName,
+                    to: newName
+                )
             case let .terminate(names):
                 return current.filter { !names.contains($0.name) }
             }
+        }
+    }
+
+    private func renamingSessions(
+        _ sessions: [TmuxSessionRecord],
+        from currentName: String,
+        to newName: String
+    ) -> [TmuxSessionRecord] {
+        sessions.map { session in
+            session.name == currentName
+                ? TmuxSessionRecord(
+                    name: newName,
+                    identity: session.identity
+                )
+                : session
         }
     }
 
