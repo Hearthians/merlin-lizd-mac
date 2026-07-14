@@ -88,8 +88,11 @@ final class TerminalTabsModel: ObservableObject {
         )
     }
 
-    func attachExistingSession(_ sessionName: String, target: TerminalTarget) {
-        guard TmuxSessionParser.isAttachable(sessionName) else { return }
+    func attachExistingSession(
+        _ session: TmuxSessionRecord,
+        target: TerminalTarget
+    ) {
+        guard TmuxSessionParser.isAttachable(session.name) else { return }
         let targetLabel: String
         switch target {
         case .local:
@@ -100,9 +103,10 @@ final class TerminalTabsModel: ObservableObject {
             targetLabel = "Worker \(workerID)"
         }
         open(
-            title: "\(targetLabel) · \(sessionName)",
+            title: "\(targetLabel) · \(session.name)",
             target: target,
-            sessionName: sessionName
+            sessionName: session.name,
+            tmuxIdentity: session.identity
         )
     }
 
@@ -112,13 +116,61 @@ final class TerminalTabsModel: ObservableObject {
             guard
                 tab.target == target,
                 let sessionName = tab.sessionName,
-                TmuxSessionParser.isAttachable(sessionName),
-                seen.insert(sessionName).inserted
+                TmuxSessionParser.isAttachable(sessionName)
             else {
                 return nil
             }
-            return TmuxSessionRecord(name: sessionName)
+            let session = TmuxSessionRecord(
+                name: sessionName,
+                identity: tab.tmuxIdentity
+            )
+            return seen.insert(session.id).inserted ? session : nil
         }
+    }
+
+    func resolveTmuxIdentity(
+        for tab: TerminalTabRecord
+    ) async -> TmuxSessionIdentity? {
+        guard let current = tabs.first(where: { $0.id == tab.id }) else {
+            return nil
+        }
+        if let identity = current.tmuxIdentity {
+            return identity
+        }
+        guard
+            let sessionName = current.sessionName,
+            TmuxSessionParser.isAttachable(sessionName)
+        else {
+            return nil
+        }
+
+        let snapshot = await tmuxSessionDiscovery.refresh(
+            target: current.target,
+            lane: .foreground
+        )
+        guard snapshot.readiness == .ready, snapshot.lastError == nil else {
+            return nil
+        }
+        let identities = Set(snapshot.sessions.compactMap { session in
+            session.name == sessionName ? session.identity : nil
+        })
+        guard identities.count == 1, let identity = identities.first else {
+            return nil
+        }
+
+        guard
+            let index = tabs.firstIndex(where: { $0.id == tab.id }),
+            tabs[index].target == current.target,
+            tabs[index].sessionName == sessionName
+        else {
+            return nil
+        }
+        if let existing = tabs[index].tmuxIdentity {
+            return existing
+        }
+        tabs[index].tmuxIdentity = identity
+        persist()
+        return identity
     }
 
     func prioritize(_ target: TerminalTarget) {
@@ -241,16 +293,21 @@ final class TerminalTabsModel: ObservableObject {
             to: newName
         )
 
-        // The remote operation is authoritative. Persist its new identity only
-        // if this tab still describes the session that was renamed.
-        guard
-            let currentIndex = tabs.firstIndex(where: { $0.id == id }),
-            tabs[currentIndex].sessionName == currentName
-        else {
-            return
+        // The remote operation is authoritative. Stable identities follow a
+        // rename; unresolved legacy tabs can only be matched by target/name.
+        var changed = false
+        for index in tabs.indices where tabs[index].target == tab.target {
+            let matchesIdentity = tab.tmuxIdentity != nil
+                && tabs[index].tmuxIdentity == tab.tmuxIdentity
+            let matchesLegacyName = tabs[index].tmuxIdentity == nil
+                && tabs[index].sessionName == currentName
+            guard matchesIdentity || matchesLegacyName else { continue }
+            tabs[index].sessionName = newName
+            changed = true
         }
-        tabs[currentIndex].sessionName = newName
-        persist()
+        if changed {
+            persist()
+        }
     }
 
     func terminateTmuxSessionAndClose(_ id: String) async throws {
@@ -333,13 +390,19 @@ final class TerminalTabsModel: ObservableObject {
         )
     }
 
-    private func open(title: String, target: TerminalTarget, sessionName: String?) {
+    private func open(
+        title: String,
+        target: TerminalTarget,
+        sessionName: String?,
+        tmuxIdentity: TmuxSessionIdentity? = nil
+    ) {
         let id = UUID().uuidString
         let record = TerminalTabRecord(
             id: id,
             title: title,
             target: target,
-            sessionName: sessionName
+            sessionName: sessionName,
+            tmuxIdentity: tmuxIdentity
         )
         tabs.append(record)
         selectedTabID = id

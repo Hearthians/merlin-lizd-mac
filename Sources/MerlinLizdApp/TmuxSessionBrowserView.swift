@@ -220,7 +220,7 @@ struct TmuxSessionBrowserView: View {
                             Spacer()
                             Button("接入") {
                                 terminals.attachExistingSession(
-                                    session.name,
+                                    session,
                                     target: model.target
                                 )
                                 dismiss()

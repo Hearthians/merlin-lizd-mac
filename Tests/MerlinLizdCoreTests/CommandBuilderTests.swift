@@ -218,7 +218,7 @@ struct CommandBuilderTests {
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=10",
             "hl_gpu_2",
-            "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- tmux list-sessions -F#{session_name}"
+            "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- tmux list-sessions -F#{session_name},#{session_id},#{session_created}"
         ])
     }
 
@@ -236,7 +236,9 @@ struct CommandBuilderTests {
 
         #expect(remote.contains("mlx worker login 3966762 --"))
         #expect(remote.contains("printf \\\"__MLZ_READY__\\n\\\""))
-        #expect(remote.contains("tmux list-sessions -F#{session_name}"))
+        #expect(remote.contains(
+            "tmux list-sessions -F#{session_name},#{session_id},#{session_created}"
+        ))
         #expect(remote.components(separatedBy: "mlx worker login").count == 2)
         #expect(!remote.contains("new-session"))
         #expect(!remote.contains("attach"))
@@ -271,7 +273,7 @@ struct CommandBuilderTests {
         )
 
         #expect(reconstructed ==
-            #"sh -lc 'printf "__MLZ_READY__\n"; tmux list-sessions -F#{session_name}'"#)
+            #"sh -lc 'printf "__MLZ_READY__\n"; tmux list-sessions -F#{session_name},#{session_id},#{session_created}'"#)
 
         let directory = temporarySSHDirectory()
         _ = try await runner.run(.init(
@@ -308,7 +310,7 @@ struct CommandBuilderTests {
         #expect(workerOutput.exitCode == 0)
         #expect(workerOutput.stdout.split(separator: "\n").map(String.init) == [
             "__MLZ_READY__",
-            "__TMUX_ARGS__:list-sessions -F#{session_name}",
+            "__TMUX_ARGS__:list-sessions -F#{session_name},#{session_id},#{session_created}",
             "worker-session",
         ])
     }

@@ -165,7 +165,8 @@ public enum MerlinCommands {
         target: TerminalTarget,
         localTmuxPath: String = "/opt/homebrew/bin/tmux"
     ) throws -> CommandSpec {
-        let tmuxArguments = ["list-sessions", "-F", "#{session_name}"]
+        let format = "#{session_name},#{session_id},#{session_created}"
+        let tmuxArguments = ["list-sessions", "-F", format]
         switch target {
         case .local:
             guard localTmuxPath.hasPrefix("/") else {
@@ -178,7 +179,7 @@ public enum MerlinCommands {
                 executable: "/usr/bin/ssh",
                 arguments: nonInteractiveSSHArguments(
                     alias: alias,
-                    remoteCommand: "tmux list-sessions -F#{session_name}"
+                    remoteCommand: "tmux list-sessions -F\(format)"
                 )
             )
         case let .worker(_, _, alias, workerID):
@@ -191,7 +192,7 @@ public enum MerlinCommands {
                     // mlx reconstructs its remote command without preserving
                     // quoting. Keeping the format attached to -F prevents the
                     // leading # from becoming a shell comment.
-                    remoteCommand: "NO_COLOR=1 TERM=dumb mlx worker login \(workerID) -- tmux list-sessions -F#{session_name}"
+                    remoteCommand: "NO_COLOR=1 TERM=dumb mlx worker login \(workerID) -- tmux list-sessions -F\(format)"
                 )
             )
         }
@@ -206,7 +207,7 @@ public enum MerlinCommands {
             // literal single quotes in mlx's argv. When mlx rejoins argv for
             // the Worker shell, those quotes still bind the entire fixed body
             // as sh -lc's one command-string argument.
-            remoteCommands: #"sh -lc "'printf \"__MLZ_READY__\n\"; tmux list-sessions -F#{session_name}'""#
+            remoteCommands: #"sh -lc "'printf \"__MLZ_READY__\n\"; tmux list-sessions -F#{session_name},#{session_id},#{session_created}'""#
         )
     }
 

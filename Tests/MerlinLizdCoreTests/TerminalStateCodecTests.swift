@@ -3,6 +3,42 @@ import Testing
 
 @Suite("Terminal tab persistence")
 struct TerminalStateCodecTests {
+    @Test("decodes legacy terminal tabs without tmux identity")
+    func decodesLegacyTabWithoutTmuxIdentity() throws {
+        let legacyJSON = #"{"selectedTabID":"tab-local","tabs":[{"id":"tab-local","sessionName":"training","target":{"local":{}},"title":"Local"}]}"#
+
+        let decoded = try TerminalStateCodec.decode(legacyJSON)
+
+        #expect(decoded.tabs.first?.tmuxIdentity == nil)
+    }
+
+    @Test("round-trips stable tmux identity")
+    func roundTripsTmuxIdentity() throws {
+        let tab = TerminalTabRecord(
+            id: "tab-worker",
+            title: "Training",
+            target: .worker(
+                devboxSID: "dbx_135679",
+                devboxName: "wt_hl",
+                alias: "hl_gpu_2",
+                workerID: "3959909"
+            ),
+            sessionName: "training",
+            tmuxIdentity: .init(
+                serverSessionID: "$3",
+                createdAtEpoch: 1_784_000_102
+            )
+        )
+
+        let encoded = try TerminalStateCodec.encode(
+            TerminalState(selectedTabID: tab.id, tabs: [tab])
+        )
+        let decoded = try TerminalStateCodec.decode(encoded)
+
+        #expect(decoded.tabs == [tab])
+        #expect(decoded.tabs.first?.tmuxIdentity == tab.tmuxIdentity)
+    }
+
     @Test("cycles terminal tabs in both directions")
     func cyclesTerminalTabs() {
         let ids = ["first", "second", "third"]

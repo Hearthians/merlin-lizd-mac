@@ -186,7 +186,10 @@ public actor TmuxSessionDiscovery {
         }
         let sessions = snapshot.sessions.map { session in
             session.name == currentName
-                ? TmuxSessionRecord(name: newName)
+                ? TmuxSessionRecord(
+                    name: newName,
+                    identity: session.identity
+                )
                 : session
         }
         snapshots[target] = replacingSessions(in: snapshot, with: sessions)
@@ -310,7 +313,10 @@ public actor TmuxSessionDiscovery {
             case let .rename(oldName, newName):
                 return current.map { session in
                     session.name == oldName
-                        ? TmuxSessionRecord(name: newName)
+                        ? TmuxSessionRecord(
+                            name: newName,
+                            identity: session.identity
+                        )
                         : session
                 }
             case let .terminate(names):

@@ -681,7 +681,7 @@ struct TmuxSessionDiscoveryTests {
     func recordsRename() async throws {
         let runner = TmuxScriptedRunner(
             output: InventoryProcessOutput(
-                stdout: "old-name\nother\n",
+                stdout: "old-name,$3,100\nother,$4,101\n",
                 stderr: "",
                 exitCode: 0
             )
@@ -700,10 +700,41 @@ struct TmuxSessionDiscoveryTests {
             to: "new-name"
         )
 
-        #expect(
-            await discovery.snapshot(target: target)?.sessions.map(\.name)
-                == ["new-name", "other"]
-        )
+        let sessions = await discovery.snapshot(target: target)?.sessions
+        #expect(sessions == [
+            TmuxSessionRecord(
+                name: "new-name",
+                identity: .init(serverSessionID: "$3", createdAtEpoch: 100)
+            ),
+            TmuxSessionRecord(
+                name: "other",
+                identity: .init(serverSessionID: "$4", createdAtEpoch: 101)
+            ),
+        ])
+    }
+
+    @Test("same-name recreation replaces the stable session identity")
+    func sameNameRecreationChangesIdentity() async throws {
+        let runner = TmuxSnapshotRunner(steps: [
+            .output(.init(
+                stdout: "training,$3,100\n",
+                stderr: "",
+                exitCode: 0
+            )),
+            .output(.init(
+                stdout: "training,$9,200\n",
+                stderr: "",
+                exitCode: 0
+            )),
+        ])
+        let discovery = TmuxSessionDiscovery(processRunner: runner)
+
+        let original = await discovery.refresh(target: tmuxTestTarget)
+        let recreated = await discovery.refresh(target: tmuxTestTarget)
+
+        #expect(original.sessions.map(\.id) == ["$3@100"])
+        #expect(recreated.sessions.map(\.id) == ["$9@200"])
+        #expect(original.sessions != recreated.sessions)
     }
 
     @Test("removes terminated sessions without refreshing cache age")
