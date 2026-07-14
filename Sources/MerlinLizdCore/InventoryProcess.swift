@@ -220,13 +220,16 @@ actor BoundedInventoryProcessRunner: InventoryProcessRunning {
 
 final class FoundationInventoryProcessRunner: InventoryProcessRunning, @unchecked Sendable {
     private let processExitBoundaryHook: @Sendable () async -> Void
+    private let reapBoundaryHook: @Sendable () async -> Void
     private let completionBoundaryHook: @Sendable () async -> Void
 
     init(
         processExitBoundaryHook: @escaping @Sendable () async -> Void = {},
+        reapBoundaryHook: @escaping @Sendable () async -> Void = {},
         completionBoundaryHook: @escaping @Sendable () async -> Void = {}
     ) {
         self.processExitBoundaryHook = processExitBoundaryHook
+        self.reapBoundaryHook = reapBoundaryHook
         self.completionBoundaryHook = completionBoundaryHook
     }
 
@@ -267,6 +270,7 @@ final class FoundationInventoryProcessRunner: InventoryProcessRunning, @unchecke
                 exitCode: exitCode
             )
             await processBox.reap()
+            await reapBoundaryHook()
             let completionFinalized = processBox.finalizeCompletion()
             await completionBoundaryHook()
             guard completionFinalized else {
@@ -531,6 +535,7 @@ private final class RunningProcessBox: @unchecked Sendable {
     private var forceKillScheduled = false
     private var escalationComplete = false
     private var reapCommitted = false
+    private var reapFinished = false
     private var started = false
     private var processID: pid_t?
     private var processGroupID: pid_t?
@@ -594,11 +599,11 @@ private final class RunningProcessBox: @unchecked Sendable {
                 lock.unlock()
                 continuation.resume(returning: nil)
             } else if cancellationRequested, !escalationComplete {
+                reapCommitted = true
                 reapWaiter = continuation
                 lock.unlock()
             } else {
                 reapCommitted = true
-                processGroupID = nil
                 let processID = self.processID
                 lock.unlock()
                 continuation.resume(returning: processID)
@@ -611,6 +616,17 @@ private final class RunningProcessBox: @unchecked Sendable {
         repeat {
             waitResult = Darwin.waitpid(processIDToReap, &waitStatus, 0)
         } while waitResult == -1 && errno == EINTR
+
+        completeReap()
+    }
+
+    private func completeReap() {
+        lock.lock()
+        reapFinished = true
+        if cancellationRequested, escalationComplete {
+            processGroupID = nil
+        }
+        lock.unlock()
     }
 
     func finalizeCompletion() -> Bool {
@@ -618,6 +634,7 @@ private final class RunningProcessBox: @unchecked Sendable {
         defer { lock.unlock() }
         guard !cancellationRequested else { return false }
         completionFinalized = true
+        processGroupID = nil
         return true
     }
 
@@ -633,7 +650,6 @@ private final class RunningProcessBox: @unchecked Sendable {
         cancellationRequested = true
         if
             started,
-            !reapCommitted,
             let processGroupID,
             !forceKillScheduled
         {
@@ -656,7 +672,8 @@ private final class RunningProcessBox: @unchecked Sendable {
         lock.lock()
         guard
             forceKillScheduled,
-            !reapCommitted,
+            cancellationRequested,
+            !completionFinalized,
             self.processGroupID == processGroupID
         else {
             lock.unlock()
@@ -674,9 +691,10 @@ private final class RunningProcessBox: @unchecked Sendable {
 
         lock.lock()
         escalationComplete = true
-        if !reapCommitted, let reapWaiter {
-            reapCommitted = true
+        if reapFinished {
             processGroupID = nil
+        }
+        if let reapWaiter {
             processIDToReap = processID
             waiter = reapWaiter
             self.reapWaiter = nil

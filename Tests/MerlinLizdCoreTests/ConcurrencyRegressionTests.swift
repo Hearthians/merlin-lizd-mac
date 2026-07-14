@@ -110,6 +110,61 @@ struct ConcurrencyRegressionTests {
         #expect(await parentPIDFile.waitUntilProcessIsAbsent(parentProcessID))
     }
 
+    @Test("cancellation after leader reap still terminates its live process group")
+    func cancellationAfterReapTerminatesDescendant() async throws {
+        let parentPIDFile = TemporaryProcessIDFile()
+        let descendantPIDFile = TemporaryProcessIDFile()
+        defer {
+            parentPIDFile.remove()
+            descendantPIDFile.remove()
+        }
+
+        let reapGate = AsyncStartGate()
+        let runner = FoundationInventoryProcessRunner(
+            reapBoundaryHook: {
+                await reapGate.wait()
+            }
+        )
+        let task = Task {
+            try await runner.run(CommandSpec(
+                executable: "/bin/sh",
+                arguments: [
+                    "-c",
+                    "echo $$ > \"$1\"; /bin/sh -c 'trap \"\" TERM; exec 1>&- 2>&-; exec /bin/sleep 30' & echo $! > \"$2\"; exit 0",
+                    "merlin-lizd-reap-cancel-test",
+                    parentPIDFile.path,
+                    descendantPIDFile.path,
+                ]
+            ))
+        }
+
+        await reapGate.waitUntilEntered()
+        let parentProcessID = try await parentPIDFile.waitForProcessID()
+        let descendantProcessID = try await descendantPIDFile.waitForProcessID()
+        #expect(parentPIDFile.processIsAbsent(parentProcessID))
+        #expect(getpgid(descendantProcessID) == parentProcessID)
+
+        task.cancel()
+        await reapGate.open()
+
+        var descendantWasTerminated = false
+        for _ in 0..<800 {
+            if descendantPIDFile.processIsAbsent(descendantProcessID) {
+                descendantWasTerminated = true
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        if !descendantWasTerminated {
+            _ = kill(-parentProcessID, SIGKILL)
+            _ = await descendantPIDFile.waitUntilProcessIsAbsent(
+                descendantProcessID
+            )
+        }
+        #expect(descendantWasTerminated)
+        await expectCancellation(from: task)
+    }
+
     @Test("a task cancelled before process launch never starts the child")
     func cancellationBeforeLaunchDoesNotStartProcess() async throws {
         let marker = TemporaryMarkerFile()
