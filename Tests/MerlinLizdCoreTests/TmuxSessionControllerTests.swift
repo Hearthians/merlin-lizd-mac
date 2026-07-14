@@ -1450,6 +1450,135 @@ struct TmuxSessionControllerTests {
         #expect(arguments.last == ["select-window", "-t", "@12"])
         #expect(!arguments.contains { $0 == ["select-pane", "-t", "%34"] })
     }
+
+    @Test("failed kill reconciles an existing exact pane as not committed")
+    func failedKillWithExistingPaneIsNotCommitted() async throws {
+        let runner = GatedSurfaceRunner(actions: [
+            .output(splitOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%35")),
+            .transportUnavailable,
+            .output(surfaceOutput(paneID: "%35")),
+        ])
+        let controller = TmuxSessionController(processRunner: runner)
+        let origin = surface(paneID: "%34")
+        _ = try await controller.createTemporaryPane(
+            from: origin,
+            route: localRoute()
+        )
+
+        #expect(
+            try await controller.closeTemporaryPane(
+                "%35",
+                restoring: origin,
+                route: localRoute()
+            ) == .notCommitted(reason: .transportUnavailable)
+        )
+        let arguments = await runner.commands().map(\.arguments)
+        #expect(arguments.filter { $0.first == "kill-pane" } == [[
+            "kill-pane", "-t", "%35",
+        ]])
+        #expect(arguments.filter { $0.first == "display-message" }.count == 3)
+    }
+
+    @Test("failed kill reconciles an absent exact pane as committed")
+    func failedKillWithAbsentPaneIsClosed() async throws {
+        let runner = GatedSurfaceRunner(actions: [
+            .output(splitOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%35")),
+            .transportUnavailable,
+            .output(InventoryProcessOutput(
+                stdout: "",
+                stderr: "can't find pane: %35",
+                exitCode: 1
+            )),
+            .output(successfulOutput()),
+            .output(successfulOutput()),
+            .output(surfaceOutput(paneID: "%34")),
+        ])
+        let controller = TmuxSessionController(processRunner: runner)
+        let origin = surface(paneID: "%34")
+        _ = try await controller.createTemporaryPane(
+            from: origin,
+            route: localRoute()
+        )
+
+        #expect(
+            try await controller.closeTemporaryPane(
+                "%35",
+                restoring: origin,
+                route: localRoute()
+            ) == .closed(restoration: .restored)
+        )
+        #expect(
+            try await controller.closeTemporaryPane(
+                "%35",
+                restoring: origin,
+                route: localRoute()
+            ) == .notCommitted(reason: .paneNotOwned)
+        )
+        let arguments = await runner.commands().map(\.arguments)
+        #expect(arguments.filter { $0.first == "kill-pane" }.count == 1)
+    }
+
+    @Test("unavailable reconciliation quarantines exact ownership before retry")
+    func unavailableReconciliationQuarantinesOwnership() async throws {
+        let reason = TmuxTemporaryPaneCloseIndeterminateReason(
+            mutationFailure: .transportUnavailable,
+            reconciliationFailure: .unavailable
+        )
+        let runner = GatedSurfaceRunner(actions: [
+            .output(splitOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%35")),
+            .output(surfaceOutput(paneID: "%35")),
+            .transportUnavailable,
+            .sensitiveFailure("first reconciliation secret"),
+            .sensitiveFailure("second reconciliation secret"),
+            .output(surfaceOutput(paneID: "%35")),
+            .output(successfulOutput()),
+            .output(successfulOutput()),
+            .output(successfulOutput()),
+            .output(surfaceOutput(paneID: "%34")),
+        ])
+        let controller = TmuxSessionController(processRunner: runner)
+        let origin = surface(paneID: "%34")
+        _ = try await controller.createTemporaryPane(
+            from: origin,
+            route: localRoute()
+        )
+
+        #expect(
+            try await controller.closeTemporaryPane(
+                "%35",
+                restoring: origin,
+                route: localRoute()
+            ) == .indeterminate(reason: reason)
+        )
+        #expect(
+            try await controller.closeTemporaryPane(
+                "%35",
+                restoring: origin,
+                route: localRoute()
+            ) == .indeterminate(reason: reason)
+        )
+        #expect(await runner.commands().filter {
+            $0.arguments.first == "kill-pane"
+        }.count == 1)
+
+        #expect(
+            try await controller.closeTemporaryPane(
+                "%35",
+                restoring: origin,
+                route: localRoute()
+            ) == .closed(restoration: .restored)
+        )
+        let commands = await runner.commands()
+        #expect(commands.filter { $0.arguments.first == "kill-pane" }.count == 2)
+        #expect(!commands.flatMap(\.arguments).contains {
+            $0.contains("secret")
+        })
+    }
 }
 
 private func tmuxIdentity() -> TmuxSessionIdentity {

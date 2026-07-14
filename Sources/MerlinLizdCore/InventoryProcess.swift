@@ -219,6 +219,14 @@ actor BoundedInventoryProcessRunner: InventoryProcessRunning {
 }
 
 final class FoundationInventoryProcessRunner: InventoryProcessRunning, @unchecked Sendable {
+    private let completionBoundaryHook: @Sendable () async -> Void
+
+    init(
+        completionBoundaryHook: @escaping @Sendable () async -> Void = {}
+    ) {
+        self.completionBoundaryHook = completionBoundaryHook
+    }
+
     func run(_ command: CommandSpec) async throws -> InventoryProcessOutput {
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
@@ -255,12 +263,16 @@ final class FoundationInventoryProcessRunner: InventoryProcessRunning, @unchecke
                 exitCode: exitCode
             )
             await processBox.reap()
-            try Task.checkCancellation()
+            await completionBoundaryHook()
+            guard processBox.completionPrecededCancellation else {
+                throw CancellationError()
+            }
             return output
         } onCancel: {
-            processBox.cancel()
-            stdout.requestClose()
-            stderr.requestClose()
+            if processBox.cancel() {
+                stdout.requestClose()
+                stderr.requestClose()
+            }
         }
     }
 }
@@ -518,6 +530,7 @@ private final class RunningProcessBox: @unchecked Sendable {
     private var processID: pid_t?
     private var processGroupID: pid_t?
     private var observedExitCode: Int32?
+    private var didCompletionPrecedeCancellation: Bool?
     private var exitWaiter: CheckedContinuation<Int32, Never>?
     private var reapWaiter: CheckedContinuation<pid_t?, Never>?
 
@@ -595,10 +608,21 @@ private final class RunningProcessBox: @unchecked Sendable {
         } while waitResult == -1 && errno == EINTR
     }
 
-    func cancel() {
+    var completionPrecededCancellation: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return didCompletionPrecedeCancellation == true
+    }
+
+    @discardableResult
+    func cancel() -> Bool {
         var groupToTerminate: pid_t?
 
         lock.lock()
+        guard observedExitCode == nil, !reapCommitted else {
+            lock.unlock()
+            return false
+        }
         cancellationRequested = true
         if
             started,
@@ -611,13 +635,14 @@ private final class RunningProcessBox: @unchecked Sendable {
         }
         lock.unlock()
 
-        guard let groupToTerminate else { return }
+        guard let groupToTerminate else { return true }
         signalProcessGroup(groupToTerminate, signal: SIGTERM)
         DispatchQueue.global(qos: .utility).asyncAfter(
             deadline: .now() + Self.forceKillGracePeriod
         ) { [self] in
             forceKillIfNeeded(processGroupID: groupToTerminate)
         }
+        return true
     }
 
     private func forceKillIfNeeded(processGroupID: pid_t) {
@@ -768,6 +793,7 @@ private final class RunningProcessBox: @unchecked Sendable {
             return
         }
         observedExitCode = status
+        didCompletionPrecedeCancellation = !cancellationRequested
         let waiter = exitWaiter
         exitWaiter = nil
         lock.unlock()

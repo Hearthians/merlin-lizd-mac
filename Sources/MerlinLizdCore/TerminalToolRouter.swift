@@ -116,6 +116,7 @@ public actor TerminalToolRouter {
         let provenance: RetainedTemporaryPaneLease
         let lease: TemporaryPaneLease?
         var retentionReason: TemporaryPaneRetentionReason?
+        var indeterminateReason: TmuxTemporaryPaneCloseIndeterminateReason?
         var isAutoCloseable: Bool
     }
 
@@ -765,6 +766,7 @@ public actor TerminalToolRouter {
                 provenance: provenance,
                 lease: lease,
                 retentionReason: nil,
+                indeterminateReason: nil,
                 isAutoCloseable: true
             )
             do {
@@ -951,6 +953,7 @@ public actor TerminalToolRouter {
                     provenance: provenance,
                     lease: nil,
                     retentionReason: retentionReason,
+                    indeterminateReason: nil,
                     isAutoCloseable: false
                 )
                 do {
@@ -1347,8 +1350,12 @@ public actor TerminalToolRouter {
                 let restoration: TmuxOriginRestoreOutcome
                 switch closeOutcome {
                 case let .notCommitted(reason):
+                    let resolvedRecord = resolveLeaseIndeterminate(
+                        turn: turn,
+                        leaseID: lease.id
+                    ) ?? record
                     return try await retainExistingLease(
-                        record,
+                        resolvedRecord,
                         reason: reason == .cancelled
                             ? .interrupted
                             : .closeNotCommitted(reason),
@@ -1357,6 +1364,13 @@ public actor TerminalToolRouter {
                     )
                 case let .closed(outcome):
                     restoration = outcome
+                case let .indeterminate(reason):
+                    return try await reportIndeterminateLease(
+                        record,
+                        reason: reason,
+                        preparation: preparation,
+                        turn: turn
+                    )
                 }
                 leases.removeValue(forKey: leaseKey)
                 do {
@@ -1809,40 +1823,61 @@ public actor TerminalToolRouter {
         for task in tasks {
             _ = await task.result
         }
-        var auditFailures: [TerminalTurnRetainedPaneAudit] = []
+        var retainedAuditFailures: [TerminalTurnRetainedPaneAudit] = []
+        var indeterminateAuditFailures: [TerminalTurnIndeterminatePaneAudit]
+            = []
         let retainedKeys = leases.keys.filter { $0.turn == turn }
         for key in retainedKeys {
             guard let record = leases.removeValue(forKey: key) else { continue }
             let operationID = UUID()
             let retainedReason = preexistingReasons[key] ?? reason
             do {
+                let paneEvent: TerminalJournalTemporaryPaneEvent
+                if let indeterminateReason = record.indeterminateReason {
+                    paneEvent = .indeterminate(
+                        leaseID: record.provenance.id,
+                        pane: TerminalJournalPaneProvenance(
+                            record.provenance.pane
+                        ),
+                        reason: indeterminateReason
+                    )
+                } else {
+                    paneEvent = .retained(
+                        leaseID: record.provenance.id,
+                        pane: TerminalJournalPaneProvenance(
+                            record.provenance.pane
+                        ),
+                        reason: TerminalJournalRetentionReasonCode(
+                            retainedReason
+                        )
+                    )
+                }
                 try await append(
                     event(
                         binding: record.binding,
                         turn: turn,
                         operationID: operationID,
-                        kind: .temporaryPane(
-                            .retained(
-                                leaseID: record.provenance.id,
-                                pane: TerminalJournalPaneProvenance(
-                                    record.provenance.pane
-                                ),
-                                reason: TerminalJournalRetentionReasonCode(
-                                    retainedReason
-                                )
-                            )
-                        )
+                        kind: .temporaryPane(paneEvent)
                     ),
                     turn: turn,
                     blocksMutations: false
                 )
             } catch {
-                auditFailures.append(
-                    TerminalTurnRetainedPaneAudit(
-                        provenance: record.provenance,
-                        reason: .auditUnavailable
+                if let indeterminateReason = record.indeterminateReason {
+                    indeterminateAuditFailures.append(
+                        TerminalTurnIndeterminatePaneAudit(
+                            provenance: record.provenance,
+                            reason: indeterminateReason
+                        )
                     )
-                )
+                } else {
+                    retainedAuditFailures.append(
+                        TerminalTurnRetainedPaneAudit(
+                            provenance: record.provenance,
+                            reason: .auditUnavailable
+                        )
+                    )
+                }
             }
         }
         blockedTurns.remove(turn)
@@ -1866,8 +1901,15 @@ public actor TerminalToolRouter {
             turnLifecycles.removeValue(forKey: turn)
         }
         terminationReasons.removeValue(forKey: turn)
-        if !auditFailures.isEmpty {
-            throw TerminalTurnTerminationError.auditUnavailable(auditFailures)
+        if !indeterminateAuditFailures.isEmpty {
+            throw TerminalTurnTerminationError.indeterminateAuditUnavailable(
+                indeterminateAuditFailures
+            )
+        }
+        if !retainedAuditFailures.isEmpty {
+            throw TerminalTurnTerminationError.auditUnavailable(
+                retainedAuditFailures
+            )
         }
     }
 
@@ -1965,8 +2007,19 @@ public actor TerminalToolRouter {
         preparation: MutationPreparation,
         turn: TurnKey
     ) async throws -> TerminalToolResult {
-        let retainedReason = record.retentionReason
-            ?? effectiveRetentionReason(reason, turn: turn)
+        if let reason = record.indeterminateReason {
+            return try await reportIndeterminateLease(
+                record,
+                reason: reason,
+                preparation: preparation,
+                turn: turn
+            )
+        }
+        let retainedReason = retentionReason(
+            for: record,
+            requested: reason,
+            turn: turn
+        )
         updateLeaseRetention(
             turn: turn,
             leaseID: record.provenance.id,
@@ -2013,8 +2066,20 @@ public actor TerminalToolRouter {
         turn: TurnKey,
         binding: TerminalEndpointBinding
     ) async throws -> TerminalToolResult {
-        let retainedReason = record.retentionReason
-            ?? effectiveRetentionReason(reason, turn: turn)
+        if let reason = record.indeterminateReason {
+            return try await reportIndeterminateLease(
+                record,
+                reason: reason,
+                operationID: operationID,
+                turn: turn,
+                binding: binding
+            )
+        }
+        let retainedReason = retentionReason(
+            for: record,
+            requested: reason,
+            turn: turn
+        )
         updateLeaseRetention(
             turn: turn,
             leaseID: record.provenance.id,
@@ -2071,6 +2136,110 @@ public actor TerminalToolRouter {
         }
         return .temporaryPaneFinished(
             .retained(lease, reason: retainedReason)
+        )
+    }
+
+    private func reportIndeterminateLease(
+        _ record: LeaseRecord,
+        reason: TmuxTemporaryPaneCloseIndeterminateReason,
+        preparation: MutationPreparation,
+        turn: TurnKey
+    ) async throws -> TerminalToolResult {
+        updateLeaseIndeterminate(
+            turn: turn,
+            leaseID: record.provenance.id,
+            reason: reason
+        )
+        do {
+            try await appendTemporary(
+                .indeterminate(
+                    leaseID: record.provenance.id,
+                    pane: TerminalJournalPaneProvenance(record.provenance.pane),
+                    reason: reason
+                ),
+                preparation: preparation,
+                turn: turn
+            )
+        } catch {
+            // Preserve fail-closed behavior without permanently preventing the
+            // only explicit operation that can reconcile this exact lease.
+            // A retry must still durably pass every pre-action audit write.
+            blockedTurns.remove(turn)
+            guard let lease = record.lease else {
+                throw TerminalToolRouterError.temporaryPaneAuditUnavailable(
+                    record.provenance,
+                    reason: .auditUnavailable
+                )
+            }
+            throw TerminalToolRouterError
+                .temporaryPaneCloseIndeterminateAuditUnavailable(
+                    lease,
+                    reason: reason
+                )
+        }
+        guard let lease = record.lease else {
+            throw TerminalToolRouterError.temporaryPaneAuditUnavailable(
+                record.provenance,
+                reason: .auditUnavailable
+            )
+        }
+        return .temporaryPaneFinished(
+            .indeterminate(lease, reason: reason)
+        )
+    }
+
+    private func reportIndeterminateLease(
+        _ record: LeaseRecord,
+        reason: TmuxTemporaryPaneCloseIndeterminateReason,
+        operationID: UUID,
+        turn: TurnKey,
+        binding: TerminalEndpointBinding
+    ) async throws -> TerminalToolResult {
+        updateLeaseIndeterminate(
+            turn: turn,
+            leaseID: record.provenance.id,
+            reason: reason
+        )
+        do {
+            try await append(
+                event(
+                    binding: binding,
+                    turn: turn,
+                    operationID: operationID,
+                    kind: .temporaryPane(
+                        .indeterminate(
+                            leaseID: record.provenance.id,
+                            pane: TerminalJournalPaneProvenance(
+                                record.provenance.pane
+                            ),
+                            reason: reason
+                        )
+                    )
+                ),
+                turn: turn
+            )
+        } catch {
+            blockedTurns.remove(turn)
+            guard let lease = record.lease else {
+                throw TerminalToolRouterError.temporaryPaneAuditUnavailable(
+                    record.provenance,
+                    reason: .auditUnavailable
+                )
+            }
+            throw TerminalToolRouterError
+                .temporaryPaneCloseIndeterminateAuditUnavailable(
+                    lease,
+                    reason: reason
+                )
+        }
+        guard let lease = record.lease else {
+            throw TerminalToolRouterError.temporaryPaneAuditUnavailable(
+                record.provenance,
+                reason: .auditUnavailable
+            )
+        }
+        return .temporaryPaneFinished(
+            .indeterminate(lease, reason: reason)
         )
     }
 
@@ -2443,10 +2612,34 @@ public actor TerminalToolRouter {
         let key = LeaseKey(turn: turn, leaseID: leaseID)
         guard var record = leases[key] else { return }
         record.retentionReason = reason
+        record.indeterminateReason = nil
         if let isAutoCloseable {
             record.isAutoCloseable = isAutoCloseable
         }
         leases[key] = record
+    }
+
+    private func updateLeaseIndeterminate(
+        turn: TurnKey,
+        leaseID: UUID,
+        reason: TmuxTemporaryPaneCloseIndeterminateReason
+    ) {
+        let key = LeaseKey(turn: turn, leaseID: leaseID)
+        guard var record = leases[key] else { return }
+        record.retentionReason = nil
+        record.indeterminateReason = reason
+        leases[key] = record
+    }
+
+    private func resolveLeaseIndeterminate(
+        turn: TurnKey,
+        leaseID: UUID
+    ) -> LeaseRecord? {
+        let key = LeaseKey(turn: turn, leaseID: leaseID)
+        guard var record = leases[key] else { return nil }
+        record.indeterminateReason = nil
+        leases[key] = record
+        return record
     }
 
     private func pinLossRetentionReason(
@@ -2468,6 +2661,17 @@ public actor TerminalToolRouter {
             return requested
         }
         return terminationReason
+    }
+
+    private func retentionReason(
+        for record: LeaseRecord,
+        requested: TemporaryPaneRetentionReason,
+        turn: TurnKey
+    ) -> TemporaryPaneRetentionReason {
+        if !record.isAutoCloseable, let existing = record.retentionReason {
+            return existing
+        }
+        return effectiveRetentionReason(requested, turn: turn)
     }
 
     private func activateTurn(

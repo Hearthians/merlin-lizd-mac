@@ -1774,6 +1774,348 @@ struct TerminalToolRouterTests {
         }
     }
 
+    @Test("indeterminate close quarantines the exact lease without retained or closed audit")
+    func indeterminateCloseQuarantinesExactLease() async throws {
+        let reason = TmuxTemporaryPaneCloseIndeterminateReason(
+            mutationFailure: .transportUnavailable,
+            reconciliationFailure: .unavailable
+        )
+        let fixture = try await finishFixture(
+            closeOutcome: .indeterminate(reason: reason),
+            revision: 5_881,
+            paneID: "%indeterminate",
+            nonce: "D81D"
+        )
+
+        #expect(
+            fixture.result == .temporaryPaneFinished(
+                .indeterminate(fixture.lease, reason: reason)
+            )
+        )
+        let leaseEvents = await fixture.journal.snapshot().compactMap {
+            event -> TerminalJournalTemporaryPaneEvent? in
+            guard case let .temporaryPane(value) = event.kind else {
+                return nil
+            }
+            return value
+        }
+        #expect(leaseEvents.contains(
+            .indeterminate(
+                leaseID: fixture.lease.id,
+                pane: TerminalJournalPaneProvenance(
+                    windowID: fixture.lease.temporary.windowID,
+                    paneID: fixture.lease.temporary.paneID
+                ),
+                reason: reason
+            )
+        ))
+        #expect(!leaseEvents.contains { event in
+            switch event {
+            case .retained, .closed: true
+            case .created, .indeterminate: false
+            }
+        })
+        await #expect(throws: TerminalToolRouterError.liveLeaseExists) {
+            _ = try await fixture.router.execute(
+                handle: fixture.handle,
+                turnID: fixture.turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .createTemporaryPane(expectedRevision: 5_883)
+            )
+        }
+        #expect(await fixture.surfaces.recordedCalls().filter {
+            $0 == "close:\(fixture.lease.temporary.paneID)"
+        }.count == 1)
+    }
+
+    @Test("indeterminate audit failure preserves quarantine for explicit retry")
+    func indeterminateAuditFailurePreservesRetry() async throws {
+        let revision: UInt64 = 5_891
+        let nonce = "D91D"
+        let reason = TmuxTemporaryPaneCloseIndeterminateReason(
+            mutationFailure: .timedOut,
+            reconciliationFailure: .transportUnavailable
+        )
+        let initial = TerminalToolFixtures.screen(revision: revision)
+        let paneScreen = TerminalToolFixtures.screen(revision: revision + 1)
+        let probed = TerminalToolFixtures.screen(
+            revision: revision + 2,
+            text: "B\(nonce)\nE\(nonce)\n$ "
+        )
+        let port = FakeTerminalToolPort(snapshot: initial)
+        await port.enqueueWait(.init(snapshot: paneScreen, timedOut: false))
+        let origin = TerminalToolFixtures.surface()
+        let temporary = TerminalToolFixtures.surface(
+            paneID: "%indeterminate-audit"
+        )
+        let surfaces = FakeTerminalSurfaceController(
+            surface: origin,
+            createdSurface: temporary
+        )
+        await surfaces.setCloseOutcome(.indeterminate(reason: reason))
+        let journal = MemoryTerminalToolJournal()
+        let (router, handle, turnID) = try await makeRouter(
+            port: port,
+            surfaces: surfaces,
+            journal: journal,
+            nonce: nonce
+        )
+        let create = Task {
+            try await router.execute(
+                handle: handle,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .createTemporaryPane(expectedRevision: revision)
+            )
+        }
+        try await approveNextRequest(router: router)
+        guard case let .temporaryPaneCreated(lease, _) = try await create.value
+        else {
+            Issue.record("expected temporary pane lease")
+            return
+        }
+        await port.setSnapshot(paneScreen)
+        await port.enqueueWait(.init(snapshot: probed, timedOut: false))
+        await journal.failAfterAdditionalAppends(8)
+        let finish = Task {
+            try await router.execute(
+                handle: handle,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .finishTemporaryPane(
+                    leaseID: lease.id,
+                    expectedRevision: revision + 1
+                )
+            )
+        }
+        try await approveNextRequest(router: router)
+
+        await #expect(
+            throws: TerminalToolRouterError
+                .temporaryPaneCloseIndeterminateAuditUnavailable(
+                    lease,
+                    reason: reason
+                )
+        ) {
+            _ = try await finish.value
+        }
+        await #expect(throws: TerminalToolRouterError.liveLeaseExists) {
+            _ = try await router.execute(
+                handle: handle,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .createTemporaryPane(expectedRevision: revision + 2)
+            )
+        }
+
+        await journal.failOnAppend(nil)
+        await port.enqueueWait(.init(
+            snapshot: TerminalToolFixtures.screen(
+                revision: revision + 3,
+                text: "B\(nonce)\nE\(nonce)\n$ "
+            ),
+            timedOut: false
+        ))
+        await surfaces.setCloseOutcome(.closed(restoration: .restored))
+        let retry = Task {
+            try await router.execute(
+                handle: handle,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .finishTemporaryPane(
+                    leaseID: lease.id,
+                    expectedRevision: revision + 2
+                )
+            )
+        }
+        try await approveNextRequest(router: router)
+        #expect(
+            try await retry.value == .temporaryPaneFinished(.closed(lease))
+        )
+        #expect(await surfaces.recordedCalls().filter {
+            $0 == "close:\(temporary.paneID)"
+        }.count == 2)
+    }
+
+    @Test("turn termination preserves indeterminate audit semantics")
+    func terminationJournalsIndeterminateLease() async throws {
+        let reason = TmuxTemporaryPaneCloseIndeterminateReason(
+            mutationFailure: .commandFailed,
+            reconciliationFailure: .timedOut
+        )
+        let fixture = try await finishFixture(
+            closeOutcome: .indeterminate(reason: reason),
+            revision: 5_901,
+            paneID: "%indeterminate-termination",
+            nonce: "DA1D"
+        )
+
+        try await fixture.router.endTurn(
+            handle: fixture.handle,
+            turnID: fixture.turnID
+        )
+
+        let events: [TerminalJournalTemporaryPaneEvent]
+            = await fixture.journal.snapshot().compactMap { event in
+            guard case let .temporaryPane(value) = event.kind else {
+                return nil
+            }
+            return value
+        }
+        let matching = events.filter { event in
+            switch event {
+            case let .created(id, _),
+                let .closed(id, _, _),
+                let .retained(id, _, _),
+                let .indeterminate(id, _, _):
+                id == fixture.lease.id
+            }
+        }
+        #expect(matching.filter { event in
+            guard case .indeterminate = event else { return false }
+            return true
+        }.count == 2)
+        #expect(!matching.contains { event in
+            guard case .retained = event else { return false }
+            return true
+        })
+    }
+
+    @Test("indeterminate termination audit failure reports exact quarantine")
+    func terminationIndeterminateAuditFailureIsTyped() async throws {
+        let reason = TmuxTemporaryPaneCloseIndeterminateReason(
+            mutationFailure: .commandFailed,
+            reconciliationFailure: .transportUnavailable
+        )
+        let fixture = try await finishFixture(
+            closeOutcome: .indeterminate(reason: reason),
+            revision: 5_911,
+            paneID: "%indeterminate-termination-audit",
+            nonce: "DB1D"
+        )
+        let audit = TerminalTurnIndeterminatePaneAudit(
+            provenance: RetainedTemporaryPaneLease(
+                id: fixture.lease.id,
+                conversationKey: fixture.lease.conversationKey,
+                origin: fixture.lease.origin,
+                route: TerminalToolFixtures.route,
+                pane: RetainedTemporaryPane(
+                    windowID: fixture.lease.temporary.windowID,
+                    paneID: fixture.lease.temporary.paneID
+                )
+            ),
+            reason: reason
+        )
+        await fixture.journal.setFailAppend(true)
+
+        await #expect(
+            throws: TerminalTurnTerminationError
+                .indeterminateAuditUnavailable([audit])
+        ) {
+            try await fixture.router.endTurn(
+                handle: fixture.handle,
+                turnID: fixture.turnID
+            )
+        }
+    }
+
+    @Test("retry cancellation replaces an auto-closeable lease's old reason")
+    func retryCancellationUsesCurrentRetentionReason() async throws {
+        let fixture = try await probeTimedOutFinishFixture(
+            revision: 5_861,
+            paneID: "%retry-cancel",
+            nonce: "D61D"
+        )
+        let observeGate = TerminalToolTestGate()
+        let countsBeforeRetry = await fixture.port.counts()
+        await fixture.port.blockObserves(
+            on: observeGate,
+            checkCancellationAfterGate: true
+        )
+        let retry = Task {
+            try await fixture.router.execute(
+                handle: fixture.handle,
+                turnID: fixture.turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .finishTemporaryPane(
+                    leaseID: fixture.lease.id,
+                    expectedRevision: 5_862
+                )
+            )
+        }
+        while await fixture.port.counts().observe == countsBeforeRetry.observe {
+            await Task.yield()
+        }
+
+        retry.cancel()
+        await observeGate.open()
+
+        #expect(
+            try await retry.value == .temporaryPaneFinished(
+                .retained(fixture.lease, reason: .interrupted)
+            )
+        )
+        let reasons: [TerminalJournalRetentionReasonCode]
+            = await fixture.journal.snapshot().compactMap { event in
+            guard case let .temporaryPane(.retained(id, _, reason)) = event.kind,
+                id == fixture.lease.id
+            else { return nil }
+            return reason
+        }
+        #expect(reasons.suffix(2) == [.probeTimedOut, .interrupted])
+    }
+
+    @Test("retry close failure replaces an auto-closeable lease's old reason")
+    func retryCloseFailureUsesCurrentRetentionReason() async throws {
+        let fixture = try await probeTimedOutFinishFixture(
+            revision: 5_871,
+            paneID: "%retry-close-failure",
+            nonce: "D71D"
+        )
+        await fixture.port.enqueueWait(.init(
+            snapshot: TerminalToolFixtures.screen(
+                revision: 5_873,
+                text: "BD71D\nED71D\n$ "
+            ),
+            timedOut: false
+        ))
+        await fixture.surfaces.setCloseOutcome(
+            .notCommitted(reason: .commandFailed)
+        )
+        let retry = Task {
+            try await fixture.router.execute(
+                handle: fixture.handle,
+                turnID: fixture.turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .finishTemporaryPane(
+                    leaseID: fixture.lease.id,
+                    expectedRevision: 5_872
+                )
+            )
+        }
+        try await approveNextRequest(router: fixture.router)
+
+        #expect(
+            try await retry.value == .temporaryPaneFinished(
+                .retained(
+                    fixture.lease,
+                    reason: .closeNotCommitted(.commandFailed)
+                )
+            )
+        )
+        let reasons: [TerminalJournalRetentionReasonCode]
+            = await fixture.journal.snapshot().compactMap { event in
+            guard case let .temporaryPane(.retained(id, _, reason)) = event.kind,
+                id == fixture.lease.id
+            else { return nil }
+            return reason
+        }
+        #expect(reasons.suffix(2) == [
+            .probeTimedOut,
+            .controllerCommandFailed,
+        ])
+    }
+
     @Test("finish preserves a live lease after pre-existing endpoint pin loss")
     func finishAfterPinLossRetainsWithoutAccess() async throws {
         let initial = TerminalToolFixtures.screen(revision: 581)
@@ -3778,6 +4120,72 @@ struct TerminalToolRouterTests {
             journal,
             surfaces
         )
+    }
+
+    private func probeTimedOutFinishFixture(
+        revision: UInt64,
+        paneID: String,
+        nonce: String
+    ) async throws -> (
+        lease: TemporaryPaneLease,
+        router: TerminalToolRouter,
+        handle: AgentTurnHandle,
+        turnID: AgentTurnID,
+        port: FakeTerminalToolPort,
+        journal: MemoryTerminalToolJournal,
+        surfaces: FakeTerminalSurfaceController
+    ) {
+        let initial = TerminalToolFixtures.screen(revision: revision)
+        let paneScreen = TerminalToolFixtures.screen(revision: revision + 1)
+        let port = FakeTerminalToolPort(snapshot: initial)
+        await port.enqueueWait(.init(snapshot: paneScreen, timedOut: false))
+        let origin = TerminalToolFixtures.surface()
+        let temporary = TerminalToolFixtures.surface(paneID: paneID)
+        let surfaces = FakeTerminalSurfaceController(
+            surface: origin,
+            createdSurface: temporary
+        )
+        let journal = MemoryTerminalToolJournal()
+        let (router, handle, turnID) = try await makeRouter(
+            port: port,
+            surfaces: surfaces,
+            journal: journal,
+            nonce: nonce
+        )
+        let create = Task {
+            try await router.execute(
+                handle: handle,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .createTemporaryPane(expectedRevision: revision)
+            )
+        }
+        try await approveNextRequest(router: router)
+        guard case let .temporaryPaneCreated(lease, _) = try await create.value
+        else {
+            Issue.record("expected temporary pane lease")
+            throw TerminalToolRouterError.terminalFailure
+        }
+        await port.setSnapshot(paneScreen)
+        await port.enqueueWait(.init(snapshot: paneScreen, timedOut: true))
+        let firstFinish = Task {
+            try await router.execute(
+                handle: handle,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .finishTemporaryPane(
+                    leaseID: lease.id,
+                    expectedRevision: revision + 1
+                )
+            )
+        }
+        try await approveNextRequest(router: router)
+        #expect(
+            try await firstFinish.value == .temporaryPaneFinished(
+                .retained(lease, reason: .probeTimedOut)
+            )
+        )
+        return (lease, router, handle, turnID, port, journal, surfaces)
     }
 
     private func makeReplayRouter() async throws -> (

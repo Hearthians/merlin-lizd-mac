@@ -93,8 +93,25 @@ public struct TerminalTurnRetainedPaneAudit: Codable, Equatable, Sendable {
     }
 }
 
+public struct TerminalTurnIndeterminatePaneAudit: Codable, Equatable,
+    Sendable {
+    public let provenance: RetainedTemporaryPaneLease
+    public let reason: TmuxTemporaryPaneCloseIndeterminateReason
+
+    public init(
+        provenance: RetainedTemporaryPaneLease,
+        reason: TmuxTemporaryPaneCloseIndeterminateReason
+    ) {
+        self.provenance = provenance
+        self.reason = reason
+    }
+}
+
 public enum TerminalTurnTerminationError: Error, Equatable, Sendable {
     case auditUnavailable([TerminalTurnRetainedPaneAudit])
+    case indeterminateAuditUnavailable(
+        [TerminalTurnIndeterminatePaneAudit]
+    )
 }
 
 public enum TemporaryPaneFinishOutcome: Codable, Equatable, Sendable {
@@ -106,6 +123,10 @@ public enum TemporaryPaneFinishOutcome: Codable, Equatable, Sendable {
     case retained(
         TemporaryPaneLease,
         reason: TemporaryPaneRetentionReason
+    )
+    case indeterminate(
+        TemporaryPaneLease,
+        reason: TmuxTemporaryPaneCloseIndeterminateReason
     )
 }
 
@@ -150,5 +171,9 @@ public enum TerminalToolRouterError: Error, Equatable, Sendable {
     case temporaryPaneCloseAuditUnavailable(
         TemporaryPaneLease,
         restoration: TmuxOriginRestoreOutcome
+    )
+    case temporaryPaneCloseIndeterminateAuditUnavailable(
+        TemporaryPaneLease,
+        reason: TmuxTemporaryPaneCloseIndeterminateReason
     )
 }

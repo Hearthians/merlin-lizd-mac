@@ -190,6 +190,41 @@ struct TerminalOperationJournalTests {
                 restoration: .restored
             )
         )
+
+        let indeterminateReason = TmuxTemporaryPaneCloseIndeterminateReason(
+            mutationFailure: .transportUnavailable,
+            reconciliationFailure: .unavailable
+        )
+        let indeterminate = TerminalJournalTemporaryPaneEvent.indeterminate(
+            leaseID: leaseID,
+            pane: TerminalJournalPaneProvenance(
+                windowID: "@12",
+                paneID: "%34"
+            ),
+            reason: indeterminateReason
+        )
+        let indeterminateJSON = try #require(terminalUTF8String(
+            terminalEncodeTemporaryPaneEvent(indeterminate)
+        ))
+        #expect(
+            try terminalDecodeTemporaryPaneEvent(
+                terminalUTF8Data(indeterminateJSON)
+            ) == indeterminate
+        )
+        #expect(indeterminateJSON.contains("\"indeterminate\""))
+        #expect(indeterminateJSON.contains("\"transportUnavailable\""))
+        #expect(indeterminateJSON.contains("\"unavailable\""))
+        #expect(!indeterminateJSON.contains("secret"))
+
+        let poisonedIndeterminateJSON = indeterminateJSON.replacingOccurrences(
+            of: "unavailable",
+            with: "secret diagnostic: /private/token"
+        )
+        #expect(throws: DecodingError.self) {
+            try terminalDecodeTemporaryPaneEvent(
+                terminalUTF8Data(poisonedIndeterminateJSON)
+            )
+        }
     }
 
     @Test("screen evidence round-trips exact cursor mode dimensions and diff")

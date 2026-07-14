@@ -98,9 +98,24 @@ public enum TmuxOriginRestoreOutcome: Codable, Equatable, Sendable {
     case failed(TmuxOriginRestoreFailureReason)
 }
 
+public struct TmuxTemporaryPaneCloseIndeterminateReason: Codable, Equatable,
+    Sendable {
+    public let mutationFailure: TmuxTemporaryPaneCloseFailureReason
+    public let reconciliationFailure: TmuxTemporaryPaneCloseFailureReason
+
+    public init(
+        mutationFailure: TmuxTemporaryPaneCloseFailureReason,
+        reconciliationFailure: TmuxTemporaryPaneCloseFailureReason
+    ) {
+        self.mutationFailure = mutationFailure
+        self.reconciliationFailure = reconciliationFailure
+    }
+}
+
 public enum TmuxTemporaryPaneCloseOutcome: Codable, Equatable, Sendable {
     case notCommitted(reason: TmuxTemporaryPaneCloseFailureReason)
     case closed(restoration: TmuxOriginRestoreOutcome)
+    case indeterminate(reason: TmuxTemporaryPaneCloseIndeterminateReason)
 }
 
 public protocol TmuxSurfaceControlling: Sendable {

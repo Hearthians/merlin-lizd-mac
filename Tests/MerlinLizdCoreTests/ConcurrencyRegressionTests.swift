@@ -37,6 +37,29 @@ struct ConcurrencyRegressionTests {
         }
     }
 
+    @Test("authoritative process completion wins a later task cancellation")
+    func authoritativeCompletionWinsLateCancellation() async throws {
+        let completionGate = AsyncStartGate()
+        let runner = FoundationInventoryProcessRunner(
+            completionBoundaryHook: {
+                await completionGate.wait()
+            }
+        )
+        let task = Task {
+            try await runner.run(CommandSpec(
+                executable: "/usr/bin/true",
+                arguments: []
+            ))
+        }
+
+        await completionGate.waitUntilEntered()
+        task.cancel()
+        await completionGate.open()
+
+        let output = try await task.value
+        #expect(output.exitCode == 0)
+    }
+
     @Test("a task cancelled before process launch never starts the child")
     func cancellationBeforeLaunchDoesNotStartProcess() async throws {
         let marker = TemporaryMarkerFile()

@@ -173,6 +173,11 @@ public enum TerminalJournalTemporaryPaneEvent: Equatable, Sendable {
         pane: TerminalJournalPaneProvenance,
         reason: TerminalJournalRetentionReasonCode
     )
+    case indeterminate(
+        leaseID: UUID,
+        pane: TerminalJournalPaneProvenance,
+        reason: TmuxTemporaryPaneCloseIndeterminateReason
+    )
 }
 
 extension TerminalJournalTemporaryPaneEvent: Codable {
@@ -180,6 +185,7 @@ extension TerminalJournalTemporaryPaneEvent: Codable {
         case created
         case closed
         case retained
+        case indeterminate
     }
 
     private struct Payload: Codable {
@@ -189,12 +195,14 @@ extension TerminalJournalTemporaryPaneEvent: Codable {
         let reasonCode: TerminalJournalRetentionReasonCode?
         let reason: String?
         let restoration: TmuxOriginRestoreOutcome?
+        let indeterminateReason: TmuxTemporaryPaneCloseIndeterminateReason?
 
         init(
             leaseID: UUID,
             pane: TerminalJournalPaneProvenance,
             reasonCode: TerminalJournalRetentionReasonCode? = nil,
-            restoration: TmuxOriginRestoreOutcome? = nil
+            restoration: TmuxOriginRestoreOutcome? = nil,
+            indeterminateReason: TmuxTemporaryPaneCloseIndeterminateReason? = nil
         ) {
             self.leaseID = leaseID
             self.pane = pane
@@ -202,6 +210,7 @@ extension TerminalJournalTemporaryPaneEvent: Codable {
             self.reasonCode = reasonCode
             reason = nil
             self.restoration = restoration
+            self.indeterminateReason = indeterminateReason
         }
 
         var decodedPane: TerminalJournalPaneProvenance? {
@@ -256,6 +265,27 @@ extension TerminalJournalTemporaryPaneEvent: Codable {
             )
             return
         }
+        if container.contains(.indeterminate) {
+            let payload = try container.decode(
+                Payload.self,
+                forKey: .indeterminate
+            )
+            guard let pane = payload.decodedPane,
+                let reason = payload.indeterminateReason
+            else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .indeterminate,
+                    in: container,
+                    debugDescription: "Missing indeterminate pane provenance or reason"
+                )
+            }
+            self = .indeterminate(
+                leaseID: payload.leaseID,
+                pane: pane,
+                reason: reason
+            )
+            return
+        }
         let payload = try container.decode(Payload.self, forKey: .retained)
         guard let pane = payload.decodedPane else {
             throw DecodingError.dataCorruptedError(
@@ -306,6 +336,15 @@ extension TerminalJournalTemporaryPaneEvent: Codable {
             try container.encode(
                 Payload(leaseID: leaseID, pane: pane, reasonCode: reason),
                 forKey: .retained
+            )
+        case let .indeterminate(leaseID, pane, reason):
+            try container.encode(
+                Payload(
+                    leaseID: leaseID,
+                    pane: pane,
+                    indeterminateReason: reason
+                ),
+                forKey: .indeterminate
             )
         }
     }
