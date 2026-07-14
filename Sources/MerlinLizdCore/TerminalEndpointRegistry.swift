@@ -41,20 +41,28 @@ public struct TerminalEndpointBinding: Sendable {
     }
 }
 
+public enum TerminalEndpointPinPhase: Equatable, Sendable {
+    case prepared
+    case active
+}
+
 public struct TerminalEndpointPinLoss: Equatable, Sendable {
     public let threadID: AgentThreadID
-    public let turnID: AgentTurnID
+    public let turnID: AgentTurnID?
+    public let phase: TerminalEndpointPinPhase
     public let conversationKey: TerminalConversationKey
     public let endpointID: TerminalEndpointID
 
     public init(
         threadID: AgentThreadID,
-        turnID: AgentTurnID,
+        turnID: AgentTurnID?,
+        phase: TerminalEndpointPinPhase,
         conversationKey: TerminalConversationKey,
         endpointID: TerminalEndpointID
     ) {
         self.threadID = threadID
         self.turnID = turnID
+        self.phase = phase
         self.conversationKey = conversationKey
         self.endpointID = endpointID
     }
@@ -111,8 +119,10 @@ public actor TerminalEndpointRegistry {
 
     public init() {}
 
-    public func register(_ endpoint: TerminalEndpoint) {
-        guard routeMatchesConversation(endpoint) else { return }
+    public func register(_ endpoint: TerminalEndpoint) throws {
+        guard routeMatchesConversation(endpoint) else {
+            throw TerminalEndpointRegistryError.endpointRouteMismatch
+        }
         focusOrder &+= 1
         endpoints[endpoint.id] = RegisteredEndpoint(
             endpoint: endpoint,
@@ -129,17 +139,16 @@ public actor TerminalEndpointRegistry {
             else { continue }
             binding.pinLost = true
             bindings[threadID] = binding
-            if let turnID = binding.turnID {
-                let loss = TerminalEndpointPinLoss(
-                    threadID: threadID,
-                    turnID: turnID,
-                    conversationKey: binding.conversationKey,
-                    endpointID: endpointID
-                )
-                losses.append(loss)
-                eventSubscribers.values.forEach {
-                    $0.yield(.pinLost(loss))
-                }
+            let loss = TerminalEndpointPinLoss(
+                threadID: threadID,
+                turnID: binding.turnID,
+                phase: binding.turnID == nil ? .prepared : .active,
+                conversationKey: binding.conversationKey,
+                endpointID: endpointID
+            )
+            losses.append(loss)
+            eventSubscribers.values.forEach {
+                $0.yield(.pinLost(loss))
             }
         }
     }
@@ -260,12 +269,23 @@ public actor TerminalEndpointRegistry {
 
     public func releaseTurn(
         threadID: AgentThreadID,
-        turnID: AgentTurnID?
+        turnID: AgentTurnID
     ) async {
         guard let stored = bindings[threadID] else { return }
-        if let turnID, let existing = stored.turnID, existing != turnID {
-            return
-        }
+        guard stored.turnID == turnID else { return }
+        bindings.removeValue(forKey: threadID)
+        conversationOwners.removeValue(forKey: stored.conversationKey)
+        await stored.endpoint.terminal.setKeyboardOwner(.user)
+    }
+
+    public func releasePrepared(
+        threadID: AgentThreadID,
+        conversationKey: TerminalConversationKey
+    ) async {
+        guard let stored = bindings[threadID],
+            stored.turnID == nil,
+            stored.conversationKey == conversationKey
+        else { return }
         bindings.removeValue(forKey: threadID)
         conversationOwners.removeValue(forKey: stored.conversationKey)
         await stored.endpoint.terminal.setKeyboardOwner(.user)

@@ -67,7 +67,10 @@ struct TerminalOperationJournalTests {
                         leaseID: terminalUUID(
                             "30000000-0000-0000-0000-000000000001"
                         ),
-                        paneID: "%9",
+                        pane: TerminalJournalPaneProvenance(
+                            windowID: "@9",
+                            paneID: "%9"
+                        ),
                         reason: "background job remains"
                     )
                 )
@@ -81,6 +84,45 @@ struct TerminalOperationJournalTests {
         #expect(
             try await journal.entries(for: terminalTestConversationKey())
                 == events
+        )
+        let reopened = try FileTerminalOperationJournal(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        #expect(
+            try await reopened.entries(for: terminalTestConversationKey())
+                == events
+        )
+    }
+
+    @Test("pane provenance codec preserves full new IDs and accepts legacy pane-only events")
+    func paneProvenanceCodecCompatibility() throws {
+        let leaseID = terminalUUID("30000000-0000-0000-0000-000000000002")
+        let event = TerminalJournalTemporaryPaneEvent.retained(
+            leaseID: leaseID,
+            pane: TerminalJournalPaneProvenance(
+                windowID: "@12",
+                paneID: "%34"
+            ),
+            reason: "interrupted"
+        )
+        #expect(
+            try terminalDecodeTemporaryPaneEvent(
+                terminalEncodeTemporaryPaneEvent(event)
+            ) == event
+        )
+
+        let legacy = terminalUTF8Data("""
+            {"retained":{"leaseID":"\(leaseID.uuidString)","paneID":"%34","reason":"interrupted"}}
+            """)
+        #expect(
+            try terminalDecodeTemporaryPaneEvent(legacy) == .retained(
+                leaseID: leaseID,
+                pane: TerminalJournalPaneProvenance(
+                    windowID: nil,
+                    paneID: "%34"
+                ),
+                reason: "interrupted"
+            )
         )
     }
 

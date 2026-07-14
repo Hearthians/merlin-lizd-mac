@@ -39,11 +39,51 @@ public enum TemporaryPaneRetentionReason: Codable, Equatable, Sendable {
     case userSurfaceSwitch(expectedPaneID: String, actualPaneID: String)
     case terminalWidthUncertain(required: Int, available: Int)
     case routeUnavailable
+    case auditUnavailable
     case interrupted
     case crashed
     case turnEnded
     case pinLost
     case controllerRetained(RetainedTemporaryPaneReason)
+}
+
+public struct RetainedTemporaryPaneLease: Codable, Equatable, Sendable {
+    public let id: UUID
+    public let conversationKey: TerminalConversationKey
+    public let origin: TmuxSurface
+    public let route: TmuxRoute
+    public let pane: RetainedTemporaryPane
+
+    public init(
+        id: UUID,
+        conversationKey: TerminalConversationKey,
+        origin: TmuxSurface,
+        route: TmuxRoute,
+        pane: RetainedTemporaryPane
+    ) {
+        self.id = id
+        self.conversationKey = conversationKey
+        self.origin = origin
+        self.route = route
+        self.pane = pane
+    }
+}
+
+public struct TerminalTurnRetainedPaneAudit: Codable, Equatable, Sendable {
+    public let provenance: RetainedTemporaryPaneLease
+    public let reason: TemporaryPaneRetentionReason
+
+    public init(
+        provenance: RetainedTemporaryPaneLease,
+        reason: TemporaryPaneRetentionReason
+    ) {
+        self.provenance = provenance
+        self.reason = reason
+    }
+}
+
+public enum TerminalTurnTerminationError: Error, Equatable, Sendable {
+    case auditUnavailable([TerminalTurnRetainedPaneAudit])
 }
 
 public enum TemporaryPaneFinishOutcome: Codable, Equatable, Sendable {
@@ -85,7 +125,11 @@ public enum TerminalToolRouterError: Error, Equatable, Sendable {
     case liveLeaseExists
     case leaseNotFound
     case temporaryPaneRetained(
-        paneID: String,
-        reason: RetainedTemporaryPaneReason
+        RetainedTemporaryPaneLease,
+        reason: TemporaryPaneRetentionReason
+    )
+    case temporaryPaneAuditUnavailable(
+        RetainedTemporaryPaneLease,
+        reason: TemporaryPaneRetentionReason
     )
 }

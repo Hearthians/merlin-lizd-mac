@@ -30,6 +30,20 @@ actor TerminalToolTestLog {
     }
 }
 
+actor TerminalToolCompletionProbe {
+    private var error: TerminalToolRouterError?
+    private var didComplete = false
+
+    func complete(with error: TerminalToolRouterError?) {
+        self.error = error
+        didComplete = true
+    }
+
+    func snapshot() -> (didComplete: Bool, error: TerminalToolRouterError?) {
+        (didComplete, error)
+    }
+}
+
 actor FakeTerminalToolPort: TerminalSessionPort {
     enum Failure: Error, Equatable {
         case send
@@ -47,6 +61,8 @@ actor FakeTerminalToolPort: TerminalSessionPort {
     private var waitCount = 0
     private var sendCount = 0
     private var sendGate: TerminalToolTestGate?
+    private var waitGate: TerminalToolTestGate?
+    private var checkCancellationAfterWaitGate = false
     private let label: String
     private let log: TerminalToolTestLog?
 
@@ -90,6 +106,12 @@ actor FakeTerminalToolPort: TerminalSessionPort {
         if !waitFailures.isEmpty, let failure = waitFailures.removeFirst() {
             throw failure
         }
+        if let waitGate {
+            await waitGate.wait()
+            if checkCancellationAfterWaitGate {
+                try Task.checkCancellation()
+            }
+        }
         guard !waitResults.isEmpty else {
             return TerminalScreenWaitResult(snapshot: snapshot, timedOut: false)
         }
@@ -123,6 +145,14 @@ actor FakeTerminalToolPort: TerminalSessionPort {
         sendGate = gate
     }
 
+    func blockWaits(
+        on gate: TerminalToolTestGate?,
+        checkCancellationAfterGate: Bool = false
+    ) {
+        waitGate = gate
+        checkCancellationAfterWaitGate = checkCancellationAfterGate
+    }
+
     func counts() -> (observe: Int, send: Int, wait: Int) {
         (observeCount, sendCount, waitCount)
     }
@@ -139,6 +169,7 @@ actor FakeTerminalToolPort: TerminalSessionPort {
 actor FakeTerminalSurfaceController: TmuxSurfaceControlling {
     enum Failure: Error, Equatable {
         case current
+        case currentCancelled
         case select
         case create
         case close
@@ -147,6 +178,10 @@ actor FakeTerminalSurfaceController: TmuxSurfaceControlling {
     private var surface: TmuxSurface
     private var createdSurface: TmuxSurface
     private var failure: Failure?
+    private var retainedCreateError: (
+        pane: RetainedTemporaryPane,
+        reason: RetainedTemporaryPaneReason
+    )?
     private var calls: [String] = []
     private let log: TerminalToolTestLog?
 
@@ -163,6 +198,7 @@ actor FakeTerminalSurfaceController: TmuxSurfaceControlling {
     func currentSurface(route: TmuxRoute) async throws -> TmuxSurface {
         calls.append("current")
         await log?.append("surface:current")
+        if failure == .currentCancelled { throw CancellationError() }
         if failure == .current { throw Failure.current }
         return surface
     }
@@ -185,6 +221,12 @@ actor FakeTerminalSurfaceController: TmuxSurfaceControlling {
     ) async throws -> TmuxSurface {
         calls.append("create")
         await log?.append("surface:create")
+        if let retainedCreateError {
+            throw TmuxSurfaceControlError.temporaryPaneRetained(
+                pane: retainedCreateError.pane,
+                reason: retainedCreateError.reason
+            )
+        }
         if failure == .create { throw Failure.create }
         surface = createdSurface
         return surface
@@ -211,6 +253,13 @@ actor FakeTerminalSurfaceController: TmuxSurfaceControlling {
 
     func setFailure(_ failure: Failure?) {
         self.failure = failure
+    }
+
+    func setRetainedCreateError(
+        pane: RetainedTemporaryPane,
+        reason: RetainedTemporaryPaneReason
+    ) {
+        retainedCreateError = (pane, reason)
     }
 
     func recordedCalls() -> [String] {

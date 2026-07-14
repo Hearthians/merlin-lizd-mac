@@ -73,10 +73,22 @@ public actor TerminalToolRouter {
         let task: Task<TerminalToolResult, any Error>
     }
 
+    private enum TurnLifecycle: Sendable {
+        case active
+        case terminating
+        case ended
+    }
+
     private struct LeaseRecord: Sendable {
-        let turn: TurnKey
         let binding: TerminalEndpointBinding
-        let lease: TemporaryPaneLease
+        let provenance: RetainedTemporaryPaneLease
+        let lease: TemporaryPaneLease?
+        let retentionReason: TemporaryPaneRetentionReason?
+    }
+
+    private struct LeaseKey: Hashable, Sendable {
+        let turn: TurnKey
+        let leaseID: UUID
     }
 
     private struct MutationPreparation: Sendable {
@@ -103,8 +115,10 @@ public actor TerminalToolRouter {
     private let probeTimeout: Duration
 
     private var activeOperations: [UUID: ActiveOperation] = [:]
-    private var leases: [TurnKey: LeaseRecord] = [:]
+    private var leases: [LeaseKey: LeaseRecord] = [:]
     private var blockedTurns: Set<TurnKey> = []
+    private var preparedTurns: [AgentThreadID: TerminalConversationKey] = [:]
+    private var turnLifecycles: [TurnKey: TurnLifecycle] = [:]
 
     public init(
         registry: TerminalEndpointRegistry,
@@ -136,17 +150,41 @@ public actor TerminalToolRouter {
         threadID: AgentThreadID,
         conversationKey: TerminalConversationKey
     ) async throws -> TerminalEndpointBinding {
-        try await registry.prepareTurn(
-            threadID: threadID,
-            conversationKey: conversationKey
-        )
+        guard preparedTurns[threadID] == nil else {
+            throw TerminalEndpointRegistryError.threadAlreadyPrepared
+        }
+        preparedTurns[threadID] = conversationKey
+        do {
+            return try await registry.prepareTurn(
+                threadID: threadID,
+                conversationKey: conversationKey
+            )
+        } catch {
+            if preparedTurns[threadID] == conversationKey {
+                preparedTurns.removeValue(forKey: threadID)
+            }
+            throw error
+        }
     }
 
     public func confirmTurnID(
         threadID: AgentThreadID,
         turnID: AgentTurnID
     ) async throws {
-        try await registry.confirmTurnID(threadID: threadID, turnID: turnID)
+        let turn = TurnKey(threadID: threadID, turnID: turnID)
+        let preparedKey = try activateTurn(turn)
+        do {
+            try await registry.confirmTurnID(threadID: threadID, turnID: turnID)
+        } catch {
+            if let preparedKey {
+                turnLifecycles[turn] = .ended
+                await registry.releasePrepared(
+                    threadID: threadID,
+                    conversationKey: preparedKey
+                )
+            }
+            throw mapRegistryError(error)
+        }
     }
 
     public func execute(
@@ -155,21 +193,31 @@ public actor TerminalToolRouter {
         conversationKey: TerminalConversationKey,
         call: TerminalToolCall
     ) async throws -> TerminalToolResult {
-        let binding: TerminalEndpointBinding
-        do {
-            binding = try await registry.claimPreparedTurn(
-                threadID: threadID,
-                conversationKey: conversationKey,
-                turnID: turnID
-            )
-        } catch {
-            throw mapRegistryError(error)
-        }
-
         let operationID = UUID()
         let turn = TurnKey(threadID: threadID, turnID: turnID)
+        let preparedKey = try activateTurn(
+            turn,
+            conversationKey: conversationKey
+        )
         let task = Task {
-            try await self.runSerialized(
+            let binding: TerminalEndpointBinding
+            do {
+                binding = try await self.registry.claimPreparedTurn(
+                    threadID: threadID,
+                    conversationKey: conversationKey,
+                    turnID: turnID
+                )
+            } catch {
+                if let preparedKey {
+                    self.turnLifecycles[turn] = .ended
+                    await self.registry.releasePrepared(
+                        threadID: threadID,
+                        conversationKey: preparedKey
+                    )
+                }
+                throw self.mapRegistryError(error)
+            }
+            return try await self.runSerialized(
                 turn: turn,
                 binding: binding,
                 call: call
@@ -206,8 +254,8 @@ public actor TerminalToolRouter {
     public func interruptTurn(
         threadID: AgentThreadID,
         turnID: AgentTurnID
-    ) async {
-        await terminateTurn(
+    ) async throws {
+        try await terminateTurn(
             TurnKey(threadID: threadID, turnID: turnID),
             reason: .interrupted
         )
@@ -216,8 +264,8 @@ public actor TerminalToolRouter {
     public func endTurn(
         threadID: AgentThreadID,
         turnID: AgentTurnID
-    ) async {
-        await terminateTurn(
+    ) async throws {
+        try await terminateTurn(
             TurnKey(threadID: threadID, turnID: turnID),
             reason: .turnEnded
         )
@@ -226,8 +274,8 @@ public actor TerminalToolRouter {
     public func crashTurn(
         threadID: AgentThreadID,
         turnID: AgentTurnID
-    ) async {
-        await terminateTurn(
+    ) async throws {
+        try await terminateTurn(
             TurnKey(threadID: threadID, turnID: turnID),
             reason: .crashed
         )
@@ -549,7 +597,7 @@ public actor TerminalToolRouter {
         turn: TurnKey,
         binding: TerminalEndpointBinding
     ) async throws -> TerminalToolResult {
-        guard leases[turn] == nil else {
+        guard liveLease(for: turn) == nil else {
             throw TerminalToolRouterError.liveLeaseExists
         }
         let screen = try await observedScreen(binding.endpoint.terminal)
@@ -576,16 +624,68 @@ public actor TerminalToolRouter {
                     from: origin,
                     route: binding.endpoint.route
                 )
-            try verifySurfaceIdentity(temporary, binding: binding)
-            guard temporary.paneID != origin.paneID else {
-                throw TerminalToolRouterError.surfaceFailure
-            }
             let lease = TemporaryPaneLease(
                 id: leaseID,
                 conversationKey: binding.conversationKey,
                 origin: origin,
                 temporary: temporary
             )
+            let provenance = retainedProvenance(
+                lease: lease,
+                route: binding.endpoint.route
+            )
+            leases[LeaseKey(turn: turn, leaseID: lease.id)] = LeaseRecord(
+                binding: binding,
+                provenance: provenance,
+                lease: lease,
+                retentionReason: nil
+            )
+            do {
+                try await appendTemporary(
+                    .created(
+                        leaseID: lease.id,
+                        pane: TerminalJournalPaneProvenance(
+                            windowID: lease.temporary.windowID,
+                            paneID: lease.temporary.paneID
+                        )
+                    ),
+                    preparation: preparation,
+                    turn: turn
+                )
+            } catch {
+                throw TerminalToolRouterError.temporaryPaneAuditUnavailable(
+                    provenance,
+                    reason: .auditUnavailable
+                )
+            }
+            if Task.isCancelled {
+                try await throwRetainedCreatedLease(
+                    lease,
+                    provenance,
+                    reason: .interrupted,
+                    preparation: preparation,
+                    turn: turn
+                )
+            }
+            guard temporary.sessionIdentity == binding.conversationKey.tmux,
+                temporary.sessionIdentity == binding.endpoint.route.expectedIdentity
+            else {
+                throw TerminalToolRouterError.temporaryPaneRetained(
+                    provenance,
+                    reason: .controllerRetained(
+                        .sessionIdentityMismatch(
+                            expected: binding.endpoint.route.expectedIdentity,
+                            actual: temporary.sessionIdentity
+                        )
+                    )
+                )
+            }
+            guard temporary.paneID != origin.paneID else {
+                throw TerminalToolRouterError.temporaryPaneRetained(
+                    provenance,
+                    reason: .controllerRetained(.unavailable)
+                )
+            }
             let waitResult: TerminalScreenWaitResult
             do {
                 waitResult = try await binding.endpoint.terminal.waitForScreen(
@@ -595,22 +695,26 @@ public actor TerminalToolRouter {
                     )
                 )
             } catch is CancellationError {
-                try await appendTemporary(
-                    .retained(
-                        leaseID: lease.id,
-                        paneID: lease.temporary.paneID,
-                        reason: String(
-                            describing: TemporaryPaneRetentionReason.interrupted
-                        )
-                    ),
+                try await throwRetainedCreatedLease(
+                    lease,
+                    provenance,
+                    reason: .interrupted,
                     preparation: preparation,
                     turn: turn
                 )
-                throw TerminalToolRouterError.interrupted
             } catch {
                 return try await retainCreatedLease(
                     lease,
                     reason: .disconnected,
+                    preparation: preparation,
+                    turn: turn
+                )
+            }
+            if Task.isCancelled {
+                try await throwRetainedCreatedLease(
+                    lease,
+                    provenance,
+                    reason: .interrupted,
                     preparation: preparation,
                     turn: turn
                 )
@@ -639,22 +743,26 @@ public actor TerminalToolRouter {
             do {
                 current = try await currentSurface(binding)
             } catch TerminalToolRouterError.interrupted {
-                try await appendTemporary(
-                    .retained(
-                        leaseID: lease.id,
-                        paneID: lease.temporary.paneID,
-                        reason: String(
-                            describing: TemporaryPaneRetentionReason.interrupted
-                        )
-                    ),
+                try await throwRetainedCreatedLease(
+                    lease,
+                    provenance,
+                    reason: .interrupted,
                     preparation: preparation,
                     turn: turn
                 )
-                throw TerminalToolRouterError.interrupted
             } catch {
                 return try await retainCreatedLease(
                     lease,
                     reason: .routeUnavailable,
+                    preparation: preparation,
+                    turn: turn
+                )
+            }
+            if Task.isCancelled {
+                try await throwRetainedCreatedLease(
+                    lease,
+                    provenance,
+                    reason: .interrupted,
                     preparation: preparation,
                     turn: turn
                 )
@@ -670,34 +778,46 @@ public actor TerminalToolRouter {
                     turn: turn
                 )
             }
-            leases[turn] = LeaseRecord(
-                turn: turn,
-                binding: binding,
-                lease: lease
-            )
-            try await appendTemporary(
-                .created(leaseID: lease.id, paneID: temporary.paneID),
-                preparation: preparation,
-                turn: turn
-            )
             return .temporaryPaneCreated(
                 lease,
                 screen: waitResult.snapshot
             )
         } catch let error as TmuxSurfaceControlError {
             if case let .temporaryPaneRetained(pane, reason) = error {
-                try await appendTemporary(
-                    .retained(
-                        leaseID: leaseID,
-                        paneID: pane.paneID,
-                        reason: String(describing: reason)
-                    ),
-                    preparation: preparation,
-                    turn: turn
+                let provenance = RetainedTemporaryPaneLease(
+                    id: leaseID,
+                    conversationKey: binding.conversationKey,
+                    origin: origin,
+                    route: binding.endpoint.route,
+                    pane: pane
                 )
+                let retentionReason = TemporaryPaneRetentionReason
+                    .controllerRetained(reason)
+                leases[LeaseKey(turn: turn, leaseID: leaseID)] = LeaseRecord(
+                    binding: binding,
+                    provenance: provenance,
+                    lease: nil,
+                    retentionReason: retentionReason
+                )
+                do {
+                    try await appendTemporary(
+                        .retained(
+                            leaseID: leaseID,
+                            pane: TerminalJournalPaneProvenance(pane),
+                            reason: String(describing: retentionReason)
+                        ),
+                        preparation: preparation,
+                        turn: turn
+                    )
+                } catch {
+                    throw TerminalToolRouterError.temporaryPaneAuditUnavailable(
+                        provenance,
+                        reason: retentionReason
+                    )
+                }
                 throw TerminalToolRouterError.temporaryPaneRetained(
-                    paneID: pane.paneID,
-                    reason: reason
+                    provenance,
+                    reason: retentionReason
                 )
             }
             try await appendResult(
@@ -741,10 +861,16 @@ public actor TerminalToolRouter {
         turn: TurnKey,
         binding: TerminalEndpointBinding
     ) async throws -> TerminalToolResult {
-        guard let record = leases[turn], record.lease.id == leaseID else {
+        let leaseKey = LeaseKey(turn: turn, leaseID: leaseID)
+        guard let record = leases[leaseKey] else {
             throw TerminalToolRouterError.leaseNotFound
         }
-        let lease = record.lease
+        guard let lease = record.lease else {
+            throw TerminalToolRouterError.temporaryPaneRetained(
+                record.provenance,
+                reason: record.retentionReason ?? .routeUnavailable
+            )
+        }
         let screen: TerminalScreenSnapshot
         do {
             screen = try await binding.endpoint.terminal.observeScreen()
@@ -775,6 +901,14 @@ public actor TerminalToolRouter {
         let current: TmuxSurface
         do {
             current = try await currentSurface(binding)
+        } catch TerminalToolRouterError.interrupted {
+            return try await retainExistingLease(
+                record,
+                reason: .interrupted,
+                operationID: UUID(),
+                turn: turn,
+                binding: binding
+            )
         } catch {
             return try await retainExistingLease(
                 record,
@@ -824,14 +958,22 @@ public actor TerminalToolRouter {
             )
         }
 
-        let preparation = try await prepareMutation(
-            operation: "finishTemporaryPane",
-            batch: batch,
-            initialScreen: screen,
-            initialSurface: current,
-            turn: turn,
-            binding: binding
-        )
+        let preparation: MutationPreparation
+        do {
+            preparation = try await prepareMutation(
+                operation: "finishTemporaryPane",
+                batch: batch,
+                initialScreen: screen,
+                initialSurface: current,
+                turn: turn,
+                binding: binding
+            )
+        } catch TerminalToolRouterError.auditUnavailable {
+            throw TerminalToolRouterError.temporaryPaneAuditUnavailable(
+                record.provenance,
+                reason: .auditUnavailable
+            )
+        }
 
         switch probe {
         case let .retain(reason):
@@ -968,18 +1110,28 @@ public actor TerminalToolRouter {
                         turn: turn
                     )
                 }
-                leases.removeValue(forKey: turn)
-                try await appendTemporary(
-                    .closed(
-                        leaseID: lease.id,
-                        paneID: lease.temporary.paneID
-                    ),
-                    preparation: preparation,
-                    turn: turn
-                )
+                leases.removeValue(forKey: leaseKey)
+                do {
+                    try await appendTemporary(
+                        .closed(
+                            leaseID: lease.id,
+                            pane: TerminalJournalPaneProvenance(
+                                windowID: lease.temporary.windowID,
+                                paneID: lease.temporary.paneID
+                            )
+                        ),
+                        preparation: preparation,
+                        turn: turn
+                    )
+                } catch {
+                    throw TerminalToolRouterError.temporaryPaneAuditUnavailable(
+                        record.provenance,
+                        reason: .auditUnavailable
+                    )
+                }
                 return .temporaryPaneFinished(.closed(lease))
             } catch is CancellationError {
-                if leases[turn]?.lease.id == lease.id {
+                if leases[leaseKey]?.lease?.id == lease.id {
                     return try await retainExistingLease(
                         record,
                         reason: .interrupted,
@@ -988,6 +1140,11 @@ public actor TerminalToolRouter {
                     )
                 }
                 throw TerminalToolRouterError.interrupted
+            } catch TerminalToolRouterError.auditUnavailable {
+                throw TerminalToolRouterError.temporaryPaneAuditUnavailable(
+                    record.provenance,
+                    reason: .auditUnavailable
+                )
             } catch let error as TerminalToolRouterError {
                 throw error
             } catch {
@@ -1286,7 +1443,18 @@ public actor TerminalToolRouter {
     private func terminateTurn(
         _ turn: TurnKey,
         reason: TemporaryPaneRetentionReason
-    ) async {
+    ) async throws {
+        let preparedKey: TerminalConversationKey?
+        switch turnLifecycles[turn] {
+        case .active:
+            turnLifecycles[turn] = .terminating
+            preparedKey = nil
+        case .terminating, .ended:
+            return
+        case nil:
+            preparedKey = preparedTurns.removeValue(forKey: turn.threadID)
+            turnLifecycles[turn] = .terminating
+        }
         await approvalBroker.cancelTurn(brokerTurnID(turn))
         let tasks = activeOperations.values
             .filter { $0.turn == turn }
@@ -1295,30 +1463,55 @@ public actor TerminalToolRouter {
         for task in tasks {
             _ = await task.result
         }
-        if let record = leases.removeValue(forKey: turn) {
+        var auditFailures: [TerminalTurnRetainedPaneAudit] = []
+        let retainedKeys = leases.keys.filter { $0.turn == turn }
+        for key in retainedKeys {
+            guard let record = leases.removeValue(forKey: key) else { continue }
             let operationID = UUID()
-            try? await append(
-                event(
-                    binding: record.binding,
-                    turn: turn,
-                    operationID: operationID,
-                    kind: .temporaryPane(
-                        .retained(
-                            leaseID: record.lease.id,
-                            paneID: record.lease.temporary.paneID,
-                            reason: String(describing: reason)
+            do {
+                try await append(
+                    event(
+                        binding: record.binding,
+                        turn: turn,
+                        operationID: operationID,
+                        kind: .temporaryPane(
+                            .retained(
+                                leaseID: record.provenance.id,
+                                pane: TerminalJournalPaneProvenance(
+                                    record.provenance.pane
+                                ),
+                                reason: String(describing: reason)
+                            )
                         )
+                    ),
+                    turn: turn,
+                    blocksMutations: false
+                )
+            } catch {
+                auditFailures.append(
+                    TerminalTurnRetainedPaneAudit(
+                        provenance: record.provenance,
+                        reason: reason
                     )
-                ),
-                turn: turn,
-                blocksMutations: false
-            )
+                )
+            }
         }
         blockedTurns.remove(turn)
-        await registry.releaseTurn(
-            threadID: turn.threadID,
-            turnID: turn.turnID
-        )
+        if let preparedKey {
+            await registry.releasePrepared(
+                threadID: turn.threadID,
+                conversationKey: preparedKey
+            )
+        } else {
+            await registry.releaseTurn(
+                threadID: turn.threadID,
+                turnID: turn.turnID
+            )
+        }
+        turnLifecycles[turn] = .ended
+        if !auditFailures.isEmpty {
+            throw TerminalTurnTerminationError.auditUnavailable(auditFailures)
+        }
     }
 
     private func retainCreatedLease(
@@ -1327,16 +1520,62 @@ public actor TerminalToolRouter {
         preparation: MutationPreparation,
         turn: TurnKey
     ) async throws -> TerminalToolResult {
-        try await appendTemporary(
-            .retained(
-                leaseID: lease.id,
-                paneID: lease.temporary.paneID,
-                reason: String(describing: reason)
-            ),
-            preparation: preparation,
-            turn: turn
-        )
+        do {
+            try await appendTemporary(
+                .retained(
+                    leaseID: lease.id,
+                    pane: TerminalJournalPaneProvenance(
+                        windowID: lease.temporary.windowID,
+                        paneID: lease.temporary.paneID
+                    ),
+                    reason: String(describing: reason)
+                ),
+                preparation: preparation,
+                turn: turn
+            )
+        } catch {
+            let provenance = retainedProvenance(
+                lease: lease,
+                route: preparation.binding.endpoint.route
+            )
+            throw TerminalToolRouterError.temporaryPaneAuditUnavailable(
+                provenance,
+                reason: reason
+            )
+        }
         return .temporaryPaneRetained(lease, reason: reason)
+    }
+
+    private func throwRetainedCreatedLease(
+        _ lease: TemporaryPaneLease,
+        _ provenance: RetainedTemporaryPaneLease,
+        reason: TemporaryPaneRetentionReason,
+        preparation: MutationPreparation,
+        turn: TurnKey
+    ) async throws -> Never {
+        do {
+            try await appendTemporary(
+                .retained(
+                    leaseID: lease.id,
+                    pane: TerminalJournalPaneProvenance(
+                        windowID: lease.temporary.windowID,
+                        paneID: lease.temporary.paneID
+                    ),
+                    reason: String(describing: reason)
+                ),
+                preparation: preparation,
+                turn: turn
+            )
+        } catch {
+            throw TerminalToolRouterError.temporaryPaneAuditUnavailable(
+                provenance,
+                reason: reason
+            )
+        }
+        throw TerminalToolRouterError.temporaryPaneRetained(
+            provenance,
+            reason: reason
+        )
     }
 
     private func retainExistingLease(
@@ -1345,18 +1584,30 @@ public actor TerminalToolRouter {
         preparation: MutationPreparation,
         turn: TurnKey
     ) async throws -> TerminalToolResult {
-        leases.removeValue(forKey: turn)
-        try await appendTemporary(
-            .retained(
-                leaseID: record.lease.id,
-                paneID: record.lease.temporary.paneID,
-                reason: String(describing: reason)
-            ),
-            preparation: preparation,
-            turn: turn
-        )
+        guard let lease = record.lease else {
+            throw TerminalToolRouterError.temporaryPaneRetained(
+                record.provenance,
+                reason: record.retentionReason ?? reason
+            )
+        }
+        do {
+            try await appendTemporary(
+                .retained(
+                    leaseID: record.provenance.id,
+                    pane: TerminalJournalPaneProvenance(record.provenance.pane),
+                    reason: String(describing: reason)
+                ),
+                preparation: preparation,
+                turn: turn
+            )
+        } catch {
+            throw TerminalToolRouterError.temporaryPaneAuditUnavailable(
+                record.provenance,
+                reason: reason
+            )
+        }
         return .temporaryPaneFinished(
-            .retained(record.lease, reason: reason)
+            .retained(lease, reason: reason)
         )
     }
 
@@ -1367,36 +1618,50 @@ public actor TerminalToolRouter {
         turn: TurnKey,
         binding: TerminalEndpointBinding
     ) async throws -> TerminalToolResult {
-        leases.removeValue(forKey: turn)
-        try await append(
-            event(
-                binding: binding,
-                turn: turn,
-                operationID: operationID,
-                kind: .request(
-                    operation: "finishTemporaryPane",
-                    purpose: "retain temporary pane after uncertainty"
-                )
-            ),
-            turn: turn
-        )
-        try await append(
-            event(
-                binding: binding,
-                turn: turn,
-                operationID: operationID,
-                kind: .temporaryPane(
-                    .retained(
-                        leaseID: record.lease.id,
-                        paneID: record.lease.temporary.paneID,
-                        reason: String(describing: reason)
+        guard let lease = record.lease else {
+            throw TerminalToolRouterError.temporaryPaneRetained(
+                record.provenance,
+                reason: record.retentionReason ?? reason
+            )
+        }
+        do {
+            try await append(
+                event(
+                    binding: binding,
+                    turn: turn,
+                    operationID: operationID,
+                    kind: .request(
+                        operation: "finishTemporaryPane",
+                        purpose: "retain temporary pane after uncertainty"
                     )
-                )
-            ),
-            turn: turn
-        )
+                ),
+                turn: turn
+            )
+            try await append(
+                event(
+                    binding: binding,
+                    turn: turn,
+                    operationID: operationID,
+                    kind: .temporaryPane(
+                        .retained(
+                            leaseID: record.provenance.id,
+                            pane: TerminalJournalPaneProvenance(
+                                record.provenance.pane
+                            ),
+                            reason: String(describing: reason)
+                        ),
+                    )
+                ),
+                turn: turn
+            )
+        } catch {
+            throw TerminalToolRouterError.temporaryPaneAuditUnavailable(
+                record.provenance,
+                reason: reason
+            )
+        }
         return .temporaryPaneFinished(
-            .retained(record.lease, reason: reason)
+            .retained(lease, reason: reason)
         )
     }
 
@@ -1729,7 +1994,50 @@ public actor TerminalToolRouter {
     }
 
     private func brokerTurnID(_ turn: TurnKey) -> String {
-        "\(turn.threadID.rawValue)\u{1F}\(turn.turnID.rawValue)"
+        let thread = turn.threadID.rawValue
+        let turnID = turn.turnID.rawValue
+        return "\(thread.utf8.count):\(thread)\(turnID.utf8.count):\(turnID)"
+    }
+
+    private func retainedProvenance(
+        lease: TemporaryPaneLease,
+        route: TmuxRoute
+    ) -> RetainedTemporaryPaneLease {
+        RetainedTemporaryPaneLease(
+            id: lease.id,
+            conversationKey: lease.conversationKey,
+            origin: lease.origin,
+            route: route,
+            pane: RetainedTemporaryPane(
+                windowID: lease.temporary.windowID,
+                paneID: lease.temporary.paneID
+            )
+        )
+    }
+
+    private func liveLease(for turn: TurnKey) -> LeaseRecord? {
+        leases.first(where: { $0.key.turn == turn })?.value
+    }
+
+    private func activateTurn(
+        _ turn: TurnKey,
+        conversationKey: TerminalConversationKey? = nil
+    ) throws -> TerminalConversationKey? {
+        switch turnLifecycles[turn] {
+        case .active:
+            return nil
+        case .terminating, .ended:
+            throw TerminalToolRouterError.turnUnavailable
+        case nil:
+            guard let preparedKey = preparedTurns[turn.threadID],
+                conversationKey == nil || preparedKey == conversationKey
+            else {
+                throw TerminalToolRouterError.turnUnavailable
+            }
+            preparedTurns.removeValue(forKey: turn.threadID)
+            turnLifecycles[turn] = .active
+            return preparedKey
+        }
     }
 
     private func mapRegistryError(_ error: any Error) -> TerminalToolRouterError {

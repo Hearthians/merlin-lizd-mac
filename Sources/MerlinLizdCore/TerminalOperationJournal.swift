@@ -15,10 +15,137 @@ public enum TerminalJournalResult: Codable, Equatable, Sendable {
     case auditUnavailable
 }
 
-public enum TerminalJournalTemporaryPaneEvent: Codable, Equatable, Sendable {
-    case created(leaseID: UUID, paneID: String)
-    case closed(leaseID: UUID, paneID: String)
-    case retained(leaseID: UUID, paneID: String, reason: String)
+public struct TerminalJournalPaneProvenance: Codable, Equatable, Sendable {
+    public let windowID: String?
+    public let paneID: String
+
+    public init(windowID: String?, paneID: String) {
+        self.windowID = windowID
+        self.paneID = paneID
+    }
+
+    public init(_ pane: RetainedTemporaryPane) {
+        self.init(windowID: pane.windowID, paneID: pane.paneID)
+    }
+}
+
+public enum TerminalJournalTemporaryPaneEvent: Equatable, Sendable {
+    case created(leaseID: UUID, pane: TerminalJournalPaneProvenance)
+    case closed(leaseID: UUID, pane: TerminalJournalPaneProvenance)
+    case retained(
+        leaseID: UUID,
+        pane: TerminalJournalPaneProvenance,
+        reason: String
+    )
+}
+
+extension TerminalJournalTemporaryPaneEvent: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case created
+        case closed
+        case retained
+    }
+
+    private struct Payload: Codable {
+        let leaseID: UUID
+        let pane: TerminalJournalPaneProvenance?
+        let paneID: String?
+        let reason: String?
+
+        init(
+            leaseID: UUID,
+            pane: TerminalJournalPaneProvenance,
+            reason: String? = nil
+        ) {
+            self.leaseID = leaseID
+            self.pane = pane
+            paneID = nil
+            self.reason = reason
+        }
+
+        var decodedPane: TerminalJournalPaneProvenance? {
+            switch (pane, paneID) {
+            case let (pane?, nil):
+                pane
+            case let (nil, paneID?):
+                TerminalJournalPaneProvenance(
+                    windowID: nil,
+                    paneID: paneID
+                )
+            default:
+                nil
+            }
+        }
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        guard container.allKeys.count == 1 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: container.allKeys.first ?? .retained,
+                in: container,
+                debugDescription: "Expected exactly one temporary pane event"
+            )
+        }
+        if container.contains(.created) {
+            let payload = try container.decode(Payload.self, forKey: .created)
+            guard let pane = payload.decodedPane else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .created,
+                    in: container,
+                    debugDescription: "Missing temporary pane provenance"
+                )
+            }
+            self = .created(leaseID: payload.leaseID, pane: pane)
+            return
+        }
+        if container.contains(.closed) {
+            let payload = try container.decode(Payload.self, forKey: .closed)
+            guard let pane = payload.decodedPane else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .closed,
+                    in: container,
+                    debugDescription: "Missing temporary pane provenance"
+                )
+            }
+            self = .closed(leaseID: payload.leaseID, pane: pane)
+            return
+        }
+        let payload = try container.decode(Payload.self, forKey: .retained)
+        guard let pane = payload.decodedPane, let reason = payload.reason else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .retained,
+                in: container,
+                debugDescription: "Missing retained pane provenance"
+            )
+        }
+        self = .retained(
+            leaseID: payload.leaseID,
+            pane: pane,
+            reason: reason
+        )
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case let .created(leaseID, pane):
+            try container.encode(
+                Payload(leaseID: leaseID, pane: pane),
+                forKey: .created
+            )
+        case let .closed(leaseID, pane):
+            try container.encode(
+                Payload(leaseID: leaseID, pane: pane),
+                forKey: .closed
+            )
+        case let .retained(leaseID, pane, reason):
+            try container.encode(
+                Payload(leaseID: leaseID, pane: pane, reason: reason),
+                forKey: .retained
+            )
+        }
+    }
 }
 
 public enum TerminalJournalEventKind: Codable, Equatable, Sendable {

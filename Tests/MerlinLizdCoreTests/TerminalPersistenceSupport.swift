@@ -314,3 +314,21 @@ actor GatedFailingTerminalJournal: TerminalOperationJournaling {
         count
     }
 }
+
+func terminalEncodeTemporaryPaneEvent(
+    _ event: TerminalJournalTemporaryPaneEvent
+) throws -> Data {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    return try encoder.encode(event)
+}
+
+func terminalDecodeTemporaryPaneEvent(
+    _ data: Data
+) throws -> TerminalJournalTemporaryPaneEvent {
+    try JSONDecoder().decode(TerminalJournalTemporaryPaneEvent.self, from: data)
+}
+
+func terminalUTF8Data(_ value: String) -> Data {
+    Data(value.utf8)
+}

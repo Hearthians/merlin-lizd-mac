@@ -202,7 +202,7 @@ struct TerminalToolRouterTests {
             )
         }
         _ = try await pendingRequest(router: router)
-        await router.interruptTurn(threadID: threadID, turnID: turnID)
+        try await router.interruptTurn(threadID: threadID, turnID: turnID)
         await #expect(throws: TerminalToolRouterError.interrupted) {
             try await interruptedTask.value
         }
@@ -249,7 +249,7 @@ struct TerminalToolRouterTests {
             approvalBroker: broker,
             journal: firstJournal
         )
-        await registry.register(
+        try await registry.register(
             TerminalToolFixtures.endpoint(
                 id: TerminalToolFixtures.newID(),
                 port: firstPort,
@@ -305,7 +305,7 @@ struct TerminalToolRouterTests {
         let otherSurfaces = FakeTerminalSurfaceController(
             surface: otherSurfaceValue
         )
-        await registry.register(
+        try await registry.register(
             TerminalToolFixtures.endpoint(
                 id: TerminalToolFixtures.newID(),
                 key: otherKey,
@@ -390,7 +390,50 @@ struct TerminalToolRouterTests {
         let surfaceCalls = await surfaces.recordedCalls()
         #expect(!surfaceCalls.contains { $0.hasPrefix("close:") })
 
-        await router.interruptTurn(threadID: threadID, turnID: turnID)
+        let retryFinish = Task {
+            try await router.execute(
+                threadID: threadID,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .finishTemporaryPane(
+                    leaseID: lease.id,
+                    expectedRevision: 21
+                )
+            )
+        }
+        for _ in 0..<100 {
+            if let request = await router.pendingApprovals().first {
+                #expect(await router.approveOnce(request.id))
+                break
+            }
+            if retryFinish.isCancelled { break }
+            await Task.yield()
+        }
+        #expect(
+            try await retryFinish.value == .temporaryPaneFinished(
+                .retained(lease, reason: .foregroundProcess("python"))
+            )
+        )
+        let duplicateCreate = Task {
+            try await router.execute(
+                threadID: threadID,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .createTemporaryPane(expectedRevision: 21)
+            )
+        }
+        for _ in 0..<100 {
+            if let request = await router.pendingApprovals().first {
+                _ = await router.denyApproval(request.id)
+                break
+            }
+            await Task.yield()
+        }
+        await #expect(throws: TerminalToolRouterError.liveLeaseExists) {
+            try await duplicateCreate.value
+        }
+
+        try await router.interruptTurn(threadID: threadID, turnID: turnID)
         #expect(await port.counts().send == 0)
     }
 
@@ -424,7 +467,6 @@ struct TerminalToolRouterTests {
             )
         }
         while await port.counts().send == 0 { await Task.yield() }
-
         let cancelled = Task {
             try await router.execute(
                 threadID: threadID,
@@ -501,8 +543,327 @@ struct TerminalToolRouterTests {
         #expect(lease.origin == original)
         #expect(lease.temporary == temporary)
         #expect(reason == .disconnected)
+        #expect(lease.temporary.windowID == "@1")
         let calls = await surfaces.recordedCalls()
         #expect(!calls.contains { $0.hasPrefix("close:") })
+        let duplicateCreate = Task {
+            try await router.execute(
+                threadID: threadID,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .createTemporaryPane(expectedRevision: 50)
+            )
+        }
+        for _ in 0..<100 {
+            if let request = await router.pendingApprovals().first {
+                _ = await router.denyApproval(request.id)
+                break
+            }
+            await Task.yield()
+        }
+        await #expect(throws: TerminalToolRouterError.liveLeaseExists) {
+            try await duplicateCreate.value
+        }
+    }
+
+    @Test("Task4 retained split preserves full provenance and one live lease")
+    func controllerRetainedSplitPreservesProvenance() async throws {
+        let port = FakeTerminalToolPort(
+            snapshot: TerminalToolFixtures.screen(revision: 55)
+        )
+        let origin = TerminalToolFixtures.surface()
+        let retainedPane = RetainedTemporaryPane(windowID: "@77", paneID: "%77")
+        let surfaces = FakeTerminalSurfaceController(surface: origin)
+        await surfaces.setRetainedCreateError(
+            pane: retainedPane,
+            reason: .transportUnavailable
+        )
+        let journal = MemoryTerminalToolJournal()
+        let (router, threadID, turnID) = try await makeRouter(
+            port: port,
+            surfaces: surfaces,
+            journal: journal
+        )
+        let create = Task {
+            try await router.execute(
+                threadID: threadID,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .createTemporaryPane(expectedRevision: 55)
+            )
+        }
+        try await approveNextRequest(router: router)
+
+        do {
+            _ = try await create.value
+            Issue.record("expected retained split error")
+        } catch let TerminalToolRouterError.temporaryPaneRetained(
+            provenance,
+            reason
+        ) {
+            #expect(provenance.conversationKey == TerminalToolFixtures.key)
+            #expect(provenance.origin == origin)
+            #expect(provenance.route == TerminalToolFixtures.route)
+            #expect(provenance.pane == retainedPane)
+            #expect(reason == .controllerRetained(.transportUnavailable))
+        } catch {
+            Issue.record("unexpected error: \(error)")
+        }
+
+        await #expect(throws: TerminalToolRouterError.liveLeaseExists) {
+            try await router.execute(
+                threadID: threadID,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .createTemporaryPane(expectedRevision: 55)
+            )
+        }
+        let events = await journal.snapshot()
+        #expect(events.contains { event in
+            guard case let .temporaryPane(.retained(_, pane, journalReason))
+                = event.kind
+            else { return false }
+            return pane.windowID == retainedPane.windowID
+                && pane.paneID == retainedPane.paneID
+                && journalReason.contains("controllerRetained")
+        })
+    }
+
+    @Test("returned split is owned before identity verification")
+    func splitIsStoredBeforeIdentityVerification() async throws {
+        let port = FakeTerminalToolPort(
+            snapshot: TerminalToolFixtures.screen(revision: 55)
+        )
+        let origin = TerminalToolFixtures.surface()
+        let mismatchedIdentity = TmuxSessionIdentity(
+            serverSessionID: "$unexpected",
+            createdAtEpoch: 551
+        )
+        let temporary = TmuxSurface(
+            sessionIdentity: mismatchedIdentity,
+            windowID: "@88",
+            paneID: "%88",
+            currentCommand: "zsh"
+        )
+        let surfaces = FakeTerminalSurfaceController(
+            surface: origin,
+            createdSurface: temporary
+        )
+        let journal = MemoryTerminalToolJournal()
+        let (router, threadID, turnID) = try await makeRouter(
+            port: port,
+            surfaces: surfaces,
+            journal: journal
+        )
+        let create = Task {
+            try await router.execute(
+                threadID: threadID,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .createTemporaryPane(expectedRevision: 55)
+            )
+        }
+        try await approveNextRequest(router: router)
+
+        do {
+            _ = try await create.value
+            Issue.record("expected retained identity mismatch")
+        } catch let TerminalToolRouterError.temporaryPaneRetained(
+            provenance,
+            reason
+        ) {
+            #expect(provenance.pane.windowID == temporary.windowID)
+            #expect(provenance.pane.paneID == temporary.paneID)
+            #expect(
+                reason == .controllerRetained(
+                    .sessionIdentityMismatch(
+                        expected: TerminalToolFixtures.identity,
+                        actual: mismatchedIdentity
+                    )
+                )
+            )
+        } catch {
+            Issue.record("unexpected error: \(error)")
+        }
+
+        await #expect(throws: TerminalToolRouterError.liveLeaseExists) {
+            try await router.execute(
+                threadID: threadID,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .createTemporaryPane(expectedRevision: 55)
+            )
+        }
+    }
+
+    @Test("post-split audit failure returns full provenance and keeps the lease live")
+    func postSplitAuditFailurePreservesLease() async throws {
+        let port = FakeTerminalToolPort(
+            snapshot: TerminalToolFixtures.screen(revision: 56)
+        )
+        let origin = TerminalToolFixtures.surface()
+        let temporary = TerminalToolFixtures.surface(paneID: "%78")
+        let surfaces = FakeTerminalSurfaceController(
+            surface: origin,
+            createdSurface: temporary
+        )
+        let journal = MemoryTerminalToolJournal()
+        await journal.failOnAppend(7)
+        let (router, threadID, turnID) = try await makeRouter(
+            port: port,
+            surfaces: surfaces,
+            journal: journal
+        )
+        let create = Task {
+            try await router.execute(
+                threadID: threadID,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .createTemporaryPane(expectedRevision: 56)
+            )
+        }
+        try await approveNextRequest(router: router)
+
+        do {
+            _ = try await create.value
+            Issue.record("expected post-split audit failure")
+        } catch let TerminalToolRouterError.temporaryPaneAuditUnavailable(
+            provenance,
+            reason
+        ) {
+            #expect(provenance.origin == origin)
+            #expect(provenance.route == TerminalToolFixtures.route)
+            #expect(provenance.pane.windowID == temporary.windowID)
+            #expect(provenance.pane.paneID == temporary.paneID)
+            #expect(reason == .auditUnavailable)
+        } catch {
+            Issue.record("unexpected error: \(error)")
+        }
+
+        await journal.failOnAppend(nil)
+        await #expect(throws: TerminalToolRouterError.liveLeaseExists) {
+            try await router.execute(
+                threadID: threadID,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .createTemporaryPane(expectedRevision: 56)
+            )
+        }
+    }
+
+    @Test("successful split followed by cancellation returns full retained provenance")
+    func postSplitCancellationReturnsProvenance() async throws {
+        let waitGate = TerminalToolTestGate()
+        let port = FakeTerminalToolPort(
+            snapshot: TerminalToolFixtures.screen(revision: 56)
+        )
+        await port.blockWaits(
+            on: waitGate,
+            checkCancellationAfterGate: true
+        )
+        let origin = TerminalToolFixtures.surface()
+        let temporary = TerminalToolFixtures.surface(paneID: "%80")
+        let surfaces = FakeTerminalSurfaceController(
+            surface: origin,
+            createdSurface: temporary
+        )
+        let journal = MemoryTerminalToolJournal()
+        let (router, threadID, turnID) = try await makeRouter(
+            port: port,
+            surfaces: surfaces,
+            journal: journal
+        )
+        let create = Task {
+            try await router.execute(
+                threadID: threadID,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .createTemporaryPane(expectedRevision: 56)
+            )
+        }
+        try await approveNextRequest(router: router)
+        while await port.counts().wait == 0 { await Task.yield() }
+        create.cancel()
+        await waitGate.open()
+
+        do {
+            _ = try await create.value
+            Issue.record("expected retained cancellation")
+        } catch let TerminalToolRouterError.temporaryPaneRetained(
+            provenance,
+            reason
+        ) {
+            #expect(provenance.origin == origin)
+            #expect(provenance.pane.windowID == temporary.windowID)
+            #expect(provenance.pane.paneID == temporary.paneID)
+            #expect(reason == .interrupted)
+        } catch {
+            Issue.record("unexpected error: \(error)")
+        }
+
+        await #expect(throws: TerminalToolRouterError.liveLeaseExists) {
+            try await router.execute(
+                threadID: threadID,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .createTemporaryPane(expectedRevision: 56)
+            )
+        }
+    }
+
+    @Test("finish current-surface cancellation retains as interrupted for retry")
+    func finishCurrentSurfaceCancellationIsInterrupted() async throws {
+        let initial = TerminalToolFixtures.screen(revision: 57)
+        let paneScreen = TerminalToolFixtures.screen(revision: 58)
+        let port = FakeTerminalToolPort(snapshot: initial)
+        await port.enqueueWait(.init(snapshot: paneScreen, timedOut: false))
+        let origin = TerminalToolFixtures.surface()
+        let temporary = TerminalToolFixtures.surface(paneID: "%79")
+        let surfaces = FakeTerminalSurfaceController(
+            surface: origin,
+            createdSurface: temporary
+        )
+        let journal = MemoryTerminalToolJournal()
+        let (router, threadID, turnID) = try await makeRouter(
+            port: port,
+            surfaces: surfaces,
+            journal: journal
+        )
+        let create = Task {
+            try await router.execute(
+                threadID: threadID,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .createTemporaryPane(expectedRevision: 57)
+            )
+        }
+        try await approveNextRequest(router: router)
+        guard case let .temporaryPaneCreated(lease, _) = try await create.value else {
+            Issue.record("expected lease")
+            return
+        }
+        await port.setSnapshot(paneScreen)
+        await surfaces.setFailure(.currentCancelled)
+
+        #expect(
+            try await router.execute(
+                threadID: threadID,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .finishTemporaryPane(
+                    leaseID: lease.id,
+                    expectedRevision: 58
+                )
+            ) == .temporaryPaneFinished(.retained(lease, reason: .interrupted))
+        )
+        await #expect(throws: TerminalToolRouterError.liveLeaseExists) {
+            try await router.execute(
+                threadID: threadID,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .createTemporaryPane(expectedRevision: 58)
+            )
+        }
     }
 
     @Test("duplicate exact probe markers are ambiguous and never close the pane")
@@ -809,21 +1170,264 @@ struct TerminalToolRouterTests {
                 call: .createTemporaryPane(expectedRevision: 111)
             )
         }
-        await router.interruptTurn(threadID: threadID, turnID: turnID)
+        try await router.interruptTurn(threadID: threadID, turnID: turnID)
 
         #expect(await port.counts().send == 0)
         let calls = await surfaces.recordedCalls()
         #expect(!calls.contains { $0.hasPrefix("close:") })
         let events = await journal.snapshot()
         #expect(events.contains { event in
-            guard case let .temporaryPane(.retained(id, paneID, reason))
+            guard case let .temporaryPane(.retained(id, pane, reason))
                 = event.kind
             else { return false }
             return id == lease.id
-                && paneID == temporary.paneID
+                && pane.windowID == temporary.windowID
+                && pane.paneID == temporary.paneID
                 && reason == "interrupted"
         })
         #expect(await port.keyboardOwners() == [.codex, .user])
+    }
+
+    @Test("termination returns full audit failure after releasing the endpoint")
+    func terminationAuditFailureStillReleasesEndpoint() async throws {
+        let initial = TerminalToolFixtures.screen(revision: 115)
+        let paneScreen = TerminalToolFixtures.screen(revision: 116)
+        let port = FakeTerminalToolPort(snapshot: initial)
+        await port.enqueueWait(.init(snapshot: paneScreen, timedOut: false))
+        let origin = TerminalToolFixtures.surface()
+        let temporary = TerminalToolFixtures.surface(paneID: "%14")
+        let surfaces = FakeTerminalSurfaceController(
+            surface: origin,
+            createdSurface: temporary
+        )
+        let journal = MemoryTerminalToolJournal()
+        let (router, threadID, turnID) = try await makeRouter(
+            port: port,
+            surfaces: surfaces,
+            journal: journal
+        )
+        let create = Task {
+            try await router.execute(
+                threadID: threadID,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .createTemporaryPane(expectedRevision: 115)
+            )
+        }
+        try await approveNextRequest(router: router)
+        guard case let .temporaryPaneCreated(lease, _) = try await create.value else {
+            Issue.record("expected lease")
+            return
+        }
+        let provenance = RetainedTemporaryPaneLease(
+            id: lease.id,
+            conversationKey: lease.conversationKey,
+            origin: origin,
+            route: TerminalToolFixtures.route,
+            pane: RetainedTemporaryPane(
+                windowID: temporary.windowID,
+                paneID: temporary.paneID
+            )
+        )
+        await journal.setFailAppend(true)
+
+        await #expect(
+            throws: TerminalTurnTerminationError.auditUnavailable([
+                TerminalTurnRetainedPaneAudit(
+                    provenance: provenance,
+                    reason: .interrupted
+                )
+            ])
+        ) {
+            try await router.interruptTurn(threadID: threadID, turnID: turnID)
+        }
+        #expect(await port.keyboardOwners() == [.codex, .user])
+    }
+
+    @Test("termination rejects late admission and releases only after admitted work finishes")
+    func terminationAdmissionBarrier() async throws {
+        let gate = TerminalToolTestGate()
+        let port = FakeTerminalToolPort(
+            snapshot: TerminalToolFixtures.screen(revision: 120)
+        )
+        await port.blockSends(on: gate)
+        let surfaces = FakeTerminalSurfaceController(
+            surface: TerminalToolFixtures.surface()
+        )
+        let journal = MemoryTerminalToolJournal()
+        let (router, threadID, turnID) = try await makeRouter(
+            port: port,
+            surfaces: surfaces,
+            journal: journal
+        )
+        let admitted = Task {
+            try await router.execute(
+                threadID: threadID,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .sendInput(
+                    TerminalToolFixtures.input(
+                        revision: 120,
+                        purpose: "cancellation-ignoring send"
+                    )
+                )
+            )
+        }
+        while await port.counts().send == 0 { await Task.yield() }
+        let admittedCounts = await port.counts()
+
+        let termination = Task {
+            try await router.interruptTurn(threadID: threadID, turnID: turnID)
+        }
+        for _ in 0..<100 { await Task.yield() }
+
+        let lateProbe = TerminalToolCompletionProbe()
+        let late = Task {
+            do {
+                _ = try await router.execute(
+                    threadID: threadID,
+                    turnID: turnID,
+                    conversationKey: TerminalToolFixtures.key,
+                    call: .observeScreen
+                )
+                await lateProbe.complete(with: nil)
+            } catch let error as TerminalToolRouterError {
+                await lateProbe.complete(with: error)
+            } catch {
+                await lateProbe.complete(with: nil)
+            }
+        }
+        for _ in 0..<100 { await Task.yield() }
+
+        let lateSnapshot = await lateProbe.snapshot()
+        #expect(lateSnapshot.didComplete)
+        #expect(lateSnapshot.error == .turnUnavailable)
+        let countsBeforeRelease = await port.counts()
+        #expect(countsBeforeRelease.observe == admittedCounts.observe)
+        #expect(countsBeforeRelease.send == admittedCounts.send)
+        #expect(countsBeforeRelease.wait == admittedCounts.wait)
+        await #expect(throws: TerminalEndpointRegistryError.threadAlreadyPrepared) {
+            try await router.beginTurn(
+                threadID: threadID,
+                conversationKey: TerminalToolFixtures.key
+            )
+        }
+        #expect(await port.keyboardOwners() == [.codex])
+
+        await gate.open()
+        _ = try? await admitted.value
+        try await termination.value
+        await late.value
+        #expect(await port.keyboardOwners() == [.codex, .user])
+
+        _ = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+    }
+
+    @Test("formerly colliding turn IDs cancel approvals independently")
+    func approvalTurnKeyCollisionIsolation() async throws {
+        let firstPort = FakeTerminalToolPort(
+            snapshot: TerminalToolFixtures.screen(revision: 130)
+        )
+        let firstSurfaces = FakeTerminalSurfaceController(
+            surface: TerminalToolFixtures.surface()
+        )
+        let otherIdentity = TmuxSessionIdentity(
+            serverSessionID: "$collision-2",
+            createdAtEpoch: 130
+        )
+        let otherKey = TerminalConversationKey(target: .local, tmux: otherIdentity)
+        let otherRoute = TmuxRoute(
+            target: .local,
+            sessionName: "collision-2",
+            expectedIdentity: otherIdentity
+        )
+        let secondPort = FakeTerminalToolPort(
+            snapshot: TerminalToolFixtures.screen(revision: 130)
+        )
+        let secondSurfaces = FakeTerminalSurfaceController(
+            surface: TmuxSurface(
+                sessionIdentity: otherIdentity,
+                windowID: "@2",
+                paneID: "%2",
+                currentCommand: "zsh"
+            )
+        )
+        let registry = TerminalEndpointRegistry()
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: TerminalToolFixtures.newID(),
+                port: firstPort,
+                controller: firstSurfaces
+            )
+        )
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: TerminalToolFixtures.newID(),
+                key: otherKey,
+                port: secondPort,
+                controller: secondSurfaces,
+                route: otherRoute
+            )
+        )
+        let router = TerminalToolRouter(
+            registry: registry,
+            approvalBroker: TerminalApprovalBroker(),
+            journal: MemoryTerminalToolJournal()
+        )
+        let firstThread = AgentThreadID(rawValue: "a")
+        let firstTurn = AgentTurnID(rawValue: "b\u{1F}c")
+        let secondThread = AgentThreadID(rawValue: "a\u{1F}b")
+        let secondTurn = AgentTurnID(rawValue: "c")
+        _ = try await router.beginTurn(
+            threadID: firstThread,
+            conversationKey: TerminalToolFixtures.key
+        )
+        _ = try await router.beginTurn(
+            threadID: secondThread,
+            conversationKey: otherKey
+        )
+        let action = TerminalInputBatch(
+            expectedRevision: 130,
+            events: [.key(.enter, modifiers: [])],
+            purpose: "collision isolation",
+            declaredRisk: .routine
+        )
+        let first = Task {
+            try await router.execute(
+                threadID: firstThread,
+                turnID: firstTurn,
+                conversationKey: TerminalToolFixtures.key,
+                call: .sendInput(action)
+            )
+        }
+        let second = Task {
+            try await router.execute(
+                threadID: secondThread,
+                turnID: secondTurn,
+                conversationKey: otherKey,
+                call: .sendInput(action)
+            )
+        }
+        for _ in 0..<100 {
+            if await router.pendingApprovals().count == 2 { break }
+            await Task.yield()
+        }
+        #expect(await router.pendingApprovals().count == 2)
+
+        try await router.interruptTurn(threadID: firstThread, turnID: firstTurn)
+        await #expect(throws: TerminalToolRouterError.interrupted) {
+            try await first.value
+        }
+        let remaining = await router.pendingApprovals()
+        #expect(remaining.count == 1)
+        if let request = remaining.first {
+            #expect(await router.approveOnce(request.id))
+        }
+        _ = try await second.value
+        #expect(await secondPort.counts().send == 1)
     }
 
     private func makeRouter(
@@ -837,7 +1441,7 @@ struct TerminalToolRouterTests {
         AgentTurnID
     ) {
         let registry = TerminalEndpointRegistry()
-        await registry.register(
+        try await registry.register(
             TerminalToolFixtures.endpoint(
                 id: TerminalToolFixtures.newID(),
                 port: port,
