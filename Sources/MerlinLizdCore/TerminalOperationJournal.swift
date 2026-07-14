@@ -548,12 +548,7 @@ public actor FileTerminalOperationJournal: TerminalOperationJournaling {
         parentPath: String,
         hooks: TerminalOperationJournalHooks
     ) throws -> Int32 {
-        let created: Bool
-        if mkdirat(parent, name, S_IRWXU) == 0 {
-            created = true
-        } else if errno == EEXIST {
-            created = false
-        } else {
+        if mkdirat(parent, name, S_IRWXU) != 0, errno != EEXIST {
             throw posixError("mkdirat", path)
         }
         let descriptor = openat(
@@ -564,12 +559,10 @@ public actor FileTerminalOperationJournal: TerminalOperationJournaling {
         guard descriptor >= 0 else { throw posixError("openat", path) }
         do {
             try validateDirectory(descriptor, path: path, makePrivate: true)
-            if created {
-                if let directorySync = hooks.directorySync {
-                    try directorySync(parent, parentPath)
-                } else {
-                    try syncDirectory(descriptor: parent, path: parentPath)
-                }
+            if let directorySync = hooks.directorySync {
+                try directorySync(parent, parentPath)
+            } else {
+                try syncDirectory(descriptor: parent, path: parentPath)
             }
             return descriptor
         } catch {

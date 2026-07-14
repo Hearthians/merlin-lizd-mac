@@ -210,6 +210,49 @@ struct TerminalOperationJournalTests {
         )
     }
 
+    @Test("directory sync retries an entry left behind by a prior sync failure")
+    func retriesDirectorySyncAfterCreatedEntryAlreadyExists() throws {
+        let fixture = try TerminalPersistenceFixture()
+        defer { fixture.remove() }
+        let recorder = TerminalDirectorySyncRecorder(failingCalls: [1, 2])
+        let application = fixture.applicationSupportDirectory
+            .appendingPathComponent("MerlinLizd", isDirectory: true)
+        let root = application
+            .appendingPathComponent("TerminalOperations", isDirectory: true)
+        let hooks = TerminalOperationJournalHooks(directorySync: recorder.sync)
+
+        #expect(throws: ScriptedTerminalJournalError.unavailable) {
+            _ = try FileTerminalOperationJournal(
+                applicationSupportDirectory: fixture.applicationSupportDirectory,
+                hooks: hooks
+            )
+        }
+        #expect(terminalFileExists(at: application))
+
+        #expect(throws: ScriptedTerminalJournalError.unavailable) {
+            _ = try FileTerminalOperationJournal(
+                applicationSupportDirectory: fixture.applicationSupportDirectory,
+                hooks: hooks
+            )
+        }
+
+        _ = try FileTerminalOperationJournal(
+            applicationSupportDirectory: fixture.applicationSupportDirectory,
+            hooks: hooks
+        )
+
+        #expect(
+            recorder.paths() == [
+                fixture.applicationSupportDirectory.path,
+                fixture.applicationSupportDirectory.path,
+                fixture.applicationSupportDirectory.path,
+                application.path,
+                root.path,
+                root.path,
+            ]
+        )
+    }
+
     @Test("each returned durability boundary contains only complete JSONL records")
     func writesCompleteRecordsPerSyncBoundary() async throws {
         let fixture = try TerminalPersistenceFixture()

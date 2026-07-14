@@ -24,11 +24,15 @@ struct TerminalPersistenceFixture: Sendable {
 
 final class TerminalDirectorySyncRecorder: @unchecked Sendable {
     private let lock = NSLock()
-    private let failingCall: Int?
+    private let failingCalls: Set<Int>
     private var recordedPaths: [String] = []
 
     init(failingCall: Int? = nil) {
-        self.failingCall = failingCall
+        failingCalls = failingCall.map { [$0] } ?? []
+    }
+
+    init(failingCalls: Set<Int>) {
+        self.failingCalls = failingCalls
     }
 
     func sync(_ descriptor: Int32, path: String) throws {
@@ -36,7 +40,7 @@ final class TerminalDirectorySyncRecorder: @unchecked Sendable {
         recordedPaths.append(path)
         let call = recordedPaths.count
         lock.unlock()
-        if call == failingCall {
+        if failingCalls.contains(call) {
             throw ScriptedTerminalJournalError.unavailable
         }
         guard Darwin.fsync(descriptor) == 0 else {

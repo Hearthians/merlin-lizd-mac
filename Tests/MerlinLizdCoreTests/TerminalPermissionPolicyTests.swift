@@ -229,8 +229,8 @@ struct TerminalPermissionPolicyTests {
         }
     }
 
-    @Test("private-use character keys deny in normal and alternate screens")
-    func deniesPrivateUseCharacterKeysInEveryScreenMode() throws {
+    @Test("non-printable scalar character keys deny in every screen mode")
+    func deniesNonPrintableScalarCharacterKeysInEveryScreenMode() throws {
         let modes = [
             TerminalScreenMode.normal,
             TerminalScreenMode(
@@ -240,14 +240,48 @@ struct TerminalPermissionPolicyTests {
         ]
 
         for mode in modes {
+            for value in ["\u{E000}", "\u{115F}", "🏽", "🇨"] {
+                assertDenied(
+                    try evaluate(
+                        events: [
+                            .key(.character(value), modifiers: []),
+                        ],
+                        screen: terminalTestScreen(mode: mode)
+                    ),
+                    context: "\(value.debugDescription) in mode \(mode)"
+                )
+            }
+        }
+    }
+
+    @Test("single-scalar character keys share printable text validation")
+    func characterKeyValidationMatchesTextValidation() throws {
+        let scalarValues = Array(UInt32(0)...UInt32(0xFF)) + [
+            0x0301, 0x0378, 0x115F, 0x200B, 0x2028, 0x2029, 0x202E,
+            0x3000, 0x4F60, 0xE000, 0xFE0F, 0x1F1E8, 0x1F3FD,
+            0x1F600,
+        ]
+        for scalarValue in scalarValues {
+            guard let scalar = Unicode.Scalar(scalarValue) else { continue }
+            let value = String(scalar)
+            let text = try evaluate(events: [.text(value)])
+            let key = try evaluate(events: [
+                .key(.character(value), modifiers: []),
+            ])
+            let isSubmissionBoundary = scalarValue == 0x0A
+                || scalarValue == 0x0D
+            #expect(
+                isDenied(key)
+                    == (isDenied(text) || isSubmissionBoundary)
+            )
+        }
+
+        for value in ["", "ab", "e\u{301}", "👩‍💻"] {
             assertDenied(
-                try evaluate(
-                    events: [
-                        .key(.character("\u{E000}"), modifiers: []),
-                    ],
-                    screen: terminalTestScreen(mode: mode)
-                ),
-                context: "private-use character in mode \(mode)"
+                try evaluate(events: [
+                    .key(.character(value), modifiers: []),
+                ]),
+                context: "malformed key shape \(value.debugDescription)"
             )
         }
     }
@@ -475,6 +509,9 @@ struct TerminalPermissionPolicyTests {
             (.character("x"), true, false),
             (.character("xy"), false, false),
             (.character("\u{E000}"), false, false),
+            (.character("\u{115F}"), false, false),
+            (.character("🏽"), false, false),
+            (.character("🇨"), false, false),
             (.enter, false, false),
             (.escape, false, false),
             (.backspace, true, false),
@@ -566,5 +603,10 @@ struct TerminalPermissionPolicyTests {
             Issue.record("expected denial for \(context)")
             return
         }
+    }
+
+    private func isDenied(_ evaluation: TerminalPermissionEvaluation) -> Bool {
+        if case .deny = evaluation.decision { return true }
+        return false
     }
 }

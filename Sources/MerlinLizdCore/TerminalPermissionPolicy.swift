@@ -178,9 +178,12 @@ public struct TerminalPermissionPolicy: Sendable {
                 return "Text input must contain only printable grapheme clusters or submission boundaries"
             }
         case let .key(.character(value), _):
-            guard value.unicodeScalars.count == 1,
+            guard value.count == 1,
+                value.unicodeScalars.count == 1,
+                let grapheme = value.first,
                 let scalar = value.unicodeScalars.first,
-                isPrintableCharacterKeyScalar(scalar)
+                !isSubmissionBoundaryScalar(scalar),
+                isPrintableTextGrapheme(grapheme)
             else {
                 return "Character input must contain exactly one printable Unicode scalar"
             }
@@ -341,33 +344,6 @@ public struct TerminalPermissionPolicy: Sendable {
             true
         default:
             false
-        }
-    }
-
-    private func isForbiddenRawTextScalar(_ scalar: Unicode.Scalar) -> Bool {
-        switch scalar.value {
-        case 0x0D, 0x0A:
-            false
-        case 0x00...0x1F, 0x7F...0x9F:
-            true
-        default:
-            false
-        }
-    }
-
-    private func isPrintableCharacterKeyScalar(_ scalar: Unicode.Scalar) -> Bool {
-        if isForbiddenRawTextScalar(scalar) || scalar.value == 0x0A
-            || scalar.value == 0x0D
-        {
-            return false
-        }
-        return switch scalar.properties.generalCategory {
-        case .control, .format, .lineSeparator, .paragraphSeparator,
-            .surrogate, .nonspacingMark, .spacingMark, .enclosingMark,
-            .privateUse, .unassigned:
-            false
-        default:
-            true
         }
     }
 
