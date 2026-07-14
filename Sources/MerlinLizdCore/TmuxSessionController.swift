@@ -115,7 +115,9 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
     public func currentSurface(route: TmuxRoute) async throws -> TmuxSurface {
         try validate(route: route)
         return try await surfaceOperations.run(for: route.conversationKey) { [self] in
-            try await currentSurfaceUnlocked(route: route)
+            let surface = try await currentSurfaceUnlocked(route: route)
+            try Task.checkCancellation()
+            return surface
         }
     }
 
@@ -165,7 +167,10 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
             )
         }
         try await runSurfaceMutation(command, target: route.target)
-        return try await currentSurfaceUnlocked(route: route)
+        try Task.checkCancellation()
+        let selected = try await currentSurfaceUnlocked(route: route)
+        try Task.checkCancellation()
+        return selected
     }
 
     public func createTemporaryPane(
@@ -219,6 +224,7 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
         do {
             try Task.checkCancellation()
             temporary = try await currentSurfaceUnlocked(route: route)
+            try Task.checkCancellation()
         } catch {
             throw TmuxSurfaceControlError.temporaryPaneRetained(
                 pane: retained,
@@ -244,15 +250,26 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
     private func retainedPaneReason(
         for error: Error
     ) -> RetainedTemporaryPaneReason {
-        if error is CancellationError {
+        if Task.isCancelled || error is CancellationError {
             return .cancelled
         }
+        if error is InventoryProcessTimeoutError {
+            return .timedOut
+        }
+        if let error = error as? SSHMasterPoolError {
+            return switch error {
+            case .shuttingDown:
+                .transportUnavailable
+            case let .commandFailed(exitCode):
+                .commandFailed(exitCode: exitCode)
+            }
+        }
         guard let error = error as? TmuxSurfaceControlError else {
-            return .transportFailure(description: String(describing: error))
+            return .unavailable
         }
         return switch error {
         case .localTmuxNotFound:
-            .localTmuxNotFound
+            .transportUnavailable
         case .workerNotReady:
             .workerNotReady
         case let .commandFailed(exitCode):
@@ -264,7 +281,7 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
         case let .temporaryPaneRetained(_, reason):
             reason
         case .paneNotOwned, .leasePaneMissing, .restoreFailed:
-            .surfaceFailure(description: String(describing: error))
+            .unavailable
         }
     }
 
@@ -313,6 +330,7 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
             route: route,
             missingLeasePaneID: paneID
         )
+        try Task.checkCancellation()
         guard leasedSurface.paneID == ownership.temporary.paneID else {
             throw TmuxSurfaceControlError.leasePaneMissing(paneID: paneID)
         }
@@ -324,6 +342,7 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
         )
         try await runSurfaceMutation(kill, target: route.target)
         temporaryPanes[key] = nil
+        try Task.checkCancellation()
 
         do {
             let restoreWindow = try MerlinCommands.restoreTmuxWindow(
@@ -332,6 +351,7 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
                 localTmuxPath: localPath
             )
             try await runSurfaceMutation(restoreWindow, target: route.target)
+            try Task.checkCancellation()
 
             let restorePane = try MerlinCommands.restoreTmuxPane(
                 target: route.target,
@@ -339,8 +359,10 @@ public actor TmuxSessionController: TmuxSurfaceControlling {
                 localTmuxPath: localPath
             )
             try await runSurfaceMutation(restorePane, target: route.target)
+            try Task.checkCancellation()
 
             let restored = try await currentSurfaceUnlocked(route: route)
+            try Task.checkCancellation()
             guard
                 restored.windowID == origin.windowID,
                 restored.paneID == origin.paneID
@@ -597,7 +619,6 @@ private actor TmuxSurfaceOperationGate {
     ) {
         guard var lane = lanes[key] else { return }
         if lane.activeID == id {
-            release(id: id, for: key)
             return
         }
         guard let index = lane.waiters.firstIndex(where: { $0.id == id }) else {

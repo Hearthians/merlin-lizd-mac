@@ -102,8 +102,9 @@ public struct RetainedTemporaryPane: Codable, Equatable, Sendable {
 /// from being returned as a verified current surface.
 public enum RetainedTemporaryPaneReason: Codable, Equatable, Sendable {
     case cancelled
-    case localTmuxNotFound
     case workerNotReady
+    case timedOut
+    case transportUnavailable
     case commandFailed(exitCode: Int32)
     case invalidSurfaceOutput
     case sessionIdentityMismatch(
@@ -111,8 +112,7 @@ public enum RetainedTemporaryPaneReason: Codable, Equatable, Sendable {
         actual: TmuxSessionIdentity
     )
     case createdPaneNotCurrent(actual: TmuxSurface)
-    case transportFailure(description: String)
-    case surfaceFailure(description: String)
+    case unavailable
 }
 
 public enum TmuxSurfaceControlError: Error, Equatable, Sendable {
