@@ -588,4 +588,42 @@ struct TerminalEndpointRegistryTests {
         await firstGate.open()
         _ = try await firstPrepare.value
     }
+
+    @Test("endpoint churn leaves no keyboard transition or ownership tombstones")
+    func endpointChurnPrunesTransientState() async throws {
+        let registry = TerminalEndpointRegistry()
+        for index in 0..<25 {
+            let port = FakeTerminalToolPort(
+                snapshot: TerminalToolFixtures.screen(revision: UInt64(index))
+            )
+            let endpointID = TerminalEndpointID(
+                rawValue: TerminalToolFixtures.newID()
+            )
+            try await registry.register(
+                TerminalToolFixtures.endpoint(
+                    id: endpointID.rawValue,
+                    port: port,
+                    controller: FakeTerminalSurfaceController(
+                        surface: TerminalToolFixtures.surface()
+                    )
+                )
+            )
+            let threadID = AgentThreadID(rawValue: "churn-\(index)")
+            _ = try await registry.prepareTurn(
+                threadID: threadID,
+                conversationKey: TerminalToolFixtures.key
+            )
+            await registry.releasePrepared(
+                threadID: threadID,
+                conversationKey: TerminalToolFixtures.key
+            )
+            await registry.unregister(endpointID)
+        }
+
+        let snapshot = await registry.testingStateSnapshot()
+        #expect(snapshot.endpointCount == 0)
+        #expect(snapshot.bindingCount == 0)
+        #expect(snapshot.conversationOwnerCount == 0)
+        #expect(snapshot.keyboardTransitionCount == 0)
+    }
 }

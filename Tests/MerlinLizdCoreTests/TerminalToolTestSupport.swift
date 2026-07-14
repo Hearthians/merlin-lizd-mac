@@ -18,6 +18,26 @@ actor TerminalToolTestGate {
     }
 }
 
+actor TerminalBindingValidationGate {
+    private let blockedCall: Int
+    private let gate: TerminalToolTestGate
+    private var calls = 0
+
+    init(blockedCall: Int, gate: TerminalToolTestGate) {
+        self.blockedCall = blockedCall
+        self.gate = gate
+    }
+
+    func validate() async {
+        calls += 1
+        if calls == blockedCall {
+            await gate.wait()
+        }
+    }
+
+    func count() -> Int { calls }
+}
+
 actor TerminalToolTestLog {
     private var values: [String] = []
 

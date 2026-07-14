@@ -71,7 +71,7 @@ struct TerminalOperationJournalTests {
                             windowID: "@9",
                             paneID: "%9"
                         ),
-                        reason: "background job remains"
+                        reason: .backgroundJobs
                     )
                 )
             ),
@@ -103,7 +103,7 @@ struct TerminalOperationJournalTests {
                 windowID: "@12",
                 paneID: "%34"
             ),
-            reason: "interrupted"
+            reason: .interrupted
         )
         #expect(
             try terminalDecodeTemporaryPaneEvent(
@@ -121,9 +121,39 @@ struct TerminalOperationJournalTests {
                     windowID: nil,
                     paneID: "%34"
                 ),
-                reason: "interrupted"
+                reason: .interrupted
             )
         )
+
+        let unknownLegacy = terminalUTF8Data("""
+            {"retained":{"leaseID":"\(leaseID.uuidString)","paneID":"%34","reason":"secret diagnostic: /private/token"}}
+            """)
+        #expect(
+            try terminalDecodeTemporaryPaneEvent(unknownLegacy) == .retained(
+                leaseID: leaseID,
+                pane: TerminalJournalPaneProvenance(
+                    windowID: nil,
+                    paneID: "%34"
+                ),
+                reason: .legacyUnknown
+            )
+        )
+
+        let encoded = try #require(terminalUTF8String(
+            terminalEncodeTemporaryPaneEvent(
+                .retained(
+                    leaseID: leaseID,
+                    pane: TerminalJournalPaneProvenance(
+                        windowID: "@12",
+                        paneID: "%34"
+                    ),
+                    reason: .controllerCommandFailed
+                )
+            )
+        ))
+        #expect(encoded.contains("\"reasonCode\":\"controllerCommandFailed\""))
+        #expect(!encoded.contains("secret"))
+        #expect(!encoded.contains("reason\""))
     }
 
     @Test("screen evidence round-trips exact cursor mode dimensions and diff")

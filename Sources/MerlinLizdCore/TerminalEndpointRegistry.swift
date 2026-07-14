@@ -95,6 +95,13 @@ public enum TerminalEndpointRegistryError: Error, Equatable, Sendable {
     case pinLost
 }
 
+struct TerminalEndpointRegistryStateSnapshot: Equatable, Sendable {
+    let endpointCount: Int
+    let bindingCount: Int
+    let conversationOwnerCount: Int
+    let keyboardTransitionCount: Int
+}
+
 public actor TerminalEndpointRegistry {
     private struct RegisteredEndpoint: Sendable {
         let endpoint: TerminalEndpoint
@@ -110,6 +117,7 @@ public actor TerminalEndpointRegistry {
     }
 
     private struct KeyboardTransition: Sendable {
+        let token: UUID
         let task: Task<Void, Never>
     }
 
@@ -145,8 +153,15 @@ public actor TerminalEndpointRegistry {
     private var eventSubscribers: [
         UUID: AsyncStream<TerminalEndpointRegistryEvent>.Continuation
     ] = [:]
+    private let bindingValidationHook: (@Sendable () async -> Void)?
 
-    public init() {}
+    public init() {
+        bindingValidationHook = nil
+    }
+
+    init(bindingValidationHook: @escaping @Sendable () async -> Void) {
+        self.bindingValidationHook = bindingValidationHook
+    }
 
     public func register(_ endpoint: TerminalEndpoint) throws {
         guard routeMatchesConversation(endpoint) else {
@@ -366,7 +381,8 @@ public actor TerminalEndpointRegistry {
         threadID: AgentThreadID,
         turnID: AgentTurnID,
         conversationKey: TerminalConversationKey
-    ) throws -> TerminalEndpointBinding {
+    ) async throws -> TerminalEndpointBinding {
+        await bindingValidationHook?()
         guard let stored = bindings[threadID] else {
             throw TerminalEndpointRegistryError.preparedBindingNotFound
         }
@@ -419,9 +435,34 @@ public actor TerminalEndpointRegistry {
         threadID: AgentThreadID,
         conversationKey: TerminalConversationKey
     ) async {
+        await releasePreparedMatching(
+            threadID: threadID,
+            conversationKey: conversationKey,
+            token: nil
+        )
+    }
+
+    public func releasePrepared(
+        threadID: AgentThreadID,
+        conversationKey: TerminalConversationKey,
+        token: TerminalEndpointBindingToken
+    ) async {
+        await releasePreparedMatching(
+            threadID: threadID,
+            conversationKey: conversationKey,
+            token: token
+        )
+    }
+
+    private func releasePreparedMatching(
+        threadID: AgentThreadID,
+        conversationKey: TerminalConversationKey,
+        token: TerminalEndpointBindingToken?
+    ) async {
         guard var stored = bindings[threadID],
             stored.turnID == nil,
-            stored.conversationKey == conversationKey
+            stored.conversationKey == conversationKey,
+            token == nil || stored.token == token
         else { return }
         let transition: KeyboardTransition
         if stored.phase == .releasing,
@@ -448,6 +489,15 @@ public actor TerminalEndpointRegistry {
         losses
     }
 
+    func testingStateSnapshot() -> TerminalEndpointRegistryStateSnapshot {
+        TerminalEndpointRegistryStateSnapshot(
+            endpointCount: endpoints.count,
+            bindingCount: bindings.count,
+            conversationOwnerCount: conversationOwners.count,
+            keyboardTransitionCount: keyboardTransitions.count
+        )
+    }
+
     public func events() -> AsyncStream<TerminalEndpointRegistryEvent> {
         let subscriberID = UUID()
         return AsyncStream { continuation in
@@ -467,16 +517,30 @@ public actor TerminalEndpointRegistry {
         for endpoint: TerminalEndpoint
     ) -> KeyboardTransition {
         let previous = keyboardTransitions[endpoint.id]?.task
+        let token = UUID()
         let transition = KeyboardTransition(
+            token: token,
             task: Task {
                 if let previous {
                     await previous.value
                 }
                 await endpoint.terminal.setKeyboardOwner(owner)
+                self.completeKeyboardTransition(
+                    endpointID: endpoint.id,
+                    token: token
+                )
             }
         )
         keyboardTransitions[endpoint.id] = transition
         return transition
+    }
+
+    private func completeKeyboardTransition(
+        endpointID: TerminalEndpointID,
+        token: UUID
+    ) {
+        guard keyboardTransitions[endpointID]?.token == token else { return }
+        keyboardTransitions.removeValue(forKey: endpointID)
     }
 
     private func exactBinding(

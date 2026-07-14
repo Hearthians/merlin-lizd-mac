@@ -29,13 +29,129 @@ public struct TerminalJournalPaneProvenance: Codable, Equatable, Sendable {
     }
 }
 
+public enum TerminalJournalRetentionReasonCode: String, Codable, Equatable,
+    Sendable
+{
+    case foregroundProcess
+    case backgroundJobs
+    case unsupportedShell
+    case markerAmbiguity
+    case probeTimedOut
+    case disconnected
+    case revisionDrift
+    case userSurfaceSwitch
+    case terminalWidthUncertain
+    case routeUnavailable
+    case auditUnavailable
+    case interrupted
+    case crashed
+    case turnEnded
+    case pinLost
+    case controllerCancelled
+    case controllerWorkerNotReady
+    case controllerTimedOut
+    case controllerTransportUnavailable
+    case controllerCommandFailed
+    case controllerInvalidSurfaceOutput
+    case controllerSessionIdentityMismatch
+    case controllerCreatedPaneNotCurrent
+    case controllerUnavailable
+    case legacyUnknown
+
+    public init(_ reason: TemporaryPaneRetentionReason) {
+        switch reason {
+        case .foregroundProcess: self = .foregroundProcess
+        case .backgroundJobs: self = .backgroundJobs
+        case .unsupportedShell: self = .unsupportedShell
+        case .markerAmbiguity: self = .markerAmbiguity
+        case .probeTimedOut: self = .probeTimedOut
+        case .disconnected: self = .disconnected
+        case .revisionDrift: self = .revisionDrift
+        case .userSurfaceSwitch: self = .userSurfaceSwitch
+        case .terminalWidthUncertain: self = .terminalWidthUncertain
+        case .routeUnavailable: self = .routeUnavailable
+        case .auditUnavailable: self = .auditUnavailable
+        case .interrupted: self = .interrupted
+        case .crashed: self = .crashed
+        case .turnEnded: self = .turnEnded
+        case .pinLost: self = .pinLost
+        case let .controllerRetained(reason):
+            switch reason {
+            case .cancelled: self = .controllerCancelled
+            case .workerNotReady: self = .controllerWorkerNotReady
+            case .timedOut: self = .controllerTimedOut
+            case .transportUnavailable:
+                self = .controllerTransportUnavailable
+            case .commandFailed: self = .controllerCommandFailed
+            case .invalidSurfaceOutput:
+                self = .controllerInvalidSurfaceOutput
+            case .sessionIdentityMismatch:
+                self = .controllerSessionIdentityMismatch
+            case .createdPaneNotCurrent:
+                self = .controllerCreatedPaneNotCurrent
+            case .unavailable: self = .controllerUnavailable
+            }
+        }
+    }
+
+    init(legacyReason: String) {
+        let stablePrefixes: [
+            (String, TerminalJournalRetentionReasonCode)
+        ] = [
+            ("foregroundProcess", .foregroundProcess),
+            ("backgroundJobs", .backgroundJobs),
+            ("unsupportedShell", .unsupportedShell),
+            ("markerAmbiguity", .markerAmbiguity),
+            ("probeTimedOut", .probeTimedOut),
+            ("disconnected", .disconnected),
+            ("revisionDrift", .revisionDrift),
+            ("userSurfaceSwitch", .userSurfaceSwitch),
+            ("terminalWidthUncertain", .terminalWidthUncertain),
+            ("routeUnavailable", .routeUnavailable),
+            ("auditUnavailable", .auditUnavailable),
+            ("interrupted", .interrupted),
+            ("crashed", .crashed),
+            ("turnEnded", .turnEnded),
+            ("pinLost", .pinLost),
+        ]
+        if let match = stablePrefixes.first(where: {
+            legacyReason.hasPrefix($0.0)
+        }) {
+            self = match.1
+            return
+        }
+        let controllerMappings: [
+            (String, TerminalJournalRetentionReasonCode)
+        ] = [
+            ("cancelled", .controllerCancelled),
+            ("workerNotReady", .controllerWorkerNotReady),
+            ("timedOut", .controllerTimedOut),
+            ("transportUnavailable", .controllerTransportUnavailable),
+            ("commandFailed", .controllerCommandFailed),
+            ("invalidSurfaceOutput", .controllerInvalidSurfaceOutput),
+            ("sessionIdentityMismatch", .controllerSessionIdentityMismatch),
+            ("createdPaneNotCurrent", .controllerCreatedPaneNotCurrent),
+            ("unavailable", .controllerUnavailable),
+        ]
+        if legacyReason.hasPrefix("controllerRetained"),
+            let match = controllerMappings.first(where: {
+                legacyReason.contains($0.0)
+            })
+        {
+            self = match.1
+            return
+        }
+        self = .legacyUnknown
+    }
+}
+
 public enum TerminalJournalTemporaryPaneEvent: Equatable, Sendable {
     case created(leaseID: UUID, pane: TerminalJournalPaneProvenance)
     case closed(leaseID: UUID, pane: TerminalJournalPaneProvenance)
     case retained(
         leaseID: UUID,
         pane: TerminalJournalPaneProvenance,
-        reason: String
+        reason: TerminalJournalRetentionReasonCode
     )
 }
 
@@ -50,17 +166,19 @@ extension TerminalJournalTemporaryPaneEvent: Codable {
         let leaseID: UUID
         let pane: TerminalJournalPaneProvenance?
         let paneID: String?
+        let reasonCode: TerminalJournalRetentionReasonCode?
         let reason: String?
 
         init(
             leaseID: UUID,
             pane: TerminalJournalPaneProvenance,
-            reason: String? = nil
+            reasonCode: TerminalJournalRetentionReasonCode? = nil
         ) {
             self.leaseID = leaseID
             self.pane = pane
             paneID = nil
-            self.reason = reason
+            self.reasonCode = reasonCode
+            reason = nil
         }
 
         var decodedPane: TerminalJournalPaneProvenance? {
@@ -112,11 +230,25 @@ extension TerminalJournalTemporaryPaneEvent: Codable {
             return
         }
         let payload = try container.decode(Payload.self, forKey: .retained)
-        guard let pane = payload.decodedPane, let reason = payload.reason else {
+        guard let pane = payload.decodedPane else {
             throw DecodingError.dataCorruptedError(
                 forKey: .retained,
                 in: container,
                 debugDescription: "Missing retained pane provenance"
+            )
+        }
+        let reason: TerminalJournalRetentionReasonCode
+        switch (payload.reasonCode, payload.reason) {
+        case let (reasonCode?, nil): reason = reasonCode
+        case let (nil, legacyReason?):
+            reason = TerminalJournalRetentionReasonCode(
+                legacyReason: legacyReason
+            )
+        default:
+            throw DecodingError.dataCorruptedError(
+                forKey: .retained,
+                in: container,
+                debugDescription: "Expected one retained reason code"
             )
         }
         self = .retained(
@@ -141,7 +273,7 @@ extension TerminalJournalTemporaryPaneEvent: Codable {
             )
         case let .retained(leaseID, pane, reason):
             try container.encode(
-                Payload(leaseID: leaseID, pane: pane, reason: reason),
+                Payload(leaseID: leaseID, pane: pane, reasonCode: reason),
                 forKey: .retained
             )
         }
