@@ -120,6 +120,133 @@ struct WorkerMetricsStreamerTests {
         }
     }
 
+    @Test("stream completion wins a later cancellation without signaling descendants")
+    func finalizedStreamIgnoresLateCancellation() async throws {
+        let parentPIDFile = TemporaryProcessIDFile()
+        let descendantPIDFile = TemporaryProcessIDFile()
+        let completionGate = AsyncStartGate()
+        let runner = POSIXInventoryProcessStreamer(
+            completionBoundaryHook: {
+                await completionGate.wait()
+            }
+        )
+        let output = runner.streamStandardOutput(CommandSpec(
+            executable: "/bin/sh",
+            arguments: [
+                "-c",
+                "echo $$ > \"$1\"; /bin/sh -c 'exec 1>&- 2>&-; exec /bin/sleep 30' & echo $! > \"$2\"; exit 0",
+                "merlin-lizd-stream-finalized-cancel-test",
+                parentPIDFile.path,
+                descendantPIDFile.path,
+            ]
+        ))
+        var parentProcessID: pid_t?
+        var descendantProcessID: pid_t?
+        var cancellationTask: Task<Void, Never>?
+        defer {
+            cancellationTask?.cancel()
+            Task {
+                await completionGate.open()
+                await output.cancelAndWait()
+            }
+            if let parentProcessID {
+                _ = kill(-parentProcessID, SIGKILL)
+            }
+            if let descendantProcessID {
+                _ = kill(descendantProcessID, SIGKILL)
+            }
+            parentPIDFile.remove()
+            descendantPIDFile.remove()
+        }
+
+        await completionGate.waitUntilEntered()
+        parentProcessID = try await parentPIDFile.waitForProcessID()
+        descendantProcessID = try await descendantPIDFile.waitForProcessID()
+        let parent = try #require(parentProcessID)
+        let descendant = try #require(descendantProcessID)
+        #expect(parentPIDFile.processIsAbsent(parent))
+        #expect(!descendantPIDFile.processIsAbsent(descendant))
+
+        cancellationTask = Task {
+            await output.cancelAndWait()
+            await output.cancelAndWait()
+        }
+        try? await Task.sleep(for: .milliseconds(20))
+        #expect(!descendantPIDFile.processIsAbsent(descendant))
+        await completionGate.open()
+        await cancellationTask?.value
+
+        do {
+            for try await _ in output.chunks {}
+        } catch {
+            Issue.record("Expected finalized stream success, got \(error)")
+        }
+    }
+
+    @Test("stream cancellation before atomic finalization kills before reap")
+    func streamCancellationBeforeFinalizationKillsGroup() async throws {
+        let parentPIDFile = TemporaryProcessIDFile()
+        let descendantPIDFile = TemporaryProcessIDFile()
+        let decisionGate = AsyncStartGate()
+        let runner = POSIXInventoryProcessStreamer(
+            completionDecisionBoundaryHook: {
+                await decisionGate.wait()
+            }
+        )
+        let output = runner.streamStandardOutput(CommandSpec(
+            executable: "/bin/sh",
+            arguments: [
+                "-c",
+                "echo $$ > \"$1\"; /bin/sh -c 'trap \"\" TERM; exec 1>&- 2>&-; exec /bin/sleep 30' & echo $! > \"$2\"; exit 0",
+                "merlin-lizd-stream-decision-cancel-test",
+                parentPIDFile.path,
+                descendantPIDFile.path,
+            ]
+        ))
+        var parentProcessID: pid_t?
+        var descendantProcessID: pid_t?
+        var cancellationTask: Task<Void, Never>?
+        defer {
+            cancellationTask?.cancel()
+            Task {
+                await decisionGate.open()
+                await output.cancelAndWait()
+            }
+            if let parentProcessID {
+                _ = kill(-parentProcessID, SIGKILL)
+            }
+            if let descendantProcessID {
+                _ = kill(descendantProcessID, SIGKILL)
+            }
+            parentPIDFile.remove()
+            descendantPIDFile.remove()
+        }
+
+        await decisionGate.waitUntilEntered()
+        parentProcessID = try await parentPIDFile.waitForProcessID()
+        descendantProcessID = try await descendantPIDFile.waitForProcessID()
+        let parent = try #require(parentProcessID)
+        let descendant = try #require(descendantProcessID)
+        #expect(parentPIDFile.processHasExitedWithoutReaping(parent))
+        #expect(getpgid(descendant) == parent)
+
+        cancellationTask = Task { await output.cancelAndWait() }
+        var descendantWasKilledBeforeReap = false
+        for _ in 0..<100 {
+            if descendantPIDFile.processIsAbsent(descendant) {
+                descendantWasKilledBeforeReap = true
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        await decisionGate.open()
+        await cancellationTask?.value
+
+        #expect(descendantWasKilledBeforeReap)
+        #expect(parentPIDFile.processIsAbsent(parent))
+        #expect(descendantPIDFile.processIsAbsent(descendant))
+    }
+
     @Test("streamer yields each framed sample from one process stream")
     func streamerYieldsEverySample() async throws {
         let wireOutput = """
@@ -181,18 +308,8 @@ struct WorkerMetricsStreamerTests {
     func cancellationReapsProcessGroup() async throws {
         let parentPIDFile = TemporaryProcessIDFile()
         let descendantPIDFile = TemporaryProcessIDFile()
-        defer {
-            parentPIDFile.remove()
-            descendantPIDFile.remove()
-        }
-
+        var parentProcessID: pid_t?
         var descendantProcessID: pid_t?
-        defer {
-            if let descendantProcessID {
-                _ = kill(descendantProcessID, SIGKILL)
-            }
-        }
-
         let runner = POSIXInventoryProcessStreamer()
         let output = runner.streamStandardOutput(CommandSpec(
             executable: "/bin/sh",
@@ -207,19 +324,32 @@ struct WorkerMetricsStreamerTests {
         let consumer = Task {
             for try await _ in output.chunks {}
         }
+        defer {
+            consumer.cancel()
+            Task { await output.cancelAndWait() }
+            if let parentProcessID {
+                _ = kill(-parentProcessID, SIGKILL)
+            }
+            if let descendantProcessID {
+                _ = kill(descendantProcessID, SIGKILL)
+            }
+            parentPIDFile.remove()
+            descendantPIDFile.remove()
+        }
 
-        let parentProcessID = try await parentPIDFile.waitForProcessID()
+        parentProcessID = try await parentPIDFile.waitForProcessID()
         descendantProcessID = try await descendantPIDFile.waitForProcessID()
-        #expect(getpgid(parentProcessID) == parentProcessID)
+        let parent = try #require(parentProcessID)
+        #expect(getpgid(parent) == parent)
         if let descendantProcessID {
-            #expect(getpgid(descendantProcessID) == parentProcessID)
+            #expect(getpgid(descendantProcessID) == parent)
         }
 
         consumer.cancel()
         _ = try? await consumer.value
         await output.cancelAndWait()
 
-        #expect(await waitUntilAbsent(parentProcessID))
+        #expect(await waitUntilAbsent(parent))
         if let descendantProcessID {
             #expect(await waitUntilAbsent(descendantProcessID))
         }
@@ -271,11 +401,6 @@ struct WorkerMetricsStreamerTests {
         WorkerMetricsStreamer.resetShutdownStateForTesting()
         let firstPIDFile = TemporaryProcessIDFile()
         let secondPIDFile = TemporaryProcessIDFile()
-        defer {
-            firstPIDFile.remove()
-            secondPIDFile.remove()
-        }
-
         let runner = POSIXInventoryProcessStreamer()
         let first = runner.streamStandardOutput(termResistantCommand(
             pidFile: firstPIDFile,
@@ -285,16 +410,34 @@ struct WorkerMetricsStreamerTests {
             pidFile: secondPIDFile,
             label: "second"
         ))
-        let firstProcessID = try await firstPIDFile.waitForProcessID()
-        let secondProcessID = try await secondPIDFile.waitForProcessID()
+        var firstProcessID: pid_t?
+        var secondProcessID: pid_t?
+        defer {
+            Task {
+                await first.cancelAndWait()
+                await second.cancelAndWait()
+            }
+            if let firstProcessID {
+                _ = kill(firstProcessID, SIGKILL)
+            }
+            if let secondProcessID {
+                _ = kill(secondProcessID, SIGKILL)
+            }
+            firstPIDFile.remove()
+            secondPIDFile.remove()
+        }
+        firstProcessID = try await firstPIDFile.waitForProcessID()
+        secondProcessID = try await secondPIDFile.waitForProcessID()
+        let firstChild = try #require(firstProcessID)
+        let secondChild = try #require(secondProcessID)
 
         await WorkerMetricsStreamer.shutdownAll()
         WorkerMetricsStreamer.resetShutdownStateForTesting()
         await first.waitForTermination()
         await second.waitForTermination()
 
-        #expect(firstPIDFile.processIsAbsent(firstProcessID))
-        #expect(secondPIDFile.processIsAbsent(secondProcessID))
+        #expect(firstPIDFile.processIsAbsent(firstChild))
+        #expect(secondPIDFile.processIsAbsent(secondChild))
     }
 
     private func termResistantCommand(

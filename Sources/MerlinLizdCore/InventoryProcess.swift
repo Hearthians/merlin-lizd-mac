@@ -220,16 +220,16 @@ actor BoundedInventoryProcessRunner: InventoryProcessRunning {
 
 final class FoundationInventoryProcessRunner: InventoryProcessRunning, @unchecked Sendable {
     private let processExitBoundaryHook: @Sendable () async -> Void
-    private let reapBoundaryHook: @Sendable () async -> Void
+    private let completionDecisionBoundaryHook: @Sendable () async -> Void
     private let completionBoundaryHook: @Sendable () async -> Void
 
     init(
         processExitBoundaryHook: @escaping @Sendable () async -> Void = {},
-        reapBoundaryHook: @escaping @Sendable () async -> Void = {},
+        completionDecisionBoundaryHook: @escaping @Sendable () async -> Void = {},
         completionBoundaryHook: @escaping @Sendable () async -> Void = {}
     ) {
         self.processExitBoundaryHook = processExitBoundaryHook
-        self.reapBoundaryHook = reapBoundaryHook
+        self.completionDecisionBoundaryHook = completionDecisionBoundaryHook
         self.completionBoundaryHook = completionBoundaryHook
     }
 
@@ -269,9 +269,8 @@ final class FoundationInventoryProcessRunner: InventoryProcessRunning, @unchecke
                 stderr: String(decoding: stderrData, as: UTF8.self),
                 exitCode: exitCode
             )
-            await processBox.reap()
-            await reapBoundaryHook()
-            let completionFinalized = processBox.finalizeCompletion()
+            await completionDecisionBoundaryHook()
+            let completionFinalized = processBox.reapAndFinalize()
             await completionBoundaryHook()
             guard completionFinalized else {
                 throw CancellationError()
@@ -295,10 +294,14 @@ final class POSIXInventoryProcessStreamer: InventoryProcessOutputStreaming, @unc
     private let stderrTailByteLimit: Int
     private let stdoutBufferChunkLimit: Int
     private let stdoutBufferByteLimit: Int
+    private let completionDecisionBoundaryHook: @Sendable () async -> Void
+    private let completionBoundaryHook: @Sendable () async -> Void
 
     init(
         stderrTailByteLimit: Int = 64 * 1_024,
-        maximumBufferedStdoutBytes: Int = defaultStdoutBufferBytes
+        maximumBufferedStdoutBytes: Int = defaultStdoutBufferBytes,
+        completionDecisionBoundaryHook: @escaping @Sendable () async -> Void = {},
+        completionBoundaryHook: @escaping @Sendable () async -> Void = {}
     ) {
         precondition(maximumBufferedStdoutBytes >= inventoryProcessIOChunkBytes)
         self.stderrTailByteLimit = max(0, stderrTailByteLimit)
@@ -306,6 +309,8 @@ final class POSIXInventoryProcessStreamer: InventoryProcessOutputStreaming, @unc
             / inventoryProcessIOChunkBytes
         stdoutBufferByteLimit = stdoutBufferChunkLimit
             * inventoryProcessIOChunkBytes
+        self.completionDecisionBoundaryHook = completionDecisionBoundaryHook
+        self.completionBoundaryHook = completionBoundaryHook
     }
 
     func streamStandardOutput(
@@ -380,9 +385,10 @@ final class POSIXInventoryProcessStreamer: InventoryProcessOutputStreaming, @unc
                 stdout.readChunks { data in
                     guard case .dropped = consume(data) else { return }
                     guard overflow.markOverflowed() else { return }
-                    processBox.cancel()
-                    stdout.requestClose()
-                    stderr.requestClose()
+                    if processBox.cancel() {
+                        stdout.requestClose()
+                        stderr.requestClose()
+                    }
                 }
             }.value
             async let stderrTail: Data = Task.detached {
@@ -392,13 +398,17 @@ final class POSIXInventoryProcessStreamer: InventoryProcessOutputStreaming, @unc
             let exitCode = await processBox.waitForExit()
             await stdoutRead
             let diagnosticTail = await stderrTail
-            await processBox.reap()
+            await completionDecisionBoundaryHook()
+            let completionFinalized = processBox.reapAndFinalize()
+            await completionBoundaryHook()
             if overflow.isOverflowed {
                 throw InventoryProcessStreamError.stdoutBufferOverflow(
                     maxBufferedBytes: stdoutBufferByteLimit
                 )
             }
-            try Task.checkCancellation()
+            guard completionFinalized else {
+                throw CancellationError()
+            }
 
             guard exitCode == 0 else {
                 throw InventoryProcessStreamError.commandFailed(
@@ -407,9 +417,10 @@ final class POSIXInventoryProcessStreamer: InventoryProcessOutputStreaming, @unc
                 )
             }
         } onCancel: {
-            processBox.cancel()
-            stdout.requestClose()
-            stderr.requestClose()
+            if processBox.cancel() {
+                stdout.requestClose()
+                stderr.requestClose()
+            }
         }
     }
 }
@@ -524,25 +535,22 @@ func shutdownAllInventoryStreamingProcesses() async {
 }
 
 private final class RunningProcessBox: @unchecked Sendable {
-    private static let forceKillGracePeriod = DispatchTimeInterval.seconds(2)
+    private enum Lifecycle {
+        case ready
+        case running(processID: pid_t, processGroupID: pid_t)
+        case cancelledBeforeStart
+        case cancelled(processID: pid_t)
+        case finalized(completed: Bool)
+    }
 
     private let command: CommandSpec
     private let standardOutput: Int32
     private let standardError: Int32
     private let childDescriptorsToClose: [Int32]
     private let lock = NSLock()
-    private var cancellationRequested = false
-    private var forceKillScheduled = false
-    private var escalationComplete = false
-    private var reapCommitted = false
-    private var reapFinished = false
-    private var started = false
-    private var processID: pid_t?
-    private var processGroupID: pid_t?
+    private var lifecycle = Lifecycle.ready
     private var observedExitCode: Int32?
-    private var completionFinalized = false
     private var exitWaiter: CheckedContinuation<Int32, Never>?
-    private var reapWaiter: CheckedContinuation<pid_t?, Never>?
 
     init(
         command: CommandSpec,
@@ -562,13 +570,14 @@ private final class RunningProcessBox: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
-        guard !cancellationRequested else {
+        guard case .ready = lifecycle else {
             throw CancellationError()
         }
         let spawnedProcessID = try spawnProcess()
-        processID = spawnedProcessID
-        processGroupID = spawnedProcessID
-        started = true
+        lifecycle = .running(
+            processID: spawnedProcessID,
+            processGroupID: spawnedProcessID
+        )
 
         DispatchQueue.global(qos: .utility).async { [self] in
             observeExit(processID: spawnedProcessID)
@@ -588,120 +597,58 @@ private final class RunningProcessBox: @unchecked Sendable {
         }
     }
 
-    /// Reaps only after all output pipes are finished. On cancellation the
-    /// leader remains a zombie until group escalation completes, preventing
-    /// its PID/PGID from being reused before the delayed SIGKILL.
-    func reap() async {
-        let processIDToReap: pid_t? = await withCheckedContinuation {
-            (continuation: CheckedContinuation<pid_t?, Never>) in
-            lock.lock()
-            if reapCommitted {
-                lock.unlock()
-                continuation.resume(returning: nil)
-            } else if cancellationRequested, !escalationComplete {
-                reapCommitted = true
-                reapWaiter = continuation
-                lock.unlock()
-            } else {
-                reapCommitted = true
-                let processID = self.processID
-                lock.unlock()
-                continuation.resume(returning: processID)
-            }
+    /// Atomically chooses cancellation or completion after the caller has
+    /// observed leader exit and drained both output pipes. The leader remains
+    /// unreaped while cancellation owns its process-group identity.
+    func reapAndFinalize() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let processID: pid_t
+        let completed: Bool
+        switch lifecycle {
+        case let .running(value, _):
+            processID = value
+            completed = true
+        case let .cancelled(value):
+            processID = value
+            completed = false
+        case .cancelledBeforeStart:
+            lifecycle = .finalized(completed: false)
+            return false
+        case let .finalized(value):
+            return value
+        case .ready:
+            return false
         }
 
-        guard let processIDToReap else { return }
         var waitStatus: Int32 = 0
         var waitResult: pid_t
         repeat {
-            waitResult = Darwin.waitpid(processIDToReap, &waitStatus, 0)
+            waitResult = Darwin.waitpid(processID, &waitStatus, 0)
         } while waitResult == -1 && errno == EINTR
-
-        completeReap()
-    }
-
-    private func completeReap() {
-        lock.lock()
-        reapFinished = true
-        if cancellationRequested, escalationComplete {
-            processGroupID = nil
-        }
-        lock.unlock()
-    }
-
-    func finalizeCompletion() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !cancellationRequested else { return false }
-        completionFinalized = true
-        processGroupID = nil
-        return true
+        lifecycle = .finalized(completed: completed)
+        return completed
     }
 
     @discardableResult
     func cancel() -> Bool {
-        var groupToTerminate: pid_t?
-
         lock.lock()
-        guard !completionFinalized else {
+        switch lifecycle {
+        case .ready:
+            lifecycle = .cancelledBeforeStart
+            lock.unlock()
+            return true
+        case let .running(processID, processGroupID):
+            signalProcessGroup(processGroupID, signal: SIGTERM)
+            signalProcessGroup(processGroupID, signal: SIGKILL)
+            lifecycle = .cancelled(processID: processID)
+            lock.unlock()
+            return true
+        case .cancelledBeforeStart, .cancelled, .finalized:
             lock.unlock()
             return false
         }
-        cancellationRequested = true
-        if
-            started,
-            let processGroupID,
-            !forceKillScheduled
-        {
-            forceKillScheduled = true
-            groupToTerminate = processGroupID
-        }
-        lock.unlock()
-
-        guard let groupToTerminate else { return true }
-        signalProcessGroup(groupToTerminate, signal: SIGTERM)
-        DispatchQueue.global(qos: .utility).asyncAfter(
-            deadline: .now() + Self.forceKillGracePeriod
-        ) { [self] in
-            forceKillIfNeeded(processGroupID: groupToTerminate)
-        }
-        return true
-    }
-
-    private func forceKillIfNeeded(processGroupID: pid_t) {
-        lock.lock()
-        guard
-            forceKillScheduled,
-            cancellationRequested,
-            !completionFinalized,
-            self.processGroupID == processGroupID
-        else {
-            lock.unlock()
-            return
-        }
-        lock.unlock()
-
-        signalProcessGroup(processGroupID, signal: SIGKILL)
-        completeEscalation()
-    }
-
-    private func completeEscalation() {
-        var waiter: CheckedContinuation<pid_t?, Never>?
-        var processIDToReap: pid_t?
-
-        lock.lock()
-        escalationComplete = true
-        if reapFinished {
-            processGroupID = nil
-        }
-        if let reapWaiter {
-            processIDToReap = processID
-            waiter = reapWaiter
-            self.reapWaiter = nil
-        }
-        lock.unlock()
-
-        waiter?.resume(returning: processIDToReap)
     }
 
     private func signalProcessGroup(_ processGroupID: pid_t, signal: Int32) {
@@ -813,7 +760,14 @@ private final class RunningProcessBox: @unchecked Sendable {
         let status = waitResult == 0 ? Int32(exitInformation.si_status) : -1
 
         lock.lock()
-        guard self.processID == processID else {
+        let ownsProcess: Bool
+        switch lifecycle {
+        case let .running(value, _), let .cancelled(value):
+            ownsProcess = value == processID
+        case .ready, .cancelledBeforeStart, .finalized:
+            ownsProcess = false
+        }
+        guard ownsProcess else {
             lock.unlock()
             return
         }
