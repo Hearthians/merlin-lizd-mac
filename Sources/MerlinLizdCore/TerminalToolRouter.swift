@@ -287,6 +287,16 @@ public actor TerminalToolRouter {
         turnID: AgentTurnID
     ) async throws {
         let turn = TurnKey(handle: handle, turnID: turnID)
+        if let provisional = turnLifecycles.keys.first(where: {
+            $0.handle == handle && $0.turnID != turnID
+        }) {
+            do {
+                try await terminateTurn(provisional, reason: .interrupted)
+            } catch {
+                throw TerminalToolRouterError.turnUnavailable
+            }
+            throw TerminalToolRouterError.turnUnavailable
+        }
         do {
             _ = try await activateTurn(turn)
             try Task.checkCancellation()
@@ -297,6 +307,27 @@ public actor TerminalToolRouter {
         } catch {
             throw mapRegistryError(error)
         }
+    }
+
+    /// Abandons a prepared or provisionally activated turn when the protocol
+    /// request fails before a trustworthy turn ID is available.
+    public func abortTurn(handle: AgentTurnHandle) async throws {
+        if let provisional = turnLifecycles.keys.first(where: {
+            $0.handle == handle
+        }) {
+            try await terminateTurn(provisional, reason: .interrupted)
+            return
+        }
+        guard let prepared = takePreparedTurn(
+            threadID: handle.threadID,
+            handle: handle
+        ) else { return }
+        _ = await prepared.task.result
+        await registry.releasePrepared(
+            handle: handle,
+            token: prepared.bindingToken,
+            conversationKey: prepared.conversationKey
+        )
     }
 
     public func execute(

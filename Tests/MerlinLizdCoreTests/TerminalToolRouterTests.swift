@@ -4689,6 +4689,160 @@ struct TerminalToolRouterTests {
         )
     }
 
+    @Test("confirming a different turn tears down the provisional turn")
+    func mismatchedConfirmationAbortsProvisionalTurn() async throws {
+        let screen = TerminalToolFixtures.screen(revision: 149)
+        let port = FakeTerminalToolPort(snapshot: screen)
+        let registry = TerminalEndpointRegistry()
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: TerminalToolFixtures.newID(),
+                port: port,
+                controller: FakeTerminalSurfaceController(
+                    surface: TerminalToolFixtures.surface()
+                )
+            )
+        )
+        let router = TerminalToolRouter(
+            registry: registry,
+            approvalBroker: TerminalApprovalBroker(),
+            journal: MemoryTerminalToolJournal()
+        )
+        let threadID = AgentThreadID(rawValue: "provisional-mismatch-thread")
+        let provisional = AgentTurnID(rawValue: "early-tool-turn")
+        let returned = AgentTurnID(rawValue: "start-response-turn")
+        let handle = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+
+        #expect(
+            try await router.execute(
+                threadID: threadID,
+                turnID: provisional,
+                call: .observeScreen
+            ) == .screen(screen)
+        )
+        await #expect(throws: TerminalToolRouterError.turnUnavailable) {
+            try await router.confirmTurnID(handle: handle, turnID: returned)
+        }
+
+        #expect(await port.keyboardOwners() == [.codex, .user])
+        await #expect(throws: TerminalToolRouterError.turnUnavailable) {
+            _ = try await router.execute(
+                threadID: threadID,
+                turnID: provisional,
+                call: .observeScreen
+            )
+        }
+        let snapshot = await router.testingStateSnapshot()
+        #expect(snapshot.preparedTurnCount == 0)
+        #expect(snapshot.activationTaskCount == 0)
+        #expect(snapshot.activeBindingCount == 0)
+        #expect(snapshot.turnLifecycleCount == 0)
+    }
+
+    @Test("aborting a prepared turn releases it without a protocol turn ID")
+    func abortPreparedTurnIsIdempotent() async throws {
+        let port = FakeTerminalToolPort(
+            snapshot: TerminalToolFixtures.screen(revision: 150)
+        )
+        let registry = TerminalEndpointRegistry()
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: TerminalToolFixtures.newID(),
+                port: port,
+                controller: FakeTerminalSurfaceController(
+                    surface: TerminalToolFixtures.surface()
+                )
+            )
+        )
+        let router = TerminalToolRouter(
+            registry: registry,
+            approvalBroker: TerminalApprovalBroker(),
+            journal: MemoryTerminalToolJournal()
+        )
+        let threadID = AgentThreadID(rawValue: "abort-prepared-thread")
+        let handle = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+
+        try await router.abortTurn(handle: handle)
+        try await router.abortTurn(handle: handle)
+
+        #expect(await port.keyboardOwners() == [.codex, .user])
+        #expect(await router.testingStateSnapshot().preparedTurnCount == 0)
+        let replacement = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        try await router.abortTurn(handle: replacement)
+    }
+
+    @Test("mismatched confirmation drains a provisional activation in progress")
+    func mismatchedConfirmationDrainsActivatingProvisional() async throws {
+        let activationGate = TerminalToolTestGate()
+        let validation = TerminalBindingValidationGate(
+            blockedCall: 1,
+            gate: activationGate
+        )
+        let port = FakeTerminalToolPort(
+            snapshot: TerminalToolFixtures.screen(revision: 151)
+        )
+        let registry = TerminalEndpointRegistry(
+            claimPreparedTurnHook: { await validation.validate() }
+        )
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: TerminalToolFixtures.newID(),
+                port: port,
+                controller: FakeTerminalSurfaceController(
+                    surface: TerminalToolFixtures.surface()
+                )
+            )
+        )
+        let router = TerminalToolRouter(
+            registry: registry,
+            approvalBroker: TerminalApprovalBroker(),
+            journal: MemoryTerminalToolJournal()
+        )
+        let threadID = AgentThreadID(rawValue: "activating-mismatch-thread")
+        let handle = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        let provisional = AgentTurnID(rawValue: "activating-provisional")
+        let executing = Task {
+            try await router.execute(
+                threadID: threadID,
+                turnID: provisional,
+                call: .observeScreen
+            )
+        }
+        while await validation.count() < 1 { await Task.yield() }
+        let confirming = Task {
+            try await router.confirmTurnID(
+                handle: handle,
+                turnID: .init(rawValue: "different-response")
+            )
+        }
+
+        await activationGate.open()
+        await #expect(throws: TerminalToolRouterError.turnUnavailable) {
+            _ = try await executing.value
+        }
+        await #expect(throws: TerminalToolRouterError.turnUnavailable) {
+            try await confirming.value
+        }
+        #expect(await port.keyboardOwners() == [.codex, .user])
+        let snapshot = await router.testingStateSnapshot()
+        #expect(snapshot.preparedTurnCount == 0)
+        #expect(snapshot.activationTaskCount == 0)
+        #expect(snapshot.activeBindingCount == 0)
+        #expect(snapshot.turnLifecycleCount == 0)
+    }
+
     private func makeRouter(
         port: FakeTerminalToolPort,
         surfaces: FakeTerminalSurfaceController,

@@ -7,12 +7,18 @@ actor ScriptedAppServerProcess: AppServerProcessRunning {
     private let gateStart: Bool
     private let writeError: AppServerProcessError?
     private let failWriteAt: Int?
+    private let gateWriteAt: Int?
     private var started = false
     private var terminated = false
     private var writes: [Data] = []
+    private var writeStarts = 0
     private var events: [AppServerProcessEvent] = []
     private var eventWaiters: [CheckedContinuation<AppServerProcessEvent?, Never>] = []
     private var writeWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var writeStartWaiters: [
+        (Int, CheckedContinuation<Void, Never>)
+    ] = []
+    private var writeGates: [CheckedContinuation<Void, Never>] = []
     private var termination = AppServerProcessTermination(exitCode: 0)
     private var terminateCalls = 0
     private var waitCalls = 0
@@ -28,12 +34,14 @@ actor ScriptedAppServerProcess: AppServerProcessRunning {
         failStart: Bool = false,
         gateStart: Bool = false,
         writeError: AppServerProcessError? = nil,
-        failWriteAt: Int? = nil
+        failWriteAt: Int? = nil,
+        gateWriteAt: Int? = nil
     ) {
         self.failStart = failStart
         self.gateStart = gateStart
         self.writeError = writeError
         self.failWriteAt = failWriteAt
+        self.gateWriteAt = gateWriteAt
     }
 
     func start() async throws {
@@ -48,6 +56,14 @@ actor ScriptedAppServerProcess: AppServerProcessRunning {
 
     func write(_ data: Data) async throws {
         guard started, !terminated else {
+            throw ScriptedAppServerProcessError.notWritable
+        }
+        writeStarts += 1
+        resumeWriteStartWaiters()
+        if gateWriteAt == writeStarts {
+            await withCheckedContinuation { writeGates.append($0) }
+        }
+        guard !terminated else {
             throw ScriptedAppServerProcessError.notWritable
         }
         if let writeError { throw writeError }
@@ -76,6 +92,7 @@ actor ScriptedAppServerProcess: AppServerProcessRunning {
         terminateCalls += 1
         guard !terminated else { return }
         terminated = true
+        releaseWrites()
         resumeEventWaitersWithEnd()
     }
 
@@ -102,6 +119,17 @@ actor ScriptedAppServerProcess: AppServerProcessRunning {
     func waitForWriteCount(_ count: Int) async {
         if writes.count >= count { return }
         await withCheckedContinuation { writeWaiters.append((count, $0)) }
+    }
+
+    func waitForWriteStartCount(_ count: Int) async {
+        if writeStarts >= count { return }
+        await withCheckedContinuation { writeStartWaiters.append((count, $0)) }
+    }
+
+    func releaseWrites() {
+        let gates = writeGates
+        writeGates.removeAll()
+        for gate in gates { gate.resume() }
     }
 
     func waitForStartCount(_ count: Int) async {
@@ -136,6 +164,18 @@ actor ScriptedAppServerProcess: AppServerProcessRunning {
             }
         }
         writeWaiters = retained
+    }
+
+    private func resumeWriteStartWaiters() {
+        var retained: [(Int, CheckedContinuation<Void, Never>)] = []
+        for waiter in writeStartWaiters {
+            if writeStarts >= waiter.0 {
+                waiter.1.resume()
+            } else {
+                retained.append(waiter)
+            }
+        }
+        writeStartWaiters = retained
     }
 
     private func resumeStartCountWaiters() {

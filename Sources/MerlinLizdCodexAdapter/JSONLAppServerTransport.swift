@@ -61,6 +61,7 @@ public actor JSONLAppServerTransport {
     private let processOwner: AppServerTransportProcessOwner
     private let eventReceiverID = UUID()
     private let knownServerRequestMethods: Set<String>
+    private let forwardUnknownServerRequests: Bool
     private let lineByteLimit: Int
     private let pendingRequestLimit: Int
     private let encoder: JSONEncoder
@@ -87,6 +88,9 @@ public actor JSONLAppServerTransport {
     public init(
         process: any AppServerProcessRunning,
         knownServerRequestMethods: Set<String> = [],
+        /// Lets an owning adapter reject and deduplicate the complete server
+        /// RPC surface instead of having the transport answer unknown methods.
+        forwardUnknownServerRequests: Bool = false,
         maximumLineBytes: Int = JSONLAppServerTransport.maximumLineBytes,
         maximumPendingRequests: Int = 1_024
     ) {
@@ -95,6 +99,7 @@ public actor JSONLAppServerTransport {
         self.process = process
         processOwner = AppServerTransportProcessOwner(process: process)
         self.knownServerRequestMethods = knownServerRequestMethods
+        self.forwardUnknownServerRequests = forwardUnknownServerRequests
         lineByteLimit = maximumLineBytes
         pendingRequestLimit = maximumPendingRequests
         let encoder = JSONEncoder()
@@ -531,7 +536,9 @@ public actor JSONLAppServerTransport {
                     fail(.invalidMessage)
                     return
                 }
-                if knownServerRequestMethods.contains(method) {
+                if knownServerRequestMethods.contains(method)
+                    || forwardUnknownServerRequests
+                {
                     enqueue(.request(
                         id: id,
                         method: method,

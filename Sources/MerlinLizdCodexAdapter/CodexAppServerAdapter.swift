@@ -6,6 +6,7 @@ public enum CodexAppServerAdapterError: Error, Equatable, Sendable {
     case invalidResponse
     case unsupportedServerRequest
     case turnAlreadyStarting
+    case resumeAlreadyInProgress
     case stopped
 }
 
@@ -40,11 +41,17 @@ struct CodexAppServerAdapterStateCounts: Equatable, Sendable {
     let replayThreads: Int
     let replayEvents: Int
     let bufferedNotifications: Int
+    let pendingResumes: Int
+    let eventSubscribers: Int
+    let availabilitySubscribers: Int
 }
 
 public actor CodexAppServerAdapter: CodexAgentClient {
     private static let maximumBufferedTurnNotifications = 128
     private static let productionMaximumInFlightToolRequests = 32
+    private static let productionCompletedServerRequestTombstoneLimit = 4_096
+    private static let productionToolRequestDrainTimeout = Duration.seconds(2)
+    private static let eventReplayLimit = 512
 
     private enum StartupOutcome: Sendable {
         case ready
@@ -65,9 +72,30 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         var overflowed: Bool
     }
 
-    private struct InFlightToolRequest: Sendable {
+    private struct PendingResume: Sendable {
         let token: UUID
-        let task: Task<Void, Never>
+        let requestTask: Task<JSONValue, Error>
+        var notifications: [BufferedTurnNotification]
+        var overflowed: Bool
+    }
+
+    private enum ServerRequestPhase: Equatable, Sendable {
+        case executing
+        case responding
+    }
+
+    private struct InFlightServerRequest: Sendable {
+        let token: UUID
+        var callID: String?
+        var phase: ServerRequestPhase
+        var task: Task<Void, Never>?
+    }
+
+    private struct PreparedToolInvocation: Sendable {
+        let callID: String
+        let threadID: AgentThreadID
+        let turnID: AgentTurnID
+        let call: TerminalToolCall
     }
 
     private let transport: JSONLAppServerTransport
@@ -75,6 +103,8 @@ public actor CodexAppServerAdapter: CodexAgentClient {
     private let toolExecutor: any CodexDynamicToolExecuting
     private let mappingStore: CodexAppServerThreadMappingStore
     private let maximumInFlightToolRequests: Int
+    private let completedServerRequestTombstoneLimit: Int
+    private let toolRequestDrainTimeout: Duration
 
     private var startupTask: Task<StartupOutcome, Never>?
     private var consumerTask: Task<Void, Never>?
@@ -82,7 +112,14 @@ public actor CodexAppServerAdapter: CodexAgentClient {
     private var knownThreads: Set<AgentThreadID> = []
     private var activeTurns: [AgentThreadID: AgentTurnID] = [:]
     private var pendingTurnStarts: [AgentThreadID: PendingTurnStart] = [:]
-    private var inFlightToolRequests: [JSONRPCID: InFlightToolRequest] = [:]
+    private var pendingResumes: [AgentThreadID: PendingResume] = [:]
+    private var deletingThreads: Set<AgentThreadID> = []
+    private var inFlightServerRequests: [JSONRPCID: InFlightServerRequest] = [:]
+    private var activeCallIDs: [String: JSONRPCID] = [:]
+    private var completedServerRequestIDs: Set<JSONRPCID> = []
+    private var completedCallIDs: Set<String> = []
+    private var serverRequestTombstonesSaturated = false
+    private var serverRequestResponsesEnabled = true
     private var eventReplay: [AgentThreadID: [AgentEvent]] = [:]
     private var eventContinuations: [
         AgentThreadID: [UUID: AsyncStream<AgentEvent>.Continuation]
@@ -91,12 +128,6 @@ public actor CodexAppServerAdapter: CodexAgentClient {
     private var availabilityContinuations: [
         UUID: AsyncStream<AgentAvailability>.Continuation
     ] = [:]
-    private var resumingThreads: Set<AgentThreadID> = []
-    private var bufferedResumeNotifications: [
-        AgentThreadID: [BufferedTurnNotification]
-    ] = [:]
-    private var overflowedResumeNotifications: Set<AgentThreadID> = []
-
     public init(
         transport: JSONLAppServerTransport,
         launchConfiguration: CodexLaunchConfiguration,
@@ -109,6 +140,9 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         self.mappingStore = mappingStore
         maximumInFlightToolRequests = Self
             .productionMaximumInFlightToolRequests
+        completedServerRequestTombstoneLimit = Self
+            .productionCompletedServerRequestTombstoneLimit
+        toolRequestDrainTimeout = Self.productionToolRequestDrainTimeout
     }
 
     init(
@@ -116,14 +150,40 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         launchConfiguration: CodexLaunchConfiguration,
         toolExecutor: any CodexDynamicToolExecuting,
         mappingStore: CodexAppServerThreadMappingStore = .init(),
-        maximumInFlightToolRequests: Int
+        maximumInFlightToolRequests: Int,
+        completedServerRequestTombstoneLimit: Int = 4_096,
+        toolRequestDrainTimeout: Duration = .seconds(2)
     ) {
         precondition(maximumInFlightToolRequests > 0)
+        precondition(completedServerRequestTombstoneLimit > 0)
+        precondition(toolRequestDrainTimeout > .zero)
         self.transport = transport
         self.launchConfiguration = launchConfiguration
         self.toolExecutor = toolExecutor
         self.mappingStore = mappingStore
         self.maximumInFlightToolRequests = maximumInFlightToolRequests
+        self.completedServerRequestTombstoneLimit
+            = completedServerRequestTombstoneLimit
+        self.toolRequestDrainTimeout = toolRequestDrainTimeout
+    }
+
+    init(
+        transport: JSONLAppServerTransport,
+        launchConfiguration: CodexLaunchConfiguration,
+        toolExecutor: any CodexDynamicToolExecuting,
+        mappingStore: CodexAppServerThreadMappingStore = .init(),
+        toolRequestDrainTimeout: Duration
+    ) {
+        precondition(toolRequestDrainTimeout > .zero)
+        self.transport = transport
+        self.launchConfiguration = launchConfiguration
+        self.toolExecutor = toolExecutor
+        self.mappingStore = mappingStore
+        maximumInFlightToolRequests = Self
+            .productionMaximumInFlightToolRequests
+        completedServerRequestTombstoneLimit = Self
+            .productionCompletedServerRequestTombstoneLimit
+        self.toolRequestDrainTimeout = toolRequestDrainTimeout
     }
 
     public init(
@@ -133,13 +193,17 @@ public actor CodexAppServerAdapter: CodexAgentClient {
     ) {
         transport = JSONLAppServerTransport(
             process: launchConfiguration.makeProcess(),
-            knownServerRequestMethods: ["item/tool/call"]
+            knownServerRequestMethods: ["item/tool/call"],
+            forwardUnknownServerRequests: true
         )
         self.launchConfiguration = launchConfiguration
         self.toolExecutor = toolExecutor
         self.mappingStore = mappingStore
         maximumInFlightToolRequests = Self
             .productionMaximumInFlightToolRequests
+        completedServerRequestTombstoneLimit = Self
+            .productionCompletedServerRequestTombstoneLimit
+        toolRequestDrainTimeout = Self.productionToolRequestDrainTimeout
     }
 
     public func startThread() async throws -> AgentThreadID {
@@ -148,10 +212,14 @@ public actor CodexAppServerAdapter: CodexAgentClient {
             method: "thread/start",
             params: launchConfiguration.threadStartParams
         )
-        guard let threadID = threadID(in: result) else {
+        guard !stopped, let threadID = threadID(in: result) else {
             throw CodexAppServerAdapterError.invalidResponse
         }
         await mappingStore.insert(threadID)
+        guard !stopped else {
+            await mappingStore.remove(threadID)
+            throw CodexAppServerAdapterError.stopped
+        }
         knownThreads.insert(threadID)
         return threadID
     }
@@ -160,41 +228,76 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         guard await mappingStore.contains(threadID) else {
             throw CodexAppServerAdapterError.unmappedThread
         }
+        guard !deletingThreads.contains(threadID) else {
+            throw CodexAppServerAdapterError.invalidResponse
+        }
+        guard pendingResumes[threadID] == nil else {
+            throw CodexAppServerAdapterError.resumeAlreadyInProgress
+        }
         try await ensureReady()
-        resumingThreads.insert(threadID)
-        bufferedResumeNotifications[threadID] = []
-        overflowedResumeNotifications.remove(threadID)
+        guard !stopped, !deletingThreads.contains(threadID) else {
+            throw CodexAppServerAdapterError.stopped
+        }
+        guard pendingResumes[threadID] == nil else {
+            throw CodexAppServerAdapterError.resumeAlreadyInProgress
+        }
+        let token = UUID()
+        let transport = transport
+        let params = JSONValue.object([
+            "threadId": .string(threadID.rawValue),
+        ])
+        let requestTask = Task<JSONValue, Error> {
+            try await transport.request(method: "thread/resume", params: params)
+        }
+        pendingResumes[threadID] = PendingResume(
+            token: token,
+            requestTask: requestTask,
+            notifications: [],
+            overflowed: false
+        )
         do {
-            let result = try await request(
-                method: "thread/resume",
-                params: .object(["threadId": .string(threadID.rawValue)])
-            )
-            guard self.threadID(in: result) == threadID else {
+            let result = try await withTaskCancellationHandler {
+                try await requestTask.value
+            } onCancel: {
+                requestTask.cancel()
+            }
+            guard let pending = pendingResumes[threadID],
+                pending.token == token,
+                !pending.overflowed,
+                !deletingThreads.contains(threadID),
+                !stopped
+            else {
+                removePendingResume(threadID: threadID, token: token)
                 throw CodexAppServerAdapterError.invalidResponse
             }
-            guard !overflowedResumeNotifications.contains(threadID) else {
+            guard self.threadID(in: result) == threadID else {
                 throw CodexAppServerAdapterError.invalidResponse
             }
             let resumedTurnID = try activeTurnID(in: result)
             let resumedHistory = try history(in: result)
+            guard await mappingStore.contains(threadID),
+                let current = pendingResumes[threadID],
+                current.token == token,
+                !current.overflowed,
+                !deletingThreads.contains(threadID),
+                !stopped
+            else {
+                removePendingResume(threadID: threadID, token: token)
+                throw CodexAppServerAdapterError.invalidResponse
+            }
             knownThreads.insert(threadID)
             activeTurns.removeValue(forKey: threadID)
+            publish(.history(resumedHistory), for: threadID)
             if let resumedTurnID {
                 activeTurns[threadID] = resumedTurnID
             }
-            publish(.history(resumedHistory), for: threadID)
-            resumingThreads.remove(threadID)
-            let buffered = bufferedResumeNotifications.removeValue(
-                forKey: threadID
-            ) ?? []
-            overflowedResumeNotifications.remove(threadID)
-            for notification in buffered {
+            pendingResumes.removeValue(forKey: threadID)
+            for notification in current.notifications
+            where notification.turnID == resumedTurnID {
                 processOwnedNotification(notification)
             }
         } catch {
-            resumingThreads.remove(threadID)
-            bufferedResumeNotifications.removeValue(forKey: threadID)
-            overflowedResumeNotifications.remove(threadID)
+            removePendingResume(threadID: threadID, token: token)
             throw normalized(error)
         }
     }
@@ -207,6 +310,9 @@ public actor CodexAppServerAdapter: CodexAgentClient {
             throw CodexAppServerAdapterError.unmappedThread
         }
         try await ensureReady()
+        guard !deletingThreads.contains(threadID), !stopped else {
+            throw CodexAppServerAdapterError.invalidResponse
+        }
         guard pendingTurnStarts[threadID] == nil else {
             throw CodexAppServerAdapterError.turnAlreadyStarting
         }
@@ -239,6 +345,8 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         guard let pending = pendingTurnStarts[threadID],
             pending.token == token,
             !pending.overflowed,
+            !deletingThreads.contains(threadID),
+            !stopped,
             let turnID = turnID(in: result)
         else {
             removePendingTurnStart(threadID: threadID, token: token)
@@ -264,6 +372,9 @@ public actor CodexAppServerAdapter: CodexAgentClient {
             throw CodexAppServerAdapterError.unmappedThread
         }
         try await ensureReady()
+        guard !deletingThreads.contains(threadID), !stopped,
+            activeTurns[threadID] == turnID
+        else { throw CodexAppServerAdapterError.invalidResponse }
         let result = try await request(
             method: "turn/steer",
             params: .object([
@@ -273,7 +384,11 @@ public actor CodexAppServerAdapter: CodexAgentClient {
             ])
         )
         guard case let .object(fields) = result,
-            fields["turnId"]?.nonemptyString == turnID.rawValue
+            fields["turnId"]?.nonemptyString == turnID.rawValue,
+            await mappingStore.contains(threadID)
+        else { throw CodexAppServerAdapterError.invalidResponse }
+        guard !deletingThreads.contains(threadID), !stopped,
+            activeTurns[threadID] == turnID
         else { throw CodexAppServerAdapterError.invalidResponse }
         publish(.userMessage(prompt), for: threadID)
     }
@@ -298,9 +413,14 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         for threadID: AgentThreadID
     ) -> AsyncStream<AgentEvent> {
         let id = UUID()
-        let pair = AsyncStream<AgentEvent>.makeStream()
+        let pair = AsyncStream<AgentEvent>.makeStream(
+            bufferingPolicy: .bufferingOldest(Self.eventReplayLimit)
+        )
         for event in eventReplay[threadID] ?? [] {
-            pair.continuation.yield(event)
+            guard case .enqueued = pair.continuation.yield(event) else {
+                pair.continuation.finish()
+                return pair.stream
+            }
         }
         if stopped {
             pair.continuation.finish()
@@ -315,7 +435,9 @@ public actor CodexAppServerAdapter: CodexAgentClient {
 
     public func availability() -> AsyncStream<AgentAvailability> {
         let id = UUID()
-        let pair = AsyncStream<AgentAvailability>.makeStream()
+        let pair = AsyncStream<AgentAvailability>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
         pair.continuation.yield(availabilityValue)
         if stopped {
             pair.continuation.finish()
@@ -337,20 +459,45 @@ public actor CodexAppServerAdapter: CodexAgentClient {
     }
 
     public func deleteThread(_ threadID: AgentThreadID) async throws {
-        try await threadMutation("thread/delete", threadID: threadID)
+        guard deletingThreads.insert(threadID).inserted else {
+            throw CodexAppServerAdapterError.invalidResponse
+        }
         cancelPendingTurnStart(for: threadID)
-        activeTurns.removeValue(forKey: threadID)
-        knownThreads.remove(threadID)
-        await mappingStore.remove(threadID)
-        finishEvents(for: threadID)
+        cancelPendingResume(for: threadID)
+        do {
+            guard await mappingStore.contains(threadID) else {
+                throw CodexAppServerAdapterError.unmappedThread
+            }
+            try await ensureReady()
+            _ = try await request(
+                method: "thread/delete",
+                params: .object(["threadId": .string(threadID.rawValue)])
+            )
+            guard deletingThreads.contains(threadID), !stopped else {
+                throw CodexAppServerAdapterError.invalidResponse
+            }
+            activeTurns.removeValue(forKey: threadID)
+            knownThreads.remove(threadID)
+            await mappingStore.remove(threadID)
+            guard deletingThreads.contains(threadID), !stopped else {
+                throw CodexAppServerAdapterError.invalidResponse
+            }
+            deletingThreads.remove(threadID)
+            finishEvents(for: threadID)
+        } catch {
+            deletingThreads.remove(threadID)
+            throw normalized(error)
+        }
     }
 
     public func shutdown() async {
         guard !stopped else { return }
         stopped = true
+        serverRequestResponsesEnabled = false
         consumerTask?.cancel()
         cancelAllPendingTurnStarts()
-        await cancelAndDrainToolRequests()
+        cancelAllPendingResumes()
+        await cancelAndDrainServerRequests()
         await transport.shutdown()
         if let consumerTask { await consumerTask.value }
         self.consumerTask = nil
@@ -358,8 +505,9 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         startupTask = nil
         activeTurns.removeAll()
         knownThreads.removeAll()
+        deletingThreads.removeAll()
         setAvailability(.stopped)
-        for threadID in Array(eventContinuations.keys) {
+        for threadID in Set(eventContinuations.keys).union(eventReplay.keys) {
             finishEvents(for: threadID)
         }
         for continuation in availabilityContinuations.values {
@@ -397,16 +545,21 @@ public actor CodexAppServerAdapter: CodexAgentClient {
             replayEvents: eventReplay.values.reduce(0) { $0 + $1.count },
             bufferedNotifications: pendingTurnStarts.values.reduce(0) {
                 $0 + $1.notifications.count
-            } + bufferedResumeNotifications.values.reduce(0) {
+            } + pendingResumes.values.reduce(0) {
+                $0 + $1.notifications.count
+            },
+            pendingResumes: pendingResumes.count,
+            eventSubscribers: eventContinuations.values.reduce(0) {
                 $0 + $1.count
-            }
+            },
+            availabilitySubscribers: availabilityContinuations.count
         )
     }
 
     var availabilityForTesting: AgentAvailability { availabilityValue }
 
     var inFlightToolRequestCountForTesting: Int {
-        inFlightToolRequests.count
+        inFlightServerRequests.count
     }
 
     var maximumInFlightToolRequestCountForTesting: Int {
@@ -491,10 +644,18 @@ public actor CodexAppServerAdapter: CodexAgentClient {
             throw CodexAppServerAdapterError.unmappedThread
         }
         try await ensureReady()
+        guard !deletingThreads.contains(threadID), !stopped else {
+            throw CodexAppServerAdapterError.invalidResponse
+        }
         _ = try await request(
             method: method,
             params: .object(["threadId": .string(threadID.rawValue)])
         )
+        guard await mappingStore.contains(threadID) else {
+            throw CodexAppServerAdapterError.invalidResponse
+        }
+        guard !deletingThreads.contains(threadID), !stopped
+        else { throw CodexAppServerAdapterError.invalidResponse }
     }
 
     private func handleServerMessage(_ message: CodexServerMessage) async {
@@ -511,78 +672,105 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         method: String,
         params: JSONValue?
     ) async {
-        guard !stopped else { return }
-        if let duplicate = inFlightToolRequests.removeValue(forKey: id) {
-            duplicate.task.cancel()
-            try? await transport.respondError(
-                to: id,
-                code: -32600,
-                message: "Duplicate request"
+        guard !stopped, serverRequestResponsesEnabled,
+            !serverRequestTombstonesSaturated,
+            inFlightServerRequests[id] == nil,
+            !completedServerRequestIDs.contains(id)
+        else { return }
+        let token = UUID()
+        inFlightServerRequests[id] = InFlightServerRequest(
+            token: token,
+            callID: nil,
+            phase: .responding,
+            task: nil
+        )
+        guard method == "item/tool/call" else {
+            beginErrorResponse(
+                id: id,
+                token: token,
+                callID: nil,
+                code: -32601,
+                message: "Method not found"
             )
             return
         }
-        guard inFlightToolRequests.count < maximumInFlightToolRequests else {
-            try? await transport.respondError(
-                to: id,
+        let preparation: Result<PreparedToolInvocation, any Error>
+        do {
+            preparation = .success(try await prepareToolInvocation(
+                params: params,
+                requireKnownThread: true
+            ))
+        } catch {
+            preparation = .failure(error)
+        }
+        guard inFlightServerRequests[id]?.token == token,
+            serverRequestResponsesEnabled,
+            !stopped,
+            !serverRequestTombstonesSaturated
+        else {
+            abandonServerRequest(id: id, token: token)
+            return
+        }
+        guard case let .success(invocation) = preparation else {
+            beginResultResponse(
+                id: id,
+                token: token,
+                callID: nil,
+                result: CodexDynamicToolCatalog.failureResponse(
+                    for: CodexDynamicToolError.invalidArguments
+                )
+            )
+            return
+        }
+        guard activeCallIDs[invocation.callID] == nil,
+            !completedCallIDs.contains(invocation.callID)
+        else {
+            beginErrorResponse(
+                id: id,
+                token: token,
+                callID: nil,
+                code: -32600,
+                message: "Duplicate tool call"
+            )
+            return
+        }
+        guard executingServerRequestCount < maximumInFlightToolRequests else {
+            beginErrorResponse(
+                id: id,
+                token: token,
+                callID: nil,
                 code: -32000,
                 message: "Server busy"
             )
             return
         }
-        let token = UUID()
-        let task = Task { [weak self] in
-            guard let self else { return }
+        activeCallIDs[invocation.callID] = id
+        inFlightServerRequests[id]?.callID = invocation.callID
+        inFlightServerRequests[id]?.phase = .executing
+        let executor = toolExecutor
+        let task = Task { [weak self, executor, invocation] in
+            let response: JSONValue
             do {
-                let result = try await self.handleServerRequest(
-                    method: method,
-                    params: params
+                let result = try await executor.execute(
+                    threadID: invocation.threadID,
+                    turnID: invocation.turnID,
+                    call: invocation.call
                 )
-                await self.finishServerRequest(
-                    id: id,
-                    token: token,
-                    result: result
-                )
+                response = try CodexDynamicToolCatalog.response(for: result)
             } catch {
-                await self.finishServerRequestWithError(id: id, token: token)
+                response = CodexDynamicToolCatalog.failureResponse(for: error)
             }
+            await self?.sendResultResponse(
+                id: id,
+                token: token,
+                result: response
+            )
         }
-        inFlightToolRequests[id] = InFlightToolRequest(
-            token: token,
-            task: task
-        )
-    }
-
-    private func finishServerRequest(
-        id: JSONRPCID,
-        token: UUID,
-        result: JSONValue
-    ) async {
-        guard inFlightToolRequests[id]?.token == token else { return }
-        guard !stopped else {
-            inFlightToolRequests.removeValue(forKey: id)
+        guard inFlightServerRequests[id]?.token == token else {
+            task.cancel()
             return
         }
-        try? await transport.respond(to: id, result: result)
-        guard inFlightToolRequests[id]?.token == token else { return }
-        inFlightToolRequests.removeValue(forKey: id)
-    }
-
-    private func finishServerRequestWithError(
-        id: JSONRPCID,
-        token: UUID
-    ) async {
-        guard inFlightToolRequests[id]?.token == token else { return }
-        guard !stopped else {
-            inFlightToolRequests.removeValue(forKey: id)
-            return
-        }
-        try? await transport.respondError(
-            to: id,
-            code: -32601,
-            message: "Method not found"
-        )
-        guard inFlightToolRequests[id]?.token == token else { return }
-        inFlightToolRequests.removeValue(forKey: id)
+        inFlightServerRequests[id]?.task = task
     }
 
     private func handleServerRequest(
@@ -592,48 +780,207 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         guard method == "item/tool/call" else {
             throw CodexAppServerAdapterError.unsupportedServerRequest
         }
-        guard case let .object(fields)? = params,
-            Set(fields.keys).isSubset(of: [
-                "arguments", "callId", "threadId", "tool", "turnId",
-                "namespace",
-            ]),
-            fields["callId"]?.nonemptyString != nil,
-            let threadText = fields["threadId"]?.nonemptyString,
-            let tool = fields["tool"]?.nonemptyString,
-            let turnText = fields["turnId"]?.nonemptyString,
-            let arguments = fields["arguments"]
-        else {
-            return CodexDynamicToolCatalog.failureResponse(
-                for: CodexDynamicToolError.invalidArguments
-            )
-        }
-        let threadID = AgentThreadID(rawValue: threadText)
-        guard await mappingStore.contains(threadID) else {
-            return CodexDynamicToolCatalog.failureResponse(
-                for: CodexAppServerAdapterError.unmappedThread
-            )
-        }
-        let namespace = fields["namespace"]?.nonemptyString
-            ?? CodexDynamicToolCatalog.namespace
-        let call: TerminalToolCall
+        let invocation: PreparedToolInvocation
         do {
-            call = try CodexDynamicToolCatalog.decode(
-                namespace: namespace,
-                tool: tool,
-                arguments: arguments
+            invocation = try await prepareToolInvocation(
+                params: params,
+                requireKnownThread: false
             )
         } catch {
             return CodexDynamicToolCatalog.failureResponse(for: error)
         }
         do {
             let result = try await toolExecutor.execute(
-                threadID: threadID,
-                turnID: AgentTurnID(rawValue: turnText),
-                call: call
+                threadID: invocation.threadID,
+                turnID: invocation.turnID,
+                call: invocation.call
             )
             return try CodexDynamicToolCatalog.response(for: result)
         } catch {
             return CodexDynamicToolCatalog.failureResponse(for: error)
+        }
+    }
+
+    private func prepareToolInvocation(
+        params: JSONValue?,
+        requireKnownThread: Bool
+    ) async throws -> PreparedToolInvocation {
+        guard case let .object(fields)? = params,
+            Set(fields.keys).isSubset(of: [
+                "arguments", "callId", "threadId", "tool", "turnId",
+                "namespace",
+            ]),
+            let callID = fields["callId"]?.nonemptyString,
+            let threadText = fields["threadId"]?.nonemptyString,
+            let tool = fields["tool"]?.nonemptyString,
+            let turnText = fields["turnId"]?.nonemptyString,
+            let arguments = fields["arguments"]
+        else {
+            throw CodexDynamicToolError.invalidArguments
+        }
+        let threadID = AgentThreadID(rawValue: threadText)
+        guard await mappingStore.contains(threadID),
+            !deletingThreads.contains(threadID),
+            !stopped,
+            !requireKnownThread || knownThreads.contains(threadID)
+        else {
+            throw CodexAppServerAdapterError.unmappedThread
+        }
+        let namespace = fields["namespace"]?.nonemptyString
+            ?? CodexDynamicToolCatalog.namespace
+        let call = try CodexDynamicToolCatalog.decode(
+            namespace: namespace,
+            tool: tool,
+            arguments: arguments
+        )
+        return PreparedToolInvocation(
+            callID: callID,
+            threadID: threadID,
+            turnID: AgentTurnID(rawValue: turnText),
+            call: call
+        )
+    }
+
+    private var executingServerRequestCount: Int {
+        inFlightServerRequests.values.reduce(0) {
+            $0 + ($1.phase == .executing ? 1 : 0)
+        }
+    }
+
+    private func beginResultResponse(
+        id: JSONRPCID,
+        token: UUID,
+        callID: String?,
+        result: JSONValue
+    ) {
+        guard inFlightServerRequests[id]?.token == token,
+            serverRequestResponsesEnabled,
+            !stopped,
+            !serverRequestTombstonesSaturated
+        else {
+            abandonServerRequest(id: id, token: token)
+            return
+        }
+        inFlightServerRequests[id] = InFlightServerRequest(
+            token: token,
+            callID: callID,
+            phase: .responding,
+            task: nil
+        )
+        let task = Task { [weak self] in
+            if let self {
+                await self.sendResultResponse(
+                    id: id,
+                    token: token,
+                    result: result
+                )
+            }
+        }
+        inFlightServerRequests[id]?.task = task
+    }
+
+    private func beginErrorResponse(
+        id: JSONRPCID,
+        token: UUID,
+        callID: String?,
+        code: Int,
+        message: String
+    ) {
+        guard inFlightServerRequests[id]?.token == token,
+            serverRequestResponsesEnabled,
+            !stopped,
+            !serverRequestTombstonesSaturated
+        else {
+            abandonServerRequest(id: id, token: token)
+            return
+        }
+        inFlightServerRequests[id] = InFlightServerRequest(
+            token: token,
+            callID: callID,
+            phase: .responding,
+            task: nil
+        )
+        let task = Task { [weak self] in
+            if let self {
+                await self.sendErrorResponse(
+                    id: id,
+                    token: token,
+                    code: code,
+                    message: message
+                )
+            }
+        }
+        inFlightServerRequests[id]?.task = task
+    }
+
+    private func sendResultResponse(
+        id: JSONRPCID,
+        token: UUID,
+        result: JSONValue
+    ) async {
+        guard var request = inFlightServerRequests[id],
+            request.token == token
+        else { return }
+        guard serverRequestResponsesEnabled, !stopped else {
+            abandonServerRequest(id: id, token: token)
+            return
+        }
+        request.phase = .responding
+        inFlightServerRequests[id] = request
+        try? await transport.respond(to: id, result: result)
+        completeServerRequest(id: id, token: token)
+    }
+
+    private func sendErrorResponse(
+        id: JSONRPCID,
+        token: UUID,
+        code: Int,
+        message: String
+    ) async {
+        guard inFlightServerRequests[id]?.token == token else { return }
+        guard serverRequestResponsesEnabled, !stopped else {
+            abandonServerRequest(id: id, token: token)
+            return
+        }
+        try? await transport.respondError(
+            to: id,
+            code: code,
+            message: message
+        )
+        completeServerRequest(id: id, token: token)
+    }
+
+    private func completeServerRequest(id: JSONRPCID, token: UUID) {
+        guard let request = inFlightServerRequests[id],
+            request.token == token
+        else { return }
+        inFlightServerRequests.removeValue(forKey: id)
+        if let callID = request.callID, activeCallIDs[callID] == id {
+            activeCallIDs.removeValue(forKey: callID)
+            if completedCallIDs.count < completedServerRequestTombstoneLimit {
+                completedCallIDs.insert(callID)
+            }
+        }
+        if completedServerRequestIDs.count
+            < completedServerRequestTombstoneLimit
+        {
+            completedServerRequestIDs.insert(id)
+        }
+        if completedServerRequestIDs.count
+            >= completedServerRequestTombstoneLimit
+            || completedCallIDs.count >= completedServerRequestTombstoneLimit
+        {
+            serverRequestTombstonesSaturated = true
+        }
+    }
+
+    private func abandonServerRequest(id: JSONRPCID, token: UUID) {
+        guard let request = inFlightServerRequests[id],
+            request.token == token
+        else { return }
+        inFlightServerRequests.removeValue(forKey: id)
+        if let callID = request.callID, activeCallIDs[callID] == id {
+            activeCallIDs.removeValue(forKey: callID)
         }
     }
 
@@ -643,9 +990,14 @@ public actor CodexAppServerAdapter: CodexAgentClient {
             params: params
         ) else { return }
         let threadID = notification.threadID
+        guard !deletingThreads.contains(threadID), !stopped else { return }
         guard knownThreads.contains(threadID)
-            || resumingThreads.contains(threadID)
+            || pendingResumes[threadID] != nil
         else { return }
+        if pendingResumes[threadID] != nil {
+            bufferResumeNotification(notification)
+            return
+        }
         if activeTurns[threadID] == notification.turnID {
             processOwnedNotification(notification)
             return
@@ -653,9 +1005,6 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         if pendingTurnStarts[threadID] != nil {
             bufferPendingStartNotification(notification)
             return
-        }
-        if resumingThreads.contains(threadID) {
-            bufferResumeNotification(notification)
         }
     }
 
@@ -693,7 +1042,8 @@ public actor CodexAppServerAdapter: CodexAgentClient {
     ) {
         let threadID = notification.threadID
         let turnID = notification.turnID
-        guard knownThreads.contains(threadID),
+        guard !deletingThreads.contains(threadID),
+            knownThreads.contains(threadID),
             activeTurns[threadID] == turnID,
             case let .object(fields)? = notification.params
         else { return }
@@ -799,13 +1149,16 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         _ notification: BufferedTurnNotification
     ) {
         let threadID = notification.threadID
-        var notifications = bufferedResumeNotifications[threadID] ?? []
-        guard notifications.count < Self.maximumBufferedTurnNotifications else {
-            overflowedResumeNotifications.insert(threadID)
+        guard var pending = pendingResumes[threadID] else { return }
+        guard pending.notifications.count
+            < Self.maximumBufferedTurnNotifications
+        else {
+            pending.overflowed = true
+            pendingResumes[threadID] = pending
             return
         }
-        notifications.append(notification)
-        bufferedResumeNotifications[threadID] = notifications
+        pending.notifications.append(notification)
+        pendingResumes[threadID] = pending
     }
 
     private func removePendingTurnStart(
@@ -826,13 +1179,30 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         for start in pending { start.requestTask.cancel() }
     }
 
+    private func removePendingResume(
+        threadID: AgentThreadID,
+        token: UUID
+    ) {
+        guard pendingResumes[threadID]?.token == token else { return }
+        pendingResumes.removeValue(forKey: threadID)
+    }
+
+    private func cancelPendingResume(for threadID: AgentThreadID) {
+        pendingResumes.removeValue(forKey: threadID)?.requestTask.cancel()
+    }
+
+    private func cancelAllPendingResumes() {
+        let pending = pendingResumes.values
+        pendingResumes.removeAll()
+        for resume in pending { resume.requestTask.cancel() }
+    }
+
     private func consumerFailed() async {
         guard !stopped else { return }
+        serverRequestResponsesEnabled = false
         cancelAllPendingTurnStarts()
-        await cancelAndDrainToolRequests()
-        resumingThreads.removeAll()
-        bufferedResumeNotifications.removeAll()
-        overflowedResumeNotifications.removeAll()
+        cancelAllPendingResumes()
+        await cancelAndDrainServerRequests()
         let failedTurns = activeTurns
         activeTurns.removeAll()
         setAvailability(.crashed)
@@ -841,11 +1211,17 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         }
     }
 
-    private func cancelAndDrainToolRequests() async {
-        let tasks = inFlightToolRequests.values.map(\.task)
-        inFlightToolRequests.removeAll()
+    private func cancelAndDrainServerRequests() async {
+        let tasks = inFlightServerRequests.values.compactMap(\.task)
         for task in tasks { task.cancel() }
-        for task in tasks { await task.value }
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: toolRequestDrainTimeout)
+        while !inFlightServerRequests.isEmpty, clock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        guard !inFlightServerRequests.isEmpty else { return }
+        inFlightServerRequests.removeAll()
+        activeCallIDs.removeAll()
     }
 
     private func takeActiveTurn(
@@ -864,18 +1240,33 @@ public actor CodexAppServerAdapter: CodexAgentClient {
     private func publish(_ event: AgentEvent, for threadID: AgentThreadID) {
         var replay = eventReplay[threadID, default: []]
         replay.append(event)
-        if replay.count > 512 { replay.removeFirst(replay.count - 512) }
+        if replay.count > Self.eventReplayLimit {
+            replay.removeFirst(replay.count - Self.eventReplayLimit)
+        }
         eventReplay[threadID] = replay
-        for continuation in eventContinuations[threadID]?.values ?? [:].values {
-            continuation.yield(event)
+        let subscribers = eventContinuations[threadID] ?? [:]
+        for (id, continuation) in subscribers {
+            switch continuation.yield(event) {
+            case .enqueued:
+                continue
+            case .dropped, .terminated:
+                continuation.finish()
+                removeEventContinuation(id, for: threadID)
+            @unknown default:
+                continuation.finish()
+                removeEventContinuation(id, for: threadID)
+            }
         }
     }
 
     private func setAvailability(_ value: AgentAvailability) {
         guard availabilityValue != value else { return }
         availabilityValue = value
-        for continuation in availabilityContinuations.values {
-            continuation.yield(value)
+        let subscribers = availabilityContinuations
+        for (id, continuation) in subscribers {
+            if case .terminated = continuation.yield(value) {
+                removeAvailabilityContinuation(id)
+            }
         }
     }
 
@@ -900,9 +1291,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
             continuation.finish()
         }
         eventReplay.removeValue(forKey: threadID)
-        bufferedResumeNotifications.removeValue(forKey: threadID)
-        overflowedResumeNotifications.remove(threadID)
-        resumingThreads.remove(threadID)
+        cancelPendingResume(for: threadID)
     }
 
     private func threadID(in result: JSONValue) -> AgentThreadID? {

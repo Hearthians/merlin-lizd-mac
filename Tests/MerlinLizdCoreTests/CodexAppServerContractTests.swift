@@ -989,8 +989,8 @@ struct CodexAppServerContractTests {
         await adapter.shutdown()
     }
 
-    @Test("duplicate request IDs cancel the original and return one failure")
-    func duplicateToolRequestIDFailsClosed() async throws {
+    @Test("duplicate request IDs are ignored while the original responds once")
+    func duplicateToolRequestIDExecutesAndRespondsOnce() async throws {
         let process = ScriptedAppServerProcess()
         let executor = GateCodexToolExecutor(blockedThreads: ["thread-1"])
         let adapter = CodexAppServerAdapter(
@@ -1006,12 +1006,14 @@ struct CodexAppServerContractTests {
         await process.emit(.standardOutput(jsonLine(request)))
         await executor.waitForCallCount(1)
         await process.emit(.standardOutput(jsonLine(request)))
+        for _ in 0..<100 { await Task.yield() }
+        #expect((await process.writtenData()).count == 3)
+        #expect(await executor.calledThreads.count == 1)
+        await executor.release(threadID: "thread-1")
         await process.waitForWriteCount(4)
-        await executor.waitForCancellationCount(1)
         let response = try jsonObject(from: await process.writtenData()[3])
         #expect(response["id"] as? String == "same")
-        #expect((response["error"] as? [String: Any])?["message"] as? String ==
-            "Duplicate request")
+        #expect(response["result"] != nil)
         #expect(await adapter.inFlightToolRequestCountForTesting == 0)
         await adapter.shutdown()
     }
@@ -1490,6 +1492,418 @@ struct CodexAppServerContractTests {
         #expect(await executor.calls.count == 1)
         await adapter.shutdown()
     }
+
+    @Test("resume is single-flight per thread and buffers before an existing active turn")
+    func resumeIsSingleFlightAndHistoryFirstForActiveThread() async throws {
+        let process = ScriptedAppServerProcess()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor()
+        )
+        let threadID = try await startMappedThread(adapter: adapter, process: process)
+        let turnID = try await startMappedTurn(
+            adapter: adapter,
+            process: process,
+            threadID: threadID,
+            turnID: "active-resume-turn",
+            requestID: 3,
+            writeCount: 4
+        )
+        let before = await adapter.replayedEventsForTesting(threadID)
+
+        let first = Task { try await adapter.resumeThread(threadID) }
+        await process.waitForWriteCount(5)
+        await #expect(throws: CodexAppServerAdapterError.resumeAlreadyInProgress) {
+            try await adapter.resumeThread(threadID)
+        }
+        await adapter.handleNotificationForTesting(
+            method: "item/agentMessage/delta",
+            params: .object([
+                "threadId": .string(threadID.rawValue),
+                "turnId": .string("wrong-resume-turn"),
+                "delta": .string("wrong"),
+            ])
+        )
+        await adapter.handleNotificationForTesting(
+            method: "item/agentMessage/delta",
+            params: .object([
+                "threadId": .string(threadID.rawValue),
+                "turnId": .string(turnID.rawValue),
+                "delta": .string("early"),
+            ])
+        )
+        #expect(await adapter.replayedEventsForTesting(threadID) == before)
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":4,"result":{"thread":{"id":"thread-1","turns":[{"id":"active-resume-turn","status":"inProgress","items":[{"type":"agentMessage","text":"history"}]}]}}}"#
+        )))
+        try await first.value
+
+        #expect(await adapter.replayedEventsForTesting(threadID).suffix(2) == [
+            .history([.init(role: .assistant, text: "history")]),
+            .assistantMessageDelta("early"),
+        ])
+        await adapter.shutdown()
+    }
+
+    @Test("resume notification overflow fails without installing history or a turn")
+    func resumeBufferOverflowFailsClosed() async throws {
+        let process = ScriptedAppServerProcess()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor()
+        )
+        let threadID = try await startMappedThread(adapter: adapter, process: process)
+        let resuming = Task { try await adapter.resumeThread(threadID) }
+        await process.waitForWriteCount(4)
+        for index in 0...128 {
+            await adapter.handleNotificationForTesting(
+                method: "item/agentMessage/delta",
+                params: .object([
+                    "threadId": .string(threadID.rawValue),
+                    "turnId": .string("resume-overflow-turn"),
+                    "delta": .string("\(index)"),
+                ])
+            )
+        }
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":3,"result":{"thread":{"id":"thread-1","turns":[{"id":"resume-overflow-turn","status":"inProgress","items":[]}]}}}"#
+        )))
+        await #expect(throws: CodexAppServerAdapterError.invalidResponse) {
+            try await resuming.value
+        }
+        #expect(await adapter.replayedEventsForTesting(threadID) == [])
+        #expect(await adapter.stateCountsForTesting.pendingResumes == 0)
+        #expect(await adapter.stateCountsForTesting.activeTurns == 0)
+        await adapter.shutdown()
+    }
+
+    @Test("delete cancels a pending resume before awaiting its RPC")
+    func deleteWinsResumeRace() async throws {
+        let process = ScriptedAppServerProcess()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor()
+        )
+        let threadID = try await startMappedThread(adapter: adapter, process: process)
+        let resuming = Task { try await adapter.resumeThread(threadID) }
+        await process.waitForWriteCount(4)
+        let deleting = Task { try await adapter.deleteThread(threadID) }
+        await process.waitForWriteCount(5)
+        await process.emit(.standardOutput(jsonLine(#"{"id":4,"result":{}}"#)))
+        try await deleting.value
+        await #expect(throws: CancellationError.self) { try await resuming.value }
+
+        await adapter.handleNotificationForTesting(
+            method: "item/agentMessage/delta",
+            params: .object([
+                "threadId": .string(threadID.rawValue),
+                "turnId": .string("late"),
+                "delta": .string("ignored"),
+            ])
+        )
+        #expect(await adapter.replayedEventsForTesting(threadID) == [])
+        #expect(await adapter.stateCountsForTesting.pendingResumes == 0)
+        await adapter.shutdown()
+    }
+
+    @Test("steer requires the exact active turn both before and after its request")
+    func steerRevalidatesExactActiveTurn() async throws {
+        let process = ScriptedAppServerProcess()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor()
+        )
+        let threadID = try await startMappedThread(adapter: adapter, process: process)
+        let turnID = try await startMappedTurn(
+            adapter: adapter,
+            process: process,
+            threadID: threadID,
+            turnID: "steer-race-turn",
+            requestID: 3,
+            writeCount: 4
+        )
+        await #expect(throws: CodexAppServerAdapterError.invalidResponse) {
+            try await adapter.steerTurn(
+                threadID: threadID,
+                turnID: .init(rawValue: "wrong"),
+                prompt: "never sent"
+            )
+        }
+        #expect((await process.writtenData()).count == 4)
+
+        let steering = Task {
+            try await adapter.steerTurn(
+                threadID: threadID,
+                turnID: turnID,
+                prompt: "racing"
+            )
+        }
+        await process.waitForWriteCount(5)
+        await adapter.handleNotificationForTesting(
+            method: "turn/completed",
+            params: .object([
+                "threadId": .string(threadID.rawValue),
+                "turn": .object([
+                    "id": .string(turnID.rawValue),
+                    "status": .string("completed"),
+                ]),
+            ])
+        )
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":4,"result":{"turnId":"steer-race-turn"}}"#
+        )))
+        await #expect(throws: CodexAppServerAdapterError.invalidResponse) {
+            try await steering.value
+        }
+        #expect(
+            await adapter.replayedEventsForTesting(threadID)
+                .contains(.userMessage("racing")) == false
+        )
+        await adapter.shutdown()
+    }
+
+    @Test("failed delete does not revive its cancelled resume and permits an explicit retry")
+    func failedDeleteLeavesNoResumeContinuation() async throws {
+        let process = ScriptedAppServerProcess()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor()
+        )
+        let threadID = try await startMappedThread(adapter: adapter, process: process)
+        let firstResume = Task { try await adapter.resumeThread(threadID) }
+        await process.waitForWriteCount(4)
+        let deleting = Task { try await adapter.deleteThread(threadID) }
+        await process.waitForWriteCount(5)
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":4,"error":{"code":-32000,"message":"delete failed"}}"#
+        )))
+        await #expect(throws: CodexAppServerAdapterError.invalidResponse) {
+            try await deleting.value
+        }
+        await #expect(throws: CancellationError.self) {
+            try await firstResume.value
+        }
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":3,"result":{"thread":{"id":"thread-1","turns":[{"id":"ghost","status":"inProgress","items":[]}]}}}"#
+        )))
+        #expect(await adapter.replayedEventsForTesting(threadID) == [])
+
+        let retry = Task { try await adapter.resumeThread(threadID) }
+        await process.waitForWriteCount(6)
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":5,"result":{"thread":{"id":"thread-1","turns":[]}}}"#
+        )))
+        try await retry.value
+        #expect(await adapter.replayedEventsForTesting(threadID) == [.history([])])
+        await adapter.shutdown()
+    }
+
+    @Test("call IDs are globally exactly-once and completed RPC tombstones saturate")
+    func callIDsAndTombstonesFailClosed() async throws {
+        let process = ScriptedAppServerProcess()
+        let executor = GateCodexToolExecutor(blockedThreads: ["thread-1"])
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(
+                process: process,
+                knownServerRequestMethods: ["item/tool/call"]
+            ),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: executor,
+            maximumInFlightToolRequests: 2,
+            completedServerRequestTombstoneLimit: 2
+        )
+        _ = try await startMappedThread(adapter: adapter, process: process)
+        let first = #"{"id":700,"method":"item/tool/call","params":{"arguments":{},"callId":"one-call","threadId":"thread-1","tool":"observe_screen","turnId":"turn-1","namespace":"merlin_tmux"}}"#
+        let alias = #"{"id":701,"method":"item/tool/call","params":{"arguments":{},"callId":"one-call","threadId":"thread-1","tool":"observe_screen","turnId":"turn-1","namespace":"merlin_tmux"}}"#
+        await process.emit(.standardOutput(jsonLine(first)))
+        await executor.waitForCallCount(1)
+        await process.emit(.standardOutput(jsonLine(alias)))
+        await process.waitForWriteCount(4)
+        #expect(await executor.calledThreads.count == 1)
+        let rejection = try jsonObject(from: await process.writtenData()[3])
+        #expect(rejection["id"] as? Int == 701)
+        #expect(rejection["error"] != nil)
+
+        await executor.release(threadID: "thread-1")
+        await process.waitForWriteCount(5)
+        await process.emit(.standardOutput(jsonLine(first)))
+        for _ in 0..<100 { await Task.yield() }
+        #expect((await process.writtenData()).count == 5)
+        #expect(await executor.calledThreads.count == 1)
+
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":702,"method":"item/tool/call","params":{"arguments":{},"callId":"after-saturation","threadId":"thread-1","tool":"observe_screen","turnId":"turn-1","namespace":"merlin_tmux"}}"#
+        )))
+        for _ in 0..<100 { await Task.yield() }
+        #expect((await process.writtenData()).count == 5)
+        #expect(await executor.calledThreads.count == 1)
+        await adapter.shutdown()
+    }
+
+    @Test("shutdown has a hard deadline for an executor that ignores cancellation")
+    func shutdownDeadlineDropsLateToolCompletion() async throws {
+        let process = ScriptedAppServerProcess()
+        let executor = StubbornCodexToolExecutor()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(
+                process: process,
+                knownServerRequestMethods: ["item/tool/call"]
+            ),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: executor,
+            toolRequestDrainTimeout: .milliseconds(20)
+        )
+        _ = try await startMappedThread(adapter: adapter, process: process)
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":800,"method":"item/tool/call","params":{"arguments":{},"callId":"stubborn","threadId":"thread-1","tool":"observe_screen","turnId":"turn-1","namespace":"merlin_tmux"}}"#
+        )))
+        await executor.waitUntilStarted()
+
+        let clock = ContinuousClock()
+        let start = clock.now
+        await adapter.shutdown()
+        #expect(clock.now - start < .seconds(1))
+        #expect(await adapter.inFlightToolRequestCountForTesting == 0)
+        await executor.release()
+        for _ in 0..<100 { await Task.yield() }
+        #expect((await process.writtenData()).count == 3)
+    }
+
+    @Test("duplicate request IDs are ignored while the physical response write is pending")
+    func duplicateDuringResponseWriteIsIgnored() async throws {
+        let process = ScriptedAppServerProcess(gateWriteAt: 4)
+        let executor = RecordingCodexToolExecutor()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(
+                process: process,
+                knownServerRequestMethods: ["item/tool/call"]
+            ),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: executor
+        )
+        _ = try await startMappedThread(adapter: adapter, process: process)
+        let request = #"{"id":"responding","method":"item/tool/call","params":{"arguments":{},"callId":"responding-call","threadId":"thread-1","tool":"observe_screen","turnId":"turn-1","namespace":"merlin_tmux"}}"#
+        await process.emit(.standardOutput(jsonLine(request)))
+        await process.waitForWriteStartCount(4)
+        await process.emit(.standardOutput(jsonLine(request)))
+        for _ in 0..<100 { await Task.yield() }
+        #expect((await process.writtenData()).count == 3)
+        #expect(await executor.calls.count == 1)
+
+        await process.releaseWrites()
+        await process.waitForWriteCount(4)
+        await process.emit(.standardOutput(jsonLine(request)))
+        for _ in 0..<100 { await Task.yield() }
+        #expect((await process.writtenData()).count == 4)
+        #expect(await executor.calls.count == 1)
+        await adapter.shutdown()
+    }
+
+    @Test("process failure has a hard deadline for an executor that ignores cancellation")
+    func crashDeadlineDropsLateToolCompletion() async throws {
+        let process = ScriptedAppServerProcess()
+        let executor = StubbornCodexToolExecutor()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(
+                process: process,
+                knownServerRequestMethods: ["item/tool/call"]
+            ),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: executor,
+            toolRequestDrainTimeout: .milliseconds(20)
+        )
+        _ = try await startMappedThread(adapter: adapter, process: process)
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":801,"method":"item/tool/call","params":{"arguments":{},"callId":"stubborn-crash","threadId":"thread-1","tool":"observe_screen","turnId":"turn-1","namespace":"merlin_tmux"}}"#
+        )))
+        await executor.waitUntilStarted()
+
+        let clock = ContinuousClock()
+        let start = clock.now
+        await adapter.consumerFailedForTesting()
+        #expect(clock.now - start < .seconds(1))
+        #expect(await adapter.inFlightToolRequestCountForTesting == 0)
+        #expect(await adapter.availabilityForTesting == .crashed)
+        await executor.release()
+        for _ in 0..<100 { await Task.yield() }
+        #expect((await process.writtenData()).count == 3)
+        await adapter.shutdown()
+    }
+
+    @Test("unknown server RPC IDs are rejected exactly once by the adapter")
+    func unknownServerRPCDuplicateIsIgnored() async throws {
+        let process = ScriptedAppServerProcess()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(
+                process: process,
+                knownServerRequestMethods: ["item/tool/call"],
+                forwardUnknownServerRequests: true
+            ),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor()
+        )
+        _ = try await startMappedThread(adapter: adapter, process: process)
+        let request = #"{"id":"unknown","method":"command/exec","params":{}}"#
+        await process.emit(.standardOutput(jsonLine(request)))
+        await process.emit(.standardOutput(jsonLine(request)))
+        await process.waitForWriteCount(4)
+        for _ in 0..<100 { await Task.yield() }
+        #expect((await process.writtenData()).count == 4)
+        let response = try jsonObject(from: await process.writtenData()[3])
+        #expect(response["id"] as? String == "unknown")
+        #expect((response["error"] as? [String: Any])?["message"] as? String ==
+            "Method not found")
+        await adapter.shutdown()
+    }
+
+    @Test("slow streams stay bounded and require resubscription after event loss")
+    func streamsAreBoundedAndResynchronizable() async throws {
+        let process = ScriptedAppServerProcess()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor()
+        )
+        let threadID = try await startMappedThread(adapter: adapter, process: process)
+        let turnID = try await startMappedTurn(
+            adapter: adapter,
+            process: process,
+            threadID: threadID,
+            turnID: "stream-turn",
+            requestID: 3,
+            writeCount: 4
+        )
+        let slow = await adapter.events(for: threadID)
+        _ = slow
+        for index in 0..<600 {
+            await adapter.handleNotificationForTesting(
+                method: "item/agentMessage/delta",
+                params: .object([
+                    "threadId": .string(threadID.rawValue),
+                    "turnId": .string(turnID.rawValue),
+                    "delta": .string("\(index)"),
+                ])
+            )
+        }
+        #expect(await adapter.stateCountsForTesting.eventSubscribers == 0)
+        #expect(await adapter.stateCountsForTesting.replayEvents == 512)
+
+        let replacement = await adapter.events(for: threadID)
+        var iterator = replacement.makeAsyncIterator()
+        #expect(await iterator.next() != nil)
+        #expect(await adapter.stateCountsForTesting.eventSubscribers == 1)
+
+        let availability = await adapter.availability()
+        await adapter.consumerFailedForTesting()
+        var availabilityIterator = availability.makeAsyncIterator()
+        #expect(await availabilityIterator.next() == .crashed)
+        await adapter.shutdown()
+    }
 }
 
 private actor RecordingCodexToolExecutor: CodexDynamicToolExecuting {
@@ -1552,6 +1966,29 @@ private actor GateCodexToolExecutor: CodexDynamicToolExecuting {
         cancellations += 1
         continuation.resume(throwing: CancellationError())
     }
+}
+
+private actor StubbornCodexToolExecutor: CodexDynamicToolExecuting {
+    private var started = false
+    private var released = false
+
+    func execute(
+        threadID: AgentThreadID,
+        turnID: AgentTurnID,
+        call: TerminalToolCall
+    ) async throws -> TerminalToolResult {
+        started = true
+        while !released {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        return .inputAccepted(.init(acceptedRevision: 1, byteCount: 0))
+    }
+
+    func waitUntilStarted() async {
+        while !started { await Task.yield() }
+    }
+
+    func release() { released = true }
 }
 
 private func waitUntil(
