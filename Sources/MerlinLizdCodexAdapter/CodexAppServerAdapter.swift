@@ -75,6 +75,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
     private struct PendingResume: Sendable {
         let token: UUID
         let requestTask: Task<JSONValue, Error>
+        let priorActiveTurnID: AgentTurnID?
         var notifications: [BufferedTurnNotification]
         var overflowed: Bool
     }
@@ -225,11 +226,20 @@ public actor CodexAppServerAdapter: CodexAgentClient {
     }
 
     public func resumeThread(_ threadID: AgentThreadID) async throws {
+        guard pendingTurnStarts[threadID] == nil else {
+            throw CodexAppServerAdapterError.turnAlreadyStarting
+        }
+        guard pendingResumes[threadID] == nil else {
+            throw CodexAppServerAdapterError.resumeAlreadyInProgress
+        }
         guard await mappingStore.contains(threadID) else {
             throw CodexAppServerAdapterError.unmappedThread
         }
         guard !deletingThreads.contains(threadID) else {
             throw CodexAppServerAdapterError.invalidResponse
+        }
+        guard pendingTurnStarts[threadID] == nil else {
+            throw CodexAppServerAdapterError.turnAlreadyStarting
         }
         guard pendingResumes[threadID] == nil else {
             throw CodexAppServerAdapterError.resumeAlreadyInProgress
@@ -237,6 +247,9 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         try await ensureReady()
         guard !stopped, !deletingThreads.contains(threadID) else {
             throw CodexAppServerAdapterError.stopped
+        }
+        guard pendingTurnStarts[threadID] == nil else {
+            throw CodexAppServerAdapterError.turnAlreadyStarting
         }
         guard pendingResumes[threadID] == nil else {
             throw CodexAppServerAdapterError.resumeAlreadyInProgress
@@ -252,6 +265,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         pendingResumes[threadID] = PendingResume(
             token: token,
             requestTask: requestTask,
+            priorActiveTurnID: activeTurns[threadID],
             notifications: [],
             overflowed: false
         )
@@ -263,17 +277,23 @@ public actor CodexAppServerAdapter: CodexAgentClient {
             }
             guard let pending = pendingResumes[threadID],
                 pending.token == token,
-                !pending.overflowed,
                 !deletingThreads.contains(threadID),
                 !stopped
             else {
-                removePendingResume(threadID: threadID, token: token)
+                throw CodexAppServerAdapterError.invalidResponse
+            }
+            guard !pending.overflowed else {
                 throw CodexAppServerAdapterError.invalidResponse
             }
             guard self.threadID(in: result) == threadID else {
                 throw CodexAppServerAdapterError.invalidResponse
             }
             let resumedTurnID = try activeTurnID(in: result)
+            if let priorActiveTurnID = pending.priorActiveTurnID {
+                guard resumedTurnID == priorActiveTurnID else {
+                    throw CodexAppServerAdapterError.invalidResponse
+                }
+            }
             let resumedHistory = try history(in: result)
             guard await mappingStore.contains(threadID),
                 let current = pendingResumes[threadID],
@@ -282,13 +302,20 @@ public actor CodexAppServerAdapter: CodexAgentClient {
                 !deletingThreads.contains(threadID),
                 !stopped
             else {
-                removePendingResume(threadID: threadID, token: token)
                 throw CodexAppServerAdapterError.invalidResponse
             }
+            if let priorActiveTurnID = current.priorActiveTurnID {
+                guard resumedTurnID == priorActiveTurnID,
+                    activeTurns[threadID] == priorActiveTurnID
+                else { throw CodexAppServerAdapterError.invalidResponse }
+            } else {
+                guard activeTurns[threadID] == nil else {
+                    throw CodexAppServerAdapterError.invalidResponse
+                }
+            }
             knownThreads.insert(threadID)
-            activeTurns.removeValue(forKey: threadID)
             publish(.history(resumedHistory), for: threadID)
-            if let resumedTurnID {
+            if current.priorActiveTurnID == nil, let resumedTurnID {
                 activeTurns[threadID] = resumedTurnID
             }
             pendingResumes.removeValue(forKey: threadID)
@@ -297,7 +324,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
                 processOwnedNotification(notification)
             }
         } catch {
-            removePendingResume(threadID: threadID, token: token)
+            recoverFailedResume(threadID: threadID, token: token)
             throw normalized(error)
         }
     }
@@ -306,12 +333,21 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         threadID: AgentThreadID,
         prompt: String
     ) async throws -> AgentTurnID {
+        guard pendingResumes[threadID] == nil else {
+            throw CodexAppServerAdapterError.resumeAlreadyInProgress
+        }
+        guard pendingTurnStarts[threadID] == nil else {
+            throw CodexAppServerAdapterError.turnAlreadyStarting
+        }
         guard await mappingStore.contains(threadID) else {
             throw CodexAppServerAdapterError.unmappedThread
         }
         try await ensureReady()
         guard !deletingThreads.contains(threadID), !stopped else {
             throw CodexAppServerAdapterError.invalidResponse
+        }
+        guard pendingResumes[threadID] == nil else {
+            throw CodexAppServerAdapterError.resumeAlreadyInProgress
         }
         guard pendingTurnStarts[threadID] == nil else {
             throw CodexAppServerAdapterError.turnAlreadyStarting
@@ -826,8 +862,15 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         else {
             throw CodexAppServerAdapterError.unmappedThread
         }
-        let namespace = fields["namespace"]?.nonemptyString
-            ?? CodexDynamicToolCatalog.namespace
+        let namespace: String
+        if let namespaceValue = fields["namespace"] {
+            guard let explicitNamespace = namespaceValue.nonemptyString else {
+                throw CodexDynamicToolError.invalidArguments
+            }
+            namespace = explicitNamespace
+        } else {
+            namespace = CodexDynamicToolCatalog.namespace
+        }
         let call = try CodexDynamicToolCatalog.decode(
             namespace: namespace,
             tool: tool,
@@ -1179,12 +1222,29 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         for start in pending { start.requestTask.cancel() }
     }
 
-    private func removePendingResume(
+    private func recoverFailedResume(
         threadID: AgentThreadID,
         token: UUID
     ) {
-        guard pendingResumes[threadID]?.token == token else { return }
+        guard let pending = pendingResumes[threadID],
+            pending.token == token
+        else { return }
         pendingResumes.removeValue(forKey: threadID)
+        guard let priorActiveTurnID = pending.priorActiveTurnID,
+            activeTurns[threadID] == priorActiveTurnID
+        else { return }
+        if pending.overflowed {
+            activeTurns.removeValue(forKey: threadID)
+            publishLive(
+                .turnFailed(priorActiveTurnID, .protocolFailure),
+                for: threadID
+            )
+            return
+        }
+        for notification in pending.notifications
+        where notification.turnID == priorActiveTurnID {
+            processOwnedNotification(notification)
+        }
     }
 
     private func cancelPendingResume(for threadID: AgentThreadID) {
