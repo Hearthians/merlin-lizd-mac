@@ -4,6 +4,10 @@ public struct TmuxSessionIdentity: Codable, Hashable, Sendable {
     public let serverSessionID: String
     public let createdAtEpoch: Int64
 
+    public var stableDisplayString: String {
+        "\(serverSessionID)@\(createdAtEpoch)"
+    }
+
     public init(serverSessionID: String, createdAtEpoch: Int64) {
         self.serverSessionID = serverSessionID
         self.createdAtEpoch = createdAtEpoch

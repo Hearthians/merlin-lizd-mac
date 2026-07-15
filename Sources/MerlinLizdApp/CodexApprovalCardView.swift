@@ -20,7 +20,8 @@ struct CodexApprovalCardView: View {
                 detail(
                     "Endpoint / tmux surface",
                     "\(request.scope.endpointID.rawValue.uuidString) · session "
-                        + "\(context.surface.sessionIdentity.serverSessionID) · window "
+                        + context.surface.sessionIdentity.stableDisplayString
+                        + " · window "
                         + "\(context.surface.windowID) · pane \(context.surface.paneID) · command "
                         + context.surface.currentCommand
                         + (context.surface.isCurrentCommandTruncated
@@ -45,7 +46,7 @@ struct CodexApprovalCardView: View {
                 detail(
                     "Endpoint / surface",
                     "\(request.scope.endpointID.rawValue.uuidString) · tmux "
-                        + conversationKey.tmux.serverSessionID
+                        + conversationKey.tmux.stableDisplayString
                 )
                 detail(
                     "Screen context",

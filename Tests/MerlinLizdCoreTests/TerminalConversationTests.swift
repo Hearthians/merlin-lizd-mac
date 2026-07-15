@@ -3,6 +3,22 @@ import Testing
 
 @Suite("Terminal conversation identity")
 struct TerminalConversationTests {
+    @Test("stable tmux identity formatting includes server ID and lifecycle")
+    func formatsCompleteStableTmuxIdentity() {
+        let original = TmuxSessionIdentity(
+            serverSessionID: "$1",
+            createdAtEpoch: 1_720_000_000
+        )
+        let restarted = TmuxSessionIdentity(
+            serverSessionID: "$1",
+            createdAtEpoch: 1_720_000_001
+        )
+
+        #expect(original.stableDisplayString == "$1@1720000000")
+        #expect(restarted.stableDisplayString == "$1@1720000001")
+        #expect(original.stableDisplayString != restarted.stableDisplayString)
+    }
+
     @Test("target aliases and display names do not affect conversation identity")
     func ignoresMutableTargetLabels() {
         let tmux = TmuxSessionIdentity(
