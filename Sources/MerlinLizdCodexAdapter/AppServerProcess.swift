@@ -4,6 +4,7 @@ import Foundation
 public enum AppServerProcessEvent: Sendable {
     case standardOutput(Data)
     case standardError(Data)
+    case outputOverflow(maximumBufferedEvents: Int)
     case terminated(exitCode: Int32)
 }
 
@@ -28,19 +29,22 @@ public enum AppServerProcessError: Error, Equatable, Sendable {
     case launchFailed
     case notRunning
     case writeFailed
+    case writeTooLarge(maximumBytes: Int)
 }
 
 /// Owns one app-server process and exposes its pipes as a pull-driven event
-/// source. The internal queue is bounded; pipe readers pause when the consumer
-/// falls behind instead of accumulating an unbounded output history.
+/// source. The internal queue is bounded and fails explicitly if the consumer
+/// falls behind, so process reaping never depends on downstream consumption.
 public actor AppServerProcess: AppServerProcessRunning {
+    public static let maximumWriteBytes = 4 * 1_024 * 1_024
     private static let ioChunkBytes = 16 * 1_024
     private static let eventBufferLimit = 32
 
     private let process: LockedFoundationProcess
-    private let standardInput: LockedFileHandle
-    private let standardOutput: LockedFileHandle
-    private let standardError: LockedFileHandle
+    private let standardInput: NonblockingFIFOFileWriter
+    private let standardOutput: NonblockingPipeReader
+    private let standardError: NonblockingPipeReader
+    private let inputReadHandle: FileHandle
     private let outputWriteHandle: FileHandle
     private let errorWriteHandle: FileHandle
     private let events = BoundedProcessEventChannel(
@@ -70,11 +74,27 @@ public actor AppServerProcess: AppServerProcessRunning {
         foundationProcess.standardError = errorPipe
 
         process = LockedFoundationProcess(foundationProcess)
-        standardInput = LockedFileHandle(inputPipe.fileHandleForWriting)
-        standardOutput = LockedFileHandle(outputPipe.fileHandleForReading)
-        standardError = LockedFileHandle(errorPipe.fileHandleForReading)
+        standardInput = NonblockingFIFOFileWriter(
+            fileDescriptor: Darwin.dup(
+                inputPipe.fileHandleForWriting.fileDescriptor
+            )
+        )
+        standardOutput = NonblockingPipeReader(
+            fileDescriptor: Darwin.dup(
+                outputPipe.fileHandleForReading.fileDescriptor
+            )
+        )
+        standardError = NonblockingPipeReader(
+            fileDescriptor: Darwin.dup(
+                errorPipe.fileHandleForReading.fileDescriptor
+            )
+        )
+        inputReadHandle = inputPipe.fileHandleForReading
         outputWriteHandle = outputPipe.fileHandleForWriting
         errorWriteHandle = errorPipe.fileHandleForWriting
+        try? inputPipe.fileHandleForWriting.close()
+        try? outputPipe.fileHandleForReading.close()
+        try? errorPipe.fileHandleForReading.close()
     }
 
     public func start() async throws {
@@ -83,36 +103,49 @@ public actor AppServerProcess: AppServerProcessRunning {
         do {
             try process.run()
         } catch {
+            await standardInput.close()
+            standardOutput.close()
+            standardError.close()
+            try? inputReadHandle.close()
+            try? outputWriteHandle.close()
+            try? errorWriteHandle.close()
             await events.finish()
             throw AppServerProcessError.launchFailed
         }
 
+        try? inputReadHandle.close()
         try? outputWriteHandle.close()
         try? errorWriteHandle.close()
 
         let output = standardOutput
         let error = standardError
+        let input = standardInput
         let process = process
         let events = events
         let outputReader = Task.detached {
             await Self.drain(
                 output,
                 event: AppServerProcessEvent.standardOutput,
-                into: events
+                into: events,
+                process: process
             )
         }
         let errorReader = Task.detached {
             await Self.drain(
                 error,
                 event: AppServerProcessEvent.standardError,
-                into: events
+                into: events,
+                process: process
             )
         }
         lifecycleTask = Task.detached {
             let exitCode = process.waitUntilExit()
+            await input.processExited()
+            output.markLeaderExited()
+            error.markLeaderExited()
             await outputReader.value
             await errorReader.value
-            await events.send(.terminated(exitCode: exitCode))
+            _ = await events.offer(.terminated(exitCode: exitCode))
             await events.finish()
             return AppServerProcessTermination(exitCode: exitCode)
         }
@@ -122,9 +155,15 @@ public actor AppServerProcess: AppServerProcessRunning {
         guard started, lifecycleTask != nil, !terminationRequested else {
             throw AppServerProcessError.notRunning
         }
+        guard data.count <= Self.maximumWriteBytes else {
+            throw AppServerProcessError.writeTooLarge(
+                maximumBytes: Self.maximumWriteBytes
+            )
+        }
         do {
-            try standardInput.write(data)
+            try await standardInput.write(data)
         } catch {
+            if let error = error as? AppServerProcessError { throw error }
             throw AppServerProcessError.writeFailed
         }
     }
@@ -136,7 +175,9 @@ public actor AppServerProcess: AppServerProcessRunning {
     public func terminate() async {
         guard started, !terminationRequested else { return }
         terminationRequested = true
-        standardInput.close()
+        await standardInput.close()
+        standardOutput.requestStop()
+        standardError.requestStop()
         process.terminate()
         process.forceTerminate()
     }
@@ -149,19 +190,31 @@ public actor AppServerProcess: AppServerProcessRunning {
     }
 
     private nonisolated static func drain(
-        _ handle: LockedFileHandle,
+        _ handle: NonblockingPipeReader,
         event: @Sendable (Data) -> AppServerProcessEvent,
-        into channel: BoundedProcessEventChannel
+        into channel: BoundedProcessEventChannel,
+        process: LockedFoundationProcess
     ) async {
-        while true {
-            let data: Data
-            do {
-                data = try handle.read(upToCount: ioChunkBytes) ?? Data()
-            } catch {
-                break
+        drainLoop: while true {
+            if handle.shouldStop { break }
+            switch handle.read(upToCount: ioChunkBytes) {
+            case let .data(data):
+                guard await channel.offer(event(data)) else {
+                    process.forceTerminate()
+                    handle.requestStop()
+                    break drainLoop
+                }
+                if handle.exhaustedPostExitDrain(data.count) {
+                    break drainLoop
+                }
+            case .wouldBlock:
+                if handle.shouldStop || handle.postExitIdleExpired {
+                    break drainLoop
+                }
+                handle.waitUntilReadable(milliseconds: 25)
+            case .end:
+                break drainLoop
             }
-            guard !data.isEmpty else { break }
-            await channel.send(event(data))
         }
         handle.close()
     }
@@ -170,9 +223,15 @@ public actor AppServerProcess: AppServerProcessRunning {
 private final class LockedFoundationProcess: @unchecked Sendable {
     private let lock = NSLock()
     private let process: Process
+    private let terminationSignal: FoundationProcessTerminationSignal
 
     init(_ process: Process) {
         self.process = process
+        let terminationSignal = FoundationProcessTerminationSignal()
+        self.terminationSignal = terminationSignal
+        process.terminationHandler = { process in
+            terminationSignal.record(exitCode: process.terminationStatus)
+        }
     }
 
     func run() throws {
@@ -180,8 +239,7 @@ private final class LockedFoundationProcess: @unchecked Sendable {
     }
 
     func waitUntilExit() -> Int32 {
-        process.waitUntilExit()
-        return lock.withLock { process.terminationStatus }
+        terminationSignal.wait()
     }
 
     func terminate() {
@@ -201,44 +259,288 @@ private final class LockedFoundationProcess: @unchecked Sendable {
     }
 }
 
-private final class LockedFileHandle: @unchecked Sendable {
+private final class FoundationProcessTerminationSignal: @unchecked Sendable {
     private let lock = NSLock()
-    private let handle: FileHandle
-    private var closed = false
+    private let semaphore = DispatchSemaphore(value: 0)
+    private var exitCode: Int32?
 
-    init(_ handle: FileHandle) {
-        self.handle = handle
+    func record(exitCode: Int32) {
+        let shouldSignal = lock.withLock {
+            guard self.exitCode == nil else { return false }
+            self.exitCode = exitCode
+            return true
+        }
+        if shouldSignal { semaphore.signal() }
     }
 
-    func read(upToCount count: Int) throws -> Data? {
-        try lock.withLock {
-            guard !closed else { return nil }
-            return try handle.read(upToCount: count)
+    func wait() -> Int32 {
+        if let exitCode = lock.withLock({ exitCode }) { return exitCode }
+        semaphore.wait()
+        return lock.withLock { exitCode ?? -1 }
+    }
+}
+
+private final class NonblockingPipeReader: @unchecked Sendable {
+    private static let maximumPostExitDrainBytes = 4 * 1_024 * 1_024
+    private static let maximumPostExitIdle = Duration.milliseconds(100)
+    enum ReadResult {
+        case data(Data)
+        case wouldBlock
+        case end
+    }
+
+    private let lock = NSLock()
+    private var fileDescriptor: Int32
+    private var stopRequested = false
+    private var leaderExitInstant: ContinuousClock.Instant?
+    private var postExitDrainBytes = 0
+
+    init(fileDescriptor: Int32) {
+        self.fileDescriptor = fileDescriptor
+        guard fileDescriptor >= 0 else { return }
+        let flags = Darwin.fcntl(fileDescriptor, F_GETFL)
+        if flags >= 0 {
+            _ = Darwin.fcntl(fileDescriptor, F_SETFL, flags | O_NONBLOCK)
         }
     }
 
-    func write(_ data: Data) throws {
-        try lock.withLock {
-            guard !closed else { throw AppServerProcessError.notRunning }
-            try handle.write(contentsOf: data)
+    var shouldStop: Bool {
+        lock.withLock { stopRequested || fileDescriptor < 0 }
+    }
+
+    var postExitIdleExpired: Bool {
+        lock.withLock {
+            guard let leaderExitInstant else { return false }
+            return ContinuousClock.now
+                >= leaderExitInstant.advanced(by: Self.maximumPostExitIdle)
         }
+    }
+
+    func read(upToCount count: Int) -> ReadResult {
+        lock.withLock {
+            guard !stopRequested, fileDescriptor >= 0 else { return .end }
+            var data = Data(count: count)
+            let byteCount = data.withUnsafeMutableBytes { buffer -> Int in
+                guard let baseAddress = buffer.baseAddress else { return 0 }
+                return Darwin.read(fileDescriptor, baseAddress, count)
+            }
+            if byteCount > 0 {
+                data.removeSubrange(byteCount..<data.count)
+                return .data(data)
+            }
+            if byteCount == 0 { return .end }
+            if errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR {
+                return .wouldBlock
+            }
+            return .end
+        }
+    }
+
+    func waitUntilReadable(milliseconds: Int32) {
+        let descriptor = lock.withLock { fileDescriptor }
+        guard descriptor >= 0 else { return }
+        var descriptorState = pollfd(
+            fd: descriptor,
+            events: Int16(POLLIN | POLLHUP | POLLERR),
+            revents: 0
+        )
+        _ = Darwin.poll(&descriptorState, 1, milliseconds)
+    }
+
+    func markLeaderExited() {
+        lock.withLock {
+            if leaderExitInstant == nil {
+                leaderExitInstant = ContinuousClock.now
+            }
+        }
+    }
+
+    func exhaustedPostExitDrain(_ byteCount: Int) -> Bool {
+        lock.withLock {
+            guard leaderExitInstant != nil else { return false }
+            postExitDrainBytes += byteCount
+            return postExitDrainBytes >= Self.maximumPostExitDrainBytes
+        }
+    }
+
+    func requestStop() {
+        lock.withLock { stopRequested = true }
     }
 
     func close() {
         lock.withLock {
-            guard !closed else { return }
-            closed = true
-            try? handle.close()
+            guard fileDescriptor >= 0 else { return }
+            _ = Darwin.close(fileDescriptor)
+            fileDescriptor = -1
+            stopRequested = true
         }
+    }
+
+    deinit { close() }
+}
+
+private actor NonblockingFIFOFileWriter {
+    private struct WriteRequest {
+        let id: UUID
+        let data: Data
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
+    private let descriptor: NonblockingWritableDescriptor
+    private var queue: [WriteRequest] = []
+    private var active: WriteRequest?
+    private var closed = false
+
+    init(fileDescriptor: Int32) {
+        descriptor = NonblockingWritableDescriptor(
+            fileDescriptor: fileDescriptor
+        )
+    }
+
+    func write(_ data: Data) async throws {
+        guard !closed else { throw AppServerProcessError.notRunning }
+        try await withCheckedThrowingContinuation { continuation in
+            queue.append(WriteRequest(
+                id: UUID(),
+                data: data,
+                continuation: continuation
+            ))
+            beginNextIfNeeded()
+        }
+    }
+
+    func close() {
+        guard !closed else { return }
+        closed = true
+        descriptor.close()
+        active?.continuation.resume(throwing: AppServerProcessError.writeFailed)
+        active = nil
+        let waiting = queue
+        queue.removeAll()
+        for request in waiting {
+            request.continuation.resume(
+                throwing: AppServerProcessError.writeFailed
+            )
+        }
+    }
+
+    func processExited() {
+        guard !closed else { return }
+        closed = true
+        descriptor.close()
+        let waiting = queue
+        queue.removeAll()
+        for request in waiting {
+            request.continuation.resume(
+                throwing: AppServerProcessError.writeFailed
+            )
+        }
+    }
+
+    private func beginNextIfNeeded() {
+        guard !closed, active == nil, !queue.isEmpty else { return }
+        let request = queue.removeFirst()
+        active = request
+        let descriptor = descriptor
+        let operation = Task.detached {
+            descriptor.writeAll(request.data)
+        }
+        Task { [weak self] in
+            let succeeded = await operation.value
+            await self?.finishWrite(id: request.id, succeeded: succeeded)
+        }
+    }
+
+    private func finishWrite(id: UUID, succeeded: Bool) {
+        guard let request = active, request.id == id else { return }
+        active = nil
+        if succeeded {
+            request.continuation.resume()
+        } else {
+            request.continuation.resume(
+                throwing: AppServerProcessError.writeFailed
+            )
+        }
+        beginNextIfNeeded()
+    }
+}
+
+private final class NonblockingWritableDescriptor: @unchecked Sendable {
+    private enum WriteResult {
+        case bytes(Int)
+        case wouldBlock
+        case failed
+    }
+
+    private let lock = NSLock()
+    private var fileDescriptor: Int32
+
+    init(fileDescriptor: Int32) {
+        self.fileDescriptor = fileDescriptor
+        guard fileDescriptor >= 0 else { return }
+        let flags = Darwin.fcntl(fileDescriptor, F_GETFL)
+        if flags >= 0 {
+            _ = Darwin.fcntl(fileDescriptor, F_SETFL, flags | O_NONBLOCK)
+        }
+        _ = Darwin.fcntl(fileDescriptor, F_SETNOSIGPIPE, 1)
+    }
+
+    func writeAll(_ data: Data) -> Bool {
+        var offset = 0
+        while offset < data.count {
+            switch writeSome(data, offset: offset) {
+            case let .bytes(count): offset += count
+            case .wouldBlock: waitUntilWritable(milliseconds: 25)
+            case .failed: return false
+            }
+        }
+        return true
+    }
+
+    func close() {
+        lock.withLock {
+            guard fileDescriptor >= 0 else { return }
+            _ = Darwin.close(fileDescriptor)
+            fileDescriptor = -1
+        }
+    }
+
+    deinit { close() }
+
+    private func writeSome(_ data: Data, offset: Int) -> WriteResult {
+        lock.withLock {
+            guard fileDescriptor >= 0 else { return .failed }
+            let result = data.withUnsafeBytes { buffer -> Int in
+                guard let baseAddress = buffer.baseAddress else { return 0 }
+                return Darwin.write(
+                    fileDescriptor,
+                    baseAddress.advanced(by: offset),
+                    data.count - offset
+                )
+            }
+            if result > 0 { return .bytes(result) }
+            if result < 0,
+                errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR
+            {
+                return .wouldBlock
+            }
+            return .failed
+        }
+    }
+
+    private func waitUntilWritable(milliseconds: Int32) {
+        let descriptor = lock.withLock { fileDescriptor }
+        guard descriptor >= 0 else { return }
+        var descriptorState = pollfd(
+            fd: descriptor,
+            events: Int16(POLLOUT | POLLHUP | POLLERR),
+            revents: 0
+        )
+        _ = Darwin.poll(&descriptorState, 1, milliseconds)
     }
 }
 
 private actor BoundedProcessEventChannel {
-    private struct Sender {
-        let event: AppServerProcessEvent
-        let continuation: CheckedContinuation<Void, Never>
-    }
-
     private struct Receiver {
         let id: UUID
         let continuation: CheckedContinuation<AppServerProcessEvent?, Never>
@@ -247,7 +549,7 @@ private actor BoundedProcessEventChannel {
     private let capacity: Int
     private var buffer: [AppServerProcessEvent] = []
     private var receivers: [Receiver] = []
-    private var senders: [Sender] = []
+    private var accepting = true
     private var finished = false
 
     init(capacity: Int) {
@@ -255,31 +557,26 @@ private actor BoundedProcessEventChannel {
         self.capacity = capacity
     }
 
-    func send(_ event: AppServerProcessEvent) async {
-        guard !finished else { return }
+    func offer(_ event: AppServerProcessEvent) -> Bool {
+        guard accepting, !finished else { return false }
         if !receivers.isEmpty {
             receivers.removeFirst().continuation.resume(returning: event)
-            return
+            return true
         }
         if buffer.count < capacity {
             buffer.append(event)
-            return
+            return true
         }
-        await withCheckedContinuation { continuation in
-            senders.append(Sender(event: event, continuation: continuation))
-        }
+        accepting = false
+        buffer.removeAll(keepingCapacity: false)
+        buffer.append(.outputOverflow(maximumBufferedEvents: capacity))
+        return false
     }
 
     func next() async -> AppServerProcessEvent? {
         if !buffer.isEmpty {
             let event = buffer.removeFirst()
-            admitSenderIfPossible()
             return event
-        }
-        if !senders.isEmpty {
-            let sender = senders.removeFirst()
-            sender.continuation.resume()
-            return sender.event
         }
         if finished { return nil }
         let receiverID = UUID()
@@ -299,32 +596,14 @@ private actor BoundedProcessEventChannel {
     func finish() {
         guard !finished else { return }
         finished = true
-        if buffer.isEmpty && senders.isEmpty {
+        accepting = false
+        if buffer.isEmpty {
             let pendingReceivers = receivers
             receivers.removeAll()
             for receiver in pendingReceivers {
                 receiver.continuation.resume(returning: nil)
             }
         }
-        let pendingSenders = senders
-        senders.removeAll()
-        for sender in pendingSenders { sender.continuation.resume() }
-    }
-
-    private func admitSenderIfPossible() {
-        guard !finished, !senders.isEmpty, buffer.count < capacity else {
-            if finished, buffer.isEmpty {
-                let pendingReceivers = receivers
-                receivers.removeAll()
-                for receiver in pendingReceivers {
-                    receiver.continuation.resume(returning: nil)
-                }
-            }
-            return
-        }
-        let sender = senders.removeFirst()
-        buffer.append(sender.event)
-        sender.continuation.resume()
     }
 
     private func cancelReceiver(_ id: UUID) {

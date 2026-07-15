@@ -7,6 +7,8 @@ public enum JSONLAppServerTransportError: Error, Equatable, Sendable {
     case stopped
     case invalidMessage
     case lineTooLarge(maximumBytes: Int)
+    case outboundLineTooLarge(maximumBytes: Int)
+    case processOutputOverflow(maximumBufferedEvents: Int)
     case processTerminated(exitCode: Int32)
     case writeFailed
     case remoteError(code: Int)
@@ -22,9 +24,21 @@ public actor JSONLAppServerTransport {
 
     private enum State: Equatable {
         case idle
-        case running
+        case starting(UUID)
+        case running(UUID)
+        case stopping(UUID?)
         case failed(JSONLAppServerTransportError)
         case stopped
+    }
+
+    private enum StartOutcome: Sendable {
+        case started
+        case failed
+    }
+
+    private struct StartWaiter {
+        let token: UUID
+        let continuation: CheckedContinuation<Void, Error>
     }
 
     private let process: any AppServerProcessRunning
@@ -37,14 +51,22 @@ public actor JSONLAppServerTransport {
     private var state: State = .idle
     private var nextRequestID: Int64 = 1
     private var standardOutputBuffer = Data()
+    private var maximumBufferedStandardOutputBytes = 0
     private var stderrTail = Data()
-    private var pending: [Int64: CheckedContinuation<JSONValue, Error>] = [:]
+    private var pending: [
+        JSONRPCID: CheckedContinuation<JSONValue, Error>
+    ] = [:]
     private var serverMessages: [CodexServerMessage] = []
     private var messageWaiters: [
         UUID: CheckedContinuation<CodexServerMessage, Error>
     ] = [:]
     private var deliveredMessageCount = 0
-    private var consumerTask: Task<Void, Never>?
+    private var processedLineCount = 0
+    private let directMessageConsumerID = UUID()
+    private var messageConsumerID: UUID?
+    private var startWaiters: [UUID: StartWaiter] = [:]
+    private var startOperation: (UUID, Task<StartOutcome, Never>)?
+    private var consumerTask: (UUID, Task<Void, Never>)?
     private var reapTask: Task<Void, Never>?
 
     public init(
@@ -65,33 +87,99 @@ public actor JSONLAppServerTransport {
     }
 
     public func start() async throws {
-        guard state == .idle else {
-            if state == .running {
-                throw JSONLAppServerTransportError.alreadyStarted
+        let token: UUID
+        switch state {
+        case .idle:
+            token = UUID()
+            state = .starting(token)
+            let process = process
+            let operation = Task.detached(priority: nil) {
+                do {
+                    try await process.start()
+                    return StartOutcome.started
+                } catch {
+                    return StartOutcome.failed
+                }
             }
-            throw currentTerminalError
+            startOperation = (token, operation)
+            Task { [weak self] in
+                let outcome = await operation.value
+                await self?.finishStart(token: token, outcome: outcome)
+            }
+        case let .starting(activeToken):
+            token = activeToken
+        case .running:
+            throw JSONLAppServerTransportError.alreadyStarted
+        case .stopping, .stopped:
+            throw JSONLAppServerTransportError.stopped
+        case let .failed(error):
+            throw error
         }
-        do {
-            try await process.start()
-        } catch {
-            state = .failed(.launchFailed)
-            throw JSONLAppServerTransportError.launchFailed
+
+        try await awaitStart(token: token)
+    }
+
+    private func awaitStart(token: UUID) async throws {
+        try Task.checkCancellation()
+        let waiterID = UUID()
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            try await withCheckedThrowingContinuation(
+                isolation: self
+            ) { continuation in
+                startWaiters[waiterID] = StartWaiter(
+                    token: token,
+                    continuation: continuation
+                )
+            }
+        } onCancel: {
+            Task { await self.cancelStartWaiter(waiterID) }
         }
-        state = .running
+        try Task.checkCancellation()
+    }
+
+    private func finishStart(token: UUID, outcome: StartOutcome) {
+        guard case let .starting(activeToken) = state,
+            activeToken == token
+        else {
+            resumeStartWaiters(
+                for: token,
+                throwing: JSONLAppServerTransportError.stopped
+            )
+            if startOperation?.0 == token { startOperation = nil }
+            return
+        }
+        if startOperation?.0 == token { startOperation = nil }
+        switch outcome {
+        case .failed:
+            let error = JSONLAppServerTransportError.launchFailed
+            state = .failed(error)
+            discardBufferedProtocolState()
+            resumeStartWaiters(for: token, throwing: error)
+            _ = beginReapIfNeeded()
+        case .started:
+            state = .running(token)
+            installConsumer(token: token)
+            resumeStartWaiters(for: token)
+        }
+    }
+
+    private func installConsumer(token: UUID) {
         let process = process
-        consumerTask = Task { [weak self] in
+        let task = Task { [weak self] in
             while let event = await process.nextEvent() {
-                await self?.consume(event)
+                await self?.consume(event, token: token)
             }
-            await self?.consumeUnexpectedEOF()
+            await self?.consumeUnexpectedEOF(token: token)
         }
+        consumerTask = (token, task)
     }
 
     public func request(
         method: String,
         params: JSONValue? = nil
     ) async throws -> JSONValue {
-        guard state == .running else { throw currentTerminalError }
+        guard case .running = state else { throw currentTerminalError }
         try Task.checkCancellation()
         guard pending.count < pendingRequestLimit else {
             throw JSONLAppServerTransportError.tooManyPendingRequests(
@@ -102,15 +190,17 @@ public actor JSONLAppServerTransport {
             fail(.invalidMessage)
             throw JSONLAppServerTransportError.invalidMessage
         }
-        let requestID = nextRequestID
+        let requestID = JSONRPCID.integer(nextRequestID)
         nextRequestID += 1
         let data: Data
         do {
             data = try encodedLine(JSONRPCRequestEnvelope(
-                id: .integer(requestID),
+                id: requestID,
                 method: method,
                 params: params
             ))
+        } catch let error as JSONLAppServerTransportError {
+            throw error
         } catch {
             throw JSONLAppServerTransportError.invalidMessage
         }
@@ -129,7 +219,7 @@ public actor JSONLAppServerTransport {
     }
 
     public func respond(to id: JSONRPCID, result: JSONValue) async throws {
-        guard state == .running else { throw currentTerminalError }
+        guard case .running = state else { throw currentTerminalError }
         try await writeLine(JSONRPCResultResponse(id: id, result: result))
     }
 
@@ -138,7 +228,7 @@ public actor JSONLAppServerTransport {
         code: Int,
         message: String
     ) async throws {
-        guard state == .running else { throw currentTerminalError }
+        guard case .running = state else { throw currentTerminalError }
         try await writeLine(JSONRPCErrorResponseEnvelope(
             id: id,
             error: .init(code: code, message: message)
@@ -146,10 +236,18 @@ public actor JSONLAppServerTransport {
     }
 
     public func nextServerMessage() async throws -> CodexServerMessage {
-        if !serverMessages.isEmpty {
-            return serverMessages.removeFirst()
+        try await nextServerMessage(consumerID: directMessageConsumerID)
+    }
+
+    private func nextServerMessage(
+        consumerID: UUID
+    ) async throws -> CodexServerMessage {
+        guard case .running = state else { throw currentTerminalError }
+        if let messageConsumerID, messageConsumerID != consumerID {
+            throw JSONLAppServerTransportError.messageConsumerAlreadyWaiting
         }
-        guard state == .running else { throw currentTerminalError }
+        messageConsumerID = consumerID
+        if !serverMessages.isEmpty { return serverMessages.removeFirst() }
         guard messageWaiters.isEmpty else {
             throw JSONLAppServerTransportError.messageConsumerAlreadyWaiting
         }
@@ -173,34 +271,52 @@ public actor JSONLAppServerTransport {
         CodexServerMessage,
         Error
     > {
-        AsyncThrowingStream(unfolding: { [weak self] in
+        let consumerID = UUID()
+        return AsyncThrowingStream(unfolding: { [weak self] in
             guard let self else { return nil }
-            return try await self.nextServerMessage()
+            return try await self.nextServerMessage(consumerID: consumerID)
         })
     }
 
     public func shutdown() async {
-        if state != .stopped {
+        if state != .stopped, !isStopping {
+            let activeToken: UUID?
+            switch state {
+            case let .starting(token), let .running(token): activeToken = token
+            default: activeToken = nil
+            }
             let error = JSONLAppServerTransportError.stopped
-            state = .stopped
-            standardOutputBuffer.removeAll(keepingCapacity: false)
+            state = .stopping(activeToken)
+            startOperation?.1.cancel()
+            discardBufferedProtocolState()
+            resumeAllStartWaiters(throwing: error)
             resumeAllPending(throwing: error)
             resumeAllMessageWaiters(throwing: error)
         }
         let reap = beginReapIfNeeded()
         await reap.value
-        consumerTask?.cancel()
+        state = .stopped
+        consumerTask?.1.cancel()
+        if let task = consumerTask?.1 { await task.value }
         consumerTask = nil
     }
 
     var pendingRequestCountForTesting: Int { pending.count }
     var deliveredMessageCountForTesting: Int { deliveredMessageCount }
+    var processedLineCountForTesting: Int { processedLineCount }
+    var queuedMessageCountForTesting: Int { serverMessages.count }
     var messageWaiterCountForTesting: Int { messageWaiters.count }
     var bufferedStandardOutputBytesForTesting: Int {
         standardOutputBuffer.count
     }
+    var maximumBufferedStandardOutputBytesForTesting: Int {
+        maximumBufferedStandardOutputBytes
+    }
     var stderrTailForTesting: Data { stderrTail }
-    var isRunningForTesting: Bool { state == .running }
+    var isRunningForTesting: Bool {
+        guard case .running = state else { return false }
+        return true
+    }
     var failureForTesting: JSONLAppServerTransportError? {
         guard case let .failed(error) = state else { return nil }
         return error
@@ -209,14 +325,21 @@ public actor JSONLAppServerTransport {
     private var currentTerminalError: JSONLAppServerTransportError {
         switch state {
         case .idle: .notStarted
+        case .starting: .notStarted
         case .running: .invalidMessage
+        case .stopping: .stopped
         case let .failed(error): error
         case .stopped: .stopped
         }
     }
 
-    private func writeRegisteredRequest(_ data: Data, id: Int64) async {
-        guard state == .running, pending[id] != nil else { return }
+    private var isStopping: Bool {
+        guard case .stopping = state else { return false }
+        return true
+    }
+
+    private func writeRegisteredRequest(_ data: Data, id: JSONRPCID) async {
+        guard case .running = state, pending[id] != nil else { return }
         do {
             try await process.write(data)
         } catch {
@@ -224,7 +347,7 @@ public actor JSONLAppServerTransport {
         }
     }
 
-    private func cancelPendingRequest(_ id: Int64) {
+    private func cancelPendingRequest(_ id: JSONRPCID) {
         pending.removeValue(forKey: id)?.resume(
             throwing: CancellationError()
         )
@@ -236,16 +359,20 @@ public actor JSONLAppServerTransport {
         )
     }
 
-    private func consume(_ event: AppServerProcessEvent) async {
+    private func consume(_ event: AppServerProcessEvent, token: UUID) async {
+        guard case let .running(activeToken) = state,
+            activeToken == token
+        else { return }
         switch event {
         case let .standardOutput(data):
-            guard state == .running else { return }
-            standardOutputBuffer.append(data)
-            await processCompleteLines()
+            await processStandardOutput(data)
         case let .standardError(data):
             appendStderr(data)
+        case let .outputOverflow(maximumBufferedEvents):
+            fail(.processOutputOverflow(
+                maximumBufferedEvents: maximumBufferedEvents
+            ))
         case let .terminated(exitCode):
-            guard state == .running else { return }
             if !standardOutputBuffer.isEmpty {
                 if standardOutputBuffer.count > lineByteLimit {
                     fail(.lineTooLarge(maximumBytes: lineByteLimit))
@@ -255,41 +382,54 @@ public actor JSONLAppServerTransport {
                 standardOutputBuffer.removeAll(keepingCapacity: false)
                 await processLine(tail)
             }
-            if state == .running {
+            if case let .running(activeToken) = state,
+                activeToken == token
+            {
                 fail(.processTerminated(exitCode: exitCode))
             }
         }
     }
 
-    private func consumeUnexpectedEOF() {
-        guard state == .running else { return }
+    private func consumeUnexpectedEOF(token: UUID) {
+        guard case let .running(activeToken) = state,
+            activeToken == token
+        else { return }
         fail(.processTerminated(exitCode: -1))
     }
 
-    private func processCompleteLines() async {
-        while let newline = standardOutputBuffer.firstIndex(of: 0x0A) {
-            let length = standardOutputBuffer.distance(
-                from: standardOutputBuffer.startIndex,
-                to: newline
-            )
-            guard length <= lineByteLimit else {
-                fail(.lineTooLarge(maximumBytes: lineByteLimit))
+    private func processStandardOutput(_ data: Data) async {
+        var cursor = data.startIndex
+        while cursor < data.endIndex {
+            if let newline = data[cursor...].firstIndex(of: 0x0A) {
+                guard appendLineFragment(data[cursor..<newline]) else { return }
+                var line = standardOutputBuffer
+                standardOutputBuffer.removeAll(keepingCapacity: true)
+                if line.last == 0x0D { line.removeLast() }
+                await processLine(line)
+                guard case .running = state else { return }
+                cursor = data.index(after: newline)
+            } else {
+                _ = appendLineFragment(data[cursor...])
                 return
             }
-            var line = Data(standardOutputBuffer[..<newline])
-            standardOutputBuffer.removeSubrange(
-                standardOutputBuffer.startIndex...newline
-            )
-            if line.last == 0x0D { line.removeLast() }
-            await processLine(line)
-            guard state == .running else { return }
-        }
-        if standardOutputBuffer.count > lineByteLimit {
-            fail(.lineTooLarge(maximumBytes: lineByteLimit))
         }
     }
 
+    private func appendLineFragment(_ fragment: Data.SubSequence) -> Bool {
+        guard fragment.count <= lineByteLimit - standardOutputBuffer.count else {
+            fail(.lineTooLarge(maximumBytes: lineByteLimit))
+            return false
+        }
+        standardOutputBuffer.append(contentsOf: fragment)
+        maximumBufferedStandardOutputBytes = max(
+            maximumBufferedStandardOutputBytes,
+            standardOutputBuffer.count
+        )
+        return true
+    }
+
     private func processLine(_ line: Data) async {
+        processedLineCount += 1
         guard !line.isEmpty,
             String(data: line, encoding: .utf8) != nil,
             let value = try? decoder.decode(JSONValue.self, from: line),
@@ -333,10 +473,7 @@ public actor JSONLAppServerTransport {
             fail(.invalidMessage)
             return
         }
-        guard let requestID = outboundRequestID(from: id) else {
-            return
-        }
-        guard let continuation = pending.removeValue(forKey: requestID) else {
+        guard let continuation = pending.removeValue(forKey: id) else {
             return
         }
         if let result = object["result"], object["error"] == nil {
@@ -391,6 +528,8 @@ public actor JSONLAppServerTransport {
         let data: Data
         do {
             data = try encodedLine(value)
+        } catch let error as JSONLAppServerTransportError {
+            throw error
         } catch {
             throw JSONLAppServerTransportError.invalidMessage
         }
@@ -403,26 +542,30 @@ public actor JSONLAppServerTransport {
     }
 
     private func encodedLine<Value: Encodable>(_ value: Value) throws -> Data {
-        var data = try encoder.encode(value)
+        let encoded: Data
+        do {
+            encoded = try encoder.encode(value)
+        } catch {
+            throw JSONLAppServerTransportError.invalidMessage
+        }
+        let maximumBytes = min(
+            lineByteLimit,
+            AppServerProcess.maximumWriteBytes
+        )
+        guard encoded.count < maximumBytes else {
+            throw JSONLAppServerTransportError.outboundLineTooLarge(
+                maximumBytes: maximumBytes
+            )
+        }
+        var data = encoded
         data.append(0x0A)
         return data
     }
 
-    private func outboundRequestID(from id: JSONRPCID) -> Int64? {
-        switch id {
-        case let .integer(value): return value
-        case let .string(value):
-            guard let integer = Int64(value), String(integer) == value else {
-                return nil
-            }
-            return integer
-        }
-    }
-
     private func fail(_ error: JSONLAppServerTransportError) {
-        guard state == .running || state == .idle else { return }
+        guard case .running = state else { return }
         state = .failed(error)
-        standardOutputBuffer.removeAll(keepingCapacity: false)
+        discardBufferedProtocolState()
         resumeAllPending(throwing: error)
         resumeAllMessageWaiters(throwing: error)
         _ = beginReapIfNeeded()
@@ -446,6 +589,42 @@ public actor JSONLAppServerTransport {
         for continuation in continuations {
             continuation.resume(throwing: error)
         }
+    }
+
+    private func cancelStartWaiter(_ id: UUID) {
+        startWaiters.removeValue(forKey: id)?.continuation.resume(
+            throwing: CancellationError()
+        )
+    }
+
+    private func resumeStartWaiters(
+        for token: UUID,
+        throwing error: JSONLAppServerTransportError? = nil
+    ) {
+        let matching = startWaiters.filter { $0.value.token == token }
+        for (id, waiter) in matching {
+            startWaiters.removeValue(forKey: id)
+            if let error {
+                waiter.continuation.resume(throwing: error)
+            } else {
+                waiter.continuation.resume()
+            }
+        }
+    }
+
+    private func resumeAllStartWaiters(
+        throwing error: JSONLAppServerTransportError
+    ) {
+        let continuations = startWaiters.values.map(\.continuation)
+        startWaiters.removeAll()
+        for continuation in continuations {
+            continuation.resume(throwing: error)
+        }
+    }
+
+    private func discardBufferedProtocolState() {
+        standardOutputBuffer.removeAll(keepingCapacity: false)
+        serverMessages.removeAll(keepingCapacity: false)
     }
 
     private func beginReapIfNeeded() -> Task<Void, Never> {

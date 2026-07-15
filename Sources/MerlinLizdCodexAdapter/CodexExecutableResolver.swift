@@ -1,7 +1,15 @@
+import Darwin
 import Foundation
 
 public protocol CodexExecutableFileChecking: Sendable {
     func isExecutableFile(at url: URL) -> Bool
+    func resolvedExecutable(at url: URL) -> URL?
+}
+
+public extension CodexExecutableFileChecking {
+    func resolvedExecutable(at url: URL) -> URL? {
+        isExecutableFile(at: url) ? url : nil
+    }
 }
 
 public protocol CodexVersionProbing: Sendable {
@@ -35,13 +43,18 @@ public struct FoundationCodexExecutableFileChecker:
     public init() {}
 
     public func isExecutableFile(at url: URL) -> Bool {
-        var isDirectory: ObjCBool = false
-        return FileManager.default.fileExists(
-            atPath: url.path,
-            isDirectory: &isDirectory
+        resolvedExecutable(at: url) != nil
+    }
+
+    public func resolvedExecutable(at url: URL) -> URL? {
+        let resolved = url.standardizedFileURL.resolvingSymlinksInPath()
+        let attributes = try? FileManager.default.attributesOfItem(
+            atPath: resolved.path
         )
-            && !isDirectory.boolValue
-            && FileManager.default.isExecutableFile(atPath: url.path)
+        guard attributes?[.type] as? FileAttributeType == .typeRegular,
+            resolved.path.withCString({ Darwin.access($0, X_OK) == 0 })
+        else { return nil }
+        return resolved
     }
 }
 
@@ -77,32 +90,19 @@ public struct CodexExecutableResolver: Sendable {
     }
 
     public func resolve() async throws -> ResolvedCodexExecutable {
-        guard let executable = candidateURLs.first(where: {
-            fileChecker.isExecutableFile(at: $0)
-        }) else {
+        guard let executable = candidateURLs.lazy.compactMap({
+            fileChecker.resolvedExecutable(at: $0)
+        }).first else {
             throw CodexExecutableResolverError.notFound
         }
 
         let deadline = ContinuousClock.now.advanced(by: probeTimeout)
         let output: String
         do {
-            output = try await withThrowingTaskGroup(of: String.self) { group in
-                group.addTask { [versionProbe] in
-                    try await versionProbe.versionOutput(
-                        executable: executable,
-                        deadline: deadline
-                    )
-                }
-                group.addTask {
-                    try await ContinuousClock().sleep(until: deadline)
-                    throw CodexExecutableResolverError.probeTimedOut
-                }
-                defer { group.cancelAll() }
-                guard let result = try await group.next() else {
-                    throw CancellationError()
-                }
-                return result
-            }
+            output = try await probeVersion(
+                executable: executable,
+                deadline: deadline
+            )
         } catch let error as CodexExecutableResolverError {
             throw error
         } catch is CancellationError {
@@ -129,6 +129,42 @@ public struct CodexExecutableResolver: Sendable {
             executable: executable,
             version: version
         )
+    }
+
+    private func probeVersion(
+        executable: URL,
+        deadline: ContinuousClock.Instant
+    ) async throws -> String {
+        let race = CodexVersionProbeRace()
+        let probe = Task { [versionProbe] in
+            do {
+                let output = try await versionProbe.versionOutput(
+                    executable: executable,
+                    deadline: deadline
+                )
+                await race.resolve(.success(output))
+            } catch {
+                await race.resolve(.failure(error))
+            }
+        }
+        let timeout = Task {
+            do {
+                try await ContinuousClock().sleep(until: deadline)
+                await race.resolve(.failure(
+                    CodexExecutableResolverError.probeTimedOut
+                ))
+            } catch {
+                // The winner cancels this unstructured deadline task.
+            }
+        }
+        let outcome = await withTaskCancellationHandler {
+            await race.wait()
+        } onCancel: {
+            Task { await race.resolve(.failure(CancellationError())) }
+        }
+        probe.cancel()
+        timeout.cancel()
+        return try outcome.get()
     }
 
     private var candidateURLs: [URL] {
@@ -164,6 +200,25 @@ public struct CodexExecutableResolver: Sendable {
     }
 }
 
+private actor CodexVersionProbeRace {
+    typealias Outcome = Result<String, any Error>
+
+    private var outcome: Outcome?
+    private var waiter: CheckedContinuation<Outcome, Never>?
+
+    func wait() async -> Outcome {
+        if let outcome { return outcome }
+        return await withCheckedContinuation { waiter = $0 }
+    }
+
+    func resolve(_ outcome: Outcome) {
+        guard self.outcome == nil else { return }
+        self.outcome = outcome
+        waiter?.resume(returning: outcome)
+        waiter = nil
+    }
+}
+
 public struct FoundationCodexVersionProbe: CodexVersionProbing, Sendable {
     public init() {}
 
@@ -191,6 +246,10 @@ public struct FoundationCodexVersionProbe: CodexVersionProbing, Sendable {
                 }
             case .standardError:
                 break
+            case .outputOverflow:
+                await process.terminate()
+                _ = await process.waitForTermination()
+                throw CodexExecutableResolverError.versionProbeFailed
             case let .terminated(exitCode):
                 _ = await process.waitForTermination()
                 guard exitCode == 0 else {

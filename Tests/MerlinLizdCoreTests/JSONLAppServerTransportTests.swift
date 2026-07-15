@@ -3,6 +3,82 @@ import Testing
 
 @Suite("app-server transport", .serialized)
 struct JSONLAppServerTransportTests {
+    @Test("concurrent starts join one successful process start")
+    func concurrentStartsJoinSuccess() async throws {
+        let process = ScriptedAppServerProcess(gateStart: true)
+        let transport = JSONLAppServerTransport(process: process)
+        let first = Task { try await transport.start() }
+        await process.waitForStartCount(1)
+        let second = Task { try await transport.start() }
+        await Task.yield()
+        #expect(await process.startCallCount() == 1)
+        await process.releaseStart()
+
+        try await first.value
+        try await second.value
+        #expect(await transport.isRunningForTesting)
+        await transport.shutdown()
+    }
+
+    @Test("concurrent starts join one process failure")
+    func concurrentStartsJoinFailure() async {
+        let process = ScriptedAppServerProcess(
+            failStart: true,
+            gateStart: true
+        )
+        let transport = JSONLAppServerTransport(process: process)
+        let first = Task { try await transport.start() }
+        await process.waitForStartCount(1)
+        let second = Task { try await transport.start() }
+        await process.releaseStart()
+
+        await #expect(throws: JSONLAppServerTransportError.launchFailed) {
+            try await first.value
+        }
+        await #expect(throws: JSONLAppServerTransportError.launchFailed) {
+            try await second.value
+        }
+        #expect(await process.startCallCount() == 1)
+        await transport.shutdown()
+    }
+
+    @Test("shutdown during start wins over every late start completion")
+    func shutdownWinsStartingRace() async {
+        let process = ScriptedAppServerProcess(gateStart: true)
+        let transport = JSONLAppServerTransport(process: process)
+        let starting = Task { try await transport.start() }
+        await process.waitForStartCount(1)
+
+        await transport.shutdown()
+        await process.releaseStart()
+
+        await #expect(throws: JSONLAppServerTransportError.stopped) {
+            try await starting.value
+        }
+        #expect(await transport.isRunningForTesting == false)
+        let counts = await process.lifecycleCounts()
+        #expect(counts.terminate == 1)
+        #expect(counts.wait == 1)
+    }
+
+    @Test("cancelled start caller cannot poison the shared start")
+    func cancelledStartCallerDoesNotPoisonSharedStart() async throws {
+        let process = ScriptedAppServerProcess(gateStart: true)
+        let transport = JSONLAppServerTransport(process: process)
+        let cancelled = Task { try await transport.start() }
+        await process.waitForStartCount(1)
+        let joined = Task { try await transport.start() }
+        cancelled.cancel()
+        await process.releaseStart()
+
+        await #expect(throws: CancellationError.self) {
+            try await cancelled.value
+        }
+        try await joined.value
+        #expect(await transport.isRunningForTesting)
+        await transport.shutdown()
+    }
+
     @Test("start failures and duplicate starts use bounded lifecycle errors")
     func startErrorsAreTyped() async throws {
         let failed = JSONLAppServerTransport(
@@ -39,7 +115,40 @@ struct JSONLAppServerTransportTests {
         #expect(result.elapsed < .seconds(2))
     }
 
-    @Test("correlates concurrent responses with integer and numeric string IDs")
+    @Test("unconsumed output fails explicitly without blocking process reap")
+    func concreteProcessOutputBackpressureIsBounded() async throws {
+        let result = try await exerciseUnconsumedOutputProcess()
+        #expect(result.completedBeforeConsumption)
+        #expect(result.sawOverflow)
+    }
+
+    @Test("a blocked stdin write cannot delay termination")
+    func concreteProcessBlockedWriteDoesNotBlockTermination() async throws {
+        let result = try await exerciseBlockedStdinTermination()
+        #expect(result.terminationWasPrompt)
+        #expect(result.writeFailed)
+    }
+
+    @Test("descendants retaining pipes cannot delay leader reap")
+    func concreteProcessDescendantPipeLifetimeIsBounded() async throws {
+        #expect(try await exerciseDescendantPipeLifetimeIsBounded())
+    }
+
+    @Test("concurrent stdin writes are acknowledged in FIFO order")
+    func concreteProcessWritesAreFIFO() async throws {
+        let result = try await exerciseFIFOProcessWrites()
+        #expect(result.outputByteCount == result.expectedByteCount)
+        #expect(result.matches)
+    }
+
+    @Test("launch failure and termination close every owned descriptor")
+    func concreteProcessClosesDescriptors() async throws {
+        let deltas = try await exerciseProcessDescriptorCleanup()
+        #expect(deltas.afterLaunchFailures <= 2)
+        #expect(deltas.afterTermination <= 2)
+    }
+
+    @Test("correlates concurrent integer responses")
     func correlatesConcurrentResponses() async throws {
         let process = ScriptedAppServerProcess()
         let transport = JSONLAppServerTransport(process: process)
@@ -61,7 +170,7 @@ struct JSONLAppServerTransportTests {
         let secondID = try #require(methodsByID.first(where: { $0.value == "second" })?.key)
 
         await process.emit(.standardOutput(jsonLine(
-            "{\"jsonrpc\":\"2.0\",\"id\":\"\(secondID)\",\"result\":{\"value\":2},\"extra\":true}"
+            "{\"jsonrpc\":\"2.0\",\"id\":\(secondID),\"result\":{\"value\":2},\"extra\":true}"
         )))
         await process.emit(.standardOutput(jsonLine(
             "{\"jsonrpc\":\"2.0\",\"id\":\(firstID),\"result\":{\"value\":1}}"
@@ -69,6 +178,28 @@ struct JSONLAppServerTransportTests {
 
         #expect(try await first.value == .object(["value": .number(1)]))
         #expect(try await second.value == .object(["value": .number(2)]))
+        await transport.shutdown()
+    }
+
+    @Test("string response ID never correlates an integer request ID")
+    func responseIDTypesAreExact() async throws {
+        let process = ScriptedAppServerProcess()
+        let transport = JSONLAppServerTransport(process: process)
+        try await transport.start()
+        let request = Task { try await transport.request(method: "exact") }
+        await process.waitForWriteCount(1)
+
+        await process.emit(.standardOutput(jsonLine(
+            "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"result\":\"wrong\"}"
+        )))
+        while await transport.processedLineCountForTesting == 0 {
+            await Task.yield()
+        }
+        #expect(await transport.pendingRequestCountForTesting == 1)
+        await process.emit(.standardOutput(jsonLine(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"right\"}"
+        )))
+        #expect(try await request.value == .string("right"))
         await transport.shutdown()
     }
 
@@ -222,6 +353,69 @@ struct JSONLAppServerTransportTests {
         #expect(await transport.pendingRequestCountForTesting == 0)
     }
 
+    @Test("terminal failure discards every queued server message")
+    func failureDiscardsQueuedServerMessages() async throws {
+        let process = ScriptedAppServerProcess()
+        let transport = JSONLAppServerTransport(
+            process: process,
+            knownServerRequestMethods: ["item/tool/call"]
+        )
+        try await transport.start()
+        await process.emit(.standardOutput(jsonLine(
+            "{\"jsonrpc\":\"2.0\",\"id\":\"queued\",\"method\":\"item/tool/call\"}"
+        )))
+        await process.emit(.standardOutput(testData("malformed\n")))
+        while await transport.processedLineCountForTesting < 2 {
+            await Task.yield()
+        }
+
+        await #expect(throws: JSONLAppServerTransportError.invalidMessage) {
+            try await transport.nextServerMessage()
+        }
+        #expect(await transport.queuedMessageCountForTesting == 0)
+    }
+
+    @Test("shutdown discards queued server messages")
+    func shutdownDiscardsQueuedServerMessages() async throws {
+        let process = ScriptedAppServerProcess()
+        let transport = JSONLAppServerTransport(process: process)
+        try await transport.start()
+        await process.emit(.standardOutput(jsonLine(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"queued\"}"
+        )))
+        while await transport.processedLineCountForTesting == 0 {
+            await Task.yield()
+        }
+        await transport.shutdown()
+
+        await #expect(throws: JSONLAppServerTransportError.stopped) {
+            try await transport.nextServerMessage()
+        }
+        #expect(await transport.queuedMessageCountForTesting == 0)
+    }
+
+    @Test("a second message stream can never replace the first consumer")
+    func messageConsumerLeaseIsPermanent() async throws {
+        let process = ScriptedAppServerProcess()
+        let transport = JSONLAppServerTransport(process: process)
+        try await transport.start()
+        let first = transport.messages()
+        var firstIterator = first.makeAsyncIterator()
+        await process.emit(.standardOutput(jsonLine(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"first\"}"
+        )))
+        _ = try await firstIterator.next()
+
+        let second = transport.messages()
+        var secondIterator = second.makeAsyncIterator()
+        await #expect(
+            throws: JSONLAppServerTransportError.messageConsumerAlreadyWaiting
+        ) {
+            try await secondIterator.next()
+        }
+        await transport.shutdown()
+    }
+
     @Test("invalid UTF-8 and empty protocol lines fail closed")
     func invalidLinesFailClosed() async throws {
         for bytes in [testBytes([0xFF, 0x0A]), testBytes([0x0A])] {
@@ -254,6 +448,69 @@ struct JSONLAppServerTransportTests {
             try await request.value
         }
         #expect(await transport.bufferedStandardOutputBytesForTesting == 0)
+        #expect(
+            await transport.maximumBufferedStandardOutputBytesForTesting
+                <= JSONLAppServerTransport.maximumLineBytes
+        )
+    }
+
+    @Test("inbound line limit accepts the exact boundary")
+    func acceptsExactInboundLineBoundary() async throws {
+        let response = testData(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":true}"
+        )
+        let process = ScriptedAppServerProcess()
+        let transport = JSONLAppServerTransport(
+            process: process,
+            maximumLineBytes: response.count
+        )
+        try await transport.start()
+        let request = Task { try await transport.request(method: "m") }
+        await process.waitForWriteCount(1)
+        await process.emit(.standardOutput(response + testBytes([0x0A])))
+
+        #expect(try await request.value == .bool(true))
+        await transport.shutdown()
+    }
+
+    @Test("outbound line limit includes newline and is exact")
+    func boundsOutboundLinesExactly() async throws {
+        let exactProcess = ScriptedAppServerProcess()
+        let exact = JSONLAppServerTransport(
+            process: exactProcess,
+            maximumLineBytes: 64
+        )
+        try await exact.start()
+        let accepted = Task {
+            try await exact.request(
+                method: "m",
+                params: .string(String(repeating: "x", count: 14))
+            )
+        }
+        await exactProcess.waitForWriteCount(1)
+        #expect((await exactProcess.writtenData()[0]).count == 64)
+        accepted.cancel()
+        _ = try? await accepted.value
+        await exact.shutdown()
+
+        let rejectedProcess = ScriptedAppServerProcess()
+        let rejected = JSONLAppServerTransport(
+            process: rejectedProcess,
+            maximumLineBytes: 64
+        )
+        try await rejected.start()
+        await #expect(
+            throws: JSONLAppServerTransportError.outboundLineTooLarge(
+                maximumBytes: 64
+            )
+        ) {
+            try await rejected.request(
+                method: "m",
+                params: .string(String(repeating: "x", count: 15))
+            )
+        }
+        #expect((await rejectedProcess.writtenData()).isEmpty)
+        await rejected.shutdown()
     }
 
     @Test("stderr retains only the deterministic final 64 KiB")
@@ -297,6 +554,24 @@ struct JSONLAppServerTransportTests {
             }
             #expect(await transport.pendingRequestCountForTesting == 0)
             #expect(!String(describing: await transport.failureForTesting).contains("secret-token"))
+        }
+    }
+
+    @Test("process output overflow fails every pending request explicitly")
+    func processOutputOverflowFailsPending() async throws {
+        let process = ScriptedAppServerProcess()
+        let transport = JSONLAppServerTransport(process: process)
+        try await transport.start()
+        let request = Task { try await transport.request(method: "pending") }
+        await process.waitForWriteCount(1)
+        await process.emit(.outputOverflow(maximumBufferedEvents: 32))
+
+        await #expect(
+            throws: JSONLAppServerTransportError.processOutputOverflow(
+                maximumBufferedEvents: 32
+            )
+        ) {
+            try await request.value
         }
     }
 

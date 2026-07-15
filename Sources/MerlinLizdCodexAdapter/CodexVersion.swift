@@ -17,7 +17,11 @@ public struct CodexVersion: Codable, Comparable, Sendable {
     }
 
     public static func parse(commandOutput: String) throws -> Self {
-        let pattern = #"\Acodex-cli ([0-9]+)\.([0-9]+)\.([0-9]+)\r?\n?\z"#
+        let number = #"(?:0|[1-9][0-9]*)"#
+        let pattern = #"\Acodex-cli ("# + number
+            + #")\.("# + number
+            + #")\.("# + number
+            + #")(?:\r\n|\n)?\z"#
         guard let expression = try? NSRegularExpression(pattern: pattern),
             let match = expression.firstMatch(
                 in: commandOutput,

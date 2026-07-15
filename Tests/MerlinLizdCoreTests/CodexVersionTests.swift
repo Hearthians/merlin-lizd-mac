@@ -13,6 +13,10 @@ struct CodexVersionTests {
             try CodexVersion.parse(commandOutput: "codex-cli 0.144.2")
                 == CodexVersion(major: 0, minor: 144, patch: 2)
         )
+        #expect(
+            try CodexVersion.parse(commandOutput: "codex-cli 0.144.2\r\n")
+                == CodexVersion(major: 0, minor: 144, patch: 2)
+        )
         #expect(throws: CodexVersionParseError.self) {
             try CodexVersion.parse(commandOutput: "codex 0.144.2\n")
         }
@@ -24,6 +28,16 @@ struct CodexVersionTests {
         }
         #expect(throws: CodexVersionParseError.self) {
             try CodexVersion.parse(commandOutput: "codex-cli 0.144.2 extra\n")
+        }
+        for malformed in [
+            "codex-cli 00.144.2\n",
+            "codex-cli 0.0144.2\n",
+            "codex-cli 0.144.02\n",
+            "codex-cli 0.144.2\r",
+        ] {
+            #expect(throws: CodexVersionParseError.self) {
+                try CodexVersion.parse(commandOutput: malformed)
+            }
         }
     }
 
@@ -92,11 +106,16 @@ struct CodexVersionTests {
         ])
     }
 
-    @Test("foundation executable check rejects directories")
+    @Test("foundation executable check resolves symlinks and rejects special files")
     func executableCheckRequiresAFile() throws {
         let result = try exerciseFoundationExecutableChecker()
         #expect(!result.directoryAccepted)
         #expect(result.fileAccepted)
+        #expect(!result.fifoAccepted)
+        #expect(!result.socketAccepted)
+        #expect(!result.deviceAccepted)
+        #expect(result.symlinkAccepted)
+        #expect(result.resolvedSymlinkPath == result.filePath)
     }
 
     @Test("resolver reports a typed error when no candidate is executable")
@@ -169,6 +188,36 @@ struct CodexVersionTests {
         await #expect(throws: CodexExecutableResolverError.self) {
             try await resolver.resolve()
         }
+        let cancellationDeadline = ContinuousClock.now.advanced(
+            by: .milliseconds(100)
+        )
+        while await !probe.wasCancelled(),
+            ContinuousClock.now < cancellationDeadline
+        {
+            await Task.yield()
+        }
         #expect(await probe.wasCancelled())
+    }
+
+    @Test("version probe deadline returns even when the probe ignores cancellation")
+    func timeoutDoesNotAwaitCancellationIgnoringProbe() async {
+        let probe = ScriptedCodexVersionProbe(
+            ignoreCancellationFor: .milliseconds(500)
+        )
+        let resolver = CodexExecutableResolver(
+            override: testURL("/codex"),
+            environment: [:],
+            homeDirectory: testURL("/Users/test"),
+            fileChecker: ScriptedCodexFileChecker(executablePaths: ["/codex"]),
+            versionProbe: probe,
+            probeTimeout: .milliseconds(10)
+        )
+        let clock = ContinuousClock()
+        let started = clock.now
+
+        await #expect(throws: CodexExecutableResolverError.probeTimedOut) {
+            try await resolver.resolve()
+        }
+        #expect(started.duration(to: clock.now) < .milliseconds(200))
     }
 }
