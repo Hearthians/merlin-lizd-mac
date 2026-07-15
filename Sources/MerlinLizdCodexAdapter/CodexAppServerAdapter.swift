@@ -42,6 +42,7 @@ struct CodexAppServerAdapterStateCounts: Equatable, Sendable {
     let replayEvents: Int
     let bufferedNotifications: Int
     let pendingResumes: Int
+    let pendingDeletes: Int
     let eventSubscribers: Int
     let availabilitySubscribers: Int
 }
@@ -75,6 +76,13 @@ public actor CodexAppServerAdapter: CodexAgentClient {
     private struct PendingResume: Sendable {
         let token: UUID
         let requestTask: Task<JSONValue, Error>
+        let priorActiveTurnID: AgentTurnID?
+        var notifications: [BufferedTurnNotification]
+        var overflowed: Bool
+    }
+
+    private struct PendingDelete: Sendable {
+        let token: UUID
         let priorActiveTurnID: AgentTurnID?
         var notifications: [BufferedTurnNotification]
         var overflowed: Bool
@@ -114,7 +122,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
     private var activeTurns: [AgentThreadID: AgentTurnID] = [:]
     private var pendingTurnStarts: [AgentThreadID: PendingTurnStart] = [:]
     private var pendingResumes: [AgentThreadID: PendingResume] = [:]
-    private var deletingThreads: Set<AgentThreadID> = []
+    private var pendingDeletes: [AgentThreadID: PendingDelete] = [:]
     private var inFlightServerRequests: [JSONRPCID: InFlightServerRequest] = [:]
     private var activeCallIDs: [String: JSONRPCID] = [:]
     private var completedServerRequestIDs: Set<JSONRPCID> = []
@@ -235,7 +243,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         guard await mappingStore.contains(threadID) else {
             throw CodexAppServerAdapterError.unmappedThread
         }
-        guard !deletingThreads.contains(threadID) else {
+        guard pendingDeletes[threadID] == nil else {
             throw CodexAppServerAdapterError.invalidResponse
         }
         guard pendingTurnStarts[threadID] == nil else {
@@ -245,7 +253,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
             throw CodexAppServerAdapterError.resumeAlreadyInProgress
         }
         try await ensureReady()
-        guard !stopped, !deletingThreads.contains(threadID) else {
+        guard !stopped, pendingDeletes[threadID] == nil else {
             throw CodexAppServerAdapterError.stopped
         }
         guard pendingTurnStarts[threadID] == nil else {
@@ -277,7 +285,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
             }
             guard let pending = pendingResumes[threadID],
                 pending.token == token,
-                !deletingThreads.contains(threadID),
+                pendingDeletes[threadID] == nil,
                 !stopped
             else {
                 throw CodexAppServerAdapterError.invalidResponse
@@ -299,7 +307,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
                 let current = pendingResumes[threadID],
                 current.token == token,
                 !current.overflowed,
-                !deletingThreads.contains(threadID),
+                pendingDeletes[threadID] == nil,
                 !stopped
             else {
                 throw CodexAppServerAdapterError.invalidResponse
@@ -343,7 +351,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
             throw CodexAppServerAdapterError.unmappedThread
         }
         try await ensureReady()
-        guard !deletingThreads.contains(threadID), !stopped else {
+        guard pendingDeletes[threadID] == nil, !stopped else {
             throw CodexAppServerAdapterError.invalidResponse
         }
         guard pendingResumes[threadID] == nil else {
@@ -381,7 +389,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         guard let pending = pendingTurnStarts[threadID],
             pending.token == token,
             !pending.overflowed,
-            !deletingThreads.contains(threadID),
+            pendingDeletes[threadID] == nil,
             !stopped,
             let turnID = turnID(in: result)
         else {
@@ -408,7 +416,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
             throw CodexAppServerAdapterError.unmappedThread
         }
         try await ensureReady()
-        guard !deletingThreads.contains(threadID), !stopped,
+        guard pendingDeletes[threadID] == nil, !stopped,
             activeTurns[threadID] == turnID
         else { throw CodexAppServerAdapterError.invalidResponse }
         let result = try await request(
@@ -423,7 +431,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
             fields["turnId"]?.nonemptyString == turnID.rawValue,
             await mappingStore.contains(threadID)
         else { throw CodexAppServerAdapterError.invalidResponse }
-        guard !deletingThreads.contains(threadID), !stopped,
+        guard pendingDeletes[threadID] == nil, !stopped,
             activeTurns[threadID] == turnID
         else { throw CodexAppServerAdapterError.invalidResponse }
         publish(.userMessage(prompt), for: threadID)
@@ -495,9 +503,16 @@ public actor CodexAppServerAdapter: CodexAgentClient {
     }
 
     public func deleteThread(_ threadID: AgentThreadID) async throws {
-        guard deletingThreads.insert(threadID).inserted else {
+        guard pendingDeletes[threadID] == nil else {
             throw CodexAppServerAdapterError.invalidResponse
         }
+        let token = UUID()
+        pendingDeletes[threadID] = PendingDelete(
+            token: token,
+            priorActiveTurnID: activeTurns[threadID],
+            notifications: [],
+            overflowed: false
+        )
         cancelPendingTurnStart(for: threadID)
         cancelPendingResume(for: threadID)
         do {
@@ -509,19 +524,19 @@ public actor CodexAppServerAdapter: CodexAgentClient {
                 method: "thread/delete",
                 params: .object(["threadId": .string(threadID.rawValue)])
             )
-            guard deletingThreads.contains(threadID), !stopped else {
+            guard pendingDeletes[threadID]?.token == token, !stopped else {
                 throw CodexAppServerAdapterError.invalidResponse
             }
+            await mappingStore.remove(threadID)
+            guard pendingDeletes[threadID]?.token == token, !stopped else {
+                throw CodexAppServerAdapterError.invalidResponse
+            }
+            pendingDeletes.removeValue(forKey: threadID)
             activeTurns.removeValue(forKey: threadID)
             knownThreads.remove(threadID)
-            await mappingStore.remove(threadID)
-            guard deletingThreads.contains(threadID), !stopped else {
-                throw CodexAppServerAdapterError.invalidResponse
-            }
-            deletingThreads.remove(threadID)
             finishEvents(for: threadID)
         } catch {
-            deletingThreads.remove(threadID)
+            recoverFailedDelete(threadID: threadID, token: token)
             throw normalized(error)
         }
     }
@@ -533,6 +548,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         consumerTask?.cancel()
         cancelAllPendingTurnStarts()
         cancelAllPendingResumes()
+        pendingDeletes.removeAll()
         await cancelAndDrainServerRequests()
         await transport.shutdown()
         if let consumerTask { await consumerTask.value }
@@ -541,7 +557,6 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         startupTask = nil
         activeTurns.removeAll()
         knownThreads.removeAll()
-        deletingThreads.removeAll()
         setAvailability(.stopped)
         for threadID in Set(eventContinuations.keys).union(eventReplay.keys) {
             finishEvents(for: threadID)
@@ -583,8 +598,11 @@ public actor CodexAppServerAdapter: CodexAgentClient {
                 $0 + $1.notifications.count
             } + pendingResumes.values.reduce(0) {
                 $0 + $1.notifications.count
+            } + pendingDeletes.values.reduce(0) {
+                $0 + $1.notifications.count
             },
             pendingResumes: pendingResumes.count,
+            pendingDeletes: pendingDeletes.count,
             eventSubscribers: eventContinuations.values.reduce(0) {
                 $0 + $1.count
             },
@@ -680,7 +698,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
             throw CodexAppServerAdapterError.unmappedThread
         }
         try await ensureReady()
-        guard !deletingThreads.contains(threadID), !stopped else {
+        guard pendingDeletes[threadID] == nil, !stopped else {
             throw CodexAppServerAdapterError.invalidResponse
         }
         _ = try await request(
@@ -690,7 +708,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         guard await mappingStore.contains(threadID) else {
             throw CodexAppServerAdapterError.invalidResponse
         }
-        guard !deletingThreads.contains(threadID), !stopped
+        guard pendingDeletes[threadID] == nil, !stopped
         else { throw CodexAppServerAdapterError.invalidResponse }
     }
 
@@ -856,7 +874,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         }
         let threadID = AgentThreadID(rawValue: threadText)
         guard await mappingStore.contains(threadID),
-            !deletingThreads.contains(threadID),
+            pendingDeletes[threadID] == nil,
             !stopped,
             !requireKnownThread || knownThreads.contains(threadID)
         else {
@@ -1033,7 +1051,11 @@ public actor CodexAppServerAdapter: CodexAgentClient {
             params: params
         ) else { return }
         let threadID = notification.threadID
-        guard !deletingThreads.contains(threadID), !stopped else { return }
+        guard !stopped else { return }
+        if pendingDeletes[threadID] != nil {
+            bufferDeleteNotification(notification)
+            return
+        }
         guard knownThreads.contains(threadID)
             || pendingResumes[threadID] != nil
         else { return }
@@ -1085,7 +1107,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
     ) {
         let threadID = notification.threadID
         let turnID = notification.turnID
-        guard !deletingThreads.contains(threadID),
+        guard pendingDeletes[threadID] == nil,
             knownThreads.contains(threadID),
             activeTurns[threadID] == turnID,
             case let .object(fields)? = notification.params
@@ -1193,6 +1215,9 @@ public actor CodexAppServerAdapter: CodexAgentClient {
     ) {
         let threadID = notification.threadID
         guard var pending = pendingResumes[threadID] else { return }
+        if let priorActiveTurnID = pending.priorActiveTurnID {
+            guard notification.turnID == priorActiveTurnID else { return }
+        }
         guard pending.notifications.count
             < Self.maximumBufferedTurnNotifications
         else {
@@ -1202,6 +1227,25 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         }
         pending.notifications.append(notification)
         pendingResumes[threadID] = pending
+    }
+
+    private func bufferDeleteNotification(
+        _ notification: BufferedTurnNotification
+    ) {
+        let threadID = notification.threadID
+        guard var pending = pendingDeletes[threadID],
+            let priorActiveTurnID = pending.priorActiveTurnID,
+            notification.turnID == priorActiveTurnID
+        else { return }
+        guard pending.notifications.count
+            < Self.maximumBufferedTurnNotifications
+        else {
+            pending.overflowed = true
+            pendingDeletes[threadID] = pending
+            return
+        }
+        pending.notifications.append(notification)
+        pendingDeletes[threadID] = pending
     }
 
     private func removePendingTurnStart(
@@ -1257,14 +1301,39 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         for resume in pending { resume.requestTask.cancel() }
     }
 
+    private func recoverFailedDelete(
+        threadID: AgentThreadID,
+        token: UUID
+    ) {
+        guard let pending = pendingDeletes[threadID],
+            pending.token == token
+        else { return }
+        pendingDeletes.removeValue(forKey: threadID)
+        guard let priorActiveTurnID = pending.priorActiveTurnID,
+            activeTurns[threadID] == priorActiveTurnID
+        else { return }
+        if pending.overflowed {
+            activeTurns.removeValue(forKey: threadID)
+            publishLive(
+                .turnFailed(priorActiveTurnID, .protocolFailure),
+                for: threadID
+            )
+            return
+        }
+        for notification in pending.notifications {
+            processOwnedNotification(notification)
+        }
+    }
+
     private func consumerFailed() async {
         guard !stopped else { return }
         serverRequestResponsesEnabled = false
         cancelAllPendingTurnStarts()
         cancelAllPendingResumes()
-        await cancelAndDrainServerRequests()
+        pendingDeletes.removeAll()
         let failedTurns = activeTurns
         activeTurns.removeAll()
+        await cancelAndDrainServerRequests()
         setAvailability(.crashed)
         for (threadID, turnID) in failedTurns {
             publishLive(.turnFailed(turnID, .crashed), for: threadID)

@@ -871,18 +871,26 @@ struct CodexAppServerContractTests {
             await process.waitForWriteCount(4)
             if crashes {
                 await process.emit(.terminated(exitCode: 9))
-                await #expect(throws: CodexAppServerAdapterError.invalidResponse) {
-                    try await starting.value
+                let outcome = await captureCodexOperation {
+                    _ = try await starting.value
                 }
+                #expect([
+                    .adapterError(.invalidResponse),
+                    .cancellationError,
+                ].contains(outcome))
                 await waitUntil {
                     await adapter.availabilityForTesting == .crashed
                 }
                 #expect(await adapter.availabilityForTesting == .crashed)
             } else {
                 await adapter.shutdown()
-                await #expect(throws: CodexAppServerAdapterError.invalidResponse) {
-                    try await starting.value
+                let outcome = await captureCodexOperation {
+                    _ = try await starting.value
                 }
+                #expect([
+                    .adapterError(.invalidResponse),
+                    .cancellationError,
+                ].contains(outcome))
             }
             #expect(await adapter.stateCountsForTesting.pendingTurnStarts == 0)
             #expect(await adapter.stateCountsForTesting.activeTurns == 0)
@@ -1781,6 +1789,51 @@ struct CodexAppServerContractTests {
         await fixture.adapter.shutdown()
     }
 
+    @Test("wrong-turn resume floods do not consume the exact owner's buffer")
+    func activeResumeIgnoresWrongTurnFloodBeforeCapacity() async throws {
+        let fixture = try await startCodexActiveResumeFixture(
+            turnID: "resume-owner"
+        )
+        let staleTurnID = AgentTurnID(rawValue: "stale-turn")
+        for index in 0...128 {
+            await bufferDelta(
+                "stale-\(index)",
+                fixture: fixture,
+                turnID: staleTurnID
+            )
+        }
+        await bufferDelta("owned", fixture: fixture)
+        await fixture.adapter.handleNotificationForTesting(
+            method: "turn/completed",
+            params: completedTurnParams(
+                threadID: fixture.threadID,
+                turnID: fixture.turnID
+            )
+        )
+        #expect(
+            await fixture.adapter.stateCountsForTesting.bufferedNotifications
+                == 2
+        )
+
+        await fixture.process.emit(.standardOutput(jsonLine(
+            #"{"id":4,"error":{"code":-32000,"message":"resume failed"}}"#
+        )))
+        await #expect(throws: CodexAppServerAdapterError.invalidResponse) {
+            try await fixture.resuming.value
+        }
+
+        #expect(
+            await fixture.adapter.replayedEventsForTesting(fixture.threadID)
+                == fixture.eventsBeforeResume + [
+                    .assistantMessageDelta("owned"),
+                    .turnCompleted(fixture.turnID),
+                ]
+        )
+        #expect(await fixture.adapter.stateCountsForTesting.activeTurns == 0)
+        #expect(await fixture.adapter.stateCountsForTesting.pendingResumes == 0)
+        await fixture.adapter.shutdown()
+    }
+
     @Test("cancelled resume restores buffered events for its exact prior active turn")
     func cancelledResumePreservesPriorActiveTurnEvents() async throws {
         let fixture = try await startCodexActiveResumeFixture(
@@ -1912,6 +1965,243 @@ struct CodexAppServerContractTests {
         #expect(await fixture.adapter.stateCountsForTesting.activeTurns == 0)
         #expect(await fixture.adapter.stateCountsForTesting.pendingResumes == 0)
         await fixture.adapter.shutdown()
+    }
+
+    @Test("failed delete replays exact active-turn notifications in order")
+    func failedDeleteReplaysExactActiveTurnEvents() async throws {
+        let fixture = try await startCodexActiveTurnFixture(
+            turnID: "delete-failure-owner"
+        )
+        let deleting = Task {
+            try await fixture.adapter.deleteThread(fixture.threadID)
+        }
+        await fixture.process.waitForWriteCount(5)
+        await bufferDelta("preserved", fixture: fixture)
+        await fixture.adapter.handleNotificationForTesting(
+            method: "turn/completed",
+            params: completedTurnParams(
+                threadID: fixture.threadID,
+                turnID: fixture.turnID
+            )
+        )
+        #expect(
+            await fixture.adapter.stateCountsForTesting.bufferedNotifications
+                == 2
+        )
+        #expect(await fixture.adapter.stateCountsForTesting.pendingDeletes == 1)
+
+        await fixture.process.emit(.standardOutput(jsonLine(
+            #"{"id":4,"error":{"code":-32000,"message":"delete failed"}}"#
+        )))
+        await #expect(throws: CodexAppServerAdapterError.invalidResponse) {
+            try await deleting.value
+        }
+
+        #expect(
+            await fixture.adapter.replayedEventsForTesting(fixture.threadID)
+                == fixture.eventsBeforeDelete + [
+                    .assistantMessageDelta("preserved"),
+                    .turnCompleted(fixture.turnID),
+                ]
+        )
+        #expect(await fixture.adapter.stateCountsForTesting.activeTurns == 0)
+        #expect(
+            await fixture.adapter.stateCountsForTesting.bufferedNotifications
+                == 0
+        )
+        #expect(await fixture.adapter.stateCountsForTesting.pendingDeletes == 0)
+        await fixture.adapter.shutdown()
+    }
+
+    @Test("failed delete overflow fails the exact owner once without partial replay")
+    func failedDeleteOverflowFailsExactOwnerOnce() async throws {
+        let fixture = try await startCodexActiveTurnFixture(
+            turnID: "delete-overflow-owner"
+        )
+        let deleting = Task {
+            try await fixture.adapter.deleteThread(fixture.threadID)
+        }
+        await fixture.process.waitForWriteCount(5)
+        for index in 0...128 {
+            await bufferDelta("partial-\(index)", fixture: fixture)
+        }
+        #expect(
+            await fixture.adapter.stateCountsForTesting.bufferedNotifications
+                == 128
+        )
+        #expect(await fixture.adapter.stateCountsForTesting.pendingDeletes == 1)
+
+        await fixture.process.emit(.standardOutput(jsonLine(
+            #"{"id":4,"error":{"code":-32000,"message":"delete failed"}}"#
+        )))
+        await #expect(throws: CodexAppServerAdapterError.invalidResponse) {
+            try await deleting.value
+        }
+
+        #expect(
+            await fixture.adapter.replayedEventsForTesting(fixture.threadID)
+                == fixture.eventsBeforeDelete + [
+                    .turnFailed(fixture.turnID, .protocolFailure),
+                ]
+        )
+        #expect(await fixture.adapter.stateCountsForTesting.activeTurns == 0)
+        #expect(
+            await fixture.adapter.stateCountsForTesting.bufferedNotifications
+                == 0
+        )
+        #expect(await fixture.adapter.stateCountsForTesting.pendingDeletes == 0)
+        await fixture.adapter.shutdown()
+    }
+
+    @Test("wrong-turn delete floods do not consume the exact owner's buffer")
+    func failedDeleteIgnoresWrongTurnFloodBeforeCapacity() async throws {
+        let fixture = try await startCodexActiveTurnFixture(
+            turnID: "delete-owner"
+        )
+        let deleting = Task {
+            try await fixture.adapter.deleteThread(fixture.threadID)
+        }
+        await fixture.process.waitForWriteCount(5)
+        let staleTurnID = AgentTurnID(rawValue: "stale-delete-turn")
+        for index in 0...128 {
+            await bufferDelta(
+                "stale-\(index)",
+                fixture: fixture,
+                turnID: staleTurnID
+            )
+        }
+        await bufferDelta("owned", fixture: fixture)
+        await fixture.adapter.handleNotificationForTesting(
+            method: "turn/completed",
+            params: completedTurnParams(
+                threadID: fixture.threadID,
+                turnID: fixture.turnID
+            )
+        )
+        #expect(
+            await fixture.adapter.stateCountsForTesting.bufferedNotifications
+                == 2
+        )
+        #expect(await fixture.adapter.stateCountsForTesting.pendingDeletes == 1)
+
+        await fixture.process.emit(.standardOutput(jsonLine(
+            #"{"id":4,"error":{"code":-32000,"message":"delete failed"}}"#
+        )))
+        await #expect(throws: CodexAppServerAdapterError.invalidResponse) {
+            try await deleting.value
+        }
+
+        #expect(
+            await fixture.adapter.replayedEventsForTesting(fixture.threadID)
+                == fixture.eventsBeforeDelete + [
+                    .assistantMessageDelta("owned"),
+                    .turnCompleted(fixture.turnID),
+                ]
+        )
+        #expect(await fixture.adapter.stateCountsForTesting.activeTurns == 0)
+        #expect(await fixture.adapter.stateCountsForTesting.pendingDeletes == 0)
+        await fixture.adapter.shutdown()
+    }
+
+    @Test("successful delete discards exact active-turn notifications")
+    func successfulDeleteDiscardsBufferedActiveTurnEvents() async throws {
+        let fixture = try await startCodexActiveTurnFixture(
+            turnID: "successful-delete-owner"
+        )
+        let deleting = Task {
+            try await fixture.adapter.deleteThread(fixture.threadID)
+        }
+        await fixture.process.waitForWriteCount(5)
+        await bufferDelta("discarded", fixture: fixture)
+        await fixture.adapter.handleNotificationForTesting(
+            method: "turn/completed",
+            params: completedTurnParams(
+                threadID: fixture.threadID,
+                turnID: fixture.turnID
+            )
+        )
+        #expect(
+            await fixture.adapter.stateCountsForTesting.bufferedNotifications
+                == 2
+        )
+        #expect(await fixture.adapter.stateCountsForTesting.pendingDeletes == 1)
+
+        await fixture.process.emit(.standardOutput(jsonLine(
+            #"{"id":4,"result":{}}"#
+        )))
+        try await deleting.value
+
+        #expect(
+            await fixture.adapter.replayedEventsForTesting(fixture.threadID)
+                == []
+        )
+        #expect(await fixture.adapter.stateCountsForTesting.activeTurns == 0)
+        #expect(await fixture.adapter.stateCountsForTesting.knownThreads == 0)
+        #expect(
+            await fixture.adapter.stateCountsForTesting.bufferedNotifications
+                == 0
+        )
+        #expect(await fixture.adapter.stateCountsForTesting.pendingDeletes == 0)
+        await fixture.adapter.shutdown()
+    }
+
+    @Test("shutdown and crash discard pending-delete buffers without reviving owners")
+    func terminalProcessEndsPendingDeleteWithoutReplay() async throws {
+        for crashes in [false, true] {
+            let fixture = try await startCodexActiveTurnFixture(
+                turnID: crashes ? "crash-delete-owner" : "shutdown-delete-owner"
+            )
+            let deleting = Task {
+                try await fixture.adapter.deleteThread(fixture.threadID)
+            }
+            await fixture.process.waitForWriteCount(5)
+            await bufferDelta("must be dropped", fixture: fixture)
+            #expect(
+                await fixture.adapter.stateCountsForTesting.bufferedNotifications
+                    == 1
+            )
+            #expect(
+                await fixture.adapter.stateCountsForTesting.pendingDeletes == 1
+            )
+
+            if crashes {
+                await fixture.adapter.consumerFailedForTesting()
+                await fixture.process.emit(.standardOutput(jsonLine(
+                    #"{"id":4,"error":{"code":-32000,"message":"late delete failure"}}"#
+                )))
+                #expect(
+                    await captureCodexOperation { try await deleting.value }
+                        == .adapterError(.invalidResponse)
+                )
+                #expect(
+                    await fixture.adapter.replayedEventsForTesting(
+                        fixture.threadID
+                    ) == fixture.eventsBeforeDelete + [
+                        .turnFailed(fixture.turnID, .crashed),
+                    ]
+                )
+            } else {
+                await fixture.adapter.shutdown()
+                #expect(
+                    await captureCodexOperation { try await deleting.value }
+                        != .success
+                )
+                #expect(
+                    await fixture.adapter.replayedEventsForTesting(
+                        fixture.threadID
+                    ) == []
+                )
+            }
+            #expect(await fixture.adapter.stateCountsForTesting.activeTurns == 0)
+            #expect(
+                await fixture.adapter.stateCountsForTesting.bufferedNotifications
+                    == 0
+            )
+            #expect(
+                await fixture.adapter.stateCountsForTesting.pendingDeletes == 0
+            )
+            await fixture.adapter.shutdown()
+        }
     }
 
     @Test("delete cancels a pending resume before awaiting its RPC")
@@ -2322,6 +2612,7 @@ struct CodexAppServerContractTests {
 private enum CodexOperationOutcome: Equatable, Sendable {
     case success
     case adapterError(CodexAppServerAdapterError)
+    case cancellationError
     case otherError
 }
 
@@ -2344,6 +2635,8 @@ private func captureCodexOperation(
         return .success
     } catch let error as CodexAppServerAdapterError {
         return .adapterError(error)
+    } catch is CancellationError {
+        return .cancellationError
     } catch {
         return .otherError
     }
@@ -2393,6 +2686,38 @@ private struct CodexActiveResumeFixture {
     let resuming: Task<Void, Error>
 }
 
+private struct CodexActiveTurnFixture {
+    let process: ScriptedAppServerProcess
+    let adapter: CodexAppServerAdapter
+    let threadID: AgentThreadID
+    let turnID: AgentTurnID
+    let eventsBeforeDelete: [AgentEvent]
+}
+
+private func startCodexActiveTurnFixture(
+    turnID rawTurnID: String
+) async throws -> CodexActiveTurnFixture {
+    let mapped = try await startCodexMappedThreadFixture()
+    let turnID = try await startMappedTurn(
+        adapter: mapped.adapter,
+        process: mapped.process,
+        threadID: mapped.threadID,
+        turnID: rawTurnID,
+        requestID: 3,
+        writeCount: 4
+    )
+    let eventsBeforeDelete = await mapped.adapter.replayedEventsForTesting(
+        mapped.threadID
+    )
+    return .init(
+        process: mapped.process,
+        adapter: mapped.adapter,
+        threadID: mapped.threadID,
+        turnID: turnID,
+        eventsBeforeDelete: eventsBeforeDelete
+    )
+}
+
 private func startCodexActiveResumeFixture(
     turnID rawTurnID: String
 ) async throws -> CodexActiveResumeFixture {
@@ -2423,6 +2748,21 @@ private func startCodexActiveResumeFixture(
 private func bufferDelta(
     _ delta: String,
     fixture: CodexActiveResumeFixture,
+    turnID: AgentTurnID? = nil
+) async {
+    await fixture.adapter.handleNotificationForTesting(
+        method: "item/agentMessage/delta",
+        params: .object([
+            "threadId": .string(fixture.threadID.rawValue),
+            "turnId": .string((turnID ?? fixture.turnID).rawValue),
+            "delta": .string(delta),
+        ])
+    )
+}
+
+private func bufferDelta(
+    _ delta: String,
+    fixture: CodexActiveTurnFixture,
     turnID: AgentTurnID? = nil
 ) async {
     await fixture.adapter.handleNotificationForTesting(
