@@ -61,6 +61,60 @@ actor ScriptedSupervisorGenerationFactory {
     }
 }
 
+actor CancellationAwareSupervisorStartupGate {
+    private var isOpen = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var gateWaiters: [
+        UUID: CheckedContinuation<Void, any Error>
+    ] = [:]
+    private(set) var startCount = 0
+    private(set) var wasCancelled = false
+
+    func wait() async throws {
+        startCount += 1
+        startWaiters.forEach { $0.resume() }
+        startWaiters.removeAll()
+        let waiterID = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation(isolation: self) {
+                (continuation: CheckedContinuation<Void, any Error>) in
+                guard !Task.isCancelled else {
+                    wasCancelled = true
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                guard !isOpen else {
+                    continuation.resume()
+                    return
+                }
+                gateWaiters[waiterID] = continuation
+            }
+        } onCancel: {
+            Task { await self.cancel(waiterID) }
+        }
+    }
+
+    func waitUntilStarted() async {
+        if startCount > 0 { return }
+        await withCheckedContinuation { startWaiters.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        let waiters = Array(gateWaiters.values)
+        gateWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    private func cancel(_ waiterID: UUID) {
+        guard let waiter = gateWaiters.removeValue(forKey: waiterID) else {
+            return
+        }
+        wasCancelled = true
+        waiter.resume(throwing: CancellationError())
+    }
+}
+
 actor ScriptedSupervisorGeneration: CodexAgentClient {
     enum Gate: Hashable, Sendable {
         case startThread

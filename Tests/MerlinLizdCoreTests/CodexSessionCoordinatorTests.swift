@@ -4285,6 +4285,61 @@ struct CodexSessionCoordinatorTests {
                 == false
         )
     }
+
+    @Test("shutdown cancels a coordinator start waiting on supervisor startup")
+    func shutdownCancelsPendingSupervisorStartup() async throws {
+        let fixture = try CodexSessionPersistenceFixture()
+        defer { fixture.remove() }
+        let key = codexTestKey(createdAtEpoch: 1_721_009_004)
+        let startupGate = CancellationAwareSupervisorStartupGate()
+        let generation = ScriptedSupervisorGeneration(
+            startedThreads: ["unused-startup-thread"]
+        )
+        let supervisor = CodexAppServerSupervisor(
+            generationFactory: {
+                try await startupGate.wait()
+                return generation
+            }
+        )
+        let store = try FileCodexConversationStore(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        let registry = TerminalEndpointRegistry()
+        let journal = CodexSessionJournalSpy()
+        let coordinator = CodexSessionCoordinator(
+            agent: supervisor,
+            store: store,
+            registry: registry,
+            router: TerminalToolRouter(
+                registry: registry,
+                approvalBroker: TerminalApprovalBroker(),
+                journal: journal
+            ),
+            journal: journal
+        )
+        let completion = SupervisorCompletionProbe()
+
+        let submitting = Task { await coordinator.submit("start", for: key) }
+        await startupGate.waitUntilStarted()
+        let shuttingDown = Task {
+            await coordinator.shutdown()
+            await completion.recordCompletion()
+        }
+
+        let completedThroughSupervisorCancellation = await supervisorEventually {
+            await completion.completions == 1
+        }
+        #expect(completedThroughSupervisorCancellation)
+        if !completedThroughSupervisorCancellation {
+            await supervisor.shutdown()
+        }
+        await shuttingDown.value
+        await submitting.value
+
+        #expect(await startupGate.wasCancelled)
+        #expect(await supervisor.currentAvailability == .stopped)
+        #expect(await generation.shutdownCount == 0)
+    }
 }
 
 @Suite("Terminal tool activity stream", .serialized)

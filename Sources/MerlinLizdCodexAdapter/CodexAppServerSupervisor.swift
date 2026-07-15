@@ -48,9 +48,16 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
         let client: any CodexAgentClient
     }
 
+    private enum StartupCompletion: Sendable {
+        case success(any CodexAgentClient)
+        case failure(any Error)
+    }
+
     private struct StartupOperation: Sendable {
         let id: UUID
         let task: Task<any CodexAgentClient, any Error>
+        var completion: StartupCompletion?
+        var waiters: [UUID: CheckedContinuation<Void, Never>]
     }
 
     private struct EventForwarder: Sendable {
@@ -385,8 +392,7 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
         stopped = true
         let recovery = detachRecovery()
         recovery?.task.cancel()
-        let startup = startupOperation
-        startupOperation = nil
+        let startup = detachStartup()
         startup?.task.cancel()
         availabilityObserver?.cancel()
         availabilityObserver = nil
@@ -418,8 +424,7 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
     ) async {
         if let recovery { await recovery.task.value }
         if let startup,
-            let uninstalled = try? await startup.task.value,
-            generation == nil
+            let uninstalled = try? await startup.task.value
         {
             await uninstalled.shutdown()
         }
@@ -463,6 +468,7 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
             {
                 receiveAvailability(initial, generationID: handle.id)
             }
+            try Task.checkCancellation()
             guard owns(handle) else {
                 if stopped { throw CodexAppServerSupervisorError.stopped }
                 if let recovery = recoveryOperation {
@@ -485,27 +491,48 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
         } else {
             setAvailability(.starting)
             let factory = generationFactory
+            let operationID = UUID()
+            let task = Task<any CodexAgentClient, any Error> { [weak self] in
+                do {
+                    let client = try await factory()
+                    await self?.completeStartup(
+                        operationID: operationID,
+                        with: .success(client)
+                    )
+                    return client
+                } catch {
+                    await self?.completeStartup(
+                        operationID: operationID,
+                        with: .failure(error)
+                    )
+                    throw error
+                }
+            }
             let created = StartupOperation(
-                id: UUID(),
-                task: Task { try await factory() }
+                id: operationID,
+                task: task,
+                completion: nil,
+                waiters: [:]
             )
             startupOperation = created
             operation = created
         }
 
-        do {
-            let client = try await operation.task.value
-            guard !stopped else {
-                await client.shutdown()
-                throw CodexAppServerSupervisorError.stopped
-            }
-            if generation != nil {
-                return try await readyGeneration()
-            }
-            guard startupOperation?.id == operation.id else {
-                await client.shutdown()
-                throw CodexAppServerSupervisorError.unavailable
-            }
+        await waitForStartup(operation.id)
+        try Task.checkCancellation()
+        guard !stopped else {
+            throw CodexAppServerSupervisorError.stopped
+        }
+        guard startupOperation?.id == operation.id else {
+            if generation != nil { return try await readyGeneration() }
+            throw CodexAppServerSupervisorError.unavailable
+        }
+        guard let completion = startupOperation?.completion else {
+            return try await readyGeneration()
+        }
+
+        switch completion {
+        case let .success(client):
             startupOperation = nil
             let installed = installGeneration(client)
             if let setup = availabilitySetupTask,
@@ -513,6 +540,7 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
             {
                 receiveAvailability(initial, generationID: installed.id)
             }
+            try Task.checkCancellation()
             guard owns(installed) else {
                 if let recovery = recoveryOperation {
                     await waitForRecovery(recovery.id)
@@ -521,16 +549,67 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
                 return try await readyGeneration()
             }
             return installed
-        } catch is CancellationError {
-            if startupOperation?.id == operation.id { startupOperation = nil }
-            throw CancellationError()
-        } catch {
-            if startupOperation?.id == operation.id { startupOperation = nil }
+        case let .failure(error):
+            startupOperation = nil
+            if error is CancellationError { throw CancellationError() }
             let mapped = availability(for: error)
             if isTerminal(mapped) { terminalAvailability = mapped }
             setAvailability(mapped)
             throw CodexAppServerSupervisorError.unavailable
         }
+    }
+
+    private func waitForStartup(_ operationID: UUID) async {
+        let waiterID = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation(isolation: self) { continuation in
+                guard !Task.isCancelled,
+                    startupOperation?.id == operationID,
+                    startupOperation?.completion == nil
+                else {
+                    continuation.resume()
+                    return
+                }
+                startupOperation?.waiters[waiterID] = continuation
+            }
+        } onCancel: {
+            Task {
+                await self.cancelStartupWaiter(
+                    operationID: operationID,
+                    waiterID: waiterID
+                )
+            }
+        }
+    }
+
+    private func cancelStartupWaiter(
+        operationID: UUID,
+        waiterID: UUID
+    ) {
+        guard startupOperation?.id == operationID else { return }
+        startupOperation?.waiters.removeValue(forKey: waiterID)?.resume()
+    }
+
+    private func completeStartup(
+        operationID: UUID,
+        with completion: StartupCompletion
+    ) {
+        guard startupOperation?.id == operationID,
+            startupOperation?.completion == nil
+        else { return }
+        startupOperation?.completion = completion
+        let waiters = startupOperation?.waiters.values.map { $0 } ?? []
+        startupOperation?.waiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    private func detachStartup() -> StartupOperation? {
+        guard var operation = startupOperation else { return nil }
+        startupOperation = nil
+        let waiters = Array(operation.waiters.values)
+        operation.waiters.removeAll()
+        waiters.forEach { $0.resume() }
+        return operation
     }
 
     private func installGeneration(

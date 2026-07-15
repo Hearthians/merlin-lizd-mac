@@ -31,6 +31,85 @@ struct CodexAppServerSupervisorTests {
         await supervisor.shutdown()
     }
 
+    @Test("cancelling one startup caller preserves the shared generation")
+    func cancellingStartupCallerOnlyRemovesItsWaiter() async throws {
+        let generation = ScriptedSupervisorGeneration(
+            startedThreads: ["thread-survivor", "thread-unexpected"]
+        )
+        let startupGate = CancellationAwareSupervisorStartupGate()
+        let supervisor = CodexAppServerSupervisor(
+            generationFactory: {
+                try await startupGate.wait()
+                return generation
+            }
+        )
+        let cancelledCompletion = SupervisorCompletionProbe()
+        let survivorCompletion = SupervisorCompletionProbe()
+
+        let cancelled = Task { () -> Bool in
+            let wasCancelled: Bool
+            do {
+                _ = try await supervisor.startThread()
+                wasCancelled = false
+            } catch is CancellationError {
+                wasCancelled = true
+            } catch {
+                wasCancelled = false
+            }
+            await cancelledCompletion.recordCompletion()
+            return wasCancelled
+        }
+        let survivor = Task {
+            let threadID = try await supervisor.startThread()
+            await survivorCompletion.recordCompletion()
+            return threadID
+        }
+        await startupGate.waitUntilStarted()
+
+        cancelled.cancel()
+        let cancelledReturnedBeforeStartup = await supervisorEventually {
+            await cancelledCompletion.completions == 1
+        }
+        #expect(cancelledReturnedBeforeStartup)
+        #expect(await survivorCompletion.completions == 0)
+        #expect(await startupGate.startCount == 1)
+        #expect(await startupGate.wasCancelled == false)
+
+        await startupGate.open()
+        #expect(await cancelled.value)
+        #expect(try await survivor.value == AgentThreadID(
+            rawValue: "thread-survivor"
+        ))
+        #expect(await startupGate.startCount == 1)
+        await supervisor.shutdown()
+    }
+
+    @Test("coalesced startup failure wakes every caller without retrying")
+    func coalescedStartupFailureCompletesEveryWaiter() async {
+        let factory = ScriptedSupervisorGenerationFactory(
+            outcomes: [.failure(.crashed)],
+            gateFirstCreation: true
+        )
+        let supervisor = CodexAppServerSupervisor(
+            generationFactory: { try await factory.makeGeneration() }
+        )
+
+        let first = Task { try await supervisor.startThread() }
+        let second = Task { try await supervisor.startThread() }
+        await factory.waitForCreationCount(1)
+        await Task.yield()
+        await factory.releaseFirstCreation()
+
+        await #expect(throws: CodexAppServerSupervisorError.unavailable) {
+            try await first.value
+        }
+        await #expect(throws: CodexAppServerSupervisorError.unavailable) {
+            try await second.value
+        }
+        #expect(await factory.creationCount == 1)
+        await supervisor.shutdown()
+    }
+
     @Test("typed startup failures publish bounded protocol-neutral availability")
     func mapsTypedStartupFailures() async {
         let cases: [(
