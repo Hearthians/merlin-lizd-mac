@@ -42,6 +42,70 @@ enum CodexSessionTestDeadlineError: Error {
     case timedOut
 }
 
+enum CodexSessionStoreFailure: Error {
+    case injected
+}
+
+enum CodexSessionStoreMutationKind: Hashable, Sendable {
+    case insertIfAbsent
+    case recordOrphan
+    case advanceDeletion(CodexDeletionStage)
+    case advanceArchive(CodexArchiveReconciliationStage)
+    case completeArchive
+}
+
+actor FaultInjectingCodexConversationStore: CodexConversationStoring {
+    private let base: any CodexConversationStoring
+    private var remainingFailures: [CodexSessionStoreMutationKind: Int]
+
+    init(
+        base: any CodexConversationStoring,
+        failures: [CodexSessionStoreMutationKind: Int]
+    ) {
+        self.base = base
+        remainingFailures = failures
+    }
+
+    func snapshot() async throws -> CodexConversationStoreSnapshot {
+        try await base.snapshot()
+    }
+
+    func apply(
+        _ mutation: CodexConversationStoreMutation
+    ) async throws -> CodexConversationStoreSnapshot {
+        if let kind = kind(of: mutation),
+            remainingFailures[kind, default: 0] > 0
+        {
+            remainingFailures[kind, default: 0] -= 1
+            throw CodexConversationStoreError.posixFailure(
+                operation: "injected",
+                path: "conversation-store",
+                code: 5
+            )
+        }
+        return try await base.apply(mutation)
+    }
+
+    private func kind(
+        of mutation: CodexConversationStoreMutation
+    ) -> CodexSessionStoreMutationKind? {
+        switch mutation {
+        case .insertIfAbsent:
+            .insertIfAbsent
+        case .recordOrphan:
+            .recordOrphan
+        case let .advanceDeletion(_, stage, _):
+            .advanceDeletion(stage)
+        case let .advanceArchiveChange(_, stage, _):
+            .advanceArchive(stage)
+        case .completeArchiveChange:
+            .completeArchive
+        default:
+            nil
+        }
+    }
+}
+
 private actor CodexSessionTestRace<Value: Sendable> {
     private var result: Result<Value, any Error>?
     private var waiters: [CheckedContinuation<Result<Value, any Error>, Never>]
@@ -92,6 +156,7 @@ actor FakeCodexSessionAgent: CodexAgentClient {
         case delete
         case resume
         case start
+        case steer
     }
 
     struct SteerCall: Equatable, Sendable {
@@ -108,6 +173,10 @@ actor FakeCodexSessionAgent: CodexAgentClient {
     private let probe = CodexSessionCallProbe()
     private var nextThreadIDs: [AgentThreadID]
     private var nextTurnIDs: [AgentThreadID: [AgentTurnID]] = [:]
+    private var startThreadGate: CodexSessionTestGate?
+    private var archiveGate: CodexSessionTestGate?
+    private var deleteGate: CodexSessionTestGate?
+    private var interruptGate: CodexSessionTestGate?
     private var startTurnGates: [AgentThreadID: CodexSessionTestGate] = [:]
     private var resumeGates: [AgentThreadID: CodexSessionTestGate] = [:]
     private var resumeEvents: [AgentThreadID: [AgentEvent]] = [:]
@@ -122,6 +191,7 @@ actor FakeCodexSessionAgent: CodexAgentClient {
     private var archiveCalls: [AgentThreadID] = []
     private var unarchiveCalls: [AgentThreadID] = []
     private var deleteCalls: [AgentThreadID] = []
+    private var deletedThreads: Set<AgentThreadID> = []
     private var failure: Failure?
 
     init(threadIDs: [AgentThreadID]) {
@@ -130,6 +200,7 @@ actor FakeCodexSessionAgent: CodexAgentClient {
 
     func startThread() async throws -> AgentThreadID {
         await probe.record("startThread")
+        if let startThreadGate { await startThreadGate.wait() }
         if failure == .start { throw Failure.start }
         return nextThreadIDs.removeFirst()
     }
@@ -168,6 +239,7 @@ actor FakeCodexSessionAgent: CodexAgentClient {
             SteerCall(threadID: threadID, turnID: turnID, prompt: prompt)
         )
         await probe.record("steer:\(threadID.rawValue)")
+        if failure == .steer { throw Failure.steer }
     }
 
     func interruptTurn(
@@ -178,6 +250,7 @@ actor FakeCodexSessionAgent: CodexAgentClient {
             InterruptCall(threadID: threadID, turnID: turnID)
         )
         await probe.record("interrupt:\(threadID.rawValue)")
+        if let interruptGate { await interruptGate.wait() }
     }
 
     func events(for threadID: AgentThreadID) async -> AsyncStream<AgentEvent> {
@@ -197,6 +270,8 @@ actor FakeCodexSessionAgent: CodexAgentClient {
 
     func archiveThread(_ threadID: AgentThreadID) async throws {
         archiveCalls.append(threadID)
+        await probe.record("archive:\(threadID.rawValue)")
+        if let archiveGate { await archiveGate.wait() }
         if failure == .archive { throw Failure.archive }
     }
 
@@ -207,13 +282,37 @@ actor FakeCodexSessionAgent: CodexAgentClient {
 
     func deleteThread(_ threadID: AgentThreadID) async throws {
         deleteCalls.append(threadID)
+        await probe.record("delete:\(threadID.rawValue)")
+        if let deleteGate { await deleteGate.wait() }
         if failure == .delete { throw Failure.delete }
+        deletedThreads.insert(threadID)
+    }
+
+    func ensureThreadDeleted(_ threadID: AgentThreadID) async throws {
+        if deletedThreads.contains(threadID) { return }
+        try await deleteThread(threadID)
     }
 
     func shutdown() async {}
 
     func enqueueTurn(_ turnID: AgentTurnID, for threadID: AgentThreadID) {
         nextTurnIDs[threadID, default: []].append(turnID)
+    }
+
+    func blockStartThread(on gate: CodexSessionTestGate?) {
+        startThreadGate = gate
+    }
+
+    func blockArchive(on gate: CodexSessionTestGate?) {
+        archiveGate = gate
+    }
+
+    func blockDelete(on gate: CodexSessionTestGate?) {
+        deleteGate = gate
+    }
+
+    func blockInterrupt(on gate: CodexSessionTestGate?) {
+        interruptGate = gate
     }
 
     func blockStartTurn(
@@ -234,6 +333,11 @@ actor FakeCodexSessionAgent: CodexAgentClient {
 
     func emit(_ event: AgentEvent, for threadID: AgentThreadID) {
         _ = streams[threadID]?.yield(event)
+    }
+
+    func finishEvents(for threadID: AgentThreadID) {
+        streams.removeValue(forKey: threadID)?.finish()
+        streamValues.removeValue(forKey: threadID)
     }
 
     func waitForCall(_ name: String) async {
@@ -482,4 +586,13 @@ func codexPOSIXMode(at url: URL) throws -> Int {
 
 func codexWrite(_ contents: String, to url: URL) throws {
     try Data(contents.utf8).write(to: url)
+}
+
+extension CodexDeletionStage {
+    static let allCasesForTesting: [CodexDeletionStage] = [
+        .intentPersisted,
+        .remoteThreadDeleted,
+        .journalDeleted,
+        .routerForgotten,
+    ]
 }

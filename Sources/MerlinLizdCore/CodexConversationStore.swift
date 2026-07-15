@@ -109,28 +109,85 @@ public struct CodexArchiveReconciliation: Codable, Equatable, Sendable {
     }
 }
 
+public enum CodexOrphanFailure: String, Codable, Equatable, Sendable {
+    case remoteUnavailable
+    case persistenceUnavailable
+    case unknown
+}
+
+public struct CodexOrphanedThread: Codable, Equatable, Sendable {
+    public let threadID: AgentThreadID
+    public let attemptedKey: TerminalConversationKey
+    public let protocolGeneration: String
+    public var failure: CodexOrphanFailure
+    public var updatedAt: Date
+
+    public init(
+        threadID: AgentThreadID,
+        attemptedKey: TerminalConversationKey,
+        protocolGeneration: String = CodexConversationRecord
+            .currentProtocolGeneration,
+        failure: CodexOrphanFailure,
+        updatedAt: Date
+    ) {
+        self.threadID = threadID
+        self.attemptedKey = attemptedKey
+        self.protocolGeneration = protocolGeneration
+        self.failure = failure
+        self.updatedAt = updatedAt
+    }
+}
+
 public struct CodexConversationStoreSnapshot: Codable, Equatable, Sendable {
     public var records: [TerminalConversationKey: CodexConversationRecord]
     public var deletions: [TerminalConversationKey: CodexDeletionTombstone]
     public var archiveReconciliations: [
         TerminalConversationKey: CodexArchiveReconciliation
     ]
+    public var orphans: [AgentThreadID: CodexOrphanedThread]
 
     public init(
         records: [TerminalConversationKey: CodexConversationRecord] = [:],
         deletions: [TerminalConversationKey: CodexDeletionTombstone] = [:],
         archiveReconciliations: [
             TerminalConversationKey: CodexArchiveReconciliation
-        ] = [:]
+        ] = [:],
+        orphans: [AgentThreadID: CodexOrphanedThread] = [:]
     ) {
         self.records = records
         self.deletions = deletions
         self.archiveReconciliations = archiveReconciliations
+        self.orphans = orphans
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case records, deletions, archiveReconciliations, orphans
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        records = try container.decode(
+            [TerminalConversationKey: CodexConversationRecord].self,
+            forKey: .records
+        )
+        deletions = try container.decode(
+            [TerminalConversationKey: CodexDeletionTombstone].self,
+            forKey: .deletions
+        )
+        archiveReconciliations = try container.decode(
+            [TerminalConversationKey: CodexArchiveReconciliation].self,
+            forKey: .archiveReconciliations
+        )
+        orphans = try container.decodeIfPresent(
+            [AgentThreadID: CodexOrphanedThread].self,
+            forKey: .orphans
+        ) ?? [:]
     }
 }
 
 public enum CodexConversationStoreMutation: Sendable {
     case upsert(CodexConversationRecord)
+    case insertIfAbsent(CodexConversationRecord)
     case beginDeletion(key: TerminalConversationKey, updatedAt: Date)
     case advanceDeletion(
         key: TerminalConversationKey,
@@ -159,6 +216,8 @@ public enum CodexConversationStoreMutation: Sendable {
         updatedAt: Date
     )
     case completeArchiveChange(key: TerminalConversationKey, updatedAt: Date)
+    case recordOrphan(CodexOrphanedThread)
+    case removeOrphan(threadID: AgentThreadID)
 }
 
 public protocol CodexConversationStoring: Sendable {
@@ -177,6 +236,7 @@ public enum CodexConversationStoreError: Error, Equatable, Sendable {
     case archiveChangeInProgress
     case invalidArchiveStage
     case duplicateThreadMapping
+    case orphanLimitReached
     case unsupportedProtocolGeneration
     case posixFailure(operation: String, path: String, code: Int32)
 }
@@ -193,6 +253,7 @@ public actor FileCodexConversationStore: CodexConversationStoring {
     private static let directoryName = "CodexConversations"
     private static let storeName = "conversations.json"
     private static let lockName = ".conversations.lock"
+    private static let orphanLimit = 64
 
     private let rootDescriptor: Int32
     private let lockDescriptor: Int32
@@ -301,6 +362,23 @@ public actor FileCodexConversationStore: CodexConversationStoring {
                 throw CodexConversationStoreError.duplicateThreadMapping
             }
             state.records[record.key] = record
+        case let .insertIfAbsent(record):
+            guard state.deletions[record.key] == nil else {
+                throw CodexConversationStoreError.deletionInProgress
+            }
+            guard record.protocolGeneration
+                == CodexConversationRecord.currentProtocolGeneration
+            else {
+                throw CodexConversationStoreError
+                    .unsupportedProtocolGeneration
+            }
+            guard state.records[record.key] == nil else { return }
+            guard !state.records.values.contains(where: {
+                $0.threadID == record.threadID
+            }) else {
+                throw CodexConversationStoreError.duplicateThreadMapping
+            }
+            state.records[record.key] = record
         case let .beginDeletion(key, updatedAt):
             guard let record = state.records[key] else {
                 throw CodexConversationStoreError.recordNotFound
@@ -394,6 +472,26 @@ public actor FileCodexConversationStore: CodexConversationStoring {
             record.updatedAt = updatedAt
             state.records[key] = record
             state.archiveReconciliations.removeValue(forKey: key)
+        case let .recordOrphan(orphan):
+            guard orphan.protocolGeneration
+                == CodexConversationRecord.currentProtocolGeneration
+            else {
+                throw CodexConversationStoreError
+                    .unsupportedProtocolGeneration
+            }
+            guard !state.records.values.contains(where: {
+                $0.threadID == orphan.threadID
+            }) else {
+                throw CodexConversationStoreError.duplicateThreadMapping
+            }
+            guard state.orphans[orphan.threadID] != nil
+                || state.orphans.count < orphanLimit
+            else {
+                throw CodexConversationStoreError.orphanLimitReached
+            }
+            state.orphans[orphan.threadID] = orphan
+        case let .removeOrphan(threadID):
+            state.orphans.removeValue(forKey: threadID)
         }
     }
 
@@ -475,6 +573,9 @@ public actor FileCodexConversationStore: CodexConversationStoring {
             envelope.state.archiveReconciliations.allSatisfy({
                 $0.key == $0.value.key
             }),
+            envelope.state.orphans.allSatisfy({
+                $0.key == $0.value.threadID
+            }),
             isConsistent(envelope.state)
         else {
             throw CodexConversationStoreError.corruptEnvelope
@@ -499,11 +600,19 @@ public actor FileCodexConversationStore: CodexConversationStoring {
             return tombstone.threadID == record.threadID
                 && tombstone.protocolGeneration == record.protocolGeneration
         }) else { return false }
-        return state.archiveReconciliations.values.allSatisfy {
+        guard state.archiveReconciliations.values.allSatisfy({
             reconciliation in
             state.records[reconciliation.key]?.threadID
                 == reconciliation.threadID
-        }
+        }) else { return false }
+        return state.orphans.count <= orphanLimit
+            && state.orphans.values.allSatisfy { orphan in
+                orphan.protocolGeneration
+                    == CodexConversationRecord.currentProtocolGeneration
+                    && !records.contains(where: { record in
+                        record.threadID == orphan.threadID
+                    })
+            }
     }
 
     private static func openDirectoryTree(

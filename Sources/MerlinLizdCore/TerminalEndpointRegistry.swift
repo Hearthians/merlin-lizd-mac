@@ -249,20 +249,24 @@ public actor TerminalEndpointRegistry {
         UUID: AsyncStream<TerminalEndpointRegistryEvent>.Continuation
     ] = [:]
     private var pinRevision: UInt64 = 0
+    private var subscriptionHook: (@Sendable () async -> Void)?
     private let bindingValidationHook: (@Sendable () async -> Void)?
     private let claimPreparedTurnHook: (@Sendable () async -> Void)?
 
     public init() {
+        subscriptionHook = nil
         bindingValidationHook = nil
         claimPreparedTurnHook = nil
     }
 
     init(bindingValidationHook: @escaping @Sendable () async -> Void) {
+        subscriptionHook = nil
         self.bindingValidationHook = bindingValidationHook
         claimPreparedTurnHook = nil
     }
 
     init(claimPreparedTurnHook: @escaping @Sendable () async -> Void) {
+        subscriptionHook = nil
         bindingValidationHook = nil
         self.claimPreparedTurnHook = claimPreparedTurnHook
     }
@@ -610,7 +614,8 @@ public actor TerminalEndpointRegistry {
     /// event stream. Consumers should initialize their known pins from the
     /// returned snapshot, apply newer upserts and removals by stable pin ID,
     /// and replace their pins with `pinSnapshot()` after reconciliation.
-    public func subscribe() -> TerminalEndpointRegistrySubscription {
+    public func subscribe() async -> TerminalEndpointRegistrySubscription {
+        await subscriptionHook?()
         let subscriberID = UUID()
         let pair = AsyncStream<TerminalEndpointRegistryEvent>.makeStream(
             bufferingPolicy: .bufferingNewest(Self.eventBufferCapacity)
@@ -623,6 +628,12 @@ public actor TerminalEndpointRegistry {
             snapshot: makePinSnapshot(),
             events: pair.stream
         )
+    }
+
+    func setSubscriptionHookForTesting(
+        _ hook: (@Sendable () async -> Void)?
+    ) {
+        subscriptionHook = hook
     }
 
     /// Returns the current authoritative exact pins at the latest registry

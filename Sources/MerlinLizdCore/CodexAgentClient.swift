@@ -61,5 +61,9 @@ public protocol CodexAgentClient: Sendable {
     func archiveThread(_ threadID: AgentThreadID) async throws
     func unarchiveThread(_ threadID: AgentThreadID) async throws
     func deleteThread(_ threadID: AgentThreadID) async throws
+    /// Ensures a thread previously created by this client and durably owned by
+    /// Core is absent. Unlike `deleteThread`, retrying after a successful
+    /// deletion must also succeed.
+    func ensureThreadDeleted(_ threadID: AgentThreadID) async throws
     func shutdown() async
 }

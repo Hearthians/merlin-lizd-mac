@@ -573,6 +573,14 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         }
     }
 
+    public func ensureThreadDeleted(_ threadID: AgentThreadID) async throws {
+        // The protocol precondition limits this operation to a thread ID that
+        // originated from this client and is durably owned by Core. A missing
+        // capability mapping therefore means an earlier delete completed.
+        guard await mappingStore.contains(threadID) else { return }
+        try await deleteThread(threadID)
+    }
+
     public func shutdown() async {
         guard !stopped else { return }
         stopped = true

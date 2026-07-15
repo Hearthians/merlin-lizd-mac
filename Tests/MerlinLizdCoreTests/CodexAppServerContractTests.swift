@@ -233,6 +233,125 @@ struct CodexAppServerContractTests {
         await adapter.shutdown()
     }
 
+    @Test("ensure delete is idempotent after owned remote deletion")
+    func ensureDeleteAcceptsAnAlreadyUnmappedOwnedThread() async throws {
+        let process = ScriptedAppServerProcess()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor()
+        )
+        let threadID = try await startMappedThread(
+            adapter: adapter,
+            process: process
+        )
+
+        let deleting = Task { try await adapter.ensureThreadDeleted(threadID) }
+        await process.waitForWriteCount(4)
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":3,"result":{}}"#
+        )))
+        try await deleting.value
+        let writeCount = (await process.writtenData()).count
+
+        try await adapter.ensureThreadDeleted(threadID)
+
+        #expect((await process.writtenData()).count == writeCount)
+        await adapter.shutdown()
+    }
+
+    @Test("fresh adapter completes Core retry after remote delete stage persistence fails")
+    func freshAdapterHonorsDurableAlreadyDeletedOutcome() async throws {
+        let fixture = try CodexSessionPersistenceFixture()
+        defer { fixture.remove() }
+        let process = ScriptedAppServerProcess()
+        let mappingStore = CodexAppServerThreadMappingStore()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor(),
+            mappingStore: mappingStore
+        )
+        let threadID = try await startMappedThread(
+            adapter: adapter,
+            process: process
+        )
+        let key = codexTestKey()
+        let base = try FileCodexConversationStore(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        _ = try await base.apply(.upsert(codexTestRecord(
+            key: key,
+            threadID: threadID.rawValue
+        )))
+        let failingStore = FaultInjectingCodexConversationStore(
+            base: base,
+            failures: [.advanceDeletion(.remoteThreadDeleted): 1]
+        )
+        let firstRegistry = TerminalEndpointRegistry()
+        let firstJournal = CodexSessionJournalSpy()
+        let firstCoordinator = CodexSessionCoordinator(
+            agent: adapter,
+            store: failingStore,
+            registry: firstRegistry,
+            router: TerminalToolRouter(
+                registry: firstRegistry,
+                approvalBroker: TerminalApprovalBroker(),
+                journal: firstJournal
+            ),
+            journal: firstJournal
+        )
+
+        let deleting = Task {
+            try await firstCoordinator.deleteConversation(
+                key,
+                confirmation: .confirmed
+            )
+        }
+        await process.waitForWriteCount(4)
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":3,"result":{}}"#
+        )))
+        await #expect(throws: CodexSessionCoordinatorError.deletionPending) {
+            try await deleting.value
+        }
+        #expect(
+            await base.snapshot().deletions[key]?.lastCompletedStage
+                == .intentPersisted
+        )
+
+        let freshProcess = ScriptedAppServerProcess()
+        let freshAdapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: freshProcess),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor(),
+            mappingStore: mappingStore
+        )
+        let freshRegistry = TerminalEndpointRegistry()
+        let freshJournal = CodexSessionJournalSpy()
+        let freshCoordinator = CodexSessionCoordinator(
+            agent: freshAdapter,
+            store: base,
+            registry: freshRegistry,
+            router: TerminalToolRouter(
+                registry: freshRegistry,
+                approvalBroker: TerminalApprovalBroker(),
+                journal: freshJournal
+            ),
+            journal: freshJournal
+        )
+
+        try await freshCoordinator.deleteConversation(
+            key,
+            confirmation: .confirmed
+        )
+
+        #expect(await freshProcess.writtenData().isEmpty)
+        #expect(await base.snapshot().records[key] == nil)
+        await firstCoordinator.shutdown()
+        await freshCoordinator.shutdown()
+    }
+
     @Test("retryable errors keep the exact turn active for later output")
     func retryableErrorDoesNotTerminateTurn() async throws {
         let process = ScriptedAppServerProcess()

@@ -277,6 +277,7 @@ public actor TerminalToolRouter {
     private var toolActivities: [UUID: TerminalToolActivity] = [:]
     private var approvalActivities: [UUID: TerminalToolApprovalActivity] = [:]
     private var activityRevision: UInt64 = 0
+    private var activitySubscriptionHook: (@Sendable () async -> Void)?
     private var activitySubscribers: [
         UUID: AsyncStream<TerminalToolActivityEvent>.Continuation
     ] = [:]
@@ -299,6 +300,7 @@ public actor TerminalToolRouter {
         probeStableDuration: Duration = .milliseconds(200),
         probeTimeout: Duration = .seconds(5)
     ) {
+        activitySubscriptionHook = nil
         self.registry = registry
         self.approvalBroker = approvalBroker
         self.journal = journal
@@ -327,6 +329,7 @@ public actor TerminalToolRouter {
         probeStableDuration: Duration = .milliseconds(200),
         probeTimeout: Duration = .seconds(5)
     ) {
+        activitySubscriptionHook = nil
         precondition(observedTurnIdentityLimitPerThread > 0)
         self.registry = registry
         self.approvalBroker = approvalBroker
@@ -536,7 +539,8 @@ public actor TerminalToolRouter {
         await approvalBroker.pendingRequests()
     }
 
-    public func subscribeActivity() -> TerminalToolActivitySubscription {
+    public func subscribeActivity() async -> TerminalToolActivitySubscription {
+        await activitySubscriptionHook?()
         let subscriberID = UUID()
         let pair = AsyncStream<TerminalToolActivityEvent>.makeStream(
             bufferingPolicy: .bufferingNewest(
@@ -552,6 +556,12 @@ public actor TerminalToolRouter {
             snapshot: activitySnapshot(),
             events: pair.stream
         )
+    }
+
+    func setActivitySubscriptionHookForTesting(
+        _ hook: (@Sendable () async -> Void)?
+    ) {
+        activitySubscriptionHook = hook
     }
 
     public func activitySnapshot() -> TerminalToolActivitySnapshot {

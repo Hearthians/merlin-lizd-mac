@@ -113,6 +113,9 @@ actor FakeTerminalToolPort: TerminalSessionPort {
     private var sentBatches: [TerminalInputBatch] = []
     private var owners: [TerminalKeyboardOwner] = []
     private var ownerTransitionsStarted: [TerminalKeyboardOwner] = []
+    private var ownerTransitionWaiters: [
+        TerminalKeyboardOwner: [CheckedContinuation<Void, Never>]
+    ] = [:]
     private var ownerGates: [TerminalKeyboardOwner: TerminalToolTestGate] = [:]
     private var observeCount = 0
     private var waitCount = 0
@@ -192,6 +195,8 @@ actor FakeTerminalToolPort: TerminalSessionPort {
 
     func setKeyboardOwner(_ owner: TerminalKeyboardOwner) async {
         ownerTransitionsStarted.append(owner)
+        let waiters = ownerTransitionWaiters.removeValue(forKey: owner) ?? []
+        waiters.forEach { $0.resume() }
         await log?.append("\(label):owner-start:\(owner)")
         if let gate = ownerGates[owner] {
             await gate.wait()
@@ -261,6 +266,13 @@ actor FakeTerminalToolPort: TerminalSessionPort {
 
     func keyboardOwnerTransitionsStarted() -> [TerminalKeyboardOwner] {
         ownerTransitionsStarted
+    }
+
+    func waitForKeyboardOwnerStart(_ owner: TerminalKeyboardOwner) async {
+        if ownerTransitionsStarted.contains(owner) { return }
+        await withCheckedContinuation {
+            ownerTransitionWaiters[owner, default: []].append($0)
+        }
     }
 }
 

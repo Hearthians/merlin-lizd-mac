@@ -66,6 +66,48 @@ struct CodexConversationStoreTests {
         #expect(snapshot.records[original.key] == original)
     }
 
+    @Test("two store instances compare and insert one immutable identity")
+    func compareAndInsertKeepsTheFirstThreadAcrossInstances() async throws {
+        let fixture = try CodexSessionPersistenceFixture()
+        defer { fixture.remove() }
+        let first = try FileCodexConversationStore(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        let second = try FileCodexConversationStore(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        let firstCandidate = codexTestRecord(threadID: "thread-first")
+        let secondCandidate = codexTestRecord(threadID: "thread-second")
+        let gate = CodexSessionTestGate()
+
+        let firstInsert = Task {
+            await gate.wait()
+            return try await first.apply(.insertIfAbsent(firstCandidate))
+        }
+        let secondInsert = Task {
+            await gate.wait()
+            return try await second.apply(.insertIfAbsent(secondCandidate))
+        }
+        await gate.open()
+
+        let snapshots = try await [firstInsert.value, secondInsert.value]
+        let winners = Set(snapshots.compactMap {
+            $0.records[firstCandidate.key]?.threadID
+        })
+        #expect(winners.count == 1)
+        #expect(
+            winners == [firstCandidate.threadID]
+                || winners == [secondCandidate.threadID]
+        )
+        let relaunched = try FileCodexConversationStore(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        #expect(
+            await relaunched.snapshot().records[firstCandidate.key]?.threadID
+                == winners.first
+        )
+    }
+
     @Test("records fail closed on an unsupported protocol generation")
     func rejectsUnsupportedProtocolGeneration() async throws {
         let fixture = try CodexSessionPersistenceFixture()
@@ -144,6 +186,32 @@ struct CodexConversationStoreTests {
         #expect(tombstone?.protocolGeneration == "app-server-0.144")
         #expect(tombstone?.lastCompletedStage == .remoteThreadDeleted)
         #expect(tombstone?.failure == .journalUnavailable)
+    }
+
+    @Test("failed loser compensation preserves a bounded orphan reference")
+    func persistsOrphanThreadForRetryAcrossRelaunch() async throws {
+        let fixture = try CodexSessionPersistenceFixture()
+        defer { fixture.remove() }
+        let store = try FileCodexConversationStore(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        let orphan = CodexOrphanedThread(
+            threadID: AgentThreadID(rawValue: "thread-orphan"),
+            attemptedKey: codexTestKey(),
+            failure: .remoteUnavailable,
+            updatedAt: codexTestRecord().updatedAt.addingTimeInterval(23)
+        )
+
+        _ = try await store.apply(.recordOrphan(orphan))
+
+        let relaunched = try FileCodexConversationStore(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        #expect(await relaunched.snapshot().orphans[orphan.threadID] == orphan)
+        _ = try await relaunched.apply(
+            .removeOrphan(threadID: orphan.threadID)
+        )
+        #expect(await relaunched.snapshot().orphans.isEmpty)
     }
 
     @Test("completed deletion atomically removes mapping and tombstone")

@@ -48,6 +48,7 @@ public struct CodexSessionState: Codable, Equatable, Sendable {
     public let pendingApprovals: [TerminalApprovalRequest]
     public let archived: Bool
     public let deletionRetry: CodexDeletionRetryState?
+    public let orphanedThreads: [CodexOrphanedThread]
 
     public init(
         key: TerminalConversationKey,
@@ -57,7 +58,8 @@ public struct CodexSessionState: Codable, Equatable, Sendable {
         messages: [AgentMessage] = [],
         pendingApprovals: [TerminalApprovalRequest] = [],
         archived: Bool = false,
-        deletionRetry: CodexDeletionRetryState? = nil
+        deletionRetry: CodexDeletionRetryState? = nil,
+        orphanedThreads: [CodexOrphanedThread] = []
     ) {
         self.key = key
         self.threadID = threadID
@@ -67,13 +69,43 @@ public struct CodexSessionState: Codable, Equatable, Sendable {
         self.pendingApprovals = pendingApprovals
         self.archived = archived
         self.deletionRetry = deletionRetry
+        self.orphanedThreads = orphanedThreads
+    }
+}
+
+public struct CodexSessionActivitySnapshot: Equatable, Sendable {
+    public let revision: UInt64
+    public let states: [TerminalConversationKey: CodexSessionState]
+
+    public init(
+        revision: UInt64,
+        states: [TerminalConversationKey: CodexSessionState]
+    ) {
+        self.revision = revision
+        self.states = states
     }
 }
 
 public enum CodexSessionActivityEvent: Equatable, Sendable {
     case approvalRequested(
         key: TerminalConversationKey,
-        request: TerminalApprovalRequest
+        request: TerminalApprovalRequest,
+        revision: UInt64
     )
-    case approvalResolved(key: TerminalConversationKey, requestID: UUID)
+    case approvalResolved(
+        key: TerminalConversationKey,
+        requestID: UUID,
+        revision: UInt64
+    )
+    case reconciliationRequired(CodexSessionActivitySnapshot)
+
+    public var revision: UInt64 {
+        switch self {
+        case let .approvalRequested(_, _, revision),
+            let .approvalResolved(_, _, revision):
+            revision
+        case let .reconciliationRequired(snapshot):
+            snapshot.revision
+        }
+    }
 }
