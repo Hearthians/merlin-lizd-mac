@@ -9,6 +9,10 @@ let package = Package(
     ],
     products: [
         .library(name: "MerlinLizdCore", targets: ["MerlinLizdCore"]),
+        .library(
+            name: "MerlinLizdCodexAdapter",
+            targets: ["MerlinLizdCodexAdapter"]
+        ),
         .executable(name: "MerlinLizd", targets: ["MerlinLizdApp"]),
         .executable(name: "MerlinLizdCoreTests", targets: ["MerlinLizdCoreTests"])
     ],
@@ -18,6 +22,10 @@ let package = Package(
     targets: [
         .target(name: "MerlinLizdCore"),
         .target(
+            name: "MerlinLizdCodexAdapter",
+            dependencies: ["MerlinLizdCore"]
+        ),
+        .target(
             name: "_Testing_Foundation",
             path: "Sources/TestingFoundationShim"
         ),
@@ -25,12 +33,17 @@ let package = Package(
             name: "MerlinLizdApp",
             dependencies: [
                 "MerlinLizdCore",
+                "MerlinLizdCodexAdapter",
                 .product(name: "SwiftTerm", package: "SwiftTerm"),
             ]
         ),
         .executableTarget(
             name: "MerlinLizdCoreTests",
-            dependencies: ["MerlinLizdCore", "_Testing_Foundation"],
+            dependencies: [
+                "MerlinLizdCore",
+                "MerlinLizdCodexAdapter",
+                "_Testing_Foundation",
+            ],
             path: "Tests/MerlinLizdCoreTests",
             resources: [
                 .copy("Fixtures")
