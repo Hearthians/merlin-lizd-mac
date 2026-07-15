@@ -171,6 +171,51 @@ actor IndeterminateRereadCodexConversationStore: CodexConversationStoring {
     }
 }
 
+actor TransientIndeterminateCodexConversationStore: CodexConversationStoring {
+    private let base: any CodexConversationStoring
+    private let persistFirstInsert: Bool
+    private var didFailInsert = false
+    private var shouldFailRecovery = false
+
+    init(
+        base: any CodexConversationStoring,
+        persistFirstInsert: Bool
+    ) {
+        self.base = base
+        self.persistFirstInsert = persistFirstInsert
+    }
+
+    func snapshot() async throws -> CodexConversationStoreSnapshot {
+        try await base.snapshot()
+    }
+
+    func recoverDurableSnapshot() async throws -> CodexConversationStoreSnapshot {
+        if shouldFailRecovery {
+            shouldFailRecovery = false
+            throw CodexSessionStoreFailure.injected
+        }
+        return try await base.recoverDurableSnapshot()
+    }
+
+    func apply(
+        _ mutation: CodexConversationStoreMutation
+    ) async throws -> CodexConversationStoreSnapshot {
+        guard !didFailInsert, case .insertIfAbsent = mutation else {
+            return try await base.apply(mutation)
+        }
+        didFailInsert = true
+        if persistFirstInsert {
+            _ = try await base.apply(mutation)
+        }
+        shouldFailRecovery = true
+        throw CodexConversationStoreError.posixFailure(
+            operation: "injected-pre-rename",
+            path: "conversation-store",
+            code: 5
+        )
+    }
+}
+
 private actor CodexSessionTestRace<Value: Sendable> {
     private var result: Result<Value, any Error>?
     private var waiters: [CheckedContinuation<Result<Value, any Error>, Never>]

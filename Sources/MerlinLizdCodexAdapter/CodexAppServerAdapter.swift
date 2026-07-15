@@ -88,6 +88,11 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         var overflowed: Bool
     }
 
+    private struct EventSubscriber {
+        var cursor: UInt64?
+        var waiter: CheckedContinuation<Void, Never>?
+    }
+
     private enum ServerRequestPhase: Equatable, Sendable {
         case executing
         case responding
@@ -133,8 +138,8 @@ public actor CodexAppServerAdapter: CodexAgentClient {
     private var serverRequestResponsesEnabled = true
     private var eventReplay: [AgentThreadID: [AgentEventRecord]] = [:]
     private var eventSequences: [AgentThreadID: UInt64] = [:]
-    private var eventContinuations: [
-        AgentThreadID: [UUID: AsyncStream<AgentEventDelivery>.Continuation]
+    private var eventSubscribers: [
+        AgentThreadID: [UUID: EventSubscriber]
     ] = [:]
     private var availabilityValue: AgentAvailability = .starting
     private var availabilityContinuations: [
@@ -491,38 +496,21 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         after sequence: UInt64?
     ) -> AsyncStream<AgentEventDelivery> {
         let id = UUID()
-        let pair = AsyncStream<AgentEventDelivery>.makeStream(
-            bufferingPolicy: .bufferingNewest(1)
+        guard !stopped else {
+            return AsyncStream(unfolding: { nil })
+        }
+        eventSubscribers[threadID, default: [:]][id] = EventSubscriber(
+            cursor: sequence,
+            waiter: nil
         )
-        let replay = eventReplay[threadID] ?? []
-        if let oldest = replay.first?.sequence,
-            sequence.map { oldest > $0 &+ 1 } ?? (oldest > 1)
-        {
-            _ = pair.continuation.yield(.replayGap(
-                after: sequence,
-                oldestAvailable: oldest
-            ))
-            pair.continuation.finish()
-            return pair.stream
-        }
-        let retained = replay.filter { record in
-            sequence.map { record.sequence > $0 } ?? true
-        }
-        if !retained.isEmpty {
-            guard case .enqueued = pair.continuation.yield(.events(retained)) else {
-                pair.continuation.finish()
-                return pair.stream
+        return AsyncStream(
+            unfolding: { [weak self] in
+                await self?.nextEventDelivery(id: id, for: threadID)
+            },
+            onCancel: { [weak self] in
+                Task { await self?.cancelEventSubscriber(id, for: threadID) }
             }
-        }
-        if stopped {
-            pair.continuation.finish()
-            return pair.stream
-        }
-        eventContinuations[threadID, default: [:]][id] = pair.continuation
-        pair.continuation.onTermination = { [weak self] _ in
-            Task { await self?.removeEventContinuation(id, for: threadID) }
-        }
-        return pair.stream
+        )
     }
 
     public func availability() -> AsyncStream<AgentAvailability> {
@@ -651,7 +639,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         activeTurns.removeAll()
         knownThreads.removeAll()
         setAvailability(.stopped)
-        for threadID in Set(eventContinuations.keys)
+        for threadID in Set(eventSubscribers.keys)
             .union(eventReplay.keys)
             .union(eventSequences.keys)
         {
@@ -700,7 +688,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
             },
             pendingResumes: pendingResumes.count,
             pendingDeletes: pendingDeletes.count,
-            eventSubscribers: eventContinuations.values.reduce(0) {
+            eventSubscribers: eventSubscribers.values.reduce(0) {
                 $0 + $1.count
             },
             availabilitySubscribers: availabilityContinuations.count
@@ -1490,40 +1478,76 @@ public actor CodexAppServerAdapter: CodexAgentClient {
             replay.removeFirst(replay.count - Self.eventReplayLimit)
         }
         eventReplay[threadID] = replay
-        let subscribers = eventContinuations[threadID] ?? [:]
-        for (id, continuation) in subscribers {
-            switch continuation.yield(.event(record)) {
-            case .enqueued:
-                continue
-            case let .dropped(dropped):
-                let firstMissing = firstSequence(in: dropped)
-                    ?? record.sequence
-                let oldestRetained = replay.first?.sequence ?? firstMissing
-                _ = continuation.yield(.replayGap(
-                    after: firstMissing == 0 ? nil : firstMissing - 1,
-                    oldestAvailable: max(firstMissing, oldestRetained)
-                ))
-                continuation.finish()
-                removeEventContinuation(id, for: threadID)
-            case .terminated:
-                continuation.finish()
-                removeEventContinuation(id, for: threadID)
-            @unknown default:
-                continuation.finish()
-                removeEventContinuation(id, for: threadID)
+        wakeEventSubscribers(for: threadID)
+    }
+
+    private func nextEventDelivery(
+        id: UUID,
+        for threadID: AgentThreadID
+    ) async -> AgentEventDelivery? {
+        while !Task.isCancelled {
+            guard var subscriber = eventSubscribers[threadID]?[id] else {
+                return nil
             }
+            let replay = eventReplay[threadID] ?? []
+            if let oldest = replay.first?.sequence,
+                subscriber.cursor.map({ oldest > $0 &+ 1 }) ?? (oldest > 1)
+            {
+                cancelEventSubscriber(id, for: threadID)
+                return .replayGap(
+                    after: subscriber.cursor,
+                    oldestAvailable: oldest
+                )
+            }
+            let retained = replay.filter { record in
+                subscriber.cursor.map { record.sequence > $0 } ?? true
+            }
+            if let record = retained.first {
+                subscriber.cursor = record.sequence
+                eventSubscribers[threadID]?[id] = subscriber
+                return .event(record)
+            }
+            guard !stopped else {
+                cancelEventSubscriber(id, for: threadID)
+                return nil
+            }
+            await waitForEvent(id: id, threadID: threadID)
+        }
+        cancelEventSubscriber(id, for: threadID)
+        return nil
+    }
+
+    private func waitForEvent(id: UUID, threadID: AgentThreadID) async {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation(isolation: self) { continuation in
+                guard !Task.isCancelled,
+                    var subscriber = eventSubscribers[threadID]?[id]
+                else {
+                    continuation.resume()
+                    return
+                }
+                precondition(subscriber.waiter == nil)
+                subscriber.waiter = continuation
+                eventSubscribers[threadID]?[id] = subscriber
+            }
+        } onCancel: {
+            Task { await self.cancelEventSubscriber(id, for: threadID) }
         }
     }
 
-    private func firstSequence(in delivery: AgentEventDelivery) -> UInt64? {
-        switch delivery {
-        case let .event(record):
-            record.sequence
-        case let .events(records):
-            records.first?.sequence
-        case .replayGap:
-            nil
+    private func wakeEventSubscribers(for threadID: AgentThreadID) {
+        guard var subscribers = eventSubscribers[threadID] else { return }
+        var waiters: [CheckedContinuation<Void, Never>] = []
+        for id in subscribers.keys {
+            guard var subscriber = subscribers[id],
+                let waiter = subscriber.waiter
+            else { continue }
+            subscriber.waiter = nil
+            subscribers[id] = subscriber
+            waiters.append(waiter)
         }
+        eventSubscribers[threadID] = subscribers
+        waiters.forEach { $0.resume() }
     }
 
     private func setAvailability(_ value: AgentAvailability) {
@@ -1537,14 +1561,15 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         }
     }
 
-    private func removeEventContinuation(
+    private func cancelEventSubscriber(
         _ id: UUID,
         for threadID: AgentThreadID
     ) {
-        eventContinuations[threadID]?.removeValue(forKey: id)
-        if eventContinuations[threadID]?.isEmpty == true {
-            eventContinuations.removeValue(forKey: threadID)
+        let waiter = eventSubscribers[threadID]?.removeValue(forKey: id)?.waiter
+        if eventSubscribers[threadID]?.isEmpty == true {
+            eventSubscribers.removeValue(forKey: threadID)
         }
+        waiter?.resume()
     }
 
     private func removeAvailabilityContinuation(_ id: UUID) {
@@ -1552,12 +1577,8 @@ public actor CodexAppServerAdapter: CodexAgentClient {
     }
 
     private func finishEvents(for threadID: AgentThreadID) {
-        for continuation in eventContinuations.removeValue(
-            forKey: threadID
-        )?.values ?? [:].values {
-            continuation.onTermination = nil
-            continuation.finish()
-        }
+        let subscribers = eventSubscribers.removeValue(forKey: threadID) ?? [:]
+        subscribers.values.compactMap(\.waiter).forEach { $0.resume() }
         eventReplay.removeValue(forKey: threadID)
         eventSequences.removeValue(forKey: threadID)
         cancelPendingResume(for: threadID)

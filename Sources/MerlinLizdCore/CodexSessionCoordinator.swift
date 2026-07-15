@@ -33,6 +33,10 @@ public actor CodexSessionCoordinator {
         let task: Task<Void, Never>
     }
 
+    private struct TerminationOperation: Sendable {
+        let id: UUID
+    }
+
     private struct ArchiveOperation: Sendable {
         let id: UUID
         let desiredArchived: Bool
@@ -54,8 +58,13 @@ public actor CodexSessionCoordinator {
         let task: Task<Void, Never>
     }
 
+    private struct ActivitySubscriber {
+        var cursor: UInt64
+        var needsInitialReconciliation: Bool
+        var waiter: CheckedContinuation<Void, Never>?
+    }
+
     private static let stateStreamCapacity = 1
-    private static let activityStreamCapacity = 1
     private static let activityTransitionLimit = 64
     private static let orphanLimit = 64
 
@@ -82,9 +91,11 @@ public actor CodexSessionCoordinator {
     private var stoppingKeys: Set<TerminalConversationKey> = []
     private var deletingKeys: Set<TerminalConversationKey> = []
     private var lifecycleRevisions: [TerminalConversationKey: UInt64] = [:]
-    private var terminatingKeys: Set<TerminalConversationKey> = []
+    private var terminationOperations: [
+        TerminalConversationKey: TerminationOperation
+    ] = [:]
     private var terminationWaiters: [
-        TerminalConversationKey: [UUID: CheckedContinuation<Void, Never>]
+        UUID: [UUID: CheckedContinuation<Void, Never>]
     ] = [:]
     private var pendingStartWaiters: [
         UUID: [UUID: CheckedContinuation<Void, Never>]
@@ -119,9 +130,7 @@ public actor CodexSessionCoordinator {
             TerminalConversationKey: CodexSessionState
         ]>.Continuation
     ] = [:]
-    private var activitySubscribers: [
-        UUID: AsyncStream<CodexSessionActivityEvent>.Continuation
-    ] = [:]
+    private var activitySubscribers: [UUID: ActivitySubscriber] = [:]
     private var activityRevision: UInt64 = 0
     private var activityTransitions: [CodexSessionActivityEvent] = []
     private var registryEventHook: (
@@ -185,7 +194,7 @@ public actor CodexSessionCoordinator {
             !deletingKeys.contains(key),
             sessionStates[key]?.deletionRetry == nil
         else { return }
-        if terminatingKeys.contains(key) {
+        if terminationOperations[key] != nil {
             await waitForTermination(of: key)
             guard !Task.isCancelled else { return }
             await submit(prompt, for: key)
@@ -315,8 +324,8 @@ public actor CodexSessionCoordinator {
             activeTurns[key]?.turnID == active.turnID
         else { return }
         activeTurns.removeValue(forKey: key)
-        terminatingKeys.insert(key)
-        defer { finishTermination(of: key) }
+        let termination = beginTermination(of: key)
+        defer { finishTermination(of: key, operation: termination) }
         try? await router.interruptTurn(
             handle: active.handle,
             turnID: active.turnID
@@ -339,21 +348,24 @@ public actor CodexSessionCoordinator {
     private func waitForTermination(
         of key: TerminalConversationKey
     ) async {
-        guard terminatingKeys.contains(key) else { return }
+        guard let operation = terminationOperations[key] else { return }
         await terminationWaitHook?()
         let waiterID = UUID()
         await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
-                guard !Task.isCancelled, terminatingKeys.contains(key) else {
+                guard !Task.isCancelled,
+                    terminationOperations[key]?.id == operation.id
+                else {
                     continuation.resume()
                     return
                 }
-                terminationWaiters[key, default: [:]][waiterID] = continuation
+                terminationWaiters[operation.id, default: [:]][waiterID]
+                    = continuation
             }
         } onCancel: {
             Task {
                 await self.cancelTerminationWaiter(
-                    key: key,
+                    operationID: operation.id,
                     waiterID: waiterID
                 )
             }
@@ -361,18 +373,31 @@ public actor CodexSessionCoordinator {
     }
 
     private func cancelTerminationWaiter(
-        key: TerminalConversationKey,
+        operationID: UUID,
         waiterID: UUID
     ) {
-        terminationWaiters[key]?.removeValue(forKey: waiterID)?.resume()
-        if terminationWaiters[key]?.isEmpty == true {
-            terminationWaiters.removeValue(forKey: key)
+        terminationWaiters[operationID]?.removeValue(forKey: waiterID)?.resume()
+        if terminationWaiters[operationID]?.isEmpty == true {
+            terminationWaiters.removeValue(forKey: operationID)
         }
     }
 
-    private func finishTermination(of key: TerminalConversationKey) {
-        terminatingKeys.remove(key)
-        let waiters = terminationWaiters.removeValue(forKey: key) ?? [:]
+    private func beginTermination(
+        of key: TerminalConversationKey
+    ) -> TerminationOperation {
+        precondition(terminationOperations[key] == nil)
+        let operation = TerminationOperation(id: UUID())
+        terminationOperations[key] = operation
+        return operation
+    }
+
+    private func finishTermination(
+        of key: TerminalConversationKey,
+        operation: TerminationOperation
+    ) {
+        guard terminationOperations[key]?.id == operation.id else { return }
+        terminationOperations.removeValue(forKey: key)
+        let waiters = terminationWaiters.removeValue(forKey: operation.id) ?? [:]
         waiters.values.forEach { $0.resume() }
     }
 
@@ -433,7 +458,14 @@ public actor CodexSessionCoordinator {
     private func performStopAndTakeOver(
         _ key: TerminalConversationKey
     ) async {
+        await waitForTermination(of: key)
         let active = activeTurns.removeValue(forKey: key)
+        let termination = active.map { _ in beginTermination(of: key) }
+        defer {
+            if let termination {
+                finishTermination(of: key, operation: termination)
+            }
+        }
         let prepared = preparedTurns.removeValue(forKey: key)
         if let active {
             try? await router.interruptTurn(
@@ -449,7 +481,6 @@ public actor CodexSessionCoordinator {
             phase: .interrupted,
             pendingApprovals: []
         )
-        finishTermination(of: key)
         if let pending = pendingStarts[key] {
             pending.task.cancel()
             await pending.task.value
@@ -722,35 +753,22 @@ public actor CodexSessionCoordinator {
         after revision: UInt64? = nil
     ) -> AsyncStream<CodexSessionActivityEvent> {
         guard !isShuttingDown else {
-            return AsyncStream { $0.finish() }
+            return AsyncStream(unfolding: { nil })
         }
         let id = UUID()
-        let pair = AsyncStream<CodexSessionActivityEvent>.makeStream(
-            bufferingPolicy: .bufferingNewest(
-                revision == nil
-                    ? Self.activityStreamCapacity
-                    : Self.activityTransitionLimit
-            )
+        activitySubscribers[id] = ActivitySubscriber(
+            cursor: revision ?? activityRevision,
+            needsInitialReconciliation: revision == nil,
+            waiter: nil
         )
-        pair.continuation.onTermination = { [weak self] _ in
-            Task { await self?.removeActivitySubscriber(id) }
-        }
-        activitySubscribers[id] = pair.continuation
-        let snapshot = activitySnapshot()
-        if let revision, revision < snapshot.revision {
-            if let oldest = activityTransitions.first?.revision,
-                oldest <= revision &+ 1
-            {
-                for event in activityTransitions where event.revision > revision {
-                    _ = pair.continuation.yield(event)
-                }
-            } else {
-                _ = pair.continuation.yield(.transitionHistoryGap(snapshot))
+        return AsyncStream(
+            unfolding: { [weak self] in
+                await self?.nextActivityEvent(subscriberID: id)
+            },
+            onCancel: { [weak self] in
+                Task { await self?.cancelActivitySubscriber(id) }
             }
-        } else if revision == nil {
-            pair.continuation.yield(.reconciliationRequired(snapshot))
-        }
-        return pair.stream
+        )
     }
 
     public func snapshot() -> [TerminalConversationKey: CodexSessionState] {
@@ -814,7 +832,6 @@ public actor CodexSessionCoordinator {
         let stops = stopOperations
         let archives = archiveOperations
         let deletions = deletionOperations
-        for operation in stops.values { operation.task.cancel() }
         for operation in archives.values { operation.task.cancel() }
         for operation in deletions.values { operation.task.cancel() }
         let starts = pendingStarts
@@ -824,10 +841,16 @@ public actor CodexSessionCoordinator {
             finishPendingStart(key: key, id: start.id)
         }
 
+        while let key = terminationOperations.keys.first {
+            await waitForTermination(of: key)
+        }
         let active = activeTurns
         activeTurns.removeAll()
+        var activeTerminations: [
+            TerminalConversationKey: TerminationOperation
+        ] = [:]
         for (key, turn) in active {
-            terminatingKeys.insert(key)
+            activeTerminations[key] = beginTermination(of: key)
             try? await router.interruptTurn(
                 handle: turn.handle,
                 turnID: turn.turnID
@@ -846,7 +869,9 @@ public actor CodexSessionCoordinator {
                     turnID: turn.turnID
                 )
             }
-            finishTermination(of: key)
+            if let termination = activeTerminations[key] {
+                finishTermination(of: key, operation: termination)
+            }
         }
 
         let registryInstallation = self.registryInstallation
@@ -898,19 +923,17 @@ public actor CodexSessionCoordinator {
             finishDeletionOperation(key: key, id: operation.id)
         }
         if let restoration { _ = try? await restoration.value }
-        let terminations = Array(terminatingKeys)
-        for key in terminations { await waitForTermination(of: key) }
-        for key in terminationWaiters.keys { finishTermination(of: key) }
+        while let key = terminationOperations.keys.first {
+            await waitForTermination(of: key)
+        }
         stateSubscribers.values.forEach {
             $0.onTermination = nil
             $0.finish()
         }
-        activitySubscribers.values.forEach {
-            $0.onTermination = nil
-            $0.finish()
-        }
+        let activityWaiters = activitySubscribers.values.compactMap(\.waiter)
         stateSubscribers.removeAll()
         activitySubscribers.removeAll()
+        activityWaiters.forEach { $0.resume() }
         await agent.shutdown()
     }
 
@@ -1143,6 +1166,7 @@ public actor CodexSessionCoordinator {
         for key: TerminalConversationKey
     ) async throws -> AgentThreadID {
         var snapshot = try await store.recoverDurableSnapshot()
+        snapshot = await reconcileVolatileOrphans(after: snapshot)
         let record: CodexConversationRecord
         if let persisted = snapshot.records[key] {
             guard snapshot.deletions[key] == nil else {
@@ -1160,6 +1184,10 @@ public actor CodexSessionCoordinator {
                 do {
                     snapshot = try await store.recoverDurableSnapshot()
                 } catch {
+                    retainIndeterminateCandidate(
+                        threadID: threadID,
+                        attemptedKey: key
+                    )
                     throw firstError
                 }
                 if snapshot.records[key] == nil {
@@ -1169,6 +1197,10 @@ public actor CodexSessionCoordinator {
                         do {
                             snapshot = try await store.recoverDurableSnapshot()
                         } catch {
+                            retainIndeterminateCandidate(
+                                threadID: threadID,
+                                attemptedKey: key
+                            )
                             throw retryError
                         }
                         guard snapshot.records[key] != nil else {
@@ -1215,6 +1247,76 @@ public actor CodexSessionCoordinator {
         return record.threadID
     }
 
+    private func retainIndeterminateCandidate(
+        threadID: AgentThreadID,
+        attemptedKey: TerminalConversationKey
+    ) {
+        volatileOrphans[threadID] = CodexOrphanedThread(
+            threadID: threadID,
+            attemptedKey: attemptedKey,
+            failure: .persistenceUnavailable,
+            updatedAt: Date()
+        )
+        updateState(
+            for: attemptedKey,
+            phase: .failed(.persistenceUnavailable)
+        )
+    }
+
+    private func reconcileVolatileOrphans(
+        after durableSnapshot: CodexConversationStoreSnapshot
+    ) async -> CodexConversationStoreSnapshot {
+        var snapshot = durableSnapshot
+        let candidates = volatileOrphans.values.sorted {
+            $0.threadID.rawValue < $1.threadID.rawValue
+        }
+        for candidate in candidates {
+            let isWinner = snapshot.records.values.contains {
+                $0.threadID == candidate.threadID
+            }
+            if isWinner {
+                clearVolatileOrphan(candidate)
+                continue
+            }
+            do {
+                try await agent.ensureThreadDeleted(candidate.threadID)
+                if snapshot.orphans[candidate.threadID] != nil {
+                    do {
+                        snapshot = try await store.apply(
+                            .removeOrphan(threadID: candidate.threadID)
+                        )
+                    } catch {
+                        retainIndeterminateCandidate(
+                            threadID: candidate.threadID,
+                            attemptedKey: candidate.attemptedKey
+                        )
+                        continue
+                    }
+                }
+                clearVolatileOrphan(candidate)
+            } catch {
+                if let persisted = await recordOrphanCompensationFailure(
+                    threadID: candidate.threadID,
+                    attemptedKey: candidate.attemptedKey
+                ) {
+                    snapshot = persisted
+                }
+            }
+        }
+        return snapshot
+    }
+
+    private func clearVolatileOrphan(_ orphan: CodexOrphanedThread) {
+        volatileOrphans.removeValue(forKey: orphan.threadID)
+        guard let state = sessionStates[orphan.attemptedKey] else { return }
+        updateState(
+            for: orphan.attemptedKey,
+            orphanedThreads: state.orphanedThreads.filter {
+                $0.threadID != orphan.threadID
+            }
+        )
+    }
+
     private func reserveOrphanCapacity(
         snapshot: CodexConversationStoreSnapshot
     ) throws -> UUID {
@@ -1234,24 +1336,39 @@ public actor CodexSessionCoordinator {
     ) async {
         do {
             try await agent.ensureThreadDeleted(threadID)
-            volatileOrphans.removeValue(forKey: threadID)
-        } catch {
-            var orphan = CodexOrphanedThread(
-                threadID: threadID,
-                attemptedKey: attemptedKey,
-                failure: .remoteUnavailable,
-                updatedAt: Date()
-            )
-            volatileOrphans[threadID] = orphan
-            do {
-                _ = try await store.apply(.recordOrphan(orphan))
-            } catch {
-                orphan.failure = .persistenceUnavailable
-                orphan.updatedAt = Date()
-                volatileOrphans[threadID] = orphan
+            if let orphan = volatileOrphans[threadID] {
+                clearVolatileOrphan(orphan)
             }
-            updateState(for: attemptedKey, phase: .failed(.persistenceUnavailable))
+        } catch {
+            _ = await recordOrphanCompensationFailure(
+                threadID: threadID,
+                attemptedKey: attemptedKey
+            )
         }
+    }
+
+    private func recordOrphanCompensationFailure(
+        threadID: AgentThreadID,
+        attemptedKey: TerminalConversationKey
+    ) async -> CodexConversationStoreSnapshot? {
+        var orphan = CodexOrphanedThread(
+            threadID: threadID,
+            attemptedKey: attemptedKey,
+            failure: .remoteUnavailable,
+            updatedAt: Date()
+        )
+        volatileOrphans[threadID] = orphan
+        let snapshot: CodexConversationStoreSnapshot?
+        do {
+            snapshot = try await store.apply(.recordOrphan(orphan))
+        } catch {
+            orphan.failure = .persistenceUnavailable
+            orphan.updatedAt = Date()
+            volatileOrphans[threadID] = orphan
+            snapshot = nil
+        }
+        updateState(for: attemptedKey, phase: .failed(.persistenceUnavailable))
+        return snapshot
     }
 
     private func ensureEventConsumer(
@@ -1345,7 +1462,8 @@ public actor CodexSessionCoordinator {
         else { return }
         pendingStarts[key]?.task.cancel()
         if let active = activeTurns.removeValue(forKey: key) {
-            terminatingKeys.insert(key)
+            let termination = beginTermination(of: key)
+            defer { finishTermination(of: key, operation: termination) }
             try? await router.crashTurn(
                 handle: active.handle,
                 turnID: active.turnID
@@ -1361,7 +1479,6 @@ public actor CodexSessionCoordinator {
                 threadID: threadID,
                 turnID: active.turnID
             )
-            finishTermination(of: key)
         } else {
             resumedThreads.remove(threadID)
             updateState(for: key, phase: .failed(.protocolFailure))
@@ -1477,7 +1594,8 @@ public actor CodexSessionCoordinator {
             turnID == nil || turnID == active.turnID
         else { return }
         activeTurns.removeValue(forKey: key)
-        terminatingKeys.insert(key)
+        let operation = beginTermination(of: key)
+        defer { finishTermination(of: key, operation: operation) }
         switch termination {
         case .end:
             try? await router.endTurn(
@@ -1501,7 +1619,6 @@ public actor CodexSessionCoordinator {
             phase: phase,
             pendingApprovals: []
         )
-        finishTermination(of: key)
     }
 
     private func ensureRegistryConsumer() async {
@@ -1864,7 +1981,8 @@ public actor CodexSessionCoordinator {
             let threadID = sessionStates[key]?.threadID
         else { return }
         activeTurns.removeValue(forKey: key)
-        terminatingKeys.insert(key)
+        let termination = beginTermination(of: key)
+        defer { finishTermination(of: key, operation: termination) }
         try? await router.interruptTurn(
             handle: active.handle,
             turnID: active.turnID
@@ -1876,7 +1994,6 @@ public actor CodexSessionCoordinator {
             pendingApprovals: []
         )
         await agent.interruptTurn(threadID: threadID, turnID: active.turnID)
-        finishTermination(of: key)
     }
 
     private func state(
@@ -1927,7 +2044,8 @@ public actor CodexSessionCoordinator {
         phase: CodexSessionPhase? = nil,
         messages: [AgentMessage]? = nil,
         pendingApprovals: [TerminalApprovalRequest]? = nil,
-        archived: Bool? = nil
+        archived: Bool? = nil,
+        orphanedThreads: [CodexOrphanedThread]? = nil
     ) {
         let current = sessionStates[key] ?? CodexSessionState(key: key)
         sessionStates[key] = CodexSessionState(
@@ -1939,7 +2057,7 @@ public actor CodexSessionCoordinator {
             pendingApprovals: pendingApprovals ?? current.pendingApprovals,
             archived: archived ?? current.archived,
             deletionRetry: current.deletionRetry,
-            orphanedThreads: orphanState(
+            orphanedThreads: orphanedThreads ?? orphanState(
                 for: key,
                 durable: [],
                 existing: current.orphanedThreads
@@ -2003,8 +2121,83 @@ public actor CodexSessionCoordinator {
         stateSubscribers.removeValue(forKey: id)
     }
 
-    private func removeActivitySubscriber(_ id: UUID) {
-        activitySubscribers.removeValue(forKey: id)
+    private func cancelActivitySubscriber(_ id: UUID) {
+        activitySubscribers.removeValue(forKey: id)?.waiter?.resume()
+    }
+
+    private func nextActivityEvent(
+        subscriberID: UUID
+    ) async -> CodexSessionActivityEvent? {
+        while !Task.isCancelled {
+            guard var subscriber = activitySubscribers[subscriberID] else {
+                return nil
+            }
+            if subscriber.needsInitialReconciliation {
+                let snapshot = activitySnapshot()
+                subscriber.cursor = snapshot.revision
+                subscriber.needsInitialReconciliation = false
+                activitySubscribers[subscriberID] = subscriber
+                return .reconciliationRequired(snapshot)
+            }
+            if activityRevision > subscriber.cursor {
+                let snapshot = activitySnapshot()
+                guard let oldest = activityTransitions.first?.revision,
+                    oldest <= subscriber.cursor &+ 1
+                else {
+                    subscriber.cursor = snapshot.revision
+                    activitySubscribers[subscriberID] = subscriber
+                    return .transitionHistoryGap(snapshot)
+                }
+                if let event = activityTransitions.first(where: {
+                    $0.revision > subscriber.cursor
+                }) {
+                    subscriber.cursor = event.revision
+                    activitySubscribers[subscriberID] = subscriber
+                    return event
+                }
+                subscriber.cursor = snapshot.revision
+                activitySubscribers[subscriberID] = subscriber
+                return .transitionHistoryGap(snapshot)
+            }
+            guard !isShuttingDown else {
+                cancelActivitySubscriber(subscriberID)
+                return nil
+            }
+            await waitForActivity(subscriberID: subscriberID)
+        }
+        cancelActivitySubscriber(subscriberID)
+        return nil
+    }
+
+    private func waitForActivity(subscriberID: UUID) async {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation(isolation: self) { continuation in
+                guard !Task.isCancelled,
+                    var subscriber = activitySubscribers[subscriberID]
+                else {
+                    continuation.resume()
+                    return
+                }
+                precondition(subscriber.waiter == nil)
+                subscriber.waiter = continuation
+                activitySubscribers[subscriberID] = subscriber
+            }
+        } onCancel: {
+            Task { await self.cancelActivitySubscriber(subscriberID) }
+        }
+    }
+
+    private func wakeActivitySubscribers() {
+        var waiters: [CheckedContinuation<Void, Never>] = []
+        for id in Array(activitySubscribers.keys) {
+            guard var subscriber = activitySubscribers[id],
+                let waiter = subscriber.waiter
+            else { continue }
+            subscriber.waiter = nil
+            activitySubscribers[id] = subscriber
+            waiters.append(waiter)
+        }
+        waiters.forEach { $0.resume() }
     }
 
     private func publishActivity(
@@ -2031,22 +2224,7 @@ public actor CodexSessionCoordinator {
                 activityTransitions.count - Self.activityTransitionLimit
             )
         }
-        var ended: [UUID] = []
-        for (id, subscriber) in activitySubscribers {
-            switch subscriber.yield(event) {
-            case .enqueued:
-                break
-            case .dropped:
-                _ = subscriber.yield(
-                    .transitionHistoryGap(activitySnapshot())
-                )
-            case .terminated:
-                ended.append(id)
-            @unknown default:
-                ended.append(id)
-            }
-        }
-        ended.forEach { activitySubscribers.removeValue(forKey: $0) }
+        wakeActivitySubscribers()
     }
 
     private func activitySnapshot() -> CodexSessionActivitySnapshot {

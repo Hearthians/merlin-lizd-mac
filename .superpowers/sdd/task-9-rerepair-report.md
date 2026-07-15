@@ -108,6 +108,93 @@ future extraction of the coordinator's per-key lifecycle/activity projection.
 
 ---
 
+# Task 9 post-fix review repair addendum
+
+Base: `690bf7c`
+
+## Outcome
+
+All four Important findings in `task-9-postfix-review-findings.md` are repaired
+in one TDD wave. The changes remain confined to Core, the Codex adapter, and
+their tests; no App, Vendor, or Task 10 files changed.
+
+## RED
+
+The first full RED run executed 642 tests and recorded 12 issues, all on the
+new deterministic seams:
+
+- an indeterminate pre-rename candidate was neither retained nor reconciled,
+  while the winner case also lacked volatile ownership;
+- a suspended AgentEvent consumer was removed during producer overflow and
+  could observe a buffered post-gap record;
+- Stop followed by shutdown completed agent shutdown before the exact steer
+  cleanup, and Delete began remote deletion before that cleanup;
+- a slow activity cursor received a post-gap approval transition before an
+  explicit reconciliation event.
+
+The RED suite also established that nil-cursor and exact-cursor stream behavior
+must be pull-driven: producers may only append to their bounded ring and wake a
+single suspended waiter; they do not yield buffered data or gaps.
+
+## GREEN implementation
+
+1. Pre-rename insert ambiguity now retains the returned candidate ID in the
+   existing bounded volatile orphan set before the reservation is released.
+   Every later successful exclusive recovery reconciles that set first. A
+   durable winner clears volatile ownership without deletion; a proven loser
+   is idempotently deleted before replacement creation; failed compensation is
+   durably recorded and remains visible. Direct tests cover later absence,
+   later winner, and one-attempt failed compensation persistence.
+2. AgentEvent delivery now uses the adapter's 512-record replay ring as the
+   sole buffer. Each subscriber owns a cursor and at most one checked waiter.
+   A pull atomically returns the next retained record or a terminal gap before
+   any post-gap record. Cancellation, thread deletion, crash, and shutdown
+   remove the exact subscriber and resume its waiter.
+3. Termination cleanup now has an exact operation UUID. Waiters bind to that
+   UUID and only its owner can finish and resume them. Stop, Delete, and
+   shutdown join pre-existing steer cleanup; Stop owns any later active-turn
+   cleanup through router termination, event-consumer drain, and agent
+   interrupt. Shutdown no longer cancels an admitted Stop before joining it.
+4. Coordinator activity delivery now uses the 64-transition history ring as
+   the sole buffer, with a per-subscriber cursor and one cancellation-clean
+   waiter. A nil cursor receives a current reconciliation on first pull. An
+   exhausted cursor receives one current history-gap snapshot before any later
+   approval transition; retained requested/resolved transitions remain exact
+   and ordered.
+
+## GREEN checkpoints
+
+- `CodexSessionCoordinatorTests`: 63 tests in 2 matched suites passed,
+  including all candidate, exact termination, and activity-cursor cases.
+- `CodexAppServerContractTests`: 69 tests in 1 suite passed, including exact
+  512-record replay, nil-cursor gap, and a deterministically suspended live
+  consumer.
+- A complete repository run before the final added compensation assertion
+  passed all 642 tests in 43 suites. The final complete run is recorded below.
+
+## Final verification
+
+- `./scripts/test.sh 2>&1 | rg -C 3 'recorded an issue|Test run with'`:
+  **643 tests in 43 suites passed** in 1.625 seconds.
+- One immediately preceding parallel full run completed with two issues whose
+  names fell outside the captured tail; both Task 9 focused suites remained
+  green, and the immediate complete rerun above was clean. This repository's
+  previously documented parallel descriptor-lifetime flake remains deferred;
+  no unrelated product change was made without a reproducible failing case.
+- `CodexSessionCoordinatorTests`: **63/63 passed** after the last compensation
+  persistence assertion.
+- `CodexAppServerContractTests`: **69/69 passed**.
+- `/usr/bin/swift build`: passed; `Build complete! (0.77s)`.
+- `git diff --check`: exited 0 with no output.
+- Scope audit lists only this report, two Task 9 production files, and three
+  Task 9 test files. No App, Vendor, or Task 10 file changed.
+- Self-review of `690bf7c..HEAD`: no additional Critical or Important defects
+  found. Event and activity publishers never yield consumer data; exact
+  waiter teardown, termination ownership, bounded orphan admission, and
+  durable winner/loser decisions are covered at their concurrency seams.
+
+---
+
 # Task 9 final-review repair addendum
 
 Base: `17b54a7`

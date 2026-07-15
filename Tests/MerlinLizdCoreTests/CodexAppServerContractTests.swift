@@ -3023,7 +3023,7 @@ struct CodexAppServerContractTests {
                 ])
             )
         }
-        #expect(await adapter.stateCountsForTesting.eventSubscribers == 0)
+        #expect(await adapter.stateCountsForTesting.eventSubscribers == 1)
         #expect(await adapter.stateCountsForTesting.replayEvents == 512)
 
         var slowIterator = slow.makeAsyncIterator()
@@ -3034,8 +3034,9 @@ struct CodexAppServerContractTests {
             await adapter.shutdown()
             return
         }
-        #expect(liveAfter == 0)
-        #expect(liveOldest == 1)
+        #expect(liveAfter == nil)
+        #expect(liveOldest > 1)
+        #expect(await adapter.stateCountsForTesting.eventSubscribers == 0)
         #expect(await slowIterator.next() == nil)
 
         let exhausted = await adapter.events(for: threadID, after: 0)
@@ -3056,16 +3057,18 @@ struct CodexAppServerContractTests {
             after: oldestAvailable &- 1
         )
         var iterator = replacement.makeAsyncIterator()
-        guard case let .events(records)? = await iterator.next(),
-            let firstRecord = records.first
-        else {
-            Issue.record("expected retained replay after the exact cursor")
-            await adapter.shutdown()
-            return
+        var records: [AgentEventRecord] = []
+        while records.count < 512 {
+            guard case let .event(record)? = await iterator.next() else {
+                Issue.record("expected retained replay after the exact cursor")
+                await adapter.shutdown()
+                return
+            }
+            records.append(record)
         }
-        #expect(firstRecord.sequence == oldestAvailable)
+        #expect(records.first?.sequence == oldestAvailable)
         #expect(records.count == 512)
-        #expect(records.last?.sequence == firstRecord.sequence + 511)
+        #expect(records.last?.sequence == oldestAvailable + 511)
         #expect(await adapter.stateCountsForTesting.eventSubscribers == 1)
 
         let availability = await adapter.availability()
@@ -3115,6 +3118,60 @@ struct CodexAppServerContractTests {
         #expect(after == nil)
         #expect(oldestAvailable > 1)
         #expect(await iterator.next() == nil)
+        await adapter.shutdown()
+    }
+
+    @Test("a suspended live consumer observes a gap before post-gap records")
+    func suspendedConsumerCannotObservePostGapEvent() async throws {
+        let process = ScriptedAppServerProcess()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor()
+        )
+        let threadID = try await startMappedThread(adapter: adapter, process: process)
+        let turnID = try await startMappedTurn(
+            adapter: adapter,
+            process: process,
+            threadID: threadID,
+            turnID: "suspended-cursor-turn",
+            requestID: 3,
+            writeCount: 4
+        )
+        let stream = await adapter.events(for: threadID, after: nil)
+        let consumerGate = CodexSessionTestGate()
+        let calls = CodexSessionCallProbe()
+        let consuming = Task {
+            var iterator = stream.makeAsyncIterator()
+            await calls.record("consumer-suspended")
+            await consumerGate.wait()
+            return await iterator.next()
+        }
+        await calls.wait(for: "consumer-suspended")
+
+        for index in 0..<600 {
+            await adapter.handleNotificationForTesting(
+                method: "item/agentMessage/delta",
+                params: .object([
+                    "threadId": .string(threadID.rawValue),
+                    "turnId": .string(turnID.rawValue),
+                    "delta": .string("\(index)"),
+                ])
+            )
+        }
+
+        #expect(await adapter.stateCountsForTesting.eventSubscribers == 1)
+        await consumerGate.open()
+        guard case let .replayGap(after, oldestAvailable)? =
+            await consuming.value
+        else {
+            Issue.record("consumer observed a post-gap event before reconciliation")
+            await adapter.shutdown()
+            return
+        }
+        #expect(after == nil)
+        #expect(oldestAvailable > 1)
+        #expect(await adapter.stateCountsForTesting.eventSubscribers == 0)
         await adapter.shutdown()
     }
 }
