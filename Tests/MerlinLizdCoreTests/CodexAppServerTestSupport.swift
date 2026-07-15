@@ -5,6 +5,7 @@ import Foundation
 actor ScriptedAppServerProcess: AppServerProcessRunning {
     private let failStart: Bool
     private let gateStart: Bool
+    private let writeError: AppServerProcessError?
     private var started = false
     private var terminated = false
     private var writes: [Data] = []
@@ -15,14 +16,21 @@ actor ScriptedAppServerProcess: AppServerProcessRunning {
     private var terminateCalls = 0
     private var waitCalls = 0
     private var startCalls = 0
+    private var activeEventConsumers = 0
+    private var maximumActiveEventConsumers = 0
     private var startGates: [CheckedContinuation<Void, Never>] = []
     private var startCountWaiters: [
         (Int, CheckedContinuation<Void, Never>)
     ] = []
 
-    init(failStart: Bool = false, gateStart: Bool = false) {
+    init(
+        failStart: Bool = false,
+        gateStart: Bool = false,
+        writeError: AppServerProcessError? = nil
+    ) {
         self.failStart = failStart
         self.gateStart = gateStart
+        self.writeError = writeError
     }
 
     func start() async throws {
@@ -39,11 +47,18 @@ actor ScriptedAppServerProcess: AppServerProcessRunning {
         guard started, !terminated else {
             throw ScriptedAppServerProcessError.notWritable
         }
+        if let writeError { throw writeError }
         writes.append(data)
         resumeWriteWaiters()
     }
 
-    func nextEvent() async -> AppServerProcessEvent? {
+    func nextEvent(receiverID: UUID) async -> AppServerProcessEvent? {
+        activeEventConsumers += 1
+        maximumActiveEventConsumers = max(
+            maximumActiveEventConsumers,
+            activeEventConsumers
+        )
+        defer { activeEventConsumers -= 1 }
         if !events.isEmpty {
             return events.removeFirst()
         }
@@ -100,6 +115,10 @@ actor ScriptedAppServerProcess: AppServerProcessRunning {
     }
 
     func startCallCount() -> Int { startCalls }
+    func activeEventConsumerCount() -> Int { activeEventConsumers }
+    func maximumActiveEventConsumerCount() -> Int {
+        maximumActiveEventConsumers
+    }
 
     private func resumeWriteWaiters() {
         var retained: [(Int, CheckedContinuation<Void, Never>)] = []
@@ -130,6 +149,79 @@ actor ScriptedAppServerProcess: AppServerProcessRunning {
         let waiters = eventWaiters
         eventWaiters.removeAll()
         for waiter in waiters { waiter.resume(returning: nil) }
+    }
+}
+
+actor CancellationRecordingAppServerProcess: AppServerProcessRunning {
+    private var started = false
+    private var terminated = false
+    private var writes = 0
+    private var cancellations = 0
+    private var writeWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var cancellationWaiters: [
+        (Int, CheckedContinuation<Void, Never>)
+    ] = []
+
+    func start() { started = true }
+
+    func write(_ data: Data) async throws {
+        guard started, !terminated else {
+            throw ScriptedAppServerProcessError.notWritable
+        }
+        writes += 1
+        resumeCountWaiters(&writeWaiters, current: writes)
+        do {
+            try await withTaskCancellationHandler {
+                try await Task.sleep(for: .seconds(30))
+            } onCancel: {
+                Task { await self.recordWriteCancellation() }
+            }
+        } catch {
+            throw CancellationError()
+        }
+    }
+
+    func nextEvent(receiverID: UUID) async -> AppServerProcessEvent? {
+        while !terminated {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return nil
+    }
+
+    func terminate() { terminated = true }
+
+    func waitForTermination() async -> AppServerProcessTermination {
+        .init(exitCode: 0)
+    }
+
+    func waitForWriteCount(_ count: Int) async {
+        if writes >= count { return }
+        await withCheckedContinuation { writeWaiters.append((count, $0)) }
+    }
+
+    func waitForWriteCancellationCount(_ count: Int) async {
+        if cancellations >= count { return }
+        await withCheckedContinuation {
+            cancellationWaiters.append((count, $0))
+        }
+    }
+
+    func writeCancellationCount() -> Int { cancellations }
+
+    private func recordWriteCancellation() {
+        cancellations += 1
+        resumeCountWaiters(&cancellationWaiters, current: cancellations)
+    }
+
+    private func resumeCountWaiters(
+        _ waiters: inout [(Int, CheckedContinuation<Void, Never>)],
+        current: Int
+    ) {
+        var retained: [(Int, CheckedContinuation<Void, Never>)] = []
+        for waiter in waiters {
+            if current >= waiter.0 { waiter.1.resume() } else { retained.append(waiter) }
+        }
+        waiters = retained
     }
 }
 
@@ -419,12 +511,14 @@ func exerciseConcreteAppServerProcess() async throws -> (
         try await process.write(Data("hello\n".utf8))
         var output = Data()
         var error = Data()
-        while let event = await process.nextEvent() {
+        let receiverID = UUID()
+        while let event = await process.nextEvent(receiverID: receiverID) {
             switch event {
             case let .standardOutput(data): output.append(data)
             case let .standardError(data): error.append(data)
             case .outputOverflow: break
             case .outputDrainLimitExceeded: break
+            case .eventConsumerUnavailable: break
             case .terminated: break
             }
         }
@@ -491,7 +585,8 @@ func exerciseUnconsumedOutputProcess() async throws -> (
         let completedBeforeConsumption = await completion.isCompleted()
 
         var sawOverflow = false
-        while let event = await process.nextEvent() {
+        let receiverID = UUID()
+        while let event = await process.nextEvent(receiverID: receiverID) {
             if case .outputOverflow = event { sawOverflow = true }
         }
         _ = await waiter.value
@@ -537,6 +632,381 @@ func exerciseBlockedStdinTermination() async throws -> (
     }
 }
 
+func exerciseRunningTransportOwnerLoss() async throws -> (
+    transportReleased: Bool,
+    terminateCalls: Int,
+    waitCalls: Int,
+    eventConsumerExited: Bool
+) {
+    let process = ScriptedAppServerProcess()
+    var transport: JSONLAppServerTransport? = JSONLAppServerTransport(
+        process: process
+    )
+    try await transport?.start()
+    while await process.activeEventConsumerCount() == 0 { await Task.yield() }
+    weak let weakTransport = transport
+    transport = nil
+    let transportReleased = await waitForWeakRelease { weakTransport == nil }
+    try await waitForLifecycleCounts(process, terminate: 1, wait: 1)
+    let counts = await process.lifecycleCounts()
+    return (
+        transportReleased,
+        counts.terminate,
+        counts.wait,
+        await process.activeEventConsumerCount() == 0
+    )
+}
+
+func exerciseCancelledStartOwnerLoss() async throws -> (
+    transportReleased: Bool,
+    terminateCalls: Int,
+    waitCalls: Int
+) {
+    let process = ScriptedAppServerProcess(gateStart: true)
+    var transport: JSONLAppServerTransport? = JSONLAppServerTransport(
+        process: process
+    )
+    let start = Task { [weak transport] in try await transport?.start() }
+    await process.waitForStartCount(1)
+    start.cancel()
+    _ = try? await start.value
+    weak let weakTransport = transport
+    transport = nil
+    let transportReleased = await waitForWeakRelease { weakTransport == nil }
+    try await waitForLifecycleCounts(process, terminate: 1, wait: 1)
+    await process.releaseStart()
+    let counts = await process.lifecycleCounts()
+    return (transportReleased, counts.terminate, counts.wait)
+}
+
+func exerciseConcreteProcessOwnerLoss() async throws -> (
+    processReleased: Bool,
+    leaderExited: Bool
+) {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+        UUID().uuidString,
+        isDirectory: true
+    )
+    try FileManager.default.createDirectory(
+        at: root,
+        withIntermediateDirectories: false
+    )
+    defer { try? FileManager.default.removeItem(at: root) }
+    let pidFile = root.appendingPathComponent("leader.pid")
+    let cleanup = ExactPIDTestCleanup()
+    var process: AppServerProcess? = AppServerProcess(
+        executable: URL(fileURLWithPath: "/bin/sh"),
+        arguments: [
+            "-c",
+            "echo $$ > '\(pidFile.path)'; exec /usr/bin/python3 -c 'import time; time.sleep(30)'",
+        ],
+        environment: [:]
+    )
+    try await process?.start()
+    let processID = try await readProcessID(from: pidFile)
+    cleanup.register(processID)
+    weak let weakProcess = process
+    process = nil
+    let processReleased = await waitForWeakRelease { weakProcess == nil }
+    let leaderExited = await waitForProcessExit(
+        processID,
+        timeout: .milliseconds(500)
+    )
+    if leaderExited { cleanup.disarm() }
+    return (processReleased, leaderExited)
+}
+
+func exerciseBufferedEventConsumerExclusivity() async -> Bool {
+    let channel = BoundedProcessEventChannel(capacity: 2)
+    let firstID = UUID()
+    let secondID = UUID()
+    _ = await channel.offer(.standardOutput(Data([0x61])))
+    _ = await channel.next(receiverID: firstID)
+    _ = await channel.offer(.standardOutput(Data([0x62])))
+    guard let second = await channel.next(receiverID: secondID) else {
+        return false
+    }
+    if case .eventConsumerUnavailable = second { return true }
+    return false
+}
+
+func exerciseWaitingEventConsumerExclusivity() async -> Bool {
+    let channel = BoundedProcessEventChannel(capacity: 2)
+    let first = Task { await channel.next(receiverID: UUID()) }
+    while await channel.pendingReceiverCountForTesting == 0 {
+        await Task.yield()
+    }
+    let second = await channel.next(receiverID: UUID())
+    _ = await channel.offer(.standardOutput(Data([0x61])))
+    _ = await first.value
+    guard let second else { return false }
+    if case .eventConsumerUnavailable = second { return true }
+    return false
+}
+
+private func waitForLifecycleCounts(
+    _ process: ScriptedAppServerProcess,
+    terminate: Int,
+    wait: Int
+) async throws {
+    let deadline = ContinuousClock.now.advanced(by: .seconds(1))
+    while true {
+        let counts = await process.lifecycleCounts()
+        if counts.terminate >= terminate, counts.wait >= wait { return }
+        guard ContinuousClock.now < deadline else {
+            throw ProcessTestDeadlineError.timedOut
+        }
+        await Task.yield()
+    }
+}
+
+private func waitForWeakRelease(
+    _ condition: () -> Bool
+) async -> Bool {
+    let deadline = ContinuousClock.now.advanced(by: .seconds(1))
+    while !condition() {
+        guard ContinuousClock.now < deadline else { return false }
+        await Task.yield()
+    }
+    return true
+}
+
+private func readProcessID(from file: URL) async throws -> Int32 {
+    let deadline = ContinuousClock.now.advanced(by: .seconds(1))
+    while ContinuousClock.now < deadline {
+        if let text = try? String(contentsOf: file, encoding: .utf8),
+            let processID = Int32(text.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ))
+        {
+            return processID
+        }
+        try? await Task.sleep(for: .milliseconds(5))
+    }
+    throw ProcessTestDeadlineError.timedOut
+}
+
+private final class ExactPIDTestCleanup: @unchecked Sendable {
+    private let lock = NSLock()
+    private var processID: Int32?
+
+    func register(_ processID: Int32) {
+        lock.withLock { self.processID = processID }
+    }
+
+    func disarm() { lock.withLock { processID = nil } }
+
+    deinit {
+        let processID = lock.withLock { self.processID }
+        if let processID, processID > 1 { _ = Darwin.kill(processID, SIGKILL) }
+    }
+}
+
+func exerciseBoundedStdinQueue() async throws -> (
+    overflowWasTyped: Bool,
+    maximumRetainedRequests: Int,
+    maximumRetainedBytes: Int
+) {
+    let harness = try makeBlockedWriterHarness()
+    let chunk = Data(repeating: 0x61, count: 128 * 1_024)
+    let first = Task { try await harness.writer.write(chunk) }
+    try await waitForRetainedWriteCount(harness.writer, count: 1)
+    let second = Task { try await harness.writer.write(chunk) }
+    try await waitForRetainedWriteCount(harness.writer, count: 2)
+    let maximumRequests = await harness.writer.retainedRequestCountForTesting
+    let maximumBytes = await harness.writer.retainedByteCountForTesting
+    let overflowWasTyped: Bool
+    do {
+        try await harness.writer.write(Data([0x62]))
+        overflowWasTyped = false
+    } catch AppServerProcessError.writeQueueOverflow(
+        maximumRequests: 2,
+        maximumBytes: 256 * 1_024
+    ) {
+        overflowWasTyped = true
+    }
+    await harness.writer.close()
+    _ = try? await first.value
+    _ = try? await second.value
+    return (overflowWasTyped, maximumRequests, maximumBytes)
+}
+
+func exerciseQueuedStdinCancellation() async throws -> (
+    cancelledPromptly: Bool,
+    replacementWasAccepted: Bool,
+    outputPreservedFIFO: Bool
+) {
+    let harness = try makeBlockedWriterHarness()
+    let firstData = Data(repeating: 0x61, count: 128 * 1_024)
+    let cancelledData = Data(repeating: 0x62, count: 128 * 1_024)
+    let replacementData = Data(repeating: 0x63, count: 128 * 1_024)
+    let first = Task { try await harness.writer.write(firstData) }
+    try await waitForRetainedWriteCount(harness.writer, count: 1)
+    let cancelled = Task { try await harness.writer.write(cancelledData) }
+    try await waitForRetainedWriteCount(harness.writer, count: 2)
+    cancelled.cancel()
+    let cancelledPromptly = await taskThrowsCancellation(cancelled)
+    try await waitForRetainedWriteCount(harness.writer, count: 1)
+    let replacement = Task { try await harness.writer.write(replacementData) }
+    try await waitForRetainedWriteCount(harness.writer, count: 2)
+    let replacementWasAccepted = await harness.writer.retainedByteCountForTesting
+        == 256 * 1_024
+    let output = await harness.reader.readExactly(256 * 1_024)
+    try await first.value
+    try await replacement.value
+    await harness.writer.close()
+    return (
+        cancelledPromptly,
+        replacementWasAccepted,
+        output == firstData + replacementData
+    )
+}
+
+func exerciseActiveStdinCancellation() async throws -> (
+    cancelledPromptly: Bool,
+    retainedActiveRequest: Bool,
+    overflowWhileActive: Bool,
+    outputIncludedCancelledActiveWrite: Bool
+) {
+    let harness = try makeBlockedWriterHarness()
+    let firstData = Data(repeating: 0x61, count: 128 * 1_024)
+    let secondData = Data(repeating: 0x62, count: 128 * 1_024)
+    let first = Task { try await harness.writer.write(firstData) }
+    try await waitForRetainedWriteCount(harness.writer, count: 1)
+    first.cancel()
+    let cancelledPromptly = await taskThrowsCancellation(first)
+    let retainedRequestCount = await harness.writer.retainedRequestCountForTesting
+    let retainedByteCount = await harness.writer.retainedByteCountForTesting
+    let retainedActiveRequest = retainedRequestCount == 1
+        && retainedByteCount == 128 * 1_024
+    let second = Task { try await harness.writer.write(secondData) }
+    try await waitForRetainedWriteCount(harness.writer, count: 2)
+    let overflowWhileActive: Bool
+    do {
+        try await harness.writer.write(Data([0x63]))
+        overflowWhileActive = false
+    } catch AppServerProcessError.writeQueueOverflow {
+        overflowWhileActive = true
+    }
+    let output = await harness.reader.readExactly(256 * 1_024)
+    try await second.value
+    await harness.writer.close()
+    return (
+        cancelledPromptly,
+        retainedActiveRequest,
+        overflowWhileActive,
+        output == firstData + secondData
+    )
+}
+
+func exerciseStdinTerminationRace() async throws -> (
+    activeFailed: Bool,
+    queuedFailed: Bool,
+    retainedRequestsAfterClose: Int,
+    physicalStarts: Int,
+    newWriteWasRejected: Bool
+) {
+    let harness = try makeBlockedWriterHarness()
+    let chunk = Data(repeating: 0x61, count: 128 * 1_024)
+    let active = Task { try await harness.writer.write(chunk) }
+    try await waitForRetainedWriteCount(harness.writer, count: 1)
+    let queued = Task { try await harness.writer.write(chunk) }
+    try await waitForRetainedWriteCount(harness.writer, count: 2)
+    await harness.writer.close()
+    let activeFailed = await taskThrowsWriteFailure(active)
+    let queuedFailed = await taskThrowsWriteFailure(queued)
+    let retained = await harness.writer.retainedRequestCountForTesting
+    let starts = await harness.writer.physicalStartCountForTesting
+    let newWriteWasRejected: Bool
+    do {
+        try await harness.writer.write(Data([0x62]))
+        newWriteWasRejected = false
+    } catch AppServerProcessError.notRunning {
+        newWriteWasRejected = true
+    }
+    return (activeFailed, queuedFailed, retained, starts, newWriteWasRejected)
+}
+
+private struct BlockedWriterHarness {
+    let writer: NonblockingFIFOFileWriter
+    let reader: TestPipeReader
+}
+
+private func makeBlockedWriterHarness() throws -> BlockedWriterHarness {
+    var descriptors: [Int32] = [0, 0]
+    guard Darwin.pipe(&descriptors) == 0 else {
+        throw CocoaError(.fileWriteUnknown)
+    }
+    return BlockedWriterHarness(
+        writer: NonblockingFIFOFileWriter(
+            fileDescriptor: descriptors[1],
+            maximumRetainedRequests: 2,
+            maximumRetainedBytes: 256 * 1_024
+        ),
+        reader: TestPipeReader(fileDescriptor: descriptors[0])
+    )
+}
+
+private final class TestPipeReader: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fileDescriptor: Int32
+
+    init(fileDescriptor: Int32) { self.fileDescriptor = fileDescriptor }
+
+    func readExactly(_ byteCount: Int) async -> Data {
+        await Task.detached { [self] in
+            var result = Data()
+            while result.count < byteCount {
+                let chunk = lock.withLock { () -> Data in
+                    guard fileDescriptor >= 0 else { return Data() }
+                    let requested = min(
+                        16 * 1_024,
+                        byteCount - result.count
+                    )
+                    var data = Data(count: requested)
+                    let count = data.withUnsafeMutableBytes { bytes in
+                        Darwin.read(fileDescriptor, bytes.baseAddress, requested)
+                    }
+                    guard count > 0 else { return Data() }
+                    data.removeSubrange(count..<data.count)
+                    return data
+                }
+                guard !chunk.isEmpty else { break }
+                result.append(chunk)
+            }
+            return result
+        }.value
+    }
+
+    deinit {
+        lock.withLock {
+            if fileDescriptor >= 0 { _ = Darwin.close(fileDescriptor) }
+            fileDescriptor = -1
+        }
+    }
+}
+
+private func waitForRetainedWriteCount(
+    _ writer: NonblockingFIFOFileWriter,
+    count: Int
+) async throws {
+    let deadline = ContinuousClock.now.advanced(by: .seconds(1))
+    while await writer.retainedRequestCountForTesting != count {
+        guard ContinuousClock.now < deadline else {
+            throw ProcessTestDeadlineError.timedOut
+        }
+        await Task.yield()
+    }
+}
+
+private func taskThrowsCancellation(_ task: Task<Void, Error>) async -> Bool {
+    do { try await task.value; return false } catch is CancellationError { return true } catch { return false }
+}
+
+private func taskThrowsWriteFailure(_ task: Task<Void, Error>) async -> Bool {
+    do { try await task.value; return false } catch AppServerProcessError.writeFailed { return true } catch { return false }
+}
+
 func exerciseDescendantPipeLifetimeIsBounded() async throws -> Bool {
     let process = AppServerProcess(
         executable: URL(fileURLWithPath: "/bin/sh"),
@@ -554,7 +1024,8 @@ func exerciseDescendantPipeLifetimeIsBounded() async throws -> Bool {
         try await Task.sleep(for: .milliseconds(200))
         let bounded = await completion.isCompleted()
         if !bounded {
-            while await process.nextEvent() != nil {}
+            let receiverID = UUID()
+            while await process.nextEvent(receiverID: receiverID) != nil {}
         }
         _ = await waiter.value
         return bounded
@@ -575,14 +1046,17 @@ func exerciseContinuousDescendantDrainDeadline() async throws -> (
         at: root,
         withIntermediateDirectories: false
     )
-    defer { try? FileManager.default.removeItem(at: root) }
     let pidFile = root.appendingPathComponent("descendant.pid")
+    let descendantCleanup = ContinuousDescendantFixtureCleanup(
+        root: root,
+        pidFile: pidFile
+    )
     let baseline = try openDescriptorCount()
     let process = AppServerProcess(
         executable: URL(fileURLWithPath: "/bin/sh"),
         arguments: [
             "-c",
-            "trap '' HUP; /usr/bin/yes x & echo $! > '\(pidFile.path)'; exit 0",
+            slowContinuousDescendantCommand(pidFile: pidFile),
         ],
         environment: [:],
         maximumPostLeaderDrainBytes: 1_024 * 1_024 * 1_024,
@@ -590,36 +1064,172 @@ func exerciseContinuousDescendantDrainDeadline() async throws -> (
     )
     let clock = ContinuousClock()
     let started = clock.now
-    let processResult = try await withProcessTestDeadline(process) {
-        try await process.start()
-        var sawTypedDrainLimit = false
-        while let event = await process.nextEvent() {
-            if case .outputDrainLimitExceeded = event {
-                sawTypedDrainLimit = true
+    do {
+        let processResult = try await withProcessTestDeadline(process) {
+            try await process.start()
+            var sawTypedDrainLimit = false
+            let receiverID = UUID()
+            while let event = await process.nextEvent(receiverID: receiverID) {
+                if case .outputDrainLimitExceeded = event {
+                    sawTypedDrainLimit = true
+                }
             }
+            _ = await process.waitForTermination()
+            return (
+                sawTypedDrainLimit,
+                started.duration(to: clock.now)
+            )
         }
-        _ = await process.waitForTermination()
+        let cleanup = await descendantCleanup.cleanup(forceKill: false)
         return (
-            sawTypedDrainLimit,
-            started.duration(to: clock.now)
+            processResult.0,
+            processResult.1,
+            cleanup.descendantExited,
+            try openDescriptorCount() - baseline
         )
+    } catch {
+        _ = await descendantCleanup.cleanup(forceKill: true)
+        throw error
     }
-    let pidText = try String(contentsOf: pidFile, encoding: .utf8)
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-    let descendantPID = Int32(pidText) ?? -1
-    let descendantExited = await waitForProcessExit(
-        descendantPID,
-        timeout: .milliseconds(300)
+}
+
+private enum ForcedDescendantFixtureError: Error { case forced }
+
+func exerciseContinuousDescendantForcedFailure() async throws -> (
+    descendantExited: Bool,
+    directoryRemoved: Bool
+) {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+        UUID().uuidString,
+        isDirectory: true
     )
-    if !descendantExited, descendantPID > 1 {
-        _ = Darwin.kill(descendantPID, SIGKILL)
+    try FileManager.default.createDirectory(
+        at: root,
+        withIntermediateDirectories: false
+    )
+    let pidFile = root.appendingPathComponent("descendant.pid")
+    let descendantCleanup = ContinuousDescendantFixtureCleanup(
+        root: root,
+        pidFile: pidFile
+    )
+    let process = AppServerProcess(
+        executable: URL(fileURLWithPath: "/bin/sh"),
+        arguments: [
+            "-c",
+            slowContinuousDescendantCommand(pidFile: pidFile),
+        ],
+        environment: [:]
+    )
+    do {
+        _ = try await withProcessTestDeadline(process) {
+            try await process.start()
+            let processID = try await readProcessID(from: pidFile)
+            descendantCleanup.register(processID)
+            throw ForcedDescendantFixtureError.forced
+        }
+    } catch ForcedDescendantFixtureError.forced {
+        let cleanup = await descendantCleanup.cleanup(forceKill: true)
+        return (
+            cleanup.descendantExited,
+            !FileManager.default.fileExists(atPath: root.path)
+        )
+    } catch {
+        _ = await descendantCleanup.cleanup(forceKill: true)
+        throw error
     }
-    return (
-        processResult.0,
-        processResult.1,
-        descendantExited,
-        try openDescriptorCount() - baseline
-    )
+    _ = await descendantCleanup.cleanup(forceKill: true)
+    return (false, !FileManager.default.fileExists(atPath: root.path))
+}
+
+private func slowContinuousDescendantCommand(pidFile: URL) -> String {
+    """
+    trap '' HUP
+    /usr/bin/python3 -c 'import os,time
+    while True:
+        os.write(1,b"x\\n")
+        time.sleep(0.005)' &
+    echo $! > '\(pidFile.path)'
+    exit 0
+    """
+}
+
+private final class ContinuousDescendantFixtureCleanup: @unchecked Sendable {
+    private let lock = NSLock()
+    private let root: URL
+    private let pidFile: URL
+    private var processID: Int32?
+    private var finished = false
+
+    init(root: URL, pidFile: URL) {
+        self.root = root
+        self.pidFile = pidFile
+    }
+
+    func register(_ processID: Int32) {
+        lock.withLock { self.processID = processID }
+    }
+
+    func cleanup(forceKill: Bool) async -> (descendantExited: Bool, pid: Int32?) {
+        if lock.withLock({ finished }) {
+            let processID = lock.withLock { self.processID }
+            return (await isProcessAbsent(processID), processID)
+        }
+        let processID = await discoverProcessID()
+        if let processID { register(processID) }
+        var exited = await isProcessAbsent(processID)
+        if !forceKill, !exited, let processID {
+            exited = await waitForProcessExit(
+                processID,
+                timeout: .milliseconds(300)
+            )
+        }
+        if !exited, let processID, processID > 1 {
+            _ = Darwin.kill(processID, SIGKILL)
+            exited = await waitForProcessExit(
+                processID,
+                timeout: .milliseconds(300)
+            )
+        }
+        try? FileManager.default.removeItem(at: root)
+        lock.withLock { finished = true }
+        return (exited, processID)
+    }
+
+    private func discoverProcessID() async -> Int32? {
+        if let processID = lock.withLock({ processID }) { return processID }
+        let deadline = ContinuousClock.now.advanced(by: .milliseconds(300))
+        while ContinuousClock.now < deadline {
+            if let text = try? String(contentsOf: pidFile, encoding: .utf8),
+                let processID = Int32(text.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                ))
+            {
+                return processID
+            }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        return nil
+    }
+
+    private func isProcessAbsent(_ processID: Int32?) async -> Bool {
+        guard let processID, processID > 1 else { return false }
+        return Darwin.kill(processID, 0) != 0 && errno == ESRCH
+    }
+
+    deinit {
+        guard !lock.withLock({ finished }) else { return }
+        let registered = lock.withLock { processID }
+        let discovered = registered ?? (try? String(
+            contentsOf: pidFile,
+            encoding: .utf8
+        )).flatMap {
+            Int32($0.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        if let discovered, discovered > 1 {
+            _ = Darwin.kill(discovered, SIGKILL)
+        }
+        try? FileManager.default.removeItem(at: root)
+    }
 }
 
 private func waitForProcessExit(
@@ -656,7 +1266,8 @@ func exerciseFIFOProcessWrites() async throws -> (
         let secondWrite = Task { try await process.write(second) }
 
         var output = Data()
-        while let event = await process.nextEvent() {
+        let receiverID = UUID()
+        while let event = await process.nextEvent(receiverID: receiverID) {
             if case let .standardOutput(data) = event { output.append(data) }
         }
         try await firstWrite.value
@@ -708,6 +1319,7 @@ private func openDescriptorCount() throws -> Int {
 
 private enum ProcessTestDeadlineError: Error {
     case timedOut
+    case cleanupTimedOut
 }
 
 private actor ProcessTestRace<Value: Sendable> {
@@ -729,18 +1341,65 @@ private actor ProcessTestRace<Value: Sendable> {
     }
 }
 
+private actor ProcessTestCompletionSignal {
+    private var completed = false
+    private var waiters: [UUID: ProcessTestRace<Bool>] = [:]
+
+    func register(_ race: ProcessTestRace<Bool>) -> UUID? {
+        guard !completed else { return nil }
+        let id = UUID()
+        waiters[id] = race
+        return id
+    }
+
+    func complete() async {
+        guard !completed else { return }
+        completed = true
+        let races = waiters.values
+        waiters.removeAll()
+        for race in races { await race.resolve(.success(true)) }
+    }
+
+    func remove(_ id: UUID) { waiters.removeValue(forKey: id) }
+}
+
+private func waitForCompletion(
+    _ signal: ProcessTestCompletionSignal,
+    timeout: Duration
+) async -> Bool {
+    let race = ProcessTestRace<Bool>()
+    guard let id = await signal.register(race) else { return true }
+    let deadlineTask = Task {
+        do {
+            try await Task.sleep(for: timeout)
+            await race.resolve(.success(false))
+        } catch {
+            // Completion cancels and joins this timer.
+        }
+    }
+    let outcome = await race.wait()
+    deadlineTask.cancel()
+    await deadlineTask.value
+    await signal.remove(id)
+    return (try? outcome.get()) ?? false
+}
+
 private func withProcessTestDeadline<Value: Sendable>(
-    _ process: AppServerProcess,
+    _ process: any AppServerProcessRunning,
     timeout: Duration = .seconds(3),
+    teardownTimeout: Duration = .milliseconds(250),
+    operationJoinTimeout: Duration = .milliseconds(250),
     operation: @escaping @Sendable () async throws -> Value
 ) async throws -> Value {
     let race = ProcessTestRace<Value>()
+    let operationCompletion = ProcessTestCompletionSignal()
     let operationTask = Task {
         do {
             await race.resolve(.success(try await operation()))
         } catch {
             await race.resolve(.failure(error))
         }
+        await operationCompletion.complete()
     }
     let deadlineTask = Task {
         do {
@@ -758,8 +1417,123 @@ private func withProcessTestDeadline<Value: Sendable>(
     operationTask.cancel()
     deadlineTask.cancel()
     await deadlineTask.value
-    await process.terminate()
-    _ = await process.waitForTermination()
-    _ = await operationTask.value
+    let cleanupCompletion = ProcessTestCompletionSignal()
+    let cleanupTask = Task.detached {
+        await process.terminate()
+        _ = await process.waitForTermination()
+        await cleanupCompletion.complete()
+    }
+    var cleanupFinished = await waitForCompletion(
+        cleanupCompletion,
+        timeout: teardownTimeout
+    )
+    if !cleanupFinished {
+        process.emergencyTerminate()
+        cleanupTask.cancel()
+        cleanupFinished = await waitForCompletion(
+            cleanupCompletion,
+            timeout: operationJoinTimeout
+        )
+    }
+    let operationFinished = await waitForCompletion(
+        operationCompletion,
+        timeout: operationJoinTimeout
+    )
+    if !operationFinished { process.emergencyTerminate() }
+    if case .success = outcome, !cleanupFinished {
+        throw ProcessTestDeadlineError.cleanupTimedOut
+    }
     return try outcome.get()
+}
+
+private final class HardDeadlineProcessState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var released = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var emergencyCalls = 0
+    private var cleanupExits = 0
+    private var operationExits = 0
+
+    func wait() async {
+        if lock.withLock({ released }) { return }
+        await withCheckedContinuation { continuation in
+            let resumeImmediately = lock.withLock {
+                if released { return true }
+                waiters.append(continuation)
+                return false
+            }
+            if resumeImmediately { continuation.resume() }
+        }
+    }
+
+    func emergencyRelease() {
+        let pending = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            emergencyCalls += 1
+            guard !released else { return [] }
+            released = true
+            let pending = waiters
+            waiters.removeAll()
+            return pending
+        }
+        for waiter in pending { waiter.resume() }
+    }
+
+    func recordCleanupExit() { lock.withLock { cleanupExits += 1 } }
+    func recordOperationExit() { lock.withLock { operationExits += 1 } }
+    func snapshot() -> (emergency: Int, cleanup: Int, operation: Int) {
+        lock.withLock { (emergencyCalls, cleanupExits, operationExits) }
+    }
+}
+
+private final class HardDeadlineAppServerProcess: AppServerProcessRunning,
+    @unchecked Sendable
+{
+    let state = HardDeadlineProcessState()
+
+    func start() async throws {}
+    func write(_ data: Data) async throws {}
+    func nextEvent(receiverID: UUID) async -> AppServerProcessEvent? { nil }
+    func terminate() async {}
+    func waitForTermination() async -> AppServerProcessTermination {
+        await state.wait()
+        state.recordCleanupExit()
+        return .init(exitCode: 0)
+    }
+    nonisolated func emergencyTerminate() { state.emergencyRelease() }
+}
+
+func exerciseHardDeadlineTestCleanup() async throws -> (
+    preservedOperationTimeout: Bool,
+    elapsed: Duration,
+    emergencyCleanupCalls: Int,
+    cleanupTaskExited: Bool,
+    operationTaskExited: Bool
+) {
+    let process = HardDeadlineAppServerProcess()
+    let clock = ContinuousClock()
+    let started = clock.now
+    let preservedOperationTimeout: Bool
+    do {
+        _ = try await withProcessTestDeadline(
+            process,
+            timeout: .milliseconds(10),
+            teardownTimeout: .milliseconds(20),
+            operationJoinTimeout: .milliseconds(20)
+        ) {
+            await process.state.wait()
+            process.state.recordOperationExit()
+            return ()
+        }
+        preservedOperationTimeout = false
+    } catch ProcessTestDeadlineError.timedOut {
+        preservedOperationTimeout = true
+    }
+    let snapshot = process.state.snapshot()
+    return (
+        preservedOperationTimeout,
+        started.duration(to: clock.now),
+        snapshot.emergency,
+        snapshot.cleanup == 1,
+        snapshot.operation == 1
+    )
 }

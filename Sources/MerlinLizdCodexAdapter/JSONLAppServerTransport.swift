@@ -10,6 +10,8 @@ public enum JSONLAppServerTransportError: Error, Equatable, Sendable {
     case outboundLineTooLarge(maximumBytes: Int)
     case processOutputOverflow(maximumBufferedEvents: Int)
     case processOutputDrainLimitExceeded(maximumBytes: Int)
+    case processWriteQueueOverflow(maximumRequests: Int, maximumBytes: Int)
+    case processEventConsumerUnavailable
     case processTerminated(exitCode: Int32)
     case writeFailed
     case remoteError(code: Int)
@@ -42,7 +44,22 @@ public actor JSONLAppServerTransport {
         let continuation: CheckedContinuation<Void, Error>
     }
 
+    private enum RequestWriteOutcome: Sendable {
+        case completed
+        case cancelled
+        case queueOverflow(maximumRequests: Int, maximumBytes: Int)
+        case failed
+    }
+
+    private struct PendingRequest {
+        let token: UUID
+        let continuation: CheckedContinuation<JSONValue, Error>
+        let writeTask: Task<RequestWriteOutcome, Never>
+    }
+
     private let process: any AppServerProcessRunning
+    private let processOwner: AppServerTransportProcessOwner
+    private let eventReceiverID = UUID()
     private let knownServerRequestMethods: Set<String>
     private let lineByteLimit: Int
     private let pendingRequestLimit: Int
@@ -54,9 +71,7 @@ public actor JSONLAppServerTransport {
     private var standardOutputBuffer = Data()
     private var maximumBufferedStandardOutputBytes = 0
     private var stderrTail = Data()
-    private var pending: [
-        JSONRPCID: CheckedContinuation<JSONValue, Error>
-    ] = [:]
+    private var pending: [JSONRPCID: PendingRequest] = [:]
     private var serverMessages: [CodexServerMessage] = []
     private var messageWaiters: [
         UUID: CheckedContinuation<CodexServerMessage, Error>
@@ -68,7 +83,6 @@ public actor JSONLAppServerTransport {
     private var startWaiters: [UUID: StartWaiter] = [:]
     private var startOperation: (UUID, Task<StartOutcome, Never>)?
     private var consumerTask: (UUID, Task<Void, Never>)?
-    private var reapTask: Task<Void, Never>?
 
     public init(
         process: any AppServerProcessRunning,
@@ -79,6 +93,7 @@ public actor JSONLAppServerTransport {
         precondition(maximumLineBytes > 0)
         precondition(maximumPendingRequests > 0)
         self.process = process
+        processOwner = AppServerTransportProcessOwner(process: process)
         self.knownServerRequestMethods = knownServerRequestMethods
         lineByteLimit = maximumLineBytes
         pendingRequestLimit = maximumPendingRequests
@@ -167,8 +182,9 @@ public actor JSONLAppServerTransport {
 
     private func installConsumer(token: UUID) {
         let process = process
+        let receiverID = eventReceiverID
         let task = Task { [weak self] in
-            while let event = await process.nextEvent() {
+            while let event = await process.nextEvent(receiverID: receiverID) {
                 await self?.consume(event, token: token)
             }
             await self?.consumeUnexpectedEOF(token: token)
@@ -211,8 +227,42 @@ public actor JSONLAppServerTransport {
             return try await withCheckedThrowingContinuation(
                 isolation: self
             ) { continuation in
-                pending[requestID] = continuation
-                Task { await self.writeRegisteredRequest(data, id: requestID) }
+                let token = UUID()
+                let process = process
+                let writeTask = Task<RequestWriteOutcome, Never> {
+                    do {
+                        try await process.write(data)
+                        return .completed
+                    } catch is CancellationError {
+                        return .cancelled
+                    } catch let error as AppServerProcessError {
+                        if case let .writeQueueOverflow(
+                            maximumRequests,
+                            maximumBytes
+                        ) = error {
+                            return .queueOverflow(
+                                maximumRequests: maximumRequests,
+                                maximumBytes: maximumBytes
+                            )
+                        }
+                        return .failed
+                    } catch {
+                        return .failed
+                    }
+                }
+                pending[requestID] = PendingRequest(
+                    token: token,
+                    continuation: continuation,
+                    writeTask: writeTask
+                )
+                Task { [weak self] in
+                    let outcome = await writeTask.value
+                    await self?.finishRequestWrite(
+                        id: requestID,
+                        token: token,
+                        outcome: outcome
+                    )
+                }
             }
         } onCancel: {
             Task { await self.cancelPendingRequest(requestID) }
@@ -339,19 +389,33 @@ public actor JSONLAppServerTransport {
         return true
     }
 
-    private func writeRegisteredRequest(_ data: Data, id: JSONRPCID) async {
-        guard case .running = state, pending[id] != nil else { return }
-        do {
-            try await process.write(data)
-        } catch {
+    private func finishRequestWrite(
+        id: JSONRPCID,
+        token: UUID,
+        outcome: RequestWriteOutcome
+    ) {
+        guard let request = pending[id], request.token == token else { return }
+        switch outcome {
+        case .completed:
+            return
+        case .cancelled:
+            pending.removeValue(forKey: id)?.continuation.resume(
+                throwing: CancellationError()
+            )
+        case let .queueOverflow(maximumRequests, maximumBytes):
+            fail(.processWriteQueueOverflow(
+                maximumRequests: maximumRequests,
+                maximumBytes: maximumBytes
+            ))
+        case .failed:
             fail(.writeFailed)
         }
     }
 
     private func cancelPendingRequest(_ id: JSONRPCID) {
-        pending.removeValue(forKey: id)?.resume(
-            throwing: CancellationError()
-        )
+        guard let request = pending.removeValue(forKey: id) else { return }
+        request.writeTask.cancel()
+        request.continuation.resume(throwing: CancellationError())
     }
 
     private func cancelMessageWaiter(_ id: UUID) {
@@ -377,6 +441,8 @@ public actor JSONLAppServerTransport {
             fail(.processOutputDrainLimitExceeded(
                 maximumBytes: maximumBytes
             ))
+        case .eventConsumerUnavailable:
+            fail(.processEventConsumerUnavailable)
         case let .terminated(exitCode):
             if !standardOutputBuffer.isEmpty {
                 if standardOutputBuffer.count > lineByteLimit {
@@ -484,22 +550,22 @@ public actor JSONLAppServerTransport {
             fail(.invalidMessage)
             return
         }
-        guard let continuation = pending.removeValue(forKey: id) else {
+        guard let request = pending.removeValue(forKey: id) else {
             return
         }
         if envelope.hasResult,
             let result = envelope.result,
             !envelope.hasError
         {
-            continuation.resume(returning: result)
+            request.continuation.resume(returning: result)
         } else if let error = envelope.error, !envelope.hasResult {
-            continuation.resume(
+            request.continuation.resume(
                 throwing: JSONLAppServerTransportError.remoteError(
                     code: error.code
                 )
             )
         } else {
-            continuation.resume(
+            request.continuation.resume(
                 throwing: JSONLAppServerTransportError.invalidMessage
             )
             fail(.invalidMessage)
@@ -584,10 +650,11 @@ public actor JSONLAppServerTransport {
     private func resumeAllPending(
         throwing error: JSONLAppServerTransportError
     ) {
-        let continuations = pending.values
+        let requests = pending.values
         pending.removeAll()
-        for continuation in continuations {
-            continuation.resume(throwing: error)
+        for request in requests {
+            request.writeTask.cancel()
+            request.continuation.resume(throwing: error)
         }
     }
 
@@ -638,15 +705,32 @@ public actor JSONLAppServerTransport {
     }
 
     private func beginReapIfNeeded() -> Task<Void, Never> {
-        if let reapTask { return reapTask }
-        let process = process
-        let task = Task {
-            await process.terminate()
-            _ = await process.waitForTermination()
-        }
-        reapTask = task
-        return task
+        processOwner.beginCleanup()
     }
+}
+
+private final class AppServerTransportProcessOwner: @unchecked Sendable {
+    private let lock = NSLock()
+    private let process: any AppServerProcessRunning
+    private var cleanupTask: Task<Void, Never>?
+
+    init(process: any AppServerProcessRunning) { self.process = process }
+
+    func beginCleanup() -> Task<Void, Never> {
+        lock.withLock {
+            if let cleanupTask { return cleanupTask }
+            process.emergencyTerminate()
+            let process = process
+            let task = Task.detached {
+                await process.terminate()
+                _ = await process.waitForTermination()
+            }
+            cleanupTask = task
+            return task
+        }
+    }
+
+    deinit { _ = beginCleanup() }
 }
 
 private struct JSONRPCResultResponse: Encodable {

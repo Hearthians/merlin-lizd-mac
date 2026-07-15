@@ -99,6 +99,40 @@ struct JSONLAppServerTransportTests {
         await running.shutdown()
     }
 
+    @Test("dropping a running transport terminates and reaps its process")
+    func runningTransportOwnerLossCleansUp() async throws {
+        let result = try await exerciseRunningTransportOwnerLoss()
+        #expect(result.transportReleased)
+        #expect(result.terminateCalls == 1)
+        #expect(result.waitCalls == 1)
+        #expect(result.eventConsumerExited)
+    }
+
+    @Test("dropping a cancelled start still cleans up its process")
+    func cancelledStartOwnerLossCleansUp() async throws {
+        let result = try await exerciseCancelledStartOwnerLoss()
+        #expect(result.transportReleased)
+        #expect(result.terminateCalls == 1)
+        #expect(result.waitCalls == 1)
+    }
+
+    @Test("dropping a concrete process kills and reaps its leader")
+    func concreteProcessOwnerLossCleansUp() async throws {
+        let result = try await exerciseConcreteProcessOwnerLoss()
+        #expect(result.processReleased)
+        #expect(result.leaderExited)
+    }
+
+    @Test("process events permanently lease one buffered consumer")
+    func bufferedProcessEventConsumerIsExclusive() async {
+        #expect(await exerciseBufferedEventConsumerExclusivity())
+    }
+
+    @Test("process events reject a second waiting consumer explicitly")
+    func waitingProcessEventConsumerIsExclusive() async {
+        #expect(await exerciseWaitingEventConsumerExclusivity())
+    }
+
     @Test("concrete process drains both pipes and reaps one exit")
     func concreteProcessOwnsPipesAndReap() async throws {
         let result = try await exerciseConcreteAppServerProcess()
@@ -129,6 +163,41 @@ struct JSONLAppServerTransportTests {
         #expect(result.writeFailed)
     }
 
+    @Test("blocked stdin bounds retained requests and bytes")
+    func blockedStdinQueueIsBounded() async throws {
+        let result = try await exerciseBoundedStdinQueue()
+        #expect(result.overflowWasTyped)
+        #expect(result.maximumRetainedRequests == 2)
+        #expect(result.maximumRetainedBytes == 256 * 1_024)
+    }
+
+    @Test("cancelling a queued stdin write releases capacity and preserves FIFO")
+    func queuedStdinCancellationReleasesCapacity() async throws {
+        let result = try await exerciseQueuedStdinCancellation()
+        #expect(result.cancelledPromptly)
+        #expect(result.replacementWasAccepted)
+        #expect(result.outputPreservedFIFO)
+    }
+
+    @Test("cancelling the active stdin write retains its physical lane")
+    func activeStdinCancellationRetainsLane() async throws {
+        let result = try await exerciseActiveStdinCancellation()
+        #expect(result.cancelledPromptly)
+        #expect(result.retainedActiveRequest)
+        #expect(result.overflowWhileActive)
+        #expect(result.outputIncludedCancelledActiveWrite)
+    }
+
+    @Test("termination fails active and queued stdin callers exactly once")
+    func stdinTerminationRaceIsBounded() async throws {
+        let result = try await exerciseStdinTerminationRace()
+        #expect(result.activeFailed)
+        #expect(result.queuedFailed)
+        #expect(result.retainedRequestsAfterClose == 0)
+        #expect(result.physicalStarts == 1)
+        #expect(result.newWriteWasRejected)
+    }
+
     @Test("descendants retaining pipes cannot delay leader reap")
     func concreteProcessDescendantPipeLifetimeIsBounded() async throws {
         #expect(try await exerciseDescendantPipeLifetimeIsBounded())
@@ -141,6 +210,23 @@ struct JSONLAppServerTransportTests {
         #expect(result.elapsed < .milliseconds(500))
         #expect(result.descendantExited)
         #expect(result.descriptorDelta <= 2)
+    }
+
+    @Test("process test cleanup has an independent hard deadline")
+    func processTestCleanupHardDeadlineIsBounded() async throws {
+        let result = try await exerciseHardDeadlineTestCleanup()
+        #expect(result.preservedOperationTimeout)
+        #expect(result.elapsed < .milliseconds(250))
+        #expect(result.emergencyCleanupCalls == 1)
+        #expect(result.cleanupTaskExited)
+        #expect(result.operationTaskExited)
+    }
+
+    @Test("continuous descendant fixture cleans up after a forced failure")
+    func continuousDescendantForcedFailureCleansUp() async throws {
+        let result = try await exerciseContinuousDescendantForcedFailure()
+        #expect(result.descendantExited)
+        #expect(result.directoryRemoved)
     }
 
     @Test("concurrent stdin writes are acknowledged in FIFO order")
@@ -610,6 +696,42 @@ struct JSONLAppServerTransportTests {
         }
     }
 
+    @Test("stdin queue overflow fails pending requests with its exact bounds")
+    func processWriteQueueOverflowFailsPending() async throws {
+        let process = ScriptedAppServerProcess(writeError: .writeQueueOverflow(
+            maximumRequests: 2,
+            maximumBytes: 256 * 1_024
+        ))
+        let transport = JSONLAppServerTransport(process: process)
+        try await transport.start()
+
+        await #expect(
+            throws: JSONLAppServerTransportError.processWriteQueueOverflow(
+                maximumRequests: 2,
+                maximumBytes: 256 * 1_024
+            )
+        ) {
+            try await transport.request(method: "overflow")
+        }
+    }
+
+    @Test("losing the process event lease fails pending requests explicitly")
+    func processEventConsumerLossFailsPending() async throws {
+        let process = ScriptedAppServerProcess()
+        let transport = JSONLAppServerTransport(process: process)
+        try await transport.start()
+        let request = Task { try await transport.request(method: "pending") }
+        await process.waitForWriteCount(1)
+        await process.emit(.eventConsumerUnavailable)
+
+        await #expect(
+            throws: JSONLAppServerTransportError
+                .processEventConsumerUnavailable
+        ) {
+            try await request.value
+        }
+    }
+
     @Test("cancellation removes exactly its pending continuation")
     func cancellationRemovesPending() async throws {
         let process = ScriptedAppServerProcess()
@@ -627,6 +749,24 @@ struct JSONLAppServerTransportTests {
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}"
         )))
         #expect(await transport.isRunningForTesting)
+        await transport.shutdown()
+    }
+
+    @Test("request cancellation propagates to its exact process write")
+    func requestCancellationCancelsExactWrite() async throws {
+        let process = CancellationRecordingAppServerProcess()
+        let transport = JSONLAppServerTransport(process: process)
+        try await transport.start()
+        let request = Task { try await transport.request(method: "blocked") }
+        await process.waitForWriteCount(1)
+
+        request.cancel()
+        await #expect(throws: CancellationError.self) {
+            try await request.value
+        }
+        await process.waitForWriteCancellationCount(1)
+        #expect(await process.writeCancellationCount() == 1)
+        #expect(await transport.pendingRequestCountForTesting == 0)
         await transport.shutdown()
     }
 

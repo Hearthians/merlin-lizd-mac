@@ -327,8 +327,9 @@ public struct FoundationCodexVersionProbe: CodexVersionProbing, Sendable {
         )
         try await process.start()
         var output = Data()
+        let receiverID = UUID()
         while ContinuousClock.now < deadline,
-            let event = await process.nextEvent()
+            let event = await process.nextEvent(receiverID: receiverID)
         {
             switch event {
             case let .standardOutput(data):
@@ -345,6 +346,10 @@ public struct FoundationCodexVersionProbe: CodexVersionProbing, Sendable {
                 _ = await process.waitForTermination()
                 throw CodexExecutableResolverError.versionProbeFailed
             case .outputDrainLimitExceeded:
+                await process.terminate()
+                _ = await process.waitForTermination()
+                throw CodexExecutableResolverError.versionProbeFailed
+            case .eventConsumerUnavailable:
                 await process.terminate()
                 _ = await process.waitForTermination()
                 throw CodexExecutableResolverError.versionProbeFailed
