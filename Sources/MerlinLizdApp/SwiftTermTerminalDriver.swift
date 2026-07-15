@@ -17,7 +17,7 @@ final class SwiftTermTerminalDriver: TerminalSessionPort {
     private var waitTasks: [
         UUID: Task<TerminalScreenWaitResult, any Error>
     ] = [:]
-    private var inputTasks: [UUID: Task<Void, any Error>] = [:]
+    private let inputLane = AcknowledgedOperationLane()
 
     init(terminalView: AgentTerminalView) {
         let initial = TerminalScreenSnapshot(
@@ -49,6 +49,7 @@ final class SwiftTermTerminalDriver: TerminalSessionPort {
         guard isConnected else {
             throw SwiftTermTerminalDriverError.disconnected
         }
+        try await synchronizeCurrentFrame()
         return snapshot
     }
 
@@ -68,33 +69,30 @@ final class SwiftTermTerminalDriver: TerminalSessionPort {
             events: batch.events,
             keyboardMode: snapshot.mode.keyboardMode
         )
-        let id = UUID()
-        let task = Task {
-            try await terminalView.sendAgentBytes(Array(bytes))
-        }
-        inputTasks[id] = task
-        defer { inputTasks.removeValue(forKey: id) }
-
         do {
-            try await withTaskCancellationHandler {
-                try await task.value
-            } onCancel: {
-                task.cancel()
-            }
-        } catch is CancellationError {
-            if !isConnected {
-                throw SwiftTermTerminalDriverError.disconnected
-            }
-            throw CancellationError()
-        }
+            return try await inputLane.submit { @MainActor [weak self] in
+                guard let self, self.isConnected else {
+                    throw SwiftTermTerminalDriverError.disconnected
+                }
+                guard batch.expectedRevision == self.snapshot.revision else {
+                    throw SwiftTermTerminalDriverError.staleRevision(
+                        expected: batch.expectedRevision,
+                        actual: self.snapshot.revision
+                    )
+                }
 
-        guard isConnected else {
+                try await self.terminalView.sendAgentBytes(Array(bytes))
+                guard self.isConnected else {
+                    throw SwiftTermTerminalDriverError.disconnected
+                }
+                return TerminalInputReceipt(
+                    acceptedRevision: batch.expectedRevision,
+                    byteCount: bytes.count
+                )
+            }
+        } catch AcknowledgedOperationLaneError.disconnected {
             throw SwiftTermTerminalDriverError.disconnected
         }
-        return TerminalInputReceipt(
-            acceptedRevision: batch.expectedRevision,
-            byteCount: bytes.count
-        )
     }
 
     func waitForScreen(
@@ -103,10 +101,7 @@ final class SwiftTermTerminalDriver: TerminalSessionPort {
         guard isConnected else {
             throw SwiftTermTerminalDriverError.disconnected
         }
-        await channel.publish(snapshot)
-        guard isConnected else {
-            throw SwiftTermTerminalDriverError.disconnected
-        }
+        try await synchronizeCurrentFrame()
 
         let id = UUID()
         let task = Task {
@@ -145,17 +140,34 @@ final class SwiftTermTerminalDriver: TerminalSessionPort {
         waitTasks.removeAll()
         waits.forEach { $0.cancel() }
 
-        let inputs = Array(inputTasks.values)
-        inputTasks.removeAll()
-        inputs.forEach { $0.cancel() }
+        inputLane.disconnect()
     }
 
     private func publish(_ frame: TerminalGridFrame) {
         guard isConnected else {
             return
         }
+        let previousRevision = snapshot.revision
         let next = reducer.accept(frame)
+        guard next.revision > previousRevision else {
+            return
+        }
         snapshot = next
         Task { await channel.publish(next) }
+    }
+
+    private func synchronizeCurrentFrame() async throws {
+        let previousRevision = snapshot.revision
+        terminalView.refreshRenderedFrame()
+        guard isConnected else {
+            throw SwiftTermTerminalDriverError.disconnected
+        }
+        guard snapshot.revision > previousRevision else {
+            return
+        }
+        await channel.publish(snapshot)
+        guard isConnected else {
+            throw SwiftTermTerminalDriverError.disconnected
+        }
     }
 }

@@ -12,10 +12,31 @@ final class AgentTerminalView: LocalProcessTerminalView {
     var onRenderedFrame: ((TerminalGridFrame) -> Void)?
 
     private var cursorIsVisible = true
+    private var lastPublishedFrame: TerminalGridFrame?
+    private var framePublicationDeferralDepth = 0
 
     override func dataReceived(slice: ArraySlice<UInt8>) {
+        framePublicationDeferralDepth += 1
         super.dataReceived(slice: slice)
-        onRenderedFrame?(renderedFrame())
+        framePublicationDeferralDepth -= 1
+        publishCurrentFrameIfChanged()
+    }
+
+    override func scrolled(source: TerminalView, position: Double) {
+        super.scrolled(source: source, position: position)
+        publishCurrentFrameIfChanged()
+    }
+
+    override func selectionChanged(source: Terminal) {
+        super.selectionChanged(source: source)
+        publishCurrentFrameIfChanged()
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        framePublicationDeferralDepth += 1
+        super.setFrameSize(newSize)
+        framePublicationDeferralDepth -= 1
+        publishCurrentFrameIfChanged()
     }
 
     override func send(
@@ -39,27 +60,39 @@ final class AgentTerminalView: LocalProcessTerminalView {
     }
 
     func sendAgentBytes(_ bytes: [UInt8]) async throws {
+        try Task.checkCancellation()
         guard process.running else {
             throw AgentTerminalViewError.processNotRunning
         }
 
-        let completion = AcknowledgedWriteContinuation()
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                guard completion.install(continuation) else {
-                    return
-                }
-                guard !Task.isCancelled else {
-                    completion.finish(.failure(CancellationError()))
-                    return
-                }
-                process.send(data: bytes[...]) { result in
-                    completion.finish(result.mapError { $0 as any Error })
-                }
+        try await withCheckedThrowingContinuation { continuation in
+            process.send(data: bytes[...]) { result in
+                continuation.resume(
+                    with: result.mapError { $0 as any Error }
+                )
             }
-        } onCancel: {
-            completion.finish(.failure(CancellationError()))
         }
+    }
+
+    /// Captures and publishes the current user-visible viewport only when its
+    /// immutable frame differs from the most recently published one.
+    @discardableResult
+    func refreshRenderedFrame() -> Bool {
+        publishCurrentFrameIfChanged()
+    }
+
+    @discardableResult
+    private func publishCurrentFrameIfChanged() -> Bool {
+        guard framePublicationDeferralDepth == 0, let onRenderedFrame else {
+            return false
+        }
+        let frame = renderedFrame()
+        guard frame != lastPublishedFrame else {
+            return false
+        }
+        lastPublishedFrame = frame
+        onRenderedFrame(frame)
+        return true
     }
 
     private func renderedFrame() -> TerminalGridFrame {
@@ -76,11 +109,16 @@ final class AgentTerminalView: LocalProcessTerminalView {
         cells.reserveCapacity(columns * rows)
 
         for row in 0..<rows {
+            let characters = (0..<columns).map { column in
+                terminal.getCharData(col: column, row: row)
+            }
+            let selectedCells = TerminalViewportGeometry.selectionMask(
+                cellWidths: characters.map { Int($0?.width ?? 1) },
+                selectedColumns: selectionRanges[row]
+            )
+
             for column in 0..<columns {
-                guard let character = terminal.getCharData(
-                    col: column,
-                    row: row
-                ) else {
+                guard let character = characters[column] else {
                     cells.append(.init(grapheme: " "))
                     continue
                 }
@@ -98,8 +136,7 @@ final class AgentTerminalView: LocalProcessTerminalView {
                         grapheme: grapheme,
                         style: cellStyle(
                             character,
-                            isSelected: selectionRanges[row]?.contains(column)
-                                == true
+                            isSelected: selectedCells[column]
                         )
                     )
                 )
@@ -110,10 +147,14 @@ final class AgentTerminalView: LocalProcessTerminalView {
             columns: columns,
             rows: rows,
             cells: cells,
-            cursor: TerminalCursor(
-                row: min(max(0, activeBuffer.y), max(0, rows - 1)),
-                column: min(max(0, activeBuffer.x), max(0, columns - 1)),
-                isVisible: cursorIsVisible && columns > 0 && rows > 0
+            cursor: TerminalViewportGeometry.cursor(
+                bufferBaseRow: currentBufferBaseRow(rows: rows),
+                bufferCursorRow: activeBuffer.y,
+                displayTopRow: activeBuffer.yDisp,
+                cursorColumn: activeBuffer.x,
+                columns: columns,
+                rows: rows,
+                isShown: cursorIsVisible
             ),
             mode: TerminalScreenMode(
                 isAlternateScreen: terminal.isCurrentBufferAlternate,
@@ -122,6 +163,31 @@ final class AgentTerminalView: LocalProcessTerminalView {
                     : .normal
             )
         )
+    }
+
+    /// SwiftTerm keeps `Buffer.yBase` internal. Its public scroll-invariant
+    /// line API exposes the same resident-line extent, so derive yBase as the
+    /// live viewport's top row without widening the documented vendor patch.
+    private func currentBufferBaseRow(rows: Int) -> Int {
+        guard rows > 0 else { return 0 }
+
+        let firstResidentRow = terminal.buffer.totalLinesTrimmed
+        let maximumResidentCount = rows + max(0, terminal.options.scrollback)
+        var lowerBound = 0
+        var upperBound = maximumResidentCount + 1
+
+        while lowerBound < upperBound {
+            let candidate = lowerBound + (upperBound - lowerBound) / 2
+            if terminal.getScrollInvariantLine(
+                row: firstResidentRow + candidate
+            ) != nil {
+                lowerBound = candidate + 1
+            } else {
+                upperBound = candidate
+            }
+        }
+
+        return max(0, lowerBound - rows)
     }
 
     private func cellStyle(
@@ -141,44 +207,5 @@ final class AgentTerminalView: LocalProcessTerminalView {
         if source.contains(.italic) { style.insert(.italic) }
         if isSelected { style.insert(.selected) }
         return style
-    }
-}
-
-private final class AcknowledgedWriteContinuation: @unchecked Sendable {
-    private let lock = NSLock()
-    private var continuation: CheckedContinuation<Void, any Error>?
-    private var pendingResult: Result<Void, any Error>?
-    private var isFinished = false
-
-    func install(
-        _ continuation: CheckedContinuation<Void, any Error>
-    ) -> Bool {
-        lock.lock()
-        if isFinished {
-            let result = pendingResult
-            pendingResult = nil
-            lock.unlock()
-            continuation.resume(with: result ?? .failure(CancellationError()))
-            return false
-        }
-        self.continuation = continuation
-        lock.unlock()
-        return true
-    }
-
-    func finish(_ result: Result<Void, any Error>) {
-        lock.lock()
-        guard !isFinished else {
-            lock.unlock()
-            return
-        }
-        isFinished = true
-        let continuation = self.continuation
-        self.continuation = nil
-        if continuation == nil {
-            pendingResult = result
-        }
-        lock.unlock()
-        continuation?.resume(with: result)
     }
 }

@@ -101,7 +101,7 @@ where ChannelClock.Duration == Duration {
     }
 
     public func publish(_ newSnapshot: TerminalScreenSnapshot) {
-        guard newSnapshot.revision >= snapshot.revision else { return }
+        guard newSnapshot.revision > snapshot.revision else { return }
         snapshot = newSnapshot
 
         for id in Array(waiters.keys) {

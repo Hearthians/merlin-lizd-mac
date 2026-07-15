@@ -96,6 +96,62 @@ struct TerminalScreenChannelTests {
         #expect(result.snapshot.text == "three")
     }
 
+    @Test("repeated synchronization of one revision preserves another waiter's quiet period")
+    func duplicateRevisionDoesNotRestartQuietPeriod() async throws {
+        let clock = ManualTerminalClock()
+        let channel = TerminalScreenChannel(
+            initial: snapshot(revision: 1, text: "one"),
+            clock: clock
+        )
+        let completion = WaitCompletionProbe()
+        let waiter = Task {
+            let result = try await channel.wait(
+                .init(
+                    condition: .stable(after: 1, for: .seconds(5)),
+                    timeout: .seconds(20)
+                )
+            )
+            await completion.finish()
+            return result
+        }
+        guard await requireEventually(
+            "stable-wait timeout registration",
+            { clock.pendingSleepCount == 1 }
+        ) else {
+            waiter.cancel()
+            _ = try? await waiter.value
+            return
+        }
+
+        let changed = snapshot(revision: 2, text: "two")
+        await channel.publish(changed)
+        guard await requireEventually(
+            "stability registration",
+            { clock.pendingSleepCount == 2 }
+        ) else {
+            waiter.cancel()
+            _ = try? await waiter.value
+            return
+        }
+
+        clock.advance(by: .seconds(4))
+        for _ in 0..<10 {
+            await channel.publish(changed)
+        }
+        clock.advance(by: .seconds(1))
+        let completedAtOriginalDeadline = await eventually {
+            await completion.isFinished
+        }
+
+        #expect(completedAtOriginalDeadline)
+        if !completedAtOriginalDeadline {
+            clock.advance(by: .seconds(5))
+        }
+        let result = try await waiter.value
+        #expect(!result.timedOut)
+        #expect(result.snapshot == changed)
+    }
+
     @Test("timeout is a successful result containing the newest snapshot")
     func timeoutReturnsNewestSnapshot() async throws {
         let clock = ManualTerminalClock()
