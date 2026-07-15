@@ -4576,6 +4576,119 @@ struct TerminalToolRouterTests {
         try await router.endTurn(handle: freshHandle, turnID: reusedTurnID)
     }
 
+    @Test("protocol identity tombstones saturate per thread and fail closed")
+    func protocolIdentityTombstonesSaturatePerThread() async throws {
+        let screen = TerminalToolFixtures.screen(revision: 148)
+        let port = FakeTerminalToolPort(snapshot: screen)
+        let registry = TerminalEndpointRegistry()
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: TerminalToolFixtures.newID(),
+                port: port,
+                controller: FakeTerminalSurfaceController(
+                    surface: TerminalToolFixtures.surface()
+                )
+            )
+        )
+        let router = TerminalToolRouter(
+            registry: registry,
+            approvalBroker: TerminalApprovalBroker(),
+            journal: MemoryTerminalToolJournal(),
+            observedTurnIdentityLimitPerThread: 2
+        )
+        let saturatedThread = AgentThreadID(rawValue: "saturated-thread")
+
+        for index in 0..<2 {
+            let turnID = AgentTurnID(rawValue: "remembered-\(index)")
+            let handle = try await router.beginTurn(
+                threadID: saturatedThread,
+                conversationKey: TerminalToolFixtures.key
+            )
+            #expect(
+                try await router.execute(
+                    threadID: saturatedThread,
+                    turnID: turnID,
+                    call: .observeScreen
+                ) == .screen(screen)
+            )
+            try await router.endTurn(handle: handle, turnID: turnID)
+        }
+        #expect(
+            await router.testingStateSnapshot().observedTurnIdentityCount == 2
+        )
+
+        let rejectedHandle = try await router.beginTurn(
+            threadID: saturatedThread,
+            conversationKey: TerminalToolFixtures.key
+        )
+        let boundaryPlusOne = AgentTurnID(rawValue: "boundary-plus-one")
+        await #expect(throws: TerminalToolRouterError.turnUnavailable) {
+            try await router.confirmTurnID(
+                handle: rejectedHandle,
+                turnID: boundaryPlusOne
+            )
+        }
+        await #expect(throws: TerminalToolRouterError.turnUnavailable) {
+            try await router.execute(
+                threadID: saturatedThread,
+                turnID: boundaryPlusOne,
+                call: .observeScreen
+            )
+        }
+        await #expect(throws: TerminalToolRouterError.turnUnavailable) {
+            try await router.execute(
+                threadID: saturatedThread,
+                turnID: .init(rawValue: "remembered-0"),
+                call: .observeScreen
+            )
+        }
+        #expect(
+            await router.testingStateSnapshot().observedTurnIdentityCount == 2
+        )
+
+        let unknownThread = AgentThreadID(rawValue: "unknown-thread")
+        await #expect(throws: TerminalToolRouterError.turnUnavailable) {
+            try await router.execute(
+                threadID: unknownThread,
+                turnID: .init(rawValue: "unknown-turn"),
+                call: .observeScreen
+            )
+        }
+        #expect(
+            await router.testingStateSnapshot().observedTurnIdentityCount == 2
+        )
+        try await router.endTurn(
+            handle: rejectedHandle,
+            turnID: boundaryPlusOne
+        )
+
+        let independentThread = AgentThreadID(rawValue: "independent-thread")
+        let independentTurn = AgentTurnID(rawValue: "independent-turn")
+        let independentHandle = try await router.beginTurn(
+            threadID: independentThread,
+            conversationKey: TerminalToolFixtures.key
+        )
+        #expect(
+            try await router.execute(
+                threadID: independentThread,
+                turnID: independentTurn,
+                call: .observeScreen
+            ) == .screen(screen)
+        )
+        try await router.endTurn(
+            handle: independentHandle,
+            turnID: independentTurn
+        )
+        #expect(
+            await router.testingStateSnapshot().observedTurnIdentityCount == 3
+        )
+
+        try await router.forgetThread(saturatedThread)
+        #expect(
+            await router.testingStateSnapshot().observedTurnIdentityCount == 1
+        )
+    }
+
     private func makeRouter(
         port: FakeTerminalToolPort,
         surfaces: FakeTerminalSurfaceController,

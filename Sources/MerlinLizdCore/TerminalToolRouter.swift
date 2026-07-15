@@ -74,6 +74,8 @@ struct TerminalToolRouterStateSnapshot: Equatable, Sendable {
 }
 
 public actor TerminalToolRouter {
+    private static let productionObservedTurnIdentityLimitPerThread = 4_096
+
     private struct ThreadTurnIdentity: Hashable, Sendable {
         let threadID: AgentThreadID
         let turnID: AgentTurnID
@@ -162,6 +164,7 @@ public actor TerminalToolRouter {
     private let paneScreenTimeout: Duration
     private let probeStableDuration: Duration
     private let probeTimeout: Duration
+    private let observedTurnIdentityLimitPerThread: Int
 
     private var activeOperations: [UUID: ActiveOperation] = [:]
     private var leases: [LeaseKey: LeaseRecord] = [:]
@@ -175,6 +178,7 @@ public actor TerminalToolRouter {
     private var turnIdentityOwners: [
         ThreadTurnIdentity: AgentTurnHandle
     ] = [:]
+    private var observedTurnIdentityCounts: [AgentThreadID: Int] = [:]
 
     public init(
         registry: TerminalEndpointRegistry,
@@ -199,6 +203,37 @@ public actor TerminalToolRouter {
         self.paneScreenTimeout = paneScreenTimeout
         self.probeStableDuration = probeStableDuration
         self.probeTimeout = probeTimeout
+        self.observedTurnIdentityLimitPerThread = Self
+            .productionObservedTurnIdentityLimitPerThread
+    }
+
+    init(
+        registry: TerminalEndpointRegistry,
+        approvalBroker: TerminalApprovalBroker,
+        journal: any TerminalOperationJournaling,
+        observedTurnIdentityLimitPerThread: Int,
+        nonce: @escaping @Sendable (UUID) -> String = { leaseID in
+            String(
+                leaseID.uuidString
+                    .replacingOccurrences(of: "-", with: "")
+                    .prefix(4)
+            ).uppercased()
+        },
+        paneScreenTimeout: Duration = .seconds(5),
+        probeStableDuration: Duration = .milliseconds(200),
+        probeTimeout: Duration = .seconds(5)
+    ) {
+        precondition(observedTurnIdentityLimitPerThread > 0)
+        self.registry = registry
+        self.approvalBroker = approvalBroker
+        self.journal = journal
+        self.policy = TerminalPermissionPolicy()
+        self.nonce = nonce
+        self.paneScreenTimeout = paneScreenTimeout
+        self.probeStableDuration = probeStableDuration
+        self.probeTimeout = probeTimeout
+        self.observedTurnIdentityLimitPerThread
+            = observedTurnIdentityLimitPerThread
     }
 
     @discardableResult
@@ -316,17 +351,8 @@ public actor TerminalToolRouter {
             threadID: threadID,
             turnID: turnID
         )
-        let candidates = turnLifecycles.keys.filter {
-            $0.threadID == threadID && $0.turnID == turnID
-        }
-        guard candidates.count <= 1 else {
-            throw TerminalToolRouterError.turnUnavailable
-        }
-
-        if let turn = candidates.first {
-            guard turnIdentityOwners[identity] == turn.handle else {
-                throw TerminalToolRouterError.turnUnavailable
-            }
+        if let owner = turnIdentityOwners[identity] {
+            let turn = TurnKey(handle: owner, turnID: turnID)
             let conversationKey: TerminalConversationKey?
             switch turnLifecycles[turn] {
             case .activating:
@@ -397,6 +423,7 @@ public actor TerminalToolRouter {
         turnIdentityOwners = turnIdentityOwners.filter {
             $0.key.threadID != threadID
         }
+        observedTurnIdentityCounts.removeValue(forKey: threadID)
     }
 
     @discardableResult
@@ -2914,11 +2941,7 @@ public actor TerminalToolRouter {
             guard let prepared = preparedTurns[turn.threadID],
                 prepared.handle == turn.handle,
                 conversationKey == nil
-                    || prepared.conversationKey == conversationKey,
-                takePreparedTurn(
-                    threadID: turn.threadID,
-                    handle: turn.handle
-                ) != nil
+                    || prepared.conversationKey == conversationKey
             else {
                 throw TerminalToolRouterError.turnUnavailable
             }
@@ -2926,8 +2949,12 @@ public actor TerminalToolRouter {
                 threadID: turn.threadID,
                 turnID: turn.turnID
             )
-            if turnIdentityOwners[identity] == nil {
-                turnIdentityOwners[identity] = turn.handle
+            try rememberTurnIdentity(identity, owner: turn.handle)
+            guard takePreparedTurn(
+                threadID: turn.threadID,
+                handle: turn.handle
+            ) != nil else {
+                throw TerminalToolRouterError.turnUnavailable
             }
             turnLifecycles[turn] = .activating
             let token = UUID()
@@ -3014,6 +3041,19 @@ public actor TerminalToolRouter {
         else { return nil }
         preparedTurns.removeValue(forKey: threadID)
         return prepared
+    }
+
+    private func rememberTurnIdentity(
+        _ identity: ThreadTurnIdentity,
+        owner: AgentTurnHandle
+    ) throws {
+        guard turnIdentityOwners[identity] == nil else { return }
+        let count = observedTurnIdentityCounts[identity.threadID, default: 0]
+        guard count < observedTurnIdentityLimitPerThread else {
+            throw TerminalToolRouterError.turnUnavailable
+        }
+        turnIdentityOwners[identity] = owner
+        observedTurnIdentityCounts[identity.threadID] = count + 1
     }
 
     private func cleanupTerminationWaiter(
