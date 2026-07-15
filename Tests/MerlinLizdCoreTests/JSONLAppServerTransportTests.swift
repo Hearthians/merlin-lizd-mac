@@ -1,3 +1,4 @@
+import Darwin
 import Testing
 @testable import MerlinLizdCodexAdapter
 
@@ -227,6 +228,37 @@ struct JSONLAppServerTransportTests {
         let result = try await exerciseContinuousDescendantForcedFailure()
         #expect(result.descendantExited)
         #expect(result.directoryRemoved)
+    }
+
+    @Test("fixture cleanup signals only the exact captured process identity")
+    func fixtureCleanupSignalsMatchingIdentity() {
+        let result = exerciseMatchingFixtureProcessIdentitySignal()
+        #expect(result.signalWasSent)
+        #expect(result.signalledProcessID == result.expectedProcessID)
+        #expect(result.signal == SIGKILL)
+    }
+
+    @Test("fixture cleanup rejects reused PIDs and changed executables")
+    func fixtureCleanupRejectsChangedIdentity() {
+        let result = exerciseChangedFixtureProcessIdentitySignals()
+        #expect(result.changedStartTimeWasRejected)
+        #expect(result.changedExecutableWasRejected)
+        #expect(result.signalCount == 0)
+    }
+
+    @Test("fixture cleanup never signals an absent process")
+    func fixtureCleanupDoesNotSignalAbsentProcess() {
+        let result = exerciseAbsentFixtureProcessIdentitySignal()
+        #expect(result.wasTreatedAsGone)
+        #expect(result.signalCount == 0)
+    }
+
+    @Test("fixture deinit cleanup cannot bypass process identity checks")
+    func fixtureDeinitCleanupChecksIdentity() throws {
+        let result = try exerciseFixtureCleanupDeinitIdentityChecks()
+        #expect(result.exactPIDSignalCount == 0)
+        #expect(result.descendantSignalCount == 0)
+        #expect(result.descendantDirectoryRemoved)
     }
 
     @Test("concurrent stdin writes are acknowledged in FIFO order")

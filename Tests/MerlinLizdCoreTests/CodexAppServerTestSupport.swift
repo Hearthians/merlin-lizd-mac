@@ -698,18 +698,25 @@ func exerciseConcreteProcessOwnerLoss() async throws -> (
         executable: URL(fileURLWithPath: "/bin/sh"),
         arguments: [
             "-c",
-            "echo $$ > '\(pidFile.path)'; exec /usr/bin/python3 -c 'import time; time.sleep(30)'",
+            "echo $$ > '\(pidFile.path)'; exec /bin/sleep 30",
         ],
         environment: [:]
     )
     try await process?.start()
     let processID = try await readProcessID(from: pidFile)
-    cleanup.register(processID)
+    guard let identity = await captureFixtureProcessIdentity(
+        processID: processID,
+        expectedExecutable: .exactPath("/bin/sleep")
+    ) else {
+        throw ProcessTestDeadlineError.timedOut
+    }
+    cleanup.register(identity)
     weak let weakProcess = process
     process = nil
     let processReleased = await waitForWeakRelease { weakProcess == nil }
-    let leaderExited = await waitForProcessExit(
-        processID,
+    let leaderExited = await waitForOriginalProcessExit(
+        identity,
+        identityAccess: .live,
         timeout: .milliseconds(500)
     )
     if leaderExited { cleanup.disarm() }
@@ -786,19 +793,157 @@ private func readProcessID(from file: URL) async throws -> Int32 {
     throw ProcessTestDeadlineError.timedOut
 }
 
-private final class ExactPIDTestCleanup: @unchecked Sendable {
-    private let lock = NSLock()
-    private var processID: Int32?
+struct FixtureProcessIdentity: Equatable, Sendable {
+    let processID: Int32
+    let startTimeSeconds: UInt64
+    let startTimeMicroseconds: UInt64
+    let executablePath: String
+}
 
-    func register(_ processID: Int32) {
-        lock.withLock { self.processID = processID }
+enum FixtureExecutableExpectation: Sendable {
+    case exactPath(String)
+    case fileNamePrefix(String)
+
+    func matches(_ identity: FixtureProcessIdentity) -> Bool {
+        switch self {
+        case let .exactPath(path):
+            return identity.executablePath == path
+        case let .fileNamePrefix(prefix):
+            return URL(fileURLWithPath: identity.executablePath)
+                .lastPathComponent
+                .hasPrefix(prefix)
+        }
+    }
+}
+
+struct FixtureProcessIdentityAccess: @unchecked Sendable {
+    typealias IdentityReader = @Sendable (Int32) -> FixtureProcessIdentity?
+    typealias SignalSender = @Sendable (Int32, Int32) -> Int32
+
+    private let identityReader: IdentityReader
+    private let signalSender: SignalSender
+
+    init(
+        identityReader: @escaping IdentityReader,
+        signalSender: @escaping SignalSender
+    ) {
+        self.identityReader = identityReader
+        self.signalSender = signalSender
     }
 
-    func disarm() { lock.withLock { processID = nil } }
+    func capture(
+        processID: Int32,
+        expectedExecutable: FixtureExecutableExpectation
+    ) -> FixtureProcessIdentity? {
+        guard processID > 1,
+            let identity = identityReader(processID),
+            identity.processID == processID,
+            expectedExecutable.matches(identity)
+        else {
+            return nil
+        }
+        return identity
+    }
+
+    func originalProcessIsGone(_ identity: FixtureProcessIdentity) -> Bool {
+        identityReader(identity.processID) != identity
+    }
+
+    @discardableResult
+    func sendIfIdentityMatches(
+        _ signal: Int32,
+        to identity: FixtureProcessIdentity
+    ) -> Bool {
+        guard identity.processID > 1,
+            identityReader(identity.processID) == identity
+        else {
+            return false
+        }
+        return signalSender(identity.processID, signal) == 0
+    }
+
+    static let live = FixtureProcessIdentityAccess(
+        identityReader: { processID in
+            guard processID > 1 else { return nil }
+            var info = proc_bsdinfo()
+            let infoSize = Int32(MemoryLayout<proc_bsdinfo>.stride)
+            guard proc_pidinfo(
+                processID,
+                PROC_PIDTBSDINFO,
+                0,
+                &info,
+                infoSize
+            ) == infoSize else {
+                return nil
+            }
+            var path = [UInt8](
+                repeating: 0,
+                count: 4 * Int(MAXPATHLEN)
+            )
+            let pathLength = path.withUnsafeMutableBytes { buffer in
+                proc_pidpath(
+                    processID,
+                    buffer.baseAddress,
+                    UInt32(buffer.count)
+                )
+            }
+            guard pathLength > 0 else { return nil }
+            return FixtureProcessIdentity(
+                processID: processID,
+                startTimeSeconds: info.pbi_start_tvsec,
+                startTimeMicroseconds: info.pbi_start_tvusec,
+                executablePath: String(
+                    decoding: path.prefix(Int(pathLength)),
+                    as: UTF8.self
+                )
+            )
+        },
+        signalSender: { processID, signal in
+            Darwin.kill(processID, signal)
+        }
+    )
+}
+
+private func captureFixtureProcessIdentity(
+    processID: Int32,
+    expectedExecutable: FixtureExecutableExpectation,
+    access: FixtureProcessIdentityAccess = .live,
+    timeout: Duration = .milliseconds(300)
+) async -> FixtureProcessIdentity? {
+    let deadline = ContinuousClock.now.advanced(by: timeout)
+    while ContinuousClock.now < deadline {
+        if let identity = access.capture(
+            processID: processID,
+            expectedExecutable: expectedExecutable
+        ) {
+            return identity
+        }
+        try? await Task.sleep(for: .milliseconds(5))
+    }
+    return access.capture(
+        processID: processID,
+        expectedExecutable: expectedExecutable
+    )
+}
+
+private final class ExactPIDTestCleanup: @unchecked Sendable {
+    private let lock = NSLock()
+    private let identityAccess: FixtureProcessIdentityAccess
+    private var identity: FixtureProcessIdentity?
+
+    init(identityAccess: FixtureProcessIdentityAccess = .live) {
+        self.identityAccess = identityAccess
+    }
+
+    func register(_ identity: FixtureProcessIdentity) {
+        lock.withLock { self.identity = identity }
+    }
+
+    func disarm() { lock.withLock { identity = nil } }
 
     deinit {
-        let processID = lock.withLock { self.processID }
-        if let processID, processID > 1 { _ = Darwin.kill(processID, SIGKILL) }
+        guard let identity = lock.withLock({ identity }) else { return }
+        identityAccess.sendIfIdentityMatches(SIGKILL, to: identity)
     }
 }
 
@@ -1067,6 +1212,10 @@ func exerciseContinuousDescendantDrainDeadline() async throws -> (
     do {
         let processResult = try await withProcessTestDeadline(process) {
             try await process.start()
+            let processID = try await readProcessID(from: pidFile)
+            guard await descendantCleanup.register(processID: processID) else {
+                throw ProcessTestDeadlineError.timedOut
+            }
             var sawTypedDrainLimit = false
             let receiverID = UUID()
             while let event = await process.nextEvent(receiverID: receiverID) {
@@ -1124,7 +1273,9 @@ func exerciseContinuousDescendantForcedFailure() async throws -> (
         _ = try await withProcessTestDeadline(process) {
             try await process.start()
             let processID = try await readProcessID(from: pidFile)
-            descendantCleanup.register(processID)
+            guard await descendantCleanup.register(processID: processID) else {
+                throw ProcessTestDeadlineError.timedOut
+            }
             throw ForcedDescendantFixtureError.forced
         }
     } catch ForcedDescendantFixtureError.forced {
@@ -1144,10 +1295,10 @@ func exerciseContinuousDescendantForcedFailure() async throws -> (
 private func slowContinuousDescendantCommand(pidFile: URL) -> String {
     """
     trap '' HUP
-    /usr/bin/python3 -c 'import os,time
-    while True:
-        os.write(1,b"x\\n")
-        time.sleep(0.005)' &
+    /usr/bin/perl -e 'while (1) {
+        syswrite(STDOUT, "x\\n");
+        select(undef, undef, undef, 0.005);
+    }' &
     echo $! > '\(pidFile.path)'
     exit 0
     """
@@ -1157,92 +1308,275 @@ private final class ContinuousDescendantFixtureCleanup: @unchecked Sendable {
     private let lock = NSLock()
     private let root: URL
     private let pidFile: URL
-    private var processID: Int32?
+    private let expectedExecutable: FixtureExecutableExpectation
+    private let identityAccess: FixtureProcessIdentityAccess
+    private var identity: FixtureProcessIdentity?
     private var finished = false
 
-    init(root: URL, pidFile: URL) {
+    init(
+        root: URL,
+        pidFile: URL,
+        expectedExecutable: FixtureExecutableExpectation = .exactPath(
+            "/usr/bin/perl"
+        ),
+        identityAccess: FixtureProcessIdentityAccess = .live
+    ) {
         self.root = root
         self.pidFile = pidFile
+        self.expectedExecutable = expectedExecutable
+        self.identityAccess = identityAccess
     }
 
-    func register(_ processID: Int32) {
-        lock.withLock { self.processID = processID }
+    func register(_ identity: FixtureProcessIdentity) {
+        lock.withLock { self.identity = identity }
+    }
+
+    @discardableResult
+    func register(processID: Int32) async -> Bool {
+        guard let identity = await captureFixtureProcessIdentity(
+            processID: processID,
+            expectedExecutable: expectedExecutable,
+            access: identityAccess
+        ) else {
+            return false
+        }
+        register(identity)
+        return true
     }
 
     func cleanup(forceKill: Bool) async -> (descendantExited: Bool, pid: Int32?) {
         if lock.withLock({ finished }) {
-            let processID = lock.withLock { self.processID }
-            return (await isProcessAbsent(processID), processID)
+            let identity = lock.withLock { self.identity }
+            return (
+                identity.map(identityAccess.originalProcessIsGone) ?? false,
+                identity?.processID
+            )
         }
-        let processID = await discoverProcessID()
-        if let processID { register(processID) }
-        var exited = await isProcessAbsent(processID)
-        if !forceKill, !exited, let processID {
-            exited = await waitForProcessExit(
-                processID,
+        let identity = await discoverIdentity()
+        var exited = identity.map(identityAccess.originalProcessIsGone) ?? false
+        if !forceKill, !exited, let identity {
+            exited = await waitForOriginalProcessExit(
+                identity,
+                identityAccess: identityAccess,
                 timeout: .milliseconds(300)
             )
         }
-        if !exited, let processID, processID > 1 {
-            _ = Darwin.kill(processID, SIGKILL)
-            exited = await waitForProcessExit(
-                processID,
+        if !exited, let identity {
+            identityAccess.sendIfIdentityMatches(SIGKILL, to: identity)
+            exited = await waitForOriginalProcessExit(
+                identity,
+                identityAccess: identityAccess,
                 timeout: .milliseconds(300)
             )
         }
         try? FileManager.default.removeItem(at: root)
         lock.withLock { finished = true }
-        return (exited, processID)
+        return (exited, identity?.processID)
     }
 
-    private func discoverProcessID() async -> Int32? {
-        if let processID = lock.withLock({ processID }) { return processID }
+    private func discoverIdentity() async -> FixtureProcessIdentity? {
+        if let identity = lock.withLock({ identity }) { return identity }
         let deadline = ContinuousClock.now.advanced(by: .milliseconds(300))
         while ContinuousClock.now < deadline {
             if let text = try? String(contentsOf: pidFile, encoding: .utf8),
                 let processID = Int32(text.trimmingCharacters(
                     in: .whitespacesAndNewlines
-                ))
+                )),
+                let identity = identityAccess.capture(
+                    processID: processID,
+                    expectedExecutable: expectedExecutable
+                )
             {
-                return processID
+                register(identity)
+                return identity
             }
             try? await Task.sleep(for: .milliseconds(5))
         }
         return nil
     }
 
-    private func isProcessAbsent(_ processID: Int32?) async -> Bool {
-        guard let processID, processID > 1 else { return false }
-        return Darwin.kill(processID, 0) != 0 && errno == ESRCH
-    }
-
     deinit {
         guard !lock.withLock({ finished }) else { return }
-        let registered = lock.withLock { processID }
-        let discovered = registered ?? (try? String(
-            contentsOf: pidFile,
-            encoding: .utf8
-        )).flatMap {
-            Int32($0.trimmingCharacters(in: .whitespacesAndNewlines))
-        }
-        if let discovered, discovered > 1 {
-            _ = Darwin.kill(discovered, SIGKILL)
+        if let identity = lock.withLock({ identity }) {
+            identityAccess.sendIfIdentityMatches(SIGKILL, to: identity)
+            let deadline = ContinuousClock.now.advanced(
+                by: .milliseconds(100)
+            )
+            while ContinuousClock.now < deadline,
+                !identityAccess.originalProcessIsGone(identity)
+            {
+                usleep(5_000)
+            }
         }
         try? FileManager.default.removeItem(at: root)
     }
 }
 
-private func waitForProcessExit(
-    _ processID: Int32,
+private func waitForOriginalProcessExit(
+    _ identity: FixtureProcessIdentity,
+    identityAccess: FixtureProcessIdentityAccess,
     timeout: Duration
 ) async -> Bool {
-    guard processID > 1 else { return false }
     let deadline = ContinuousClock.now.advanced(by: timeout)
     while ContinuousClock.now < deadline {
-        if Darwin.kill(processID, 0) != 0, errno == ESRCH { return true }
+        if identityAccess.originalProcessIsGone(identity) { return true }
         try? await Task.sleep(for: .milliseconds(5))
     }
-    return Darwin.kill(processID, 0) != 0 && errno == ESRCH
+    return identityAccess.originalProcessIsGone(identity)
+}
+
+private struct FixtureSignalRecord: Sendable {
+    let processID: Int32
+    let signal: Int32
+}
+
+private final class FixtureProcessIdentityTestState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var identity: FixtureProcessIdentity?
+    private var sentSignals: [FixtureSignalRecord] = []
+
+    init(identity: FixtureProcessIdentity?) {
+        self.identity = identity
+    }
+
+    var access: FixtureProcessIdentityAccess {
+        FixtureProcessIdentityAccess(
+            identityReader: { [self] processID in
+                lock.withLock {
+                    guard identity?.processID == processID else { return nil }
+                    return identity
+                }
+            },
+            signalSender: { [self] processID, signal in
+                lock.withLock {
+                    sentSignals.append(FixtureSignalRecord(
+                        processID: processID,
+                        signal: signal
+                    ))
+                }
+                return 0
+            }
+        )
+    }
+
+    func setIdentity(_ identity: FixtureProcessIdentity?) {
+        lock.withLock { self.identity = identity }
+    }
+
+    func signals() -> [FixtureSignalRecord] {
+        lock.withLock { sentSignals }
+    }
+}
+
+private let fixtureIdentity = FixtureProcessIdentity(
+    processID: 42_424,
+    startTimeSeconds: 1_234,
+    startTimeMicroseconds: 567,
+    executablePath: "/fixtures/python3"
+)
+
+func exerciseMatchingFixtureProcessIdentitySignal() -> (
+    signalWasSent: Bool,
+    signalledProcessID: Int32?,
+    expectedProcessID: Int32,
+    signal: Int32?
+) {
+    let state = FixtureProcessIdentityTestState(identity: fixtureIdentity)
+    let sent = state.access.sendIfIdentityMatches(SIGKILL, to: fixtureIdentity)
+    let signal = state.signals().first
+    return (
+        sent,
+        signal?.processID,
+        fixtureIdentity.processID,
+        signal?.signal
+    )
+}
+
+func exerciseChangedFixtureProcessIdentitySignals() -> (
+    changedStartTimeWasRejected: Bool,
+    changedExecutableWasRejected: Bool,
+    signalCount: Int
+) {
+    let state = FixtureProcessIdentityTestState(identity: fixtureIdentity)
+    state.setIdentity(FixtureProcessIdentity(
+        processID: fixtureIdentity.processID,
+        startTimeSeconds: fixtureIdentity.startTimeSeconds + 1,
+        startTimeMicroseconds: fixtureIdentity.startTimeMicroseconds,
+        executablePath: fixtureIdentity.executablePath
+    ))
+    let startRejected = !state.access.sendIfIdentityMatches(
+        SIGKILL,
+        to: fixtureIdentity
+    )
+    state.setIdentity(FixtureProcessIdentity(
+        processID: fixtureIdentity.processID,
+        startTimeSeconds: fixtureIdentity.startTimeSeconds,
+        startTimeMicroseconds: fixtureIdentity.startTimeMicroseconds,
+        executablePath: "/unrelated/executable"
+    ))
+    let executableRejected = !state.access.sendIfIdentityMatches(
+        SIGKILL,
+        to: fixtureIdentity
+    )
+    return (startRejected, executableRejected, state.signals().count)
+}
+
+func exerciseAbsentFixtureProcessIdentitySignal() -> (
+    wasTreatedAsGone: Bool,
+    signalCount: Int
+) {
+    let state = FixtureProcessIdentityTestState(identity: nil)
+    let gone = state.access.originalProcessIsGone(fixtureIdentity)
+    _ = state.access.sendIfIdentityMatches(SIGKILL, to: fixtureIdentity)
+    return (gone, state.signals().count)
+}
+
+func exerciseFixtureCleanupDeinitIdentityChecks() throws -> (
+    exactPIDSignalCount: Int,
+    descendantSignalCount: Int,
+    descendantDirectoryRemoved: Bool
+) {
+    let changedIdentity = FixtureProcessIdentity(
+        processID: fixtureIdentity.processID,
+        startTimeSeconds: fixtureIdentity.startTimeSeconds + 1,
+        startTimeMicroseconds: fixtureIdentity.startTimeMicroseconds,
+        executablePath: fixtureIdentity.executablePath
+    )
+    let exactState = FixtureProcessIdentityTestState(identity: fixtureIdentity)
+    var exactCleanup: ExactPIDTestCleanup? = ExactPIDTestCleanup(
+        identityAccess: exactState.access
+    )
+    exactCleanup?.register(fixtureIdentity)
+    exactState.setIdentity(changedIdentity)
+    exactCleanup = nil
+
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+        UUID().uuidString,
+        isDirectory: true
+    )
+    try FileManager.default.createDirectory(
+        at: root,
+        withIntermediateDirectories: false
+    )
+    let descendantState = FixtureProcessIdentityTestState(
+        identity: fixtureIdentity
+    )
+    var descendantCleanup: ContinuousDescendantFixtureCleanup? =
+        ContinuousDescendantFixtureCleanup(
+            root: root,
+            pidFile: root.appendingPathComponent("descendant.pid"),
+            expectedExecutable: .exactPath("/fixtures/python3"),
+            identityAccess: descendantState.access
+        )
+    descendantCleanup?.register(fixtureIdentity)
+    descendantState.setIdentity(changedIdentity)
+    descendantCleanup = nil
+
+    return (
+        exactState.signals().count,
+        descendantState.signals().count,
+        !FileManager.default.fileExists(atPath: root.path)
+    )
 }
 
 func exerciseFIFOProcessWrites() async throws -> (
