@@ -1,0 +1,7 @@
+{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{"approvalPolicy":"never","cwd":"/runtime","sandbox":"read-only","environments":[],"runtimeWorkspaceRoots":[],"selectedCapabilityRoots":[],"ephemeral":false,"dynamicTools":[{"type":"namespace","name":"merlin_tmux","tools":[]}]}}
+{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}
+{"jsonrpc":"2.0","id":3,"method":"thread/resume","params":{"threadId":"thread-1"}}
+{"jsonrpc":"2.0","id":3,"result":{"thread":{"id":"thread-1","turns":[{"id":"old-turn","items":[{"type":"userMessage","content":[{"type":"inputText","text":"old prompt"}]},{"type":"agentMessage","text":"old answer"}]}]}}}
+{"jsonrpc":"2.0","id":4,"method":"thread/archive","params":{"threadId":"thread-1"}}
+{"jsonrpc":"2.0","id":5,"method":"thread/unarchive","params":{"threadId":"thread-1"}}
+{"jsonrpc":"2.0","id":6,"method":"thread/delete","params":{"threadId":"thread-1"}}

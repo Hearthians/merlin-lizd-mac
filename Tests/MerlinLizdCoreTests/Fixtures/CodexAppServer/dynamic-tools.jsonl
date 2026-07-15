@@ -1,0 +1,3 @@
+{"jsonrpc":"2.0","id":"tool-req-1","method":"item/tool/call","params":{"arguments":{},"callId":"call-1","threadId":"thread-1","tool":"observe_screen","turnId":"turn-1","namespace":"merlin_tmux"}}
+{"jsonrpc":"2.0","id":"tool-req-1","result":{"contentItems":[{"type":"inputText","text":"{\"revision\":12}"}],"success":true}}
+{"jsonrpc":"2.0","id":"tool-req-2","method":"item/tool/call","params":{"arguments":{},"callId":"call-2","threadId":"thread-1","tool":"observe_screen","turnId":"turn-2"}}

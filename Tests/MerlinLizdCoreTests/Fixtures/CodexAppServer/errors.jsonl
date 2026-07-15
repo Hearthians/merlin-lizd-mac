@@ -1,0 +1,5 @@
+{"jsonrpc":"2.0","method":"future/unknown","params":{"added":true}}
+{"jsonrpc":"2.0","method":"error","params":{"code":"usageLimitExceeded","message":"overloaded"}}
+{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":17,"turn":null}}
+{"jsonrpc":"2.0","method":"account/authentication/required","params":{}}
+{"fixture":"processCrash","exitCode":9}
