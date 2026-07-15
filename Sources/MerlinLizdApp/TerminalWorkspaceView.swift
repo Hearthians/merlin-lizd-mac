@@ -4,25 +4,52 @@ import SwiftUI
 
 struct TerminalWorkspaceView: View {
     @ObservedObject var terminals: TerminalTabsModel
+    @ObservedObject var codexDrawer: CodexDrawerModel
 
     var body: some View {
-        Group {
-            if
-                let selectedID = terminals.selectedTabID,
-                let session = terminals.session(for: selectedID)
-            {
-                TerminalSessionContent(session: session) {
-                    terminals.reconnect(selectedID)
+        GeometryReader { geometry in
+            VStack(spacing: 0) {
+                ZStack {
+                    ForEach(terminals.tabs) { tab in
+                        if let session = terminals.sessionForRendering(tab.id) {
+                            TerminalSessionContent(session: session) {
+                                terminals.reconnect(tab.id)
+                            }
+                            .id(session.id)
+                            .opacity(terminals.selectedTabID == tab.id ? 1 : 0)
+                            .allowsHitTesting(terminals.selectedTabID == tab.id)
+                            .accessibilityHidden(terminals.selectedTabID != tab.id)
+                        }
+                    }
+
+                    if terminals.selectedTabID == nil {
+                        terminalUnavailable
+                    } else if let selectedID = terminals.selectedTabID,
+                        terminals.sessionForRendering(selectedID) == nil
+                    {
+                        terminalUnavailable
+                    }
                 }
-                    .id(session.id)
-            } else {
-                ContentUnavailableView(
-                    "无法启动终端",
-                    systemImage: "terminal.fill",
-                    description: Text("目标信息无效，或本地 shell 不可用。")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .clipped()
+
+                CodexDrawerView(
+                    model: codexDrawer,
+                    containerHeight: geometry.size.height
                 )
+                .frame(height: codexDrawer.state.height(
+                    in: Double(geometry.size.height)
+                ))
             }
         }
+    }
+
+    private var terminalUnavailable: some View {
+        ContentUnavailableView(
+            "无法启动终端",
+            systemImage: "terminal.fill",
+            description: Text("目标信息无效，或本地 shell 不可用。")
+        )
     }
 }
 
@@ -56,6 +83,7 @@ private struct TerminalSessionContent: View {
 
 struct TerminalTabBar: View {
     @ObservedObject var terminals: TerminalTabsModel
+    @ObservedObject var codexDrawer: CodexDrawerModel
     let devboxes: [DevboxInventory]
 
     @State private var pendingCloseID: String?
@@ -190,6 +218,9 @@ struct TerminalTabBar: View {
                     Text(tab.title)
                         .lineLimit(1)
                         .frame(maxWidth: 180)
+                    if let badge = codexDrawer.badge(for: tab) {
+                        codexBadge(badge)
+                    }
                 }
                 .font(.caption)
                 .foregroundStyle(selected ? .primary : .secondary)
@@ -256,6 +287,40 @@ struct TerminalTabBar: View {
             }
         }
         .help(tab.sessionName.map { "tmux: \($0)" } ?? "本机终端")
+    }
+
+    private func codexBadge(_ badge: CodexDrawerBadge) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: badgeSymbol(badge.phase))
+            if badge.approvalCount > 0 {
+                Text("\(badge.approvalCount)")
+                    .monospacedDigit()
+            }
+        }
+        .font(.system(size: 9, weight: .semibold))
+        .foregroundStyle(badge.phase == .awaitingApproval ? .orange : .secondary)
+        .accessibilityLabel(badgeAccessibilityLabel(badge))
+    }
+
+    private func badgeSymbol(_ phase: CodexDrawerBadgePhase) -> String {
+        switch phase {
+        case .running: "circle.dotted.circle"
+        case .awaitingApproval: "exclamationmark.shield.fill"
+        case .waitingForUser: "person.crop.circle.badge.questionmark"
+        case .failed: "exclamationmark.triangle.fill"
+        case .interrupted: "stop.circle"
+        }
+    }
+
+    private func badgeAccessibilityLabel(_ badge: CodexDrawerBadge) -> String {
+        switch badge.phase {
+        case .running: "Codex running"
+        case .awaitingApproval:
+            "Codex waiting for \(badge.approvalCount) approval"
+        case .waitingForUser: "Codex waiting for user"
+        case .failed: "Codex failed"
+        case .interrupted: "Codex interrupted"
+        }
     }
 
     private var addTerminalMenu: some View {

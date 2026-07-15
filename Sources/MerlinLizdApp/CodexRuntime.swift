@@ -8,6 +8,7 @@ final class CodexRuntime {
     let approvalBroker: TerminalApprovalBroker
     let registry: TerminalEndpointRegistry
     let router: TerminalToolRouter
+    let journalReader: any TerminalOperationJournalReading
     let supervisor: CodexAppServerSupervisor
     let coordinator: CodexSessionCoordinator
 
@@ -57,6 +58,7 @@ final class CodexRuntime {
         self.approvalBroker = approvalBroker
         self.registry = registry
         self.router = router
+        journalReader = journal
         self.supervisor = supervisor
         coordinator = CodexSessionCoordinator(
             agent: supervisor,

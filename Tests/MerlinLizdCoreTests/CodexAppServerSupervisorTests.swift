@@ -1013,4 +1013,38 @@ struct CodexAppServerSupervisorTests {
         #expect(await factory.creationCount == 1)
         await supervisor.shutdown()
     }
+
+    @Test("explicit availability retry clears a terminal failure and probes a new generation")
+    func retriesTerminalAvailabilityOnExplicitRequest() async throws {
+        let failed = ScriptedSupervisorGeneration(
+            startedThreads: ["thread-before-retry"]
+        )
+        let replacement = ScriptedSupervisorGeneration(
+            startedThreads: ["thread-after-retry"]
+        )
+        let factory = ScriptedSupervisorGenerationFactory(outcomes: [
+            .generation(failed),
+            .generation(replacement),
+        ])
+        let supervisor = CodexAppServerSupervisor(
+            generationFactory: { try await factory.makeGeneration() },
+            sleeper: { _ in }
+        )
+
+        _ = try await supervisor.startThread()
+        await failed.publishAvailability(.overloaded)
+        let detached = await supervisorEventually {
+            await failed.shutdownCount == 1
+        }
+        #expect(detached)
+
+        await supervisor.retryAvailability()
+
+        #expect(await factory.creationCount == 2)
+        #expect(await supervisor.currentAvailability == .ready)
+        #expect(try await supervisor.startThread() == AgentThreadID(
+            rawValue: "thread-after-retry"
+        ))
+        await supervisor.shutdown()
+    }
 }

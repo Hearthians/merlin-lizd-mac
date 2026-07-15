@@ -8,6 +8,7 @@ struct MerlinLizdApplication: App {
     private var appDelegate
     @StateObject private var model: AppModel
     @StateObject private var terminals: TerminalTabsModel
+    @StateObject private var codexDrawer: CodexDrawerModel
     private let runtime: MerlinRemoteRuntime
 
     init() {
@@ -24,6 +25,12 @@ struct MerlinLizdApplication: App {
         _terminals = StateObject(
             wrappedValue: terminals
         )
+        _codexDrawer = StateObject(
+            wrappedValue: CodexDrawerModel(
+                runtime: runtime.codexRuntime,
+                terminals: terminals
+            )
+        )
         appDelegate.configure(runtime: runtime)
         model.start()
     }
@@ -33,6 +40,7 @@ struct MerlinLizdApplication: App {
             MerlinRootView(
                 model: model,
                 terminals: terminals,
+                codexDrawer: codexDrawer,
                 metricsStreamer: runtime.metricsStreamer
             )
                 .frame(minWidth: 960, minHeight: 640)

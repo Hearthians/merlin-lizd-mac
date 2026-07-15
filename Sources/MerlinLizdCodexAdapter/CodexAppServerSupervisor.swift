@@ -317,6 +317,24 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
         return pair.stream
     }
 
+    /// Clears a previously terminal availability result only after its exact
+    /// generation has finished shutting down, then performs a fresh handshake.
+    /// The UI invokes this solely from an explicit Retry action.
+    public func retryAvailability() async {
+        guard !stopped else { return }
+        if let recovery = recoveryOperation {
+            await waitForRecovery(recovery.id)
+        }
+        guard !Task.isCancelled, !stopped else { return }
+        terminalAvailability = nil
+        do {
+            _ = try await readyGeneration()
+        } catch {
+            // readyGeneration publishes the bounded typed availability that the
+            // existing stream delivers to the drawer.
+        }
+    }
+
     public func archiveThread(_ threadID: AgentThreadID) async throws {
         let handle = try await readyGeneration()
         try await loadMappedThreadIfNeeded(threadID, handle: handle)

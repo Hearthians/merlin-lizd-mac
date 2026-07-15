@@ -395,11 +395,16 @@ public struct TerminalJournalEvent: Codable, Equatable, Sendable {
     }
 }
 
-public protocol TerminalOperationJournaling: Sendable {
-    func append(_ event: TerminalJournalEvent) async throws
+public protocol TerminalOperationJournalReading: Sendable {
     func entries(
         for key: TerminalConversationKey
     ) async throws -> [TerminalJournalEvent]
+}
+
+public protocol TerminalOperationJournaling:
+    TerminalOperationJournalReading
+{
+    func append(_ event: TerminalJournalEvent) async throws
     func deleteJournal(for key: TerminalConversationKey) async throws
 }
 

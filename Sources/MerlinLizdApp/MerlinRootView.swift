@@ -5,6 +5,7 @@ import SwiftUI
 struct MerlinRootView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var terminals: TerminalTabsModel
+    @ObservedObject var codexDrawer: CodexDrawerModel
     let metricsStreamer: WorkerMetricsStreamer
     @State private var sessionBrowserTarget: TerminalTarget?
 
@@ -15,7 +16,11 @@ struct MerlinRootView: View {
         } detail: {
             VStack(spacing: 0) {
                 if !terminals.tabs.isEmpty {
-                    TerminalTabBar(terminals: terminals, devboxes: model.devboxes)
+                    TerminalTabBar(
+                        terminals: terminals,
+                        codexDrawer: codexDrawer,
+                        devboxes: model.devboxes
+                    )
                 }
 
                 if let message = model.message {
@@ -25,7 +30,10 @@ struct MerlinRootView: View {
                 }
 
                 if terminals.selectedTabID != nil {
-                    TerminalWorkspaceView(terminals: terminals)
+                    TerminalWorkspaceView(
+                        terminals: terminals,
+                        codexDrawer: codexDrawer
+                    )
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     selectedContent

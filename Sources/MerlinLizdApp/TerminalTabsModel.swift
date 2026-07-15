@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import MerlinLizdCore
 import SwiftUI
@@ -5,10 +6,13 @@ import SwiftUI
 @MainActor
 final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     @Published private(set) var tabs: [TerminalTabRecord]
+    @Published private(set) var codexTerminalContext:
+        CodexDrawerTerminalContext = .noSelection
     @Published var selectedTabID: String? {
         didSet {
             persist()
             focusSelectedCodexEndpoint()
+            refreshCodexTerminalContext()
             guard let selectedTab else { return }
             prioritize(selectedTab.target)
         }
@@ -27,6 +31,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     private var codexEndpointTokens: [String: UUID] = [:]
     private var codexEndpointTasks: [String: Task<Void, Never>] = [:]
     private var codexEndpointIDs: [String: TerminalEndpointID] = [:]
+    private var codexSessionObservers: [String: AnyCancellable] = [:]
     private var codexFocusRevision: UInt64 = 0
 
     init(
@@ -62,6 +67,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
             selectedTabID = nil
         }
         seedWarmupPriorities()
+        refreshCodexTerminalContext()
         codexRuntime?.startNotifications(
             foregroundConversation: { [weak self] in
                 self?.selectedConversationKey
@@ -200,6 +206,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     func reconnect(_ id: String) {
         guard tabs.contains(where: { $0.id == id }) else { return }
         detachCodexEndpoint(for: id)
+        codexSessionObservers.removeValue(forKey: id)?.cancel()
         sessions.removeValue(forKey: id)?.close()
         _ = session(for: id)
         selectedTabID = id
@@ -224,15 +231,29 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
                     : nil
             )
             sessions[id] = session
+            codexSessionObservers[id] = session.$state.sink {
+                [weak self] _ in
+                self?.refreshCodexTerminalContext()
+            }
             registerCodexEndpoint(for: tab, session: session)
+            refreshCodexTerminalContext()
             return session
         } catch {
             return nil
         }
     }
 
+    /// Keeps already-open background terminals hosted without eagerly
+    /// connecting every restored tab at launch.
+    func sessionForRendering(_ id: String) -> TerminalSession? {
+        if let existing = sessions[id] { return existing }
+        guard selectedTabID == id else { return nil }
+        return session(for: id)
+    }
+
     func close(_ id: String) {
         detachCodexEndpoint(for: id)
+        codexSessionObservers.removeValue(forKey: id)?.cancel()
         sessions.removeValue(forKey: id)?.close()
         guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
         let wasSelected = selectedTabID == id
@@ -504,6 +525,52 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         )
     }
 
+    func conversationKey(
+        for tab: TerminalTabRecord
+    ) -> TerminalConversationKey? {
+        guard tab.sessionName != nil, let identity = tab.tmuxIdentity else {
+            return nil
+        }
+        return TerminalConversationKey(
+            terminalTarget: tab.target,
+            tmux: identity
+        )
+    }
+
+    private func refreshCodexTerminalContext() {
+        let context: CodexDrawerTerminalContext
+        guard let selectedTab else {
+            context = .noSelection
+            if codexTerminalContext != context {
+                codexTerminalContext = context
+            }
+            return
+        }
+        guard selectedTab.sessionName != nil else {
+            context = .plainLocalShell
+            if codexTerminalContext != context {
+                codexTerminalContext = context
+            }
+            return
+        }
+        guard let key = conversationKey(for: selectedTab) else {
+            context = .unresolvedTmux
+            if codexTerminalContext != context {
+                codexTerminalContext = context
+            }
+            return
+        }
+        switch sessions[selectedTab.id]?.state {
+        case .exited, .closed:
+            context = .disconnected(key)
+        case .idle, .running, nil:
+            context = .connected(key)
+        }
+        if codexTerminalContext != context {
+            codexTerminalContext = context
+        }
+    }
+
     private func registerCodexEndpoint(
         for tab: TerminalTabRecord,
         session: TerminalSession
@@ -625,6 +692,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
 
     func replaceTerminalTabs(_ tabs: [TerminalTabRecord]) {
         self.tabs = tabs
+        refreshCodexTerminalContext()
     }
 
     func persistTerminalTabs() {
