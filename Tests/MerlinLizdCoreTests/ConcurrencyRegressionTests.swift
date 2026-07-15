@@ -413,6 +413,20 @@ struct ConcurrencyRegressionTests {
         #expect(await runner.maximumConcurrentCommands() == 1)
     }
 
+    @Test("many terminal publications waits interrupts and endpoint closes drain exact keys")
+    func terminalLifecycleStressDrainsExactKeys() async throws {
+        let result = try await CodexTerminalConcurrencyHarness.run(
+            publicationCount: 64,
+            keysPerOutcome: 8
+        )
+
+        #expect(result.completedWaitCount == 8)
+        #expect(result.interruptedWaitCount == 16)
+        #expect(result.remainingContinuationCount == 0)
+        #expect(result.crossKeyMutationCount == 0)
+        #expect(result.remainingPinCount == 0)
+    }
+
     private func command(label: String) -> CommandSpec {
         CommandSpec(executable: "/usr/bin/true", arguments: [label])
     }
@@ -428,5 +442,279 @@ struct ConcurrencyRegressionTests {
         } catch {
             Issue.record("Expected CancellationError, got \(error)")
         }
+    }
+}
+
+private struct CodexTerminalConcurrencyResult: Sendable {
+    let completedWaitCount: Int
+    let interruptedWaitCount: Int
+    let remainingContinuationCount: Int
+    let crossKeyMutationCount: Int
+    let remainingPinCount: Int
+}
+
+private actor CodexTerminalConcurrencyPort: TerminalSessionPort {
+    private struct Waiter {
+        let id: Int
+        let afterRevision: UInt64
+        let continuation: CheckedContinuation<
+            TerminalScreenWaitResult,
+            any Error
+        >
+    }
+
+    private let keyLabel: String
+    private var screen: TerminalScreenSnapshot
+    private var waiters: [Int: Waiter] = [:]
+    private var nextWaiterID = 0
+    private var registrationWaiters: [CheckedContinuation<Void, Never>] = []
+    private var sendCount = 0
+    private var owners: [TerminalKeyboardOwner] = []
+
+    init(keyLabel: String) {
+        self.keyLabel = keyLabel
+        screen = TerminalToolFixtures.screen(
+            revision: 0,
+            text: "\(keyLabel):0"
+        )
+    }
+
+    func observeScreen() -> TerminalScreenSnapshot { screen }
+
+    func sendInput(_ batch: TerminalInputBatch) -> TerminalInputReceipt {
+        sendCount += 1
+        return TerminalInputReceipt(
+            acceptedRevision: batch.expectedRevision,
+            byteCount: batch.events.count
+        )
+    }
+
+    func waitForScreen(
+        _ request: TerminalScreenWaitRequest
+    ) async throws -> TerminalScreenWaitResult {
+        let afterRevision: UInt64
+        switch request.condition {
+        case let .changed(after): afterRevision = after
+        case let .stable(after, _): afterRevision = after
+        }
+        if screen.revision > afterRevision {
+            return TerminalScreenWaitResult(snapshot: screen, timedOut: false)
+        }
+        nextWaiterID += 1
+        let id = nextWaiterID
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                waiters[id] = Waiter(
+                    id: id,
+                    afterRevision: afterRevision,
+                    continuation: continuation
+                )
+                let registered = registrationWaiters
+                registrationWaiters.removeAll()
+                registered.forEach { $0.resume() }
+            }
+        } onCancel: {
+            Task { await self.cancelWaiter(id) }
+        }
+    }
+
+    func setKeyboardOwner(_ owner: TerminalKeyboardOwner) {
+        owners.append(owner)
+    }
+
+    func waitUntilRegistered() async {
+        if !waiters.isEmpty { return }
+        await withCheckedContinuation { registrationWaiters.append($0) }
+    }
+
+    func publish(revisions: ClosedRange<UInt64>) {
+        for revision in revisions {
+            screen = TerminalToolFixtures.screen(
+                revision: revision,
+                text: "\(keyLabel):\(revision)"
+            )
+            let completed = waiters.values.filter {
+                revision > $0.afterRevision
+            }
+            for waiter in completed {
+                waiters.removeValue(forKey: waiter.id)
+                waiter.continuation.resume(returning: TerminalScreenWaitResult(
+                    snapshot: screen,
+                    timedOut: false
+                ))
+            }
+        }
+    }
+
+    func continuationCount() -> Int { waiters.count }
+    func mutationCount() -> Int { sendCount }
+
+    private func cancelWaiter(_ id: Int) {
+        guard let waiter = waiters.removeValue(forKey: id) else { return }
+        waiter.continuation.resume(throwing: CancellationError())
+    }
+}
+
+private enum CodexTerminalConcurrencyHarness {
+    private struct Context: Sendable {
+        let key: TerminalConversationKey
+        let endpointID: TerminalEndpointID
+        let port: CodexTerminalConcurrencyPort
+        let handle: AgentTurnHandle
+        let turnID: AgentTurnID
+    }
+
+    static func run(
+        publicationCount: UInt64,
+        keysPerOutcome: Int
+    ) async throws -> CodexTerminalConcurrencyResult {
+        precondition(publicationCount > 0)
+        precondition(keysPerOutcome > 0)
+        let registry = TerminalEndpointRegistry()
+        let router = TerminalToolRouter(
+            registry: registry,
+            approvalBroker: TerminalApprovalBroker(),
+            journal: MemoryTerminalToolJournal()
+        )
+        var contexts: [Context] = []
+        for index in 0..<(keysPerOutcome * 3) {
+            let identity = TmuxSessionIdentity(
+                serverSessionID: "$stress-\(index)",
+                createdAtEpoch: Int64(10_000 + index)
+            )
+            let key = TerminalConversationKey(target: .local, tmux: identity)
+            let endpointID = TerminalEndpointID(
+                rawValue: TerminalToolFixtures.newID()
+            )
+            let port = CodexTerminalConcurrencyPort(
+                keyLabel: identity.serverSessionID
+            )
+            try await registry.register(TerminalEndpoint(
+                id: endpointID,
+                conversationKey: key,
+                terminal: port,
+                surfaces: FakeTerminalSurfaceController(surface: TmuxSurface(
+                    sessionIdentity: identity,
+                    windowID: "@\(index)",
+                    paneID: "%\(index)",
+                    currentCommand: "zsh"
+                )),
+                route: TmuxRoute(
+                    target: .local,
+                    sessionName: "stress-\(index)",
+                    expectedIdentity: identity
+                )
+            ))
+            let handle = try await router.beginTurn(
+                threadID: .init(rawValue: "stress-thread-\(index)"),
+                conversationKey: key
+            )
+            contexts.append(Context(
+                key: key,
+                endpointID: endpointID,
+                port: port,
+                handle: handle,
+                turnID: .init(rawValue: "stress-turn-\(index)")
+            ))
+        }
+
+        let operations = contexts.map { context in
+            Task {
+                try await router.execute(
+                    handle: context.handle,
+                    turnID: context.turnID,
+                    conversationKey: context.key,
+                    call: .waitForScreen(.init(
+                        condition: .changed(after: 0),
+                        timeout: .seconds(60)
+                    ))
+                )
+            }
+        }
+        for context in contexts {
+            await context.port.waitUntilRegistered()
+        }
+
+        await withTaskGroup(of: Void.self) { group in
+            for index in 0..<keysPerOutcome {
+                let context = contexts[index]
+                group.addTask {
+                    await context.port.publish(revisions: 1...publicationCount)
+                }
+            }
+            for index in keysPerOutcome..<(keysPerOutcome * 2) {
+                let context = contexts[index]
+                group.addTask {
+                    try? await router.interruptTurn(
+                        handle: context.handle,
+                        turnID: context.turnID
+                    )
+                }
+            }
+            for index in (keysPerOutcome * 2)..<(keysPerOutcome * 3) {
+                let context = contexts[index]
+                group.addTask {
+                    await registry.unregister(context.endpointID)
+                    try? await router.interruptTurn(
+                        handle: context.handle,
+                        turnID: context.turnID
+                    )
+                }
+            }
+        }
+
+        var completedWaitCount = 0
+        var interruptedWaitCount = 0
+        var crossKeyMutationCount = 0
+        for (index, operation) in operations.enumerated() {
+            do {
+                let result = try await operation.value
+                guard index < keysPerOutcome,
+                    case let .screenWait(wait) = result
+                else {
+                    crossKeyMutationCount += 1
+                    continue
+                }
+                completedWaitCount += 1
+                let expectedLabel = contexts[index].key.tmux.serverSessionID
+                if !wait.snapshot.text.hasPrefix("\(expectedLabel):") {
+                    crossKeyMutationCount += 1
+                }
+            } catch TerminalToolRouterError.interrupted {
+                if index < keysPerOutcome {
+                    crossKeyMutationCount += 1
+                } else {
+                    interruptedWaitCount += 1
+                }
+            } catch {
+                crossKeyMutationCount += 1
+            }
+        }
+
+        for index in 0..<keysPerOutcome {
+            let context = contexts[index]
+            try await router.endTurn(
+                handle: context.handle,
+                turnID: context.turnID
+            )
+        }
+        var remainingContinuationCount = 0
+        for context in contexts {
+            remainingContinuationCount += await context.port
+                .continuationCount()
+            crossKeyMutationCount += await context.port.mutationCount()
+        }
+        let remainingPinCount = await registry.pinSnapshot().pins.count
+        return CodexTerminalConcurrencyResult(
+            completedWaitCount: completedWaitCount,
+            interruptedWaitCount: interruptedWaitCount,
+            remainingContinuationCount: remainingContinuationCount,
+            crossKeyMutationCount: crossKeyMutationCount,
+            remainingPinCount: remainingPinCount
+        )
     }
 }

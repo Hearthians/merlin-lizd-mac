@@ -50,6 +50,7 @@ part of v1.
 - `merlin-cli` installed and logged in
 - working SSH aliases for development machines
 - `mlx` and `tmux` on the corresponding remote machines
+- local Codex CLI `>= 0.144.2 && < 0.145.0` for the tmux Codex drawer
 - `nvidia-smi` inside GPU Workers only for the live direct-sampling supplement
   or fallback; Merlin platform history remains available without it
 
@@ -88,14 +89,18 @@ as a separate release step; the local packaging path deliberately does neither.
 
 ## Codex UI for tmux sessions
 
-Design status: approved on 2026-07-14.
+Implementation status: shipped in this repository. The native drawer, local
+app-server adapter, terminal permission router, persistent conversations,
+operation journal, notifications, and failure containment are wired into the
+`MerlinLizd` app target and covered by cross-layer acceptance tests.
 
 ### Goal and scope
 
-MerlinHub will provide a native Codex conversation drawer for every terminal
+Merlin Lizd provides a native Codex conversation drawer for every terminal
 tab backed by tmux. Codex runs on the local Mac, reuses the user's existing
 Codex login and model configuration, and operates the same tmux session shown
-by MerlinHub. The remote machine does not need Codex or an API key.
+by Merlin Lizd. The remote machine does not need Codex, and Merlin Lizd has no
+API-key field or separate model configuration.
 
 The first version supports local, Devbox, and Worker tmux sessions. It supports
 shells and full-screen interactive programs such as Vim, REPLs, and terminal
@@ -210,7 +215,7 @@ The tmux identity includes the server-provided session ID and creation time;
 the editable session name is routing and display metadata, not identity.
 Renaming a session therefore preserves its conversation. Terminating a session
 and later creating another with the same name produces a new conversation;
-the old thread remains available as history. MerlinHub resolves the real tmux
+the old thread remains available as history. Merlin Lizd resolves the real tmux
 identity before enabling Codex for a tab. Failure to resolve it disables Codex
 for that tab without affecting the terminal.
 
@@ -261,7 +266,7 @@ sends a macOS notification without switching the selected tab.
 
 ### Codex app-server adapter
 
-MerlinHub launches a local `codex app-server` child using the user's existing
+Merlin Lizd launches a local `codex app-server` child using the user's existing
 Codex home and authentication. Per-process overrides disable built-in shell,
 file-editing, web, app, and unrelated tools and provide only the namespaced
 `merlin_tmux` Dynamic Tools. The Codex process receives no remote filesystem
@@ -310,6 +315,47 @@ exact proposed input, reason, target surface, and relevant screen context.
 - App shutdown interrupts turns and stops the local app-server and terminal
   channels. Existing shutdown behavior continues to preserve all remote tmux
   sessions and their processes.
+
+### Operations, storage, and troubleshooting
+
+The supported Codex CLI range is exactly `>= 0.144.2 && < 0.145.0`. Merlin
+Lizd resolves the installed local executable, inherits the user's Codex home,
+login, model, and auth environment, and never asks for an API key. Use the
+normal Codex CLI or ChatGPT login flow if the drawer reports authentication is
+required; do not add credentials to Merlin Lizd.
+
+Codex state is stored below `~/Library/Application Support/MerlinLizd/`:
+
+- `CodexConversations/conversations.json` stores the stable tmux-to-thread
+  mapping, archive state, and staged deletion recovery.
+- `TerminalOperations/Mappings/` and `TerminalOperations/Journals/` store the
+  per-conversation operation audit. Journal JSONL can contain visible terminal
+  text, proposed input, approval context, and other secrets shown in the pane.
+- `CodexRuntime/` is the owner-only empty runtime working directory for the
+  local app-server child.
+
+These directories are created owner-only (`0700`) and durable data files are
+owner-readable/writable (`0600`). They should be protected and backed up with
+the same care as terminal history. Archiving a conversation preserves its
+mapping, Codex thread, and journal. Only the separately confirmed **Delete
+Conversation** action removes the remote Codex thread, local mapping, and
+journal through a recoverable staged deletion.
+
+Drawer availability is explicit. **Starting** means local app-server startup
+is in progress. **Authentication required** means the local Codex login must be
+repaired. **Unsupported version** requires installing a CLI in the supported
+range and is not blindly retried. **Capability unavailable**, **overloaded**,
+and **crashed** preserve terminal sessions and offer a bounded, non-sensitive
+retry path. **Endpoint registering**, **registration failed**, **detached**,
+**reconnecting**, and **disconnected** refer to the selected terminal route;
+reconnect or reopen that tmux tab before sending more work.
+
+For a drawer that cannot start, first run `codex --version`, confirm the exact
+range above, and verify the normal Codex CLI can use the existing login. For a
+terminal availability error, reconnect the tab and confirm its tmux session
+identity still resolves. Retry never replays a previously failed terminal
+input. The expanded drawer shows recent bounded journal history; the files on
+disk remain the complete audit record.
 
 ### Verification
 

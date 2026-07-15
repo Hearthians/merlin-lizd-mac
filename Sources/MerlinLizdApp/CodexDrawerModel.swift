@@ -71,6 +71,10 @@ final class CodexDrawerModel: ObservableObject {
         if let supervisor {
             availabilityTask = Task { [weak self] in
                 let stream = await supervisor.availability()
+                let initialProbe = Task {
+                    await supervisor.retryAvailability()
+                }
+                defer { initialProbe.cancel() }
                 for await availability in stream {
                     guard !Task.isCancelled else { return }
                     self?.apply(

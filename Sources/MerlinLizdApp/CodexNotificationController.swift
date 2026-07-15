@@ -10,11 +10,21 @@ private protocol CodexNotificationDelivering: AnyObject {
     func stop()
 }
 
+enum CodexNotificationDeliverySelection: Equatable, Sendable {
+    case system
+    case noOp
+
+    init(bundleURL: URL) {
+        self = bundleURL.pathExtension.lowercased() == "app" ? .system : .noOp
+    }
+}
+
 @MainActor
 final class CodexNotificationController {
     private static let maximumTrackedRequests = 128
 
-    private let delivery: any CodexNotificationDelivering
+    private let bundleURL: URL
+    private var delivery: (any CodexNotificationDelivering)?
     private var activityTask: Task<Void, Never>?
     private var foregroundConversation: (
         @MainActor @Sendable () -> TerminalConversationKey?
@@ -26,12 +36,8 @@ final class CodexNotificationController {
         limit: maximumTrackedRequests
     )
 
-    init() {
-        delivery = UserNotificationDelivery()
-    }
-
-    private init(delivery: any CodexNotificationDelivering) {
-        self.delivery = delivery
+    init(bundleURL: URL = Bundle.main.bundleURL) {
+        self.bundleURL = bundleURL
     }
 
     func start(
@@ -45,6 +51,10 @@ final class CodexNotificationController {
         stop()
         self.foregroundConversation = foregroundConversation
         self.openConversation = openConversation
+        let delivery = Self.makeDelivery(
+            selection: CodexNotificationDeliverySelection(bundleURL: bundleURL)
+        )
+        self.delivery = delivery
         delivery.responseHandler = { [weak self] identifier in
             self?.openNotification(identifier)
         }
@@ -61,8 +71,9 @@ final class CodexNotificationController {
     func stop() {
         activityTask?.cancel()
         activityTask = nil
-        delivery.responseHandler = nil
-        delivery.stop()
+        delivery?.responseHandler = nil
+        delivery?.stop()
+        delivery = nil
         foregroundConversation = nil
         openConversation = nil
         tracker.removeAll()
@@ -74,7 +85,7 @@ final class CodexNotificationController {
             foreground: foregroundConversation?()
         )
         for candidate in candidates {
-            delivery.deliver(
+            delivery?.deliver(
                 identifier: candidate.identifier,
                 title: "Codex needs approval",
                 body: "Open Merlin Lizd to review this request."
@@ -85,6 +96,30 @@ final class CodexNotificationController {
     private func openNotification(_ identifier: String) {
         guard let key = tracker.conversation(for: identifier) else { return }
         openConversation?(key)
+    }
+
+    private static func makeDelivery(
+        selection: CodexNotificationDeliverySelection
+    ) -> any CodexNotificationDelivering {
+        switch selection {
+        case .system:
+            UserNotificationDelivery()
+        case .noOp:
+            NoOpCodexNotificationDelivery()
+        }
+    }
+}
+
+@MainActor
+private final class NoOpCodexNotificationDelivery: CodexNotificationDelivering {
+    var responseHandler: (@MainActor @Sendable (String) -> Void)?
+
+    func requestAuthorization() {}
+
+    func deliver(identifier: String, title: String, body: String) {}
+
+    func stop() {
+        responseHandler = nil
     }
 }
 

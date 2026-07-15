@@ -31,6 +31,25 @@ struct CodexAppServerSupervisorTests {
         await supervisor.shutdown()
     }
 
+    @Test("resuming a thread started in the current generation is idempotent")
+    func currentGenerationResumeDoesNotReloadThread() async throws {
+        let generation = ScriptedSupervisorGeneration(
+            startedThreads: ["current-thread"]
+        )
+        let factory = ScriptedSupervisorGenerationFactory(
+            outcomes: [.generation(generation)]
+        )
+        let supervisor = CodexAppServerSupervisor(
+            generationFactory: { try await factory.makeGeneration() }
+        )
+
+        let threadID = try await supervisor.startThread()
+        try await supervisor.resumeThread(threadID)
+
+        #expect(await generation.recordedCalls == [.startThread])
+        await supervisor.shutdown()
+    }
+
     @Test("cancelling one startup caller preserves the shared generation")
     func cancellingStartupCallerOnlyRemovesItsWaiter() async throws {
         let generation = ScriptedSupervisorGeneration(

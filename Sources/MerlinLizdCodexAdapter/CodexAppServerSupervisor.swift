@@ -200,6 +200,11 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
         guard owns(handle) else {
             throw CodexAppServerSupervisorError.unavailable
         }
+        if generationThreadIDs.contains(threadID) {
+            mappedThreadIDs.insert(threadID)
+            setAvailability(.ready)
+            return
+        }
         do {
             try await handle.client.resumeThread(threadID)
             guard owns(handle) else {
@@ -319,7 +324,8 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
 
     /// Clears a previously terminal availability result only after its exact
     /// generation has finished shutting down, then performs a fresh handshake.
-    /// The UI invokes this solely from an explicit Retry action.
+    /// The UI invokes this for its initial availability probe and for an
+    /// explicit Retry action after a retryable failure.
     public func retryAvailability() async {
         guard !stopped else { return }
         if let recovery = recoveryOperation {

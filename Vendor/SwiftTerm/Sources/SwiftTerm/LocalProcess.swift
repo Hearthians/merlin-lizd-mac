@@ -225,13 +225,20 @@ public class LocalProcess {
         data: ArraySlice<UInt8>,
         completion: @escaping (Result<Void, POSIXError>) -> Void
     ) {
-        let completion = LocalProcessSendCompletion(completion)
+        let completion = LocalProcessSendCompletion(
+            queue: dispatchQueue,
+            completion
+        )
         guard running else {
             completion.finish(.failure(POSIXError(.EPIPE)))
             return
         }
         guard !data.isEmpty else {
             completion.finish(.success(()))
+            return
+        }
+        guard let io else {
+            completion.finish(.failure(POSIXError(.EPIPE)))
             return
         }
         let copy = sendCount
@@ -243,18 +250,22 @@ public class LocalProcess {
                 print ("[SEND-\(copy)] Queuing data to client: \(data) ")
             }
 
-            DispatchIO.write(toFileDescriptor: childfd, data: ddata, runningHandlerOn: DispatchQueue.global(qos: .userInitiated), handler:  { [self] remainingData, errorNumber in
-                self.total += copyCount - (remainingData?.count ?? 0)
+            io.write(offset: 0, data: ddata, queue: DispatchQueue.global(qos: .userInitiated)) { [self] done, remainingData, errorNumber in
+                let remainingCount = remainingData?.count ?? 0
+                guard done || errorNumber != 0 else { return }
+                self.total += copyCount - remainingCount
                 if self.debugIO {
                     print ("[SEND-\(copy)] completed bytes=\(self.total)")
                 }
                 if errorNumber != 0 {
                     let code = POSIXError.Code(rawValue: errorNumber) ?? .EIO
                     completion.finish(.failure(POSIXError(code)))
-                } else {
+                } else if remainingCount == 0 {
                     completion.finish(.success(()))
+                } else {
+                    completion.finish(.failure(POSIXError(.EIO)))
                 }
-            })
+            }
         }
     }
     
@@ -603,9 +614,14 @@ public class LocalProcess {
 
 private final class LocalProcessSendCompletion {
     private let lock = NSLock()
+    private let queue: DispatchQueue
     private var completion: ((Result<Void, POSIXError>) -> Void)?
 
-    init(_ completion: @escaping (Result<Void, POSIXError>) -> Void) {
+    init(
+        queue: DispatchQueue,
+        _ completion: @escaping (Result<Void, POSIXError>) -> Void
+    ) {
+        self.queue = queue
         self.completion = completion
     }
 
@@ -614,7 +630,11 @@ private final class LocalProcessSendCompletion {
         let completion = self.completion
         self.completion = nil
         lock.unlock()
-        completion?(result)
+        if let completion {
+            queue.async {
+                completion(result)
+            }
+        }
     }
 }
 #endif

@@ -4,7 +4,8 @@
 
 Merlin Lizd is a personal, native macOS workspace for seeing Lizd's Merlin CPU Devboxes and their Workers, entering any ready target quickly, and keeping remote shells durable through tmux.
 
-The primary mental model is **machines**. A future **tasks** workspace may add fan-out execution without mixing task orchestration into the v1 machine browser.
+The primary mental model is **machines**. Codex work is scoped to a real tmux
+session inside that workspace; it is not a cross-machine fan-out facility.
 
 ## Vocabulary
 
@@ -13,6 +14,19 @@ The primary mental model is **machines**. A future **tasks** workspace may add f
 - **Target**: Local Mac, one Devbox, or one Worker.
 - **Terminal tab**: one interactive terminal bound to exactly one target and, for remote targets, one tmux session.
 - **Managed session**: a tmux session created by this app. Existing external tmux sessions are also discoverable and attachable.
+- **Tmux session identity**: the server-provided session ID plus creation time.
+  It is stable across rename and is distinct from the editable session name.
+- **Terminal conversation key**: a non-optional stable target identity plus a
+  tmux session identity. It owns one persistent Codex conversation, run state,
+  approvals, and operation journal.
+- **Active visible pane**: the current window and active pane on the tmux
+  client rendered by the tab. It is the only terminal observation and mutation
+  surface for that conversation.
+- **Codex drawer**: the bottom 42-point idle, 92-point active, or 20–50%
+  expanded conversation surface attached to the selected tmux conversation.
+- **Temporary pane lease**: typed provenance for a task-created, visibly active
+  tmux pane and the original surface that must be restored after proven-safe
+  close.
 
 ## v1 user experience
 
@@ -26,6 +40,11 @@ The primary mental model is **machines**. A future **tasks** workspace may add f
 8. A stopped existing Devbox can be started after an explicit in-app confirmation. v1 has no stop, delete, Worker create, or Worker terminate actions.
 9. A Local terminal tab is available for Mac commands and manual SSH.
 10. Selecting a reachable Worker shows live utilization cards and five-minute curves for CPU, memory, GPU, and VRAM. GPU temperature and power remain visible with the latest sample.
+11. A tmux-backed tab exposes the native Codex drawer. It reuses the local
+    Codex login and model configuration, requires no API key, and supports
+    local, Devbox, and Worker tmux sessions.
+12. Matching tabs share the same Codex transcript and badges. Different tmux
+    conversations may continue in parallel while the selected tab changes.
 
 ## Inventory and refresh
 
@@ -65,16 +84,67 @@ The primary mental model is **machines**. A future **tasks** workspace may add f
 - Worker target: start system `ssh` to its parent Devbox, enter the Worker by numeric ID, and attach/create the selected tmux session there.
 - The embedded terminal is primary. Opening the same target in Terminal/iTerm remains a fallback.
 
+## Tmux Codex drawer invariants
+
+- Codex support is enabled only after a tab resolves a non-optional stable tmux
+  identity and registers its exact terminal endpoint. Plain local shells and
+  unresolved, detached, exited, closed, reconnecting, or disconnected routes
+  fail closed for new input.
+- The local `codex app-server` adapter supports Codex CLI versions
+  `>= 0.144.2 && < 0.145.0`. It inherits the existing Codex login, model, and
+  auth environment. Dynamic Tool wire/schema names remain in the replaceable
+  adapter; Core terminal tools, permissions, session routing, and journals are
+  protocol-neutral.
+- Codex observes the rendered SwiftTerm grid, including cursor, styles,
+  alternate-screen state, and keyboard mode. It sends only semantic text/key
+  events through the active terminal driver. Every mutation carries an
+  expected revision; stale revisions require re-observation and failed input
+  is never replayed.
+- Window or pane navigation is a visible tmux selection. Codex never reads or
+  mutates a hidden pane. A background tab may keep its already-running Codex
+  turn, with complete activity/journal state and a badge, but its control
+  endpoint remains pinned for the turn.
+- Task-created panes become visible before use. Close requires the fixed
+  visible `jobs -p` proof from a supported idle shell. Foreground processes,
+  background jobs, marker ambiguity, disconnect, or any uncertainty retain the
+  pane with typed provenance and a user-visible reason.
+- `TerminalPermissionPolicy` computes effective risk from both the declared
+  risk and exact visible screen/input. High-risk input exposes only **Allow
+  Once** and **Deny**. Approval is bound to the exact payload, endpoint, screen,
+  and canonical tmux surface; any drift expires it.
+- One conversation key has at most one active turn and one serialized terminal
+  mutation lane. Different keys may overlap. Duplicate tabs share messages and
+  badges, while the most recently focused matching endpoint is pinned only
+  when the next turn begins; an active pin never migrates.
+- **Stop and Take Over** first quiesces the exact coordinator turn, then returns
+  keyboard ownership. It emits no Control-C byte, pane/session kill, terminal
+  close, or remote process signal. Notification selection may reveal a
+  conversation but never grants approval.
+- The owner-only operation journal is written before each side effect and
+  records request, screen, risk, exact approval, endpoint, emitted batch,
+  result, and temporary-pane lifecycle. Archiving preserves mapping and
+  journal. Only separately confirmed deletion removes the Codex thread,
+  mapping, and journal through staged recovery.
+- App-server, PTY, SSH, endpoint, and app-shutdown failure quiesce only owned
+  local turns and channels. Remote tmux sessions and processes remain intact;
+  retry resumes durable conversations without replaying terminal input.
+
 ## Explicit non-goals
 
 - Cross-machine batch commands or task fan-out.
 - Resource creation, deletion, stopping, Worker launch, or Worker kill.
 - File browser, editor, upload/download workflow, or IDE features.
 - Multi-user onboarding, credential management, Windows, or Linux support.
+- API-key configuration, remote Codex installation, hidden-pane readers,
+  arbitrary remote shell/file APIs, MCP transport, or cross-device sync.
 
-## Delivery sequence
+## Delivery and verification
 
-1. Real-data, read-only machine tree and overview.
-2. Embedded local/SSH terminal and persistent tmux-backed tabs.
-3. External tmux discovery and confirmed Devbox start action.
-4. Package a locally runnable `.app`, then run the full tests and a two-axis code review against this specification.
+The v1 tree contains the real-data machine browser, embedded local/SSH
+terminal, persistent tmux-backed tabs, external tmux discovery, confirmed
+Devbox start/session termination, and the tmux Codex drawer described above.
+Automated acceptance uses fakes plus real local persistence and launches no
+Merlin, SSH, tmux, Codex, OpenAI, or network process. Release verification runs
+`./scripts/test.sh`, `/usr/bin/swift build`, and `./scripts/package-app.sh`; the
+authoritative product is `MerlinLizd` and the signed local bundle is
+`dist/Merlin Lizd.app`.
