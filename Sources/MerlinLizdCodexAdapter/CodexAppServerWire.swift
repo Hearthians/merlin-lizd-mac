@@ -103,6 +103,7 @@ public enum CodexServerMessage: Equatable, Sendable {
 struct JSONRPCInboundEnvelope: Decodable {
     struct ErrorBody: Decodable {
         let code: Int
+        let message: String
     }
 
     let jsonrpc: String?

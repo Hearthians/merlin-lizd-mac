@@ -17,7 +17,7 @@ struct CodexConversationStoreTests {
         let relaunched = try FileCodexConversationStore(
             applicationSupportDirectory: fixture.applicationSupportDirectory
         )
-        let snapshot = await relaunched.snapshot()
+        let snapshot = try await relaunched.snapshot()
         #expect(snapshot.records[record.key] == record)
         #expect(snapshot.deletions.isEmpty)
         #expect(snapshot.archiveReconciliations.isEmpty)
@@ -61,7 +61,7 @@ struct CodexConversationStoreTests {
         await #expect(throws: CodexConversationStoreError.self) {
             _ = try await store.apply(.upsert(conflicting))
         }
-        let snapshot = await store.snapshot()
+        let snapshot = try await store.snapshot()
         #expect(snapshot.records.count == 1)
         #expect(snapshot.records[original.key] == original)
     }
@@ -103,9 +103,49 @@ struct CodexConversationStoreTests {
             applicationSupportDirectory: fixture.applicationSupportDirectory
         )
         #expect(
-            await relaunched.snapshot().records[firstCandidate.key]?.threadID
+            try await relaunched.snapshot().records[firstCandidate.key]?.threadID
                 == winners.first
         )
+    }
+
+    @Test("an already-open store refreshes authoritative deletion state")
+    func snapshotRefreshesChangesFromAnotherOpenStore() async throws {
+        let fixture = try CodexSessionPersistenceFixture()
+        defer { fixture.remove() }
+        let writer = try FileCodexConversationStore(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        let reader = try FileCodexConversationStore(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        let record = codexTestRecord(threadID: "cross-store-thread")
+
+        _ = try await writer.apply(.upsert(record))
+        #expect(try await reader.snapshot().records[record.key] == record)
+        _ = try await writer.apply(.beginDeletion(
+            key: record.key,
+            updatedAt: record.updatedAt
+        ))
+        #expect(
+            try await reader.snapshot().deletions[record.key]?.threadID
+                == record.threadID
+        )
+        for stage in [
+            CodexDeletionStage.remoteThreadDeleted,
+            .journalDeleted,
+            .routerForgotten,
+        ] {
+            _ = try await writer.apply(.advanceDeletion(
+                key: record.key,
+                stage: stage,
+                updatedAt: record.updatedAt
+            ))
+        }
+        _ = try await writer.apply(.completeDeletion(key: record.key))
+
+        let completed = try await reader.snapshot()
+        #expect(completed.records[record.key] == nil)
+        #expect(completed.deletions[record.key] == nil)
     }
 
     @Test("records fail closed on an unsupported protocol generation")
@@ -124,7 +164,7 @@ struct CodexConversationStoreTests {
         await #expect(throws: CodexConversationStoreError.self) {
             _ = try await store.apply(.upsert(invalid))
         }
-        #expect(await store.snapshot().records.isEmpty)
+        #expect(try await store.snapshot().records.isEmpty)
     }
 
     @Test("conversation storage uses the shared private Application Support root")
@@ -179,7 +219,7 @@ struct CodexConversationStoreTests {
         let relaunched = try FileCodexConversationStore(
             applicationSupportDirectory: fixture.applicationSupportDirectory
         )
-        let snapshot = await relaunched.snapshot()
+        let snapshot = try await relaunched.snapshot()
         let tombstone = snapshot.deletions[record.key]
         #expect(snapshot.records[record.key] == record)
         #expect(tombstone?.threadID == record.threadID)
@@ -207,11 +247,13 @@ struct CodexConversationStoreTests {
         let relaunched = try FileCodexConversationStore(
             applicationSupportDirectory: fixture.applicationSupportDirectory
         )
-        #expect(await relaunched.snapshot().orphans[orphan.threadID] == orphan)
+        #expect(
+            try await relaunched.snapshot().orphans[orphan.threadID] == orphan
+        )
         _ = try await relaunched.apply(
             .removeOrphan(threadID: orphan.threadID)
         )
-        #expect(await relaunched.snapshot().orphans.isEmpty)
+        #expect(try await relaunched.snapshot().orphans.isEmpty)
     }
 
     @Test("completed deletion atomically removes mapping and tombstone")

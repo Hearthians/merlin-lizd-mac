@@ -161,6 +161,7 @@ public struct TerminalEndpointRegistrySnapshot: Equatable, Sendable {
 public struct TerminalEndpointRegistrySubscription: Sendable {
     public let snapshot: TerminalEndpointRegistrySnapshot
     public let events: AsyncStream<TerminalEndpointRegistryEvent>
+    let subscriberID: UUID?
 
     public init(
         snapshot: TerminalEndpointRegistrySnapshot,
@@ -168,6 +169,17 @@ public struct TerminalEndpointRegistrySubscription: Sendable {
     ) {
         self.snapshot = snapshot
         self.events = events
+        subscriberID = nil
+    }
+
+    init(
+        snapshot: TerminalEndpointRegistrySnapshot,
+        events: AsyncStream<TerminalEndpointRegistryEvent>,
+        subscriberID: UUID
+    ) {
+        self.snapshot = snapshot
+        self.events = events
+        self.subscriberID = subscriberID
     }
 }
 
@@ -626,8 +638,13 @@ public actor TerminalEndpointRegistry {
         eventSubscribers[subscriberID] = pair.continuation
         return TerminalEndpointRegistrySubscription(
             snapshot: makePinSnapshot(),
-            events: pair.stream
+            events: pair.stream,
+            subscriberID: subscriberID
         )
+    }
+
+    func cancelSubscription(_ subscriberID: UUID) {
+        removeEventSubscriber(subscriberID)
     }
 
     func setSubscriptionHookForTesting(
@@ -664,7 +681,11 @@ public actor TerminalEndpointRegistry {
     }
 
     private func removeEventSubscriber(_ subscriberID: UUID) {
-        eventSubscribers.removeValue(forKey: subscriberID)
+        guard let continuation = eventSubscribers.removeValue(
+            forKey: subscriberID
+        ) else { return }
+        continuation.onTermination = nil
+        continuation.finish()
     }
 
     private func makePinSnapshot() -> TerminalEndpointRegistrySnapshot {

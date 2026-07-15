@@ -43,6 +43,21 @@ public enum AgentEvent: Equatable, Sendable {
     case turnFailed(AgentTurnID?, AgentFailure)
 }
 
+public struct AgentEventRecord: Equatable, Sendable {
+    public let sequence: UInt64
+    public let event: AgentEvent
+
+    public init(sequence: UInt64, event: AgentEvent) {
+        self.sequence = sequence
+        self.event = event
+    }
+}
+
+public enum AgentEventDelivery: Equatable, Sendable {
+    case event(AgentEventRecord)
+    case replayGap(after: UInt64?, oldestAvailable: UInt64)
+}
+
 public protocol CodexAgentClient: Sendable {
     func startThread() async throws -> AgentThreadID
     func resumeThread(_ threadID: AgentThreadID) async throws
@@ -56,7 +71,10 @@ public protocol CodexAgentClient: Sendable {
         prompt: String
     ) async throws
     func interruptTurn(threadID: AgentThreadID, turnID: AgentTurnID) async
-    func events(for threadID: AgentThreadID) async -> AsyncStream<AgentEvent>
+    func events(
+        for threadID: AgentThreadID,
+        after sequence: UInt64?
+    ) async -> AsyncStream<AgentEventDelivery>
     func availability() async -> AsyncStream<AgentAvailability>
     func archiveThread(_ threadID: AgentThreadID) async throws
     func unarchiveThread(_ threadID: AgentThreadID) async throws

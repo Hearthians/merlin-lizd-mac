@@ -233,30 +233,43 @@ struct CodexAppServerContractTests {
         await adapter.shutdown()
     }
 
-    @Test("ensure delete is idempotent after owned remote deletion")
-    func ensureDeleteAcceptsAnAlreadyUnmappedOwnedThread() async throws {
+    @Test("fresh ensure delete probes and deletes an existing remote thread")
+    func ensureDeleteProbesAnActuallyFreshRemoteThread() async throws {
         let process = ScriptedAppServerProcess()
         let adapter = CodexAppServerAdapter(
             transport: JSONLAppServerTransport(process: process),
             launchConfiguration: testLaunchConfiguration(),
-            toolExecutor: RecordingCodexToolExecutor()
+            toolExecutor: RecordingCodexToolExecutor(),
+            mappingStore: CodexAppServerThreadMappingStore()
         )
-        let threadID = try await startMappedThread(
-            adapter: adapter,
-            process: process
-        )
+        let threadID = AgentThreadID(rawValue: "fresh-existing-thread")
 
-        let deleting = Task { try await adapter.ensureThreadDeleted(threadID) }
+        let deleting = Task {
+            try await adapter.ensureThreadDeleted(threadID)
+        }
+        await waitUntil { await process.writtenData().count >= 1 }
+        #expect(await process.writtenData().count == 1)
+        guard await process.writtenData().count == 1 else { return }
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":1,"result":{"codexHome":"/Users/test/.codex","platformFamily":"unix","platformOs":"macos","userAgent":"codex-cli/0.144.2"}}"#
+        )))
+        await process.waitForWriteCount(3)
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":2,"result":{"thread":{"id":"fresh-existing-thread"}}}"#
+        )))
         await process.waitForWriteCount(4)
         await process.emit(.standardOutput(jsonLine(
             #"{"id":3,"result":{}}"#
         )))
         try await deleting.value
-        let writeCount = (await process.writtenData()).count
 
-        try await adapter.ensureThreadDeleted(threadID)
-
-        #expect((await process.writtenData()).count == writeCount)
+        let methods = try await process.writtenData().map(jsonObject)
+            .compactMap { $0["method"] as? String }
+        #expect(methods == [
+            "initialize", "initialized", "thread/read", "thread/delete",
+        ])
+        #expect(await adapter.stateCountsForTesting.knownThreads == 0)
+        #expect(await adapter.stateCountsForTesting.pendingDeletes == 0)
         await adapter.shutdown()
     }
 
@@ -316,7 +329,7 @@ struct CodexAppServerContractTests {
             try await deleting.value
         }
         #expect(
-            await base.snapshot().deletions[key]?.lastCompletedStage
+            try await base.snapshot().deletions[key]?.lastCompletedStage
                 == .intentPersisted
         )
 
@@ -325,7 +338,7 @@ struct CodexAppServerContractTests {
             transport: JSONLAppServerTransport(process: freshProcess),
             launchConfiguration: testLaunchConfiguration(),
             toolExecutor: RecordingCodexToolExecutor(),
-            mappingStore: mappingStore
+            mappingStore: CodexAppServerThreadMappingStore()
         )
         let freshRegistry = TerminalEndpointRegistry()
         let freshJournal = CodexSessionJournalSpy()
@@ -341,15 +354,90 @@ struct CodexAppServerContractTests {
             journal: freshJournal
         )
 
-        try await freshCoordinator.deleteConversation(
-            key,
-            confirmation: .confirmed
-        )
+        let retrying = Task {
+            try await freshCoordinator.deleteConversation(
+                key,
+                confirmation: .confirmed
+            )
+        }
+        await freshProcess.waitForWriteCount(1)
+        await freshProcess.emit(.standardOutput(jsonLine(
+            #"{"id":1,"result":{"codexHome":"/Users/test/.codex","platformFamily":"unix","platformOs":"macos","userAgent":"codex-cli/0.144.2"}}"#
+        )))
+        await freshProcess.waitForWriteCount(3)
+        await freshProcess.emit(.standardOutput(jsonLine(
+            #"{"id":2,"error":{"code":-32600,"message":"thread not loaded"}}"#
+        )))
+        try await retrying.value
 
-        #expect(await freshProcess.writtenData().isEmpty)
-        #expect(await base.snapshot().records[key] == nil)
+        let freshMethods = try await freshProcess.writtenData()
+            .map(jsonObject)
+            .compactMap { $0["method"] as? String }
+        #expect(freshMethods == ["initialize", "initialized", "thread/read"])
+        #expect(try await base.snapshot().records[key] == nil)
         await firstCoordinator.shutdown()
         await freshCoordinator.shutdown()
+    }
+
+    @Test("ambiguous fresh thread read keeps Core deletion tombstoned")
+    func ambiguousFreshReadKeepsDeletionTombstone() async throws {
+        let fixture = try CodexSessionPersistenceFixture()
+        defer { fixture.remove() }
+        let key = codexTestKey()
+        let threadID = AgentThreadID(rawValue: "ambiguous-read-thread")
+        let store = try FileCodexConversationStore(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        _ = try await store.apply(.upsert(codexTestRecord(
+            key: key,
+            threadID: threadID.rawValue
+        )))
+        let process = ScriptedAppServerProcess()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor(),
+            mappingStore: CodexAppServerThreadMappingStore()
+        )
+        let registry = TerminalEndpointRegistry()
+        let journal = CodexSessionJournalSpy()
+        let coordinator = CodexSessionCoordinator(
+            agent: adapter,
+            store: store,
+            registry: registry,
+            router: TerminalToolRouter(
+                registry: registry,
+                approvalBroker: TerminalApprovalBroker(),
+                journal: journal
+            ),
+            journal: journal
+        )
+
+        let deleting = Task {
+            try await coordinator.deleteConversation(
+                key,
+                confirmation: .confirmed
+            )
+        }
+        await process.waitForWriteCount(1)
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":1,"result":{"codexHome":"/Users/test/.codex","platformFamily":"unix","platformOs":"macos","userAgent":"codex-cli/0.144.2"}}"#
+        )))
+        await process.waitForWriteCount(3)
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":2,"error":{"code":-32600,"message":"thread not loaded "}}"#
+        )))
+
+        await #expect(throws: CodexSessionCoordinatorError.deletionPending) {
+            try await deleting.value
+        }
+        let snapshot = try await store.snapshot()
+        #expect(snapshot.records[key]?.threadID == threadID)
+        #expect(
+            snapshot.deletions[key]?.lastCompletedStage == .intentPersisted
+        )
+        #expect(snapshot.deletions[key]?.failure == .remoteUnavailable)
+        await coordinator.shutdown()
     }
 
     @Test("retryable errors keep the exact turn active for later output")
@@ -1494,14 +1582,16 @@ struct CodexAppServerContractTests {
         let threadID = try await starting.value
         #expect(threadID == AgentThreadID(rawValue: "thread-1"))
 
-        let stream = await adapter.events(for: threadID)
-        let collected = Task { () -> [AgentEvent] in
+        let stream = await adapter.events(for: threadID, after: nil)
+        let collected = Task { () -> [AgentEventRecord] in
             var iterator = stream.makeAsyncIterator()
-            var events: [AgentEvent] = []
-            while events.count < 2, let event = await iterator.next() {
-                events.append(event)
+            var records: [AgentEventRecord] = []
+            while records.count < 2, let delivery = await iterator.next() {
+                if case let .event(record) = delivery {
+                    records.append(record)
+                }
             }
-            return events
+            return records
         }
         let resuming = Task { try await adapter.resumeThread(threadID) }
         await process.waitForWriteCount(4)
@@ -1512,8 +1602,9 @@ struct CodexAppServerContractTests {
             #"{"id":3,"result":{"thread":{"id":"thread-1","turns":[{"id":"old-turn","status":"completed","items":[{"id":"user-1","type":"userMessage","content":[{"type":"text","text":"old prompt"}]},{"id":"agent-1","type":"agentMessage","text":"old answer"}]},{"id":"live-turn","status":"inProgress","items":[]}]}}}"#
         )))
         try await resuming.value
-        let events = await collected.value
-        #expect(events == [
+        let records = await collected.value
+        #expect(records.map(\.sequence) == [1, 2])
+        #expect(records.map(\.event) == [
             .history([
                 .init(role: .user, text: "old prompt"),
                 .init(role: .assistant, text: "old answer"),
@@ -2920,7 +3011,7 @@ struct CodexAppServerContractTests {
             requestID: 3,
             writeCount: 4
         )
-        let slow = await adapter.events(for: threadID)
+        let slow = await adapter.events(for: threadID, after: nil)
         _ = slow
         for index in 0..<600 {
             await adapter.handleNotificationForTesting(
@@ -2935,7 +3026,20 @@ struct CodexAppServerContractTests {
         #expect(await adapter.stateCountsForTesting.eventSubscribers == 0)
         #expect(await adapter.stateCountsForTesting.replayEvents == 512)
 
-        let replacement = await adapter.events(for: threadID)
+        let exhausted = await adapter.events(for: threadID, after: 0)
+        var exhaustedIterator = exhausted.makeAsyncIterator()
+        guard case let .replayGap(after, oldestAvailable)? =
+            await exhaustedIterator.next()
+        else {
+            Issue.record("expected an explicit replay gap")
+            await adapter.shutdown()
+            return
+        }
+        #expect(after == 0)
+        #expect(oldestAvailable > 1)
+        #expect(await exhaustedIterator.next() == nil)
+
+        let replacement = await adapter.events(for: threadID, after: nil)
         var iterator = replacement.makeAsyncIterator()
         #expect(await iterator.next() != nil)
         #expect(await adapter.stateCountsForTesting.eventSubscribers == 1)

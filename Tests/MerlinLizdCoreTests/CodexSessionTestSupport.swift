@@ -181,9 +181,14 @@ actor FakeCodexSessionAgent: CodexAgentClient {
     private var resumeGates: [AgentThreadID: CodexSessionTestGate] = [:]
     private var resumeEvents: [AgentThreadID: [AgentEvent]] = [:]
     private var streams: [
-        AgentThreadID: AsyncStream<AgentEvent>.Continuation
+        AgentThreadID: AsyncStream<AgentEventDelivery>.Continuation
     ] = [:]
-    private var streamValues: [AgentThreadID: AsyncStream<AgentEvent>] = [:]
+    private var streamValues: [
+        AgentThreadID: AsyncStream<AgentEventDelivery>
+    ] = [:]
+    private var nextEventSequences: [AgentThreadID: UInt64] = [:]
+    private var replacementReplays: [AgentThreadID: [AgentEventRecord]] = [:]
+    private var eventCursors: [AgentThreadID: [UInt64?]] = [:]
     private var resumeCalls: [AgentThreadID] = []
     private var startCalls: [(AgentThreadID, String)] = []
     private var steerCalls: [SteerCall] = []
@@ -210,7 +215,7 @@ actor FakeCodexSessionAgent: CodexAgentClient {
         if failure == .resume { throw Failure.resume }
         resumeCalls.append(threadID)
         for event in resumeEvents[threadID, default: []] {
-            _ = streams[threadID]?.yield(event)
+            publish(event, for: threadID)
         }
         if let gate = resumeGates[threadID] {
             await gate.wait()
@@ -253,13 +258,24 @@ actor FakeCodexSessionAgent: CodexAgentClient {
         if let interruptGate { await interruptGate.wait() }
     }
 
-    func events(for threadID: AgentThreadID) async -> AsyncStream<AgentEvent> {
+    func events(
+        for threadID: AgentThreadID,
+        after sequence: UInt64?
+    ) async -> AsyncStream<AgentEventDelivery> {
+        eventCursors[threadID, default: []].append(sequence)
         if let stream = streamValues[threadID] { return stream }
-        let pair = AsyncStream<AgentEvent>.makeStream(
+        let pair = AsyncStream<AgentEventDelivery>.makeStream(
             bufferingPolicy: .bufferingNewest(64)
         )
         streams[threadID] = pair.continuation
         streamValues[threadID] = pair.stream
+        for record in replacementReplays.removeValue(forKey: threadID) ?? [] {
+            _ = pair.continuation.yield(.event(record))
+            nextEventSequences[threadID] = max(
+                nextEventSequences[threadID, default: 0],
+                record.sequence
+            )
+        }
         await probe.record("events:\(threadID.rawValue)")
         return pair.stream
     }
@@ -293,7 +309,9 @@ actor FakeCodexSessionAgent: CodexAgentClient {
         try await deleteThread(threadID)
     }
 
-    func shutdown() async {}
+    func shutdown() async {
+        await probe.record("shutdown")
+    }
 
     func enqueueTurn(_ turnID: AgentTurnID, for threadID: AgentThreadID) {
         nextTurnIDs[threadID, default: []].append(turnID)
@@ -332,7 +350,46 @@ actor FakeCodexSessionAgent: CodexAgentClient {
     }
 
     func emit(_ event: AgentEvent, for threadID: AgentThreadID) {
-        _ = streams[threadID]?.yield(event)
+        publish(event, for: threadID)
+    }
+
+    func emitSequenced(_ record: AgentEventRecord, for threadID: AgentThreadID) {
+        nextEventSequences[threadID] = max(
+            nextEventSequences[threadID, default: 0],
+            record.sequence
+        )
+        _ = streams[threadID]?.yield(.event(record))
+    }
+
+    func emitReplayGap(
+        after sequence: UInt64?,
+        oldestAvailable: UInt64,
+        for threadID: AgentThreadID
+    ) {
+        _ = streams[threadID]?.yield(.replayGap(
+            after: sequence,
+            oldestAvailable: oldestAvailable
+        ))
+    }
+
+    func setReplacementReplay(
+        _ records: [AgentEventRecord],
+        for threadID: AgentThreadID
+    ) {
+        replacementReplays[threadID] = records
+    }
+
+    func recordedEventCursors(for threadID: AgentThreadID) -> [UInt64?] {
+        eventCursors[threadID, default: []]
+    }
+
+    private func publish(_ event: AgentEvent, for threadID: AgentThreadID) {
+        let sequence = nextEventSequences[threadID, default: 0] &+ 1
+        nextEventSequences[threadID] = sequence
+        _ = streams[threadID]?.yield(.event(.init(
+            sequence: sequence,
+            event: event
+        )))
     }
 
     func finishEvents(for threadID: AgentThreadID) {
@@ -342,6 +399,10 @@ actor FakeCodexSessionAgent: CodexAgentClient {
 
     func waitForCall(_ name: String) async {
         await probe.wait(for: name)
+    }
+
+    func recordedCallCount(_ name: String) async -> Int {
+        await probe.count(name)
     }
 
     func recordedStartCalls() -> [(AgentThreadID, String)] {

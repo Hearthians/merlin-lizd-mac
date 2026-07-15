@@ -131,9 +131,10 @@ public actor CodexAppServerAdapter: CodexAgentClient {
     private var completedCallIDs: Set<String> = []
     private var serverRequestTombstonesSaturated = false
     private var serverRequestResponsesEnabled = true
-    private var eventReplay: [AgentThreadID: [AgentEvent]] = [:]
+    private var eventReplay: [AgentThreadID: [AgentEventRecord]] = [:]
+    private var eventSequences: [AgentThreadID: UInt64] = [:]
     private var eventContinuations: [
-        AgentThreadID: [UUID: AsyncStream<AgentEvent>.Continuation]
+        AgentThreadID: [UUID: AsyncStream<AgentEventDelivery>.Continuation]
     ] = [:]
     private var availabilityValue: AgentAvailability = .starting
     private var availabilityContinuations: [
@@ -486,14 +487,27 @@ public actor CodexAppServerAdapter: CodexAgentClient {
     }
 
     public func events(
-        for threadID: AgentThreadID
-    ) -> AsyncStream<AgentEvent> {
+        for threadID: AgentThreadID,
+        after sequence: UInt64?
+    ) -> AsyncStream<AgentEventDelivery> {
         let id = UUID()
-        let pair = AsyncStream<AgentEvent>.makeStream(
-            bufferingPolicy: .bufferingOldest(Self.eventReplayLimit)
+        let pair = AsyncStream<AgentEventDelivery>.makeStream(
+            bufferingPolicy: .bufferingNewest(Self.eventReplayLimit)
         )
-        for event in eventReplay[threadID] ?? [] {
-            guard case .enqueued = pair.continuation.yield(event) else {
+        let replay = eventReplay[threadID] ?? []
+        if let sequence, let oldest = replay.first?.sequence,
+            oldest > sequence &+ 1
+        {
+            _ = pair.continuation.yield(.replayGap(
+                after: sequence,
+                oldestAvailable: oldest
+            ))
+            pair.continuation.finish()
+            return pair.stream
+        }
+        for record in replay {
+            if let sequence, record.sequence <= sequence { continue }
+            guard case .enqueued = pair.continuation.yield(.event(record)) else {
                 pair.continuation.finish()
                 return pair.stream
             }
@@ -556,17 +570,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
                 method: "thread/delete",
                 params: .object(["threadId": .string(threadID.rawValue)])
             )
-            guard pendingDeletes[threadID]?.token == token, !stopped else {
-                throw CodexAppServerAdapterError.invalidResponse
-            }
-            await mappingStore.remove(threadID)
-            guard pendingDeletes[threadID]?.token == token, !stopped else {
-                throw CodexAppServerAdapterError.invalidResponse
-            }
-            pendingDeletes.removeValue(forKey: threadID)
-            activeTurns.removeValue(forKey: threadID)
-            knownThreads.remove(threadID)
-            finishEvents(for: threadID)
+            try await completeConfirmedDeletion(threadID, token: token)
         } catch {
             recoverFailedDelete(threadID: threadID, token: token)
             throw normalized(error)
@@ -574,11 +578,58 @@ public actor CodexAppServerAdapter: CodexAgentClient {
     }
 
     public func ensureThreadDeleted(_ threadID: AgentThreadID) async throws {
-        // The protocol precondition limits this operation to a thread ID that
-        // originated from this client and is durably owned by Core. A missing
-        // capability mapping therefore means an earlier delete completed.
-        guard await mappingStore.contains(threadID) else { return }
-        try await deleteThread(threadID)
+        guard pendingDeletes[threadID] == nil else {
+            throw CodexAppServerAdapterError.invalidResponse
+        }
+        let token = UUID()
+        pendingDeletes[threadID] = PendingDelete(
+            token: token,
+            priorActiveTurnID: activeTurns[threadID],
+            notifications: [],
+            overflowed: false
+        )
+        cancelPendingTurnStart(for: threadID)
+        cancelPendingResume(for: threadID)
+        do {
+            try await ensureReady()
+            let params = JSONValue.object([
+                "threadId": .string(threadID.rawValue),
+            ])
+            let read: JSONValue
+            do {
+                read = try await transport.request(
+                    method: "thread/read",
+                    params: params
+                )
+            } catch let error as JSONLAppServerTransportError {
+                if case .remoteError(
+                    code: -32600,
+                    classification: .threadNotLoaded
+                ) = error {
+                    try await completeConfirmedDeletion(threadID, token: token)
+                    return
+                }
+                throw error
+            }
+            guard self.threadID(in: read) == threadID else {
+                throw CodexAppServerAdapterError.invalidResponse
+            }
+            do {
+                _ = try await transport.request(
+                    method: "thread/delete",
+                    params: params
+                )
+            } catch let error as JSONLAppServerTransportError {
+                guard case .remoteError(
+                    code: -32600,
+                    classification: .noRolloutFound
+                ) = error else { throw error }
+            }
+            try await completeConfirmedDeletion(threadID, token: token)
+        } catch {
+            recoverFailedDelete(threadID: threadID, token: token)
+            throw normalized(error)
+        }
     }
 
     public func shutdown() async {
@@ -598,10 +649,14 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         activeTurns.removeAll()
         knownThreads.removeAll()
         setAvailability(.stopped)
-        for threadID in Set(eventContinuations.keys).union(eventReplay.keys) {
+        for threadID in Set(eventContinuations.keys)
+            .union(eventReplay.keys)
+            .union(eventSequences.keys)
+        {
             finishEvents(for: threadID)
         }
         for continuation in availabilityContinuations.values {
+            continuation.onTermination = nil
             continuation.finish()
         }
         availabilityContinuations.removeAll()
@@ -624,7 +679,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
     func replayedEventsForTesting(
         _ threadID: AgentThreadID
     ) -> [AgentEvent] {
-        eventReplay[threadID] ?? []
+        (eventReplay[threadID] ?? []).map(\.event)
     }
 
     var stateCountsForTesting: CodexAppServerAdapterStateCounts {
@@ -1341,6 +1396,23 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         for resume in pending { resume.requestTask.cancel() }
     }
 
+    private func completeConfirmedDeletion(
+        _ threadID: AgentThreadID,
+        token: UUID
+    ) async throws {
+        guard pendingDeletes[threadID]?.token == token, !stopped else {
+            throw CodexAppServerAdapterError.invalidResponse
+        }
+        await mappingStore.remove(threadID)
+        guard pendingDeletes[threadID]?.token == token, !stopped else {
+            throw CodexAppServerAdapterError.invalidResponse
+        }
+        pendingDeletes.removeValue(forKey: threadID)
+        activeTurns.removeValue(forKey: threadID)
+        knownThreads.remove(threadID)
+        finishEvents(for: threadID)
+    }
+
     private func recoverFailedDelete(
         threadID: AgentThreadID,
         token: UUID
@@ -1407,18 +1479,28 @@ public actor CodexAppServerAdapter: CodexAgentClient {
     }
 
     private func publish(_ event: AgentEvent, for threadID: AgentThreadID) {
+        let sequence = eventSequences[threadID, default: 0] &+ 1
+        eventSequences[threadID] = sequence
+        let record = AgentEventRecord(sequence: sequence, event: event)
         var replay = eventReplay[threadID, default: []]
-        replay.append(event)
+        replay.append(record)
         if replay.count > Self.eventReplayLimit {
             replay.removeFirst(replay.count - Self.eventReplayLimit)
         }
         eventReplay[threadID] = replay
         let subscribers = eventContinuations[threadID] ?? [:]
         for (id, continuation) in subscribers {
-            switch continuation.yield(event) {
+            switch continuation.yield(.event(record)) {
             case .enqueued:
                 continue
-            case .dropped, .terminated:
+            case .dropped:
+                _ = continuation.yield(.replayGap(
+                    after: record.sequence &- 1,
+                    oldestAvailable: record.sequence
+                ))
+                continuation.finish()
+                removeEventContinuation(id, for: threadID)
+            case .terminated:
                 continuation.finish()
                 removeEventContinuation(id, for: threadID)
             @unknown default:
@@ -1457,9 +1539,11 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         for continuation in eventContinuations.removeValue(
             forKey: threadID
         )?.values ?? [:].values {
+            continuation.onTermination = nil
             continuation.finish()
         }
         eventReplay.removeValue(forKey: threadID)
+        eventSequences.removeValue(forKey: threadID)
         cancelPendingResume(for: threadID)
     }
 

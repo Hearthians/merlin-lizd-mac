@@ -98,13 +98,15 @@ public enum CodexSessionActivityEvent: Equatable, Sendable {
         revision: UInt64
     )
     case reconciliationRequired(CodexSessionActivitySnapshot)
+    case transitionHistoryGap(CodexSessionActivitySnapshot)
 
     public var revision: UInt64 {
         switch self {
         case let .approvalRequested(_, _, revision),
             let .approvalResolved(_, _, revision):
             revision
-        case let .reconciliationRequired(snapshot):
+        case let .reconciliationRequired(snapshot),
+            let .transitionHistoryGap(snapshot):
             snapshot.revision
         }
     }

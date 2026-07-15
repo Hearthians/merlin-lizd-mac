@@ -260,6 +260,9 @@ public actor FileCodexConversationStore: CodexConversationStoring {
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
     private var state: CodexConversationStoreSnapshot
+    private var postRenameSyncHookForTesting: (
+        @Sendable () throws -> Void
+    )?
 
     public init(applicationSupportDirectory: URL) throws {
         let applicationRoot = applicationSupportDirectory.appendingPathComponent(
@@ -304,6 +307,7 @@ public actor FileCodexConversationStore: CodexConversationStoring {
             encoder = Self.makeEncoder()
             self.decoder = decoder
             state = loaded
+            postRenameSyncHookForTesting = nil
         } catch {
             close(lock)
             close(rootDescriptor)
@@ -316,8 +320,20 @@ public actor FileCodexConversationStore: CodexConversationStoring {
         close(rootDescriptor)
     }
 
-    public func snapshot() -> CodexConversationStoreSnapshot {
-        state
+    public func snapshot() throws -> CodexConversationStoreSnapshot {
+        try Self.lock(
+            lockDescriptor,
+            operation: LOCK_SH,
+            path: rootDirectory.appendingPathComponent(Self.lockName).path
+        )
+        defer { flock(lockDescriptor, LOCK_UN) }
+        let latest = try Self.readEnvelope(
+            rootDescriptor: rootDescriptor,
+            root: rootDirectory,
+            decoder: decoder
+        )
+        state = latest
+        return latest
     }
 
     public func apply(
@@ -339,6 +355,12 @@ public actor FileCodexConversationStore: CodexConversationStoring {
         try persist(latest)
         state = latest
         return latest
+    }
+
+    func setPostRenameSyncHookForTesting(
+        _ hook: (@Sendable () throws -> Void)?
+    ) {
+        postRenameSyncHookForTesting = hook
     }
 
     private static func reduce(
@@ -538,6 +560,7 @@ public actor FileCodexConversationStore: CodexConversationStoring {
             throw Self.posixError("renameat", storeURL.path)
         }
         shouldRemove = false
+        try postRenameSyncHookForTesting?()
         guard fsync(rootDescriptor) == 0 else {
             throw Self.posixError("fsync", rootDirectory.path)
         }

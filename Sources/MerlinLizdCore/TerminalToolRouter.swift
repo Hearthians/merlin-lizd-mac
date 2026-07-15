@@ -78,15 +78,49 @@ public enum TerminalToolActivityEvent: Equatable, Sendable {
 }
 
 public struct TerminalToolActivitySubscription: Sendable {
-    public let snapshot: TerminalToolActivitySnapshot
+    public let reconciliation: TerminalToolActivityReconciliation
     public let events: AsyncStream<TerminalToolActivityEvent>
+    let subscriberID: UUID?
 
     public init(
-        snapshot: TerminalToolActivitySnapshot,
+        reconciliation: TerminalToolActivityReconciliation,
         events: AsyncStream<TerminalToolActivityEvent>
     ) {
-        self.snapshot = snapshot
+        self.reconciliation = reconciliation
         self.events = events
+        subscriberID = nil
+    }
+
+    init(
+        reconciliation: TerminalToolActivityReconciliation,
+        events: AsyncStream<TerminalToolActivityEvent>,
+        subscriberID: UUID
+    ) {
+        self.reconciliation = reconciliation
+        self.events = events
+        self.subscriberID = subscriberID
+    }
+
+    public var snapshot: TerminalToolActivitySnapshot {
+        reconciliation.snapshot
+    }
+}
+
+public enum TerminalToolActivityReconciliation: Equatable, Sendable {
+    case replay(
+        snapshot: TerminalToolActivitySnapshot,
+        transitions: [TerminalToolActivityEvent]
+    )
+    case historyGap(
+        snapshot: TerminalToolActivitySnapshot,
+        oldestAvailableRevision: UInt64
+    )
+
+    public var snapshot: TerminalToolActivitySnapshot {
+        switch self {
+        case let .replay(snapshot, _), let .historyGap(snapshot, _):
+            snapshot
+        }
     }
 }
 
@@ -165,11 +199,14 @@ struct TerminalToolRouterStateSnapshot: Equatable, Sendable {
     let approvalActivityCount: Int
     let activitySubscriberCount: Int
     let activityEventBufferCapacity: Int
+    let activityTransitionCount: Int
+    let activityTransitionLimit: Int
 }
 
 public actor TerminalToolRouter {
     private static let productionObservedTurnIdentityLimitPerThread = 4_096
     private static let activityEventBufferCapacity = 32
+    private static let activityTransitionLimit = 64
 
     private struct ThreadTurnIdentity: Hashable, Sendable {
         let threadID: AgentThreadID
@@ -277,7 +314,10 @@ public actor TerminalToolRouter {
     private var toolActivities: [UUID: TerminalToolActivity] = [:]
     private var approvalActivities: [UUID: TerminalToolApprovalActivity] = [:]
     private var activityRevision: UInt64 = 0
+    private var activityTransitions: [TerminalToolActivityEvent] = []
     private var activitySubscriptionHook: (@Sendable () async -> Void)?
+    private var activitySnapshotHook: (@Sendable () async -> Void)?
+    private var turnTerminationHook: (@Sendable () async -> Void)?
     private var activitySubscribers: [
         UUID: AsyncStream<TerminalToolActivityEvent>.Continuation
     ] = [:]
@@ -301,6 +341,8 @@ public actor TerminalToolRouter {
         probeTimeout: Duration = .seconds(5)
     ) {
         activitySubscriptionHook = nil
+        activitySnapshotHook = nil
+        turnTerminationHook = nil
         self.registry = registry
         self.approvalBroker = approvalBroker
         self.journal = journal
@@ -330,6 +372,7 @@ public actor TerminalToolRouter {
         probeTimeout: Duration = .seconds(5)
     ) {
         activitySubscriptionHook = nil
+        turnTerminationHook = nil
         precondition(observedTurnIdentityLimitPerThread > 0)
         self.registry = registry
         self.approvalBroker = approvalBroker
@@ -539,7 +582,9 @@ public actor TerminalToolRouter {
         await approvalBroker.pendingRequests()
     }
 
-    public func subscribeActivity() async -> TerminalToolActivitySubscription {
+    public func subscribeActivity(
+        after revision: UInt64? = nil
+    ) async -> TerminalToolActivitySubscription {
         await activitySubscriptionHook?()
         let subscriberID = UUID()
         let pair = AsyncStream<TerminalToolActivityEvent>.makeStream(
@@ -553,9 +598,14 @@ public actor TerminalToolRouter {
         activitySubscribers[subscriberID] = pair.continuation
         resolveActivitySubscriberWaiters()
         return TerminalToolActivitySubscription(
-            snapshot: activitySnapshot(),
-            events: pair.stream
+            reconciliation: activityReconciliationValue(after: revision),
+            events: pair.stream,
+            subscriberID: subscriberID
         )
+    }
+
+    func cancelActivitySubscription(_ subscriberID: UUID) {
+        removeActivitySubscriber(subscriberID)
     }
 
     func setActivitySubscriptionHookForTesting(
@@ -564,7 +614,31 @@ public actor TerminalToolRouter {
         activitySubscriptionHook = hook
     }
 
-    public func activitySnapshot() -> TerminalToolActivitySnapshot {
+    func setActivitySnapshotHookForTesting(
+        _ hook: (@Sendable () async -> Void)?
+    ) {
+        activitySnapshotHook = hook
+    }
+
+    func setTurnTerminationHookForTesting(
+        _ hook: (@Sendable () async -> Void)?
+    ) {
+        turnTerminationHook = hook
+    }
+
+    public func activitySnapshot() async -> TerminalToolActivitySnapshot {
+        let snapshot = currentActivitySnapshot()
+        await activitySnapshotHook?()
+        return snapshot
+    }
+
+    public func reconcileActivity(
+        after revision: UInt64
+    ) -> TerminalToolActivityReconciliation {
+        activityReconciliationValue(after: revision)
+    }
+
+    private func currentActivitySnapshot() -> TerminalToolActivitySnapshot {
         TerminalToolActivitySnapshot(
             revision: activityRevision,
             operations: toolActivities,
@@ -585,7 +659,9 @@ public actor TerminalToolRouter {
             toolActivityCount: toolActivities.count,
             approvalActivityCount: approvalActivities.count,
             activitySubscriberCount: activitySubscribers.count,
-            activityEventBufferCapacity: Self.activityEventBufferCapacity
+            activityEventBufferCapacity: Self.activityEventBufferCapacity,
+            activityTransitionCount: activityTransitions.count,
+            activityTransitionLimit: Self.activityTransitionLimit
         )
     }
 
@@ -703,7 +779,36 @@ public actor TerminalToolRouter {
         _ makeEvent: (UInt64) -> TerminalToolActivityEvent
     ) {
         activityRevision &+= 1
-        publishActivity(makeEvent(activityRevision))
+        let event = makeEvent(activityRevision)
+        activityTransitions.append(event)
+        if activityTransitions.count > Self.activityTransitionLimit {
+            activityTransitions.removeFirst(
+                activityTransitions.count - Self.activityTransitionLimit
+            )
+        }
+        publishActivity(event)
+    }
+
+    private func activityReconciliationValue(
+        after revision: UInt64?
+    ) -> TerminalToolActivityReconciliation {
+        let snapshot = currentActivitySnapshot()
+        guard let revision, revision < snapshot.revision else {
+            return .replay(snapshot: snapshot, transitions: [])
+        }
+        guard let oldest = activityTransitions.first?.revision,
+            oldest <= revision &+ 1
+        else {
+            return .historyGap(
+                snapshot: snapshot,
+                oldestAvailableRevision: activityTransitions.first?.revision
+                    ?? snapshot.revision
+            )
+        }
+        return .replay(
+            snapshot: snapshot,
+            transitions: activityTransitions.filter { $0.revision > revision }
+        )
     }
 
     private func publishActivity(_ event: TerminalToolActivityEvent) {
@@ -726,7 +831,10 @@ public actor TerminalToolRouter {
     }
 
     private func removeActivitySubscriber(_ id: UUID) {
-        activitySubscribers.removeValue(forKey: id)
+        if let continuation = activitySubscribers.removeValue(forKey: id) {
+            continuation.onTermination = nil
+            continuation.finish()
+        }
         resolveActivitySubscriberWaiters()
     }
 
@@ -2162,6 +2270,8 @@ public actor TerminalToolRouter {
                 throw error
             }
         }
+
+        await turnTerminationHook?()
 
         let prepared: PreparedTurn?
         let activationTask: Task<TerminalEndpointBinding, any Error>?

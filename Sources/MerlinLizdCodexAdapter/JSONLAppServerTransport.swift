@@ -1,6 +1,12 @@
 import Foundation
 
 public enum JSONLAppServerTransportError: Error, Equatable, Sendable {
+    public enum RemoteClassification: Equatable, Sendable {
+        case threadNotLoaded
+        case noRolloutFound
+        case other
+    }
+
     case notStarted
     case alreadyStarted
     case launchFailed
@@ -14,7 +20,7 @@ public enum JSONLAppServerTransportError: Error, Equatable, Sendable {
     case processEventConsumerUnavailable
     case processTerminated(exitCode: Int32)
     case writeFailed
-    case remoteError(code: Int)
+    case remoteError(code: Int, classification: RemoteClassification)
     case messageBufferOverflow(maximumMessages: Int)
     case tooManyPendingRequests(maximumRequests: Int)
     case messageConsumerAlreadyWaiting
@@ -53,6 +59,7 @@ public actor JSONLAppServerTransport {
 
     private struct PendingRequest {
         let token: UUID
+        let method: String
         let continuation: CheckedContinuation<JSONValue, Error>
         let writeTask: Task<RequestWriteOutcome, Never>
     }
@@ -257,6 +264,7 @@ public actor JSONLAppServerTransport {
                 }
                 pending[requestID] = PendingRequest(
                     token: token,
+                    method: method,
                     continuation: continuation,
                     writeTask: writeTask
                 )
@@ -581,7 +589,12 @@ public actor JSONLAppServerTransport {
         } else if let error = envelope.error, !envelope.hasResult {
             request.continuation.resume(
                 throwing: JSONLAppServerTransportError.remoteError(
-                    code: error.code
+                    code: error.code,
+                    classification: Self.classifyRemoteError(
+                        method: request.method,
+                        code: error.code,
+                        message: error.message
+                    )
                 )
             )
         } else {
@@ -590,6 +603,21 @@ public actor JSONLAppServerTransport {
             )
             fail(.invalidMessage)
         }
+    }
+
+    private static func classifyRemoteError(
+        method: String,
+        code: Int,
+        message: String
+    ) -> JSONLAppServerTransportError.RemoteClassification {
+        guard code == -32600 else { return .other }
+        if method == "thread/read", message == "thread not loaded" {
+            return .threadNotLoaded
+        }
+        if method == "thread/delete", message == "no rollout found" {
+            return .noRolloutFound
+        }
+        return .other
     }
 
     private func enqueue(_ message: CodexServerMessage) {
