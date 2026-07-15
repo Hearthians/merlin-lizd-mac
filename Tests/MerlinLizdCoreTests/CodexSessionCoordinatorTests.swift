@@ -1,5 +1,6 @@
 import Testing
 @testable import MerlinLizdCore
+@testable import MerlinLizdCodexAdapter
 
 @Suite("Codex session coordinator", .serialized)
 struct CodexSessionCoordinatorTests {
@@ -4217,6 +4218,72 @@ struct CodexSessionCoordinatorTests {
         }
         var states = await coordinator.states().makeAsyncIterator()
         #expect(await states.next() == nil)
+    }
+
+    @Test("shutdown cancels recovery wait after durable exact-id transfer")
+    func shutdownCompletesAfterDurableTransferredStart() async throws {
+        let fixture = try CodexSessionPersistenceFixture()
+        defer { fixture.remove() }
+        let key = codexTestKey(createdAtEpoch: 1_721_009_003)
+        let lateThreadID = AgentThreadID(rawValue: "shutdown-transferred")
+        let failed = ScriptedSupervisorGeneration(
+            startedThreads: [lateThreadID.rawValue],
+            gatedCalls: [.startThread]
+        )
+        let sleeper = SuspendedSupervisorSleeper()
+        let factory = ScriptedSupervisorGenerationFactory(outcomes: [
+            .generation(failed),
+            .generation(ScriptedSupervisorGeneration()),
+        ])
+        let supervisor = CodexAppServerSupervisor(
+            generationFactory: { try await factory.makeGeneration() },
+            sleeper: { try await sleeper.sleep(for: $0) }
+        )
+        let store = try FileCodexConversationStore(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        let registry = TerminalEndpointRegistry()
+        let journal = CodexSessionJournalSpy()
+        let coordinator = CodexSessionCoordinator(
+            agent: supervisor,
+            store: store,
+            registry: registry,
+            router: TerminalToolRouter(
+                registry: registry,
+                approvalBroker: TerminalApprovalBroker(),
+                journal: journal
+            ),
+            journal: journal
+        )
+        let completion = SupervisorCompletionProbe()
+
+        let submitting = Task { await coordinator.submit("start", for: key) }
+        await failed.waitForCallStart(.startThread)
+        await failed.crash()
+        await sleeper.waitUntilSleeping()
+        let shuttingDown = Task {
+            await coordinator.shutdown()
+            await completion.recordCompletion()
+        }
+        await failed.waitForCallCancellation(.startThread)
+        await failed.release(.startThread)
+
+        let completedWithoutManualRecoveryRelease = await supervisorEventually {
+            await completion.completions == 1
+        }
+        #expect(completedWithoutManualRecoveryRelease)
+        if !completedWithoutManualRecoveryRelease {
+            await supervisor.shutdown()
+        }
+        await shuttingDown.value
+        await submitting.value
+
+        let snapshot = try await store.snapshot()
+        #expect(snapshot.records[key]?.threadID == lateThreadID)
+        #expect(
+            await failed.recordedCalls.contains(.resumeThread(lateThreadID))
+                == false
+        )
     }
 }
 

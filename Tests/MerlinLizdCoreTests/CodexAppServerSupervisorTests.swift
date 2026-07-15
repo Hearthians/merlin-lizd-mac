@@ -516,6 +516,108 @@ struct CodexAppServerSupervisorTests {
         #expect(try await starting.value == lateThreadID)
     }
 
+    @Test("cancelling one recovery waiter does not cancel shared recovery")
+    func recoveryWaitersHaveExactCancellationOwnership() async throws {
+        let failed = ScriptedSupervisorGeneration(startedThreads: ["owned"])
+        let sleeper = SuspendedSupervisorSleeper()
+        let factory = ScriptedSupervisorGenerationFactory(outcomes: [
+            .generation(failed),
+            .generation(ScriptedSupervisorGeneration()),
+        ])
+        let supervisor = CodexAppServerSupervisor(
+            generationFactory: { try await factory.makeGeneration() },
+            sleeper: { try await sleeper.sleep(for: $0) }
+        )
+        _ = try await supervisor.startThread()
+        await failed.crash()
+        await sleeper.waitUntilSleeping()
+        let cancelledCompletion = SupervisorCompletionProbe()
+        let retainedCompletion = SupervisorCompletionProbe()
+
+        let cancelled = Task {
+            do {
+                _ = try await supervisor.startThread()
+            } catch {}
+            await cancelledCompletion.recordCompletion()
+        }
+        let retained = Task {
+            do {
+                _ = try await supervisor.startThread()
+            } catch {}
+            await retainedCompletion.recordCompletion()
+        }
+        await Task.yield()
+        cancelled.cancel()
+
+        #expect(await supervisorEventually {
+            await cancelledCompletion.completions == 1
+        })
+        #expect(await retainedCompletion.completions == 0)
+        #expect(await sleeper.wasCancelled == false)
+
+        await supervisor.shutdown()
+        await cancelled.value
+        await retained.value
+        #expect(await retainedCompletion.completions == 1)
+        #expect(await sleeper.wasCancelled)
+    }
+
+    @Test("successful exact cleanup remains terminal after generation detach")
+    func exactCleanupSuccessCannotTransferDeletedThread() async throws {
+        let lateThreadID = AgentThreadID(rawValue: "thread-deleted")
+        let mappingStore = CodexAppServerThreadMappingStore()
+        let failed = ScriptedSupervisorGeneration(
+            startedThreads: [lateThreadID.rawValue],
+            gatedCalls: [.startThread]
+        )
+        let replacement = ScriptedSupervisorGeneration(
+            gateShutdown: true,
+            gatedCalls: [.ensureThreadDeleted]
+        )
+        let factory = ScriptedSupervisorGenerationFactory(outcomes: [
+            .generation(failed),
+            .generation(replacement),
+        ])
+        let supervisor = CodexAppServerSupervisor(
+            generationFactory: { try await factory.makeGeneration() },
+            mappingStore: mappingStore,
+            sleeper: { _ in }
+        )
+
+        let starting = Task { try await supervisor.startThread() }
+        await failed.waitForCallStart(.startThread)
+        await failed.crash()
+        await factory.waitForCreationCount(2)
+        await failed.release(.startThread)
+        await replacement.waitForCallStart(.ensureThreadDeleted)
+        #expect(
+            await replacement.remotelyDeletedThreadIDs.contains(lateThreadID)
+        )
+
+        await replacement.crash()
+        await replacement.waitForShutdownCount(1)
+        starting.cancel()
+        await replacement.waitForCallCancellation(.ensureThreadDeleted)
+        await replacement.release(.ensureThreadDeleted)
+
+        await #expect(throws: CodexAppServerSupervisorError.unavailable) {
+            try await starting.value
+        }
+
+        #expect(await mappingStore.contains(lateThreadID) == false)
+        #expect(await factory.creationCount == 2)
+        #expect(
+            await replacement.recordedCalls.contains(
+                .resumeThread(lateThreadID)
+            )
+                == false
+        )
+
+        let shuttingDown = Task { await supervisor.shutdown() }
+        await replacement.releaseShutdown()
+        await shuttingDown.value
+    }
+
     @Test("late old-generation turn creation is interrupted and rejected")
     func lateStartTurnDoesNotBecomeActive() async throws {
         let threadID = AgentThreadID(rawValue: "thread-1")

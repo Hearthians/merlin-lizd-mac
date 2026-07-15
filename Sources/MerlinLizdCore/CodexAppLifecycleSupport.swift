@@ -19,7 +19,7 @@ public actor TerminalEndpointFocusArbiter {
         _ endpointID: TerminalEndpointID,
         revision: UInt64
     ) async {
-        if let highestRevision, revision < highestRevision { return }
+        if let highestRevision, revision <= highestRevision { return }
         highestRevision = revision
         requestedFocus = (endpointID, revision)
         guard !isApplying else { return }

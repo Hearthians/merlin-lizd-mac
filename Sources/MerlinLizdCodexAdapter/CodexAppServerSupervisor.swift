@@ -61,6 +61,7 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
     private struct RecoveryOperation: Sendable {
         let id: UUID
         let task: Task<Void, Never>
+        var waiters: [UUID: CheckedContinuation<Void, Never>]
     }
 
     private enum LateThreadCompensation {
@@ -107,13 +108,14 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
 
     public init(
         generationFactory: @escaping GenerationFactory,
+        mappingStore: CodexAppServerThreadMappingStore? = nil,
         sleeper: @escaping Sleeper = { duration in
             try await Task.sleep(for: duration)
         }
     ) {
         self.generationFactory = generationFactory
         self.sleeper = sleeper
-        mappingStore = nil
+        self.mappingStore = mappingStore
     }
 
     public init(
@@ -362,9 +364,11 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
         }
         do {
             try await handle.client.ensureThreadDeleted(threadID)
-            guard owns(handle) else {
-                throw CodexAppServerSupervisorError.unavailable
-            }
+            // This exact, idempotent RPC confirms the remote ID is absent.
+            // A later generation detach cannot undo that terminal result, so
+            // unlike mutable operations it must not be rejected by a token
+            // check after the response.
+            await mappingStore?.remove(threadID)
             forgetThread(threadID)
         } catch is CancellationError {
             throw CancellationError()
@@ -379,8 +383,7 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
             return
         }
         stopped = true
-        let recovery = recoveryOperation
-        recoveryOperation = nil
+        let recovery = detachRecovery()
         recovery?.task.cancel()
         let startup = startupOperation
         startupOperation = nil
@@ -449,6 +452,7 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
     }
 
     private func readyGeneration() async throws -> Generation {
+        try Task.checkCancellation()
         guard !stopped else { throw CodexAppServerSupervisorError.stopped }
         guard terminalAvailability == nil else {
             throw CodexAppServerSupervisorError.unavailable
@@ -462,14 +466,16 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
             guard owns(handle) else {
                 if stopped { throw CodexAppServerSupervisorError.stopped }
                 if let recovery = recoveryOperation {
-                    await recovery.task.value
+                    await waitForRecovery(recovery.id)
+                    try Task.checkCancellation()
                 }
                 return try await readyGeneration()
             }
             return handle
         }
         if let recovery = recoveryOperation {
-            await recovery.task.value
+            await waitForRecovery(recovery.id)
+            try Task.checkCancellation()
             return try await readyGeneration()
         }
 
@@ -509,7 +515,8 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
             }
             guard owns(installed) else {
                 if let recovery = recoveryOperation {
-                    await recovery.task.value
+                    await waitForRecovery(recovery.id)
+                    try Task.checkCancellation()
                 }
                 return try await readyGeneration()
             }
@@ -602,7 +609,8 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
             }
             do {
                 try await replacement.client.ensureThreadDeleted(threadID)
-                guard owns(replacement) else { continue }
+                // Successful exact deletion is terminal even if this
+                // generation detached while its response was in flight.
                 await mappingStore?.remove(threadID)
                 pendingCompensationThreadIDs.remove(threadID)
                 return .deleted
@@ -714,7 +722,11 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
                 excluding: excluded
             )
         }
-        recoveryOperation = RecoveryOperation(id: recoveryID, task: task)
+        recoveryOperation = RecoveryOperation(
+            id: recoveryID,
+            task: task,
+            waiters: [:]
+        )
     }
 
     private func generationBecameTerminal(
@@ -752,7 +764,11 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
             for forwarder in forwarders { await forwarder.value }
             await self?.clearRecovery(operationID)
         }
-        recoveryOperation = RecoveryOperation(id: operationID, task: task)
+        recoveryOperation = RecoveryOperation(
+            id: operationID,
+            task: task,
+            waiters: [:]
+        )
     }
 
     private func recover(
@@ -870,8 +886,50 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
     }
 
     private func clearRecovery(_ id: UUID) {
-        guard recoveryOperation?.id == id else { return }
+        guard let operation = recoveryOperation, operation.id == id else {
+            return
+        }
         recoveryOperation = nil
+        operation.waiters.values.forEach { $0.resume() }
+    }
+
+    private func waitForRecovery(_ operationID: UUID) async {
+        let waiterID = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation(isolation: self) { continuation in
+                guard !Task.isCancelled,
+                    recoveryOperation?.id == operationID
+                else {
+                    continuation.resume()
+                    return
+                }
+                recoveryOperation?.waiters[waiterID] = continuation
+            }
+        } onCancel: {
+            Task {
+                await self.cancelRecoveryWaiter(
+                    operationID: operationID,
+                    waiterID: waiterID
+                )
+            }
+        }
+    }
+
+    private func cancelRecoveryWaiter(
+        operationID: UUID,
+        waiterID: UUID
+    ) {
+        guard recoveryOperation?.id == operationID else { return }
+        recoveryOperation?.waiters.removeValue(forKey: waiterID)?.resume()
+    }
+
+    private func detachRecovery() -> RecoveryOperation? {
+        guard var operation = recoveryOperation else { return nil }
+        recoveryOperation = nil
+        let waiters = Array(operation.waiters.values)
+        operation.waiters.removeAll()
+        waiters.forEach { $0.resume() }
+        return operation
     }
 
     private func availability(for error: any Error) -> AgentAvailability {

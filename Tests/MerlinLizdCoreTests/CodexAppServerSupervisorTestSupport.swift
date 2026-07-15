@@ -67,6 +67,7 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
         case resumeThread
         case startTurn
         case deleteThread
+        case ensureThreadDeleted
     }
 
     enum Call: Equatable, Sendable {
@@ -108,7 +109,12 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
     private var callStartWaiters: [
         (Gate, Int, CheckedContinuation<Void, Never>)
     ] = []
+    private var callCancellationCounts: [Gate: Int] = [:]
+    private var callCancellationWaiters: [
+        (Gate, Int, CheckedContinuation<Void, Never>)
+    ] = []
     private(set) var recordedCalls: [Call] = []
+    private(set) var remotelyDeletedThreadIDs: Set<AgentThreadID> = []
     private(set) var shutdownCount = 0
 
     init(
@@ -206,12 +212,14 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
         await suspendIfGated(.deleteThread)
     }
 
-    func ensureThreadDeleted(_ threadID: AgentThreadID) throws {
+    func ensureThreadDeleted(_ threadID: AgentThreadID) async throws {
         recordedCalls.append(.ensureThreadDeleted(threadID))
         if ensureThreadDeletionFailures > 0 {
             ensureThreadDeletionFailures -= 1
             throw CodexAppServerSupervisorError.unavailable
         }
+        remotelyDeletedThreadIDs.insert(threadID)
+        await suspendIfGated(.ensureThreadDeleted)
     }
 
     func shutdown() async {
@@ -275,6 +283,13 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
         }
     }
 
+    func waitForCallCancellation(_ gate: Gate, count: Int = 1) async {
+        if callCancellationCounts[gate, default: 0] >= count { return }
+        await withCheckedContinuation {
+            callCancellationWaiters.append((gate, count, $0))
+        }
+    }
+
     func release(_ gate: Gate) {
         let gates = callGates.removeValue(forKey: gate) ?? []
         gates.forEach { $0.resume() }
@@ -335,9 +350,28 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
         callStartCounts[gate, default: 0] += 1
         resumeCallStartWaiters()
         guard gatedCalls.contains(gate) else { return }
-        await withCheckedContinuation {
-            callGates[gate, default: []].append($0)
+        await withTaskCancellationHandler {
+            await withCheckedContinuation {
+                callGates[gate, default: []].append($0)
+            }
+        } onCancel: {
+            Task { await self.recordCallCancellation(gate) }
         }
+    }
+
+    private func recordCallCancellation(_ gate: Gate) {
+        callCancellationCounts[gate, default: 0] += 1
+        var retained: [(Gate, Int, CheckedContinuation<Void, Never>)] = []
+        for waiter in callCancellationWaiters {
+            if waiter.0 == gate,
+                callCancellationCounts[gate, default: 0] >= waiter.1
+            {
+                waiter.2.resume()
+            } else {
+                retained.append(waiter)
+            }
+        }
+        callCancellationWaiters = retained
     }
 
     private func resumeCallStartWaiters() {

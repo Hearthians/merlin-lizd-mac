@@ -1298,6 +1298,10 @@ public actor CodexSessionCoordinator {
             record = winner
         }
 
+        // A transferred exact ID is already durably owned at this point.
+        // Shutdown cancellation must stop before event/resume work without
+        // compensating or rolling back that committed mapping.
+        try Task.checkCancellation()
         threadOwners[record.threadID] = key
         sessionStates[key] = state(
             for: key,

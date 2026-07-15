@@ -46,6 +46,28 @@ struct CodexAppLifecycleSupportTests {
         #expect(await recorder.calls == [secondID])
     }
 
+    @Test("same focus revision cannot replace the accepted endpoint")
+    func focusRevisionMustIncreaseStrictly() async {
+        let recorder = GatedEndpointFocusRecorder()
+        let arbiter = TerminalEndpointFocusArbiter { endpointID in
+            await recorder.focus(endpointID)
+        }
+        let acceptedID = TerminalEndpointID(
+            rawValue: TerminalToolFixtures.newID()
+        )
+        let staleID = TerminalEndpointID(rawValue: TerminalToolFixtures.newID())
+
+        let accepted = Task {
+            await arbiter.requestFocus(acceptedID, revision: 4)
+        }
+        await recorder.waitForCallCount(1)
+        await recorder.releaseFirst()
+        await accepted.value
+        await arbiter.requestFocus(staleID, revision: 4)
+
+        #expect(await recorder.calls == [acceptedID])
+    }
+
     @Test("authoritative reconciliation retires absent notification ids")
     func reconciliationRemovesStaleNotificationClickTargets() throws {
         let key = TerminalConversationKey(
