@@ -8,6 +8,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     @Published var selectedTabID: String? {
         didSet {
             persist()
+            focusSelectedCodexEndpoint()
             guard let selectedTab else { return }
             prioritize(selectedTab.target)
         }
@@ -17,19 +18,25 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     private let defaults: UserDefaults
     private let managedTerminalCommands: ManagedTerminalCommandBuilder
     private let runtime: MerlinRemoteRuntime
+    private let codexRuntime: CodexRuntime?
     let tmuxSessionDiscovery: TmuxSessionDiscovery
     private let tmuxSessionController: TmuxSessionController
     private let externalTerminalLauncher = ExternalTerminalLauncher()
     private let persistenceKey = "terminal-state-v1"
+    private var codexEndpointTokens: [String: UUID] = [:]
+    private var codexEndpointTasks: [String: Task<Void, Never>] = [:]
+    private var codexEndpointIDs: [String: TerminalEndpointID] = [:]
 
     init(
         runtime: MerlinRemoteRuntime,
+        codexRuntime: CodexRuntime?,
         defaults: UserDefaults = .standard
     ) {
         managedTerminalCommands = ManagedTerminalCommandBuilder(
             sshMasterPool: runtime.sshMasterPool
         )
         self.runtime = runtime
+        self.codexRuntime = codexRuntime
         tmuxSessionDiscovery = runtime.tmuxDiscovery
         tmuxSessionController = runtime.tmuxController
         self.defaults = defaults
@@ -46,6 +53,14 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
             selectedTabID = nil
         }
         seedWarmupPriorities()
+        codexRuntime?.startNotifications(
+            foregroundConversation: { [weak self] in
+                self?.selectedConversationKey
+            },
+            openConversation: { [weak self] key in
+                self?.selectConversation(key)
+            }
+        )
     }
 
     var selectedTab: TerminalTabRecord? {
@@ -175,6 +190,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
 
     func reconnect(_ id: String) {
         guard tabs.contains(where: { $0.id == id }) else { return }
+        detachCodexEndpoint(for: id)
         sessions.removeValue(forKey: id)?.close()
         _ = session(for: id)
         selectedTabID = id
@@ -199,6 +215,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
                     : nil
             )
             sessions[id] = session
+            registerCodexEndpoint(for: tab, session: session)
             return session
         } catch {
             return nil
@@ -206,6 +223,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     }
 
     func close(_ id: String) {
+        detachCodexEndpoint(for: id)
         sessions.removeValue(forKey: id)?.close()
         guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
         let wasSelected = selectedTabID == id
@@ -465,6 +483,120 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         if let encoded = try? TerminalStateCodec.encode(state) {
             defaults.set(encoded, forKey: persistenceKey)
         }
+    }
+
+    private var selectedConversationKey: TerminalConversationKey? {
+        guard let selectedTab, let identity = selectedTab.tmuxIdentity else {
+            return nil
+        }
+        return TerminalConversationKey(
+            terminalTarget: selectedTab.target,
+            tmux: identity
+        )
+    }
+
+    private func registerCodexEndpoint(
+        for tab: TerminalTabRecord,
+        session: TerminalSession
+    ) {
+        guard let codexRuntime, tab.sessionName != nil else { return }
+        let token = UUID()
+        codexEndpointTokens[tab.id] = token
+        codexEndpointTasks[tab.id]?.cancel()
+        codexEndpointTasks[tab.id] = Task { [weak self, weak session] in
+            guard let self else { return }
+            defer {
+                if self.codexEndpointTokens[tab.id] == token {
+                    self.codexEndpointTasks.removeValue(forKey: tab.id)
+                }
+            }
+            guard let session,
+                let identity = await self.resolveTmuxIdentity(for: tab)
+            else { return }
+            await self.finishCodexEndpointRegistration(
+                tabID: tab.id,
+                token: token,
+                identity: identity,
+                session: session,
+                coordinator: codexRuntime.coordinator,
+                surfaces: codexRuntime.tmuxController
+            )
+        }
+    }
+
+    private func finishCodexEndpointRegistration(
+        tabID: String,
+        token: UUID,
+        identity: TmuxSessionIdentity,
+        session: TerminalSession,
+        coordinator: CodexSessionCoordinator,
+        surfaces: TmuxSessionController
+    ) async {
+        guard codexEndpointTokens[tabID] == token,
+            sessions[tabID] === session,
+            let currentTab = tabs.first(where: { $0.id == tabID }),
+            currentTab.tmuxIdentity == identity,
+            let sessionName = currentTab.sessionName
+        else { return }
+
+        let endpointID = TerminalEndpointID(rawValue: session.id)
+        let endpoint = TerminalEndpoint(
+            id: endpointID,
+            conversationKey: TerminalConversationKey(
+                terminalTarget: currentTab.target,
+                tmux: identity
+            ),
+            terminal: session.terminalDriver,
+            surfaces: surfaces,
+            route: TmuxRoute(
+                target: currentTab.target,
+                sessionName: sessionName,
+                expectedIdentity: identity
+            )
+        )
+        do {
+            try await coordinator.registerEndpoint(endpoint)
+        } catch {
+            return
+        }
+        guard codexEndpointTokens[tabID] == token,
+            sessions[tabID] === session
+        else {
+            await coordinator.unregisterEndpoint(endpointID)
+            return
+        }
+        codexEndpointIDs[tabID] = endpointID
+        if selectedTabID == tabID {
+            try? await coordinator.focusEndpoint(endpointID)
+        }
+    }
+
+    private func detachCodexEndpoint(for tabID: String) {
+        codexEndpointTokens.removeValue(forKey: tabID)
+        codexEndpointTasks.removeValue(forKey: tabID)?.cancel()
+        guard let endpointID = codexEndpointIDs.removeValue(forKey: tabID),
+            let coordinator = codexRuntime?.coordinator
+        else { return }
+        Task { await coordinator.unregisterEndpoint(endpointID) }
+    }
+
+    private func focusSelectedCodexEndpoint() {
+        guard let selectedTabID,
+            let endpointID = codexEndpointIDs[selectedTabID],
+            let coordinator = codexRuntime?.coordinator
+        else { return }
+        Task { try? await coordinator.focusEndpoint(endpointID) }
+    }
+
+    private func selectConversation(_ key: TerminalConversationKey) {
+        guard let tab = tabs.first(where: { tab in
+            guard let identity = tab.tmuxIdentity else { return false }
+            return TerminalConversationKey(
+                terminalTarget: tab.target,
+                tmux: identity
+            ) == key
+        }) else { return }
+        select(tab.id)
     }
 
     func terminalTabsSnapshot() -> [TerminalTabRecord] {

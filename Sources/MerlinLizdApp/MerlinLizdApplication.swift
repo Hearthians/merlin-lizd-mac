@@ -14,7 +14,10 @@ struct MerlinLizdApplication: App {
         let runtime = MerlinRemoteRuntime()
         self.runtime = runtime
         let model = AppModel(runtime: runtime)
-        let terminals = TerminalTabsModel(runtime: runtime)
+        let terminals = TerminalTabsModel(
+            runtime: runtime,
+            codexRuntime: runtime.codexRuntime
+        )
         _model = StateObject(
             wrappedValue: model
         )

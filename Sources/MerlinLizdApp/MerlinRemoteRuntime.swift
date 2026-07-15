@@ -7,6 +7,7 @@ final class MerlinRemoteRuntime {
     let tmuxController: TmuxSessionController
     let metricsStreamer: WorkerMetricsStreamer
     let warmupCoordinator: TargetWarmupCoordinator
+    let codexRuntime: CodexRuntime?
     private let submissions = OrderedAsyncSubmissionQueue()
     private var isShuttingDown = false
 
@@ -24,6 +25,7 @@ final class MerlinRemoteRuntime {
             discovery: tmuxDiscovery,
             maxConcurrentWorkerWarmups: 16
         )
+        codexRuntime = try? CodexRuntime(tmuxController: tmuxController)
     }
 
     func reconcile(
@@ -52,6 +54,7 @@ final class MerlinRemoteRuntime {
 
     func shutdown() async {
         isShuttingDown = true
+        await codexRuntime?.shutdown()
         await submissions.cancelPendingAndFinish()
         await warmupCoordinator.shutdown()
         await WorkerMetricsStreamer.shutdownAll()
