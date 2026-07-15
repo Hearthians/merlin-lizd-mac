@@ -4,6 +4,9 @@ public enum JSONLAppServerTransportError: Error, Equatable, Sendable {
     public enum RemoteClassification: Equatable, Sendable {
         case threadNotLoaded
         case noRolloutFound
+        case authenticationRequired
+        case capabilityUnavailable
+        case overloaded
         case other
     }
 
@@ -617,6 +620,18 @@ public actor JSONLAppServerTransport {
         message: String,
         requestedThreadID: String?
     ) -> JSONLAppServerTransportError.RemoteClassification {
+        if method == "initialize" {
+            switch code {
+            case 401, -32001:
+                return .authenticationRequired
+            case -32601:
+                return .capabilityUnavailable
+            case 429, -32002:
+                return .overloaded
+            default:
+                return .other
+            }
+        }
         guard code == -32600, let requestedThreadID else { return .other }
         if method == "thread/read",
             message == "thread not loaded: \(requestedThreadID)"

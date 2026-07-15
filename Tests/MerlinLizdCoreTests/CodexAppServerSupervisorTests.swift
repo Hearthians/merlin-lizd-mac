@@ -61,6 +61,10 @@ struct CodexAppServerSupervisorTests {
                 try await supervisor.startThread()
             }
             #expect(await supervisor.currentAvailability == expected)
+            await #expect(throws: CodexAppServerSupervisorError.unavailable) {
+                try await supervisor.startThread()
+            }
+            #expect(await factory.creationCount == 1)
             await supervisor.shutdown()
         }
     }
@@ -142,7 +146,9 @@ struct CodexAppServerSupervisorTests {
         await recovered.waitForResumeCount(1)
 
         #expect(await sleeper.recordedSeconds == [1, 2, 4, 8, 16, 30, 30])
-        #expect(await supervisor.currentAvailability == .ready)
+        #expect(await supervisorEventually {
+            await supervisor.currentAvailability == .ready
+        })
         await supervisor.shutdown()
     }
 
@@ -181,5 +187,513 @@ struct CodexAppServerSupervisorTests {
             )
         )
         #expect(await supervisor.currentAvailability == .stopped)
+    }
+
+    @Test("failed generation cleanup exclusively owns recovery admission")
+    func failedCleanupBlocksReplacementAdmission() async throws {
+        let failed = ScriptedSupervisorGeneration(
+            startedThreads: ["thread-failed"],
+            gateShutdown: true
+        )
+        let recovered = ScriptedSupervisorGeneration(
+            startedThreads: ["thread-recovered"]
+        )
+        let factory = ScriptedSupervisorGenerationFactory(outcomes: [
+            .generation(failed),
+            .generation(recovered),
+        ])
+        let supervisor = CodexAppServerSupervisor(
+            generationFactory: { try await factory.makeGeneration() },
+            sleeper: { _ in }
+        )
+
+        _ = try await supervisor.startThread()
+        await failed.crash()
+        await failed.waitForShutdownCount(1)
+
+        #expect(await supervisor.currentAvailability == .crashed)
+        let request = Task { try await supervisor.startThread() }
+        await Task.yield()
+        #expect(await factory.creationCount == 1)
+
+        await failed.releaseShutdown()
+        #expect(try await request.value == AgentThreadID(
+            rawValue: "thread-recovered"
+        ))
+        #expect(await factory.creationCount == 2)
+        await supervisor.shutdown()
+    }
+
+    @Test("concurrent shutdown callers join the same gated cleanup")
+    func concurrentShutdownCallersJoinCleanup() async throws {
+        let generation = ScriptedSupervisorGeneration(
+            startedThreads: ["thread-1"],
+            gateShutdown: true
+        )
+        let factory = ScriptedSupervisorGenerationFactory(
+            outcomes: [.generation(generation)]
+        )
+        let supervisor = CodexAppServerSupervisor(
+            generationFactory: { try await factory.makeGeneration() }
+        )
+        let completions = SupervisorCompletionProbe()
+
+        _ = try await supervisor.startThread()
+        let first = Task {
+            await supervisor.shutdown()
+            await completions.recordCompletion()
+        }
+        await generation.waitForShutdownCount(1)
+        let second = Task {
+            await supervisor.shutdown()
+            await completions.recordCompletion()
+        }
+        await Task.yield()
+
+        #expect(await completions.completions == 0)
+        await generation.releaseShutdown()
+        await first.value
+        await second.value
+        #expect(await completions.completions == 2)
+        #expect(await generation.shutdownCount == 1)
+
+        await supervisor.shutdown()
+        #expect(await generation.shutdownCount == 1)
+    }
+
+    @Test("shutdown during failed-child cleanup joins that cleanup")
+    func shutdownJoinsFailedChildCleanup() async throws {
+        let failed = ScriptedSupervisorGeneration(
+            startedThreads: ["thread-1"],
+            gateShutdown: true
+        )
+        let factory = ScriptedSupervisorGenerationFactory(
+            outcomes: [.generation(failed)]
+        )
+        let supervisor = CodexAppServerSupervisor(
+            generationFactory: { try await factory.makeGeneration() },
+            sleeper: { _ in }
+        )
+        let completion = SupervisorCompletionProbe()
+
+        _ = try await supervisor.startThread()
+        await failed.crash()
+        await failed.waitForShutdownCount(1)
+        let shuttingDown = Task {
+            await supervisor.shutdown()
+            await completion.recordCompletion()
+        }
+        await Task.yield()
+
+        #expect(await completion.completions == 0)
+        await failed.releaseShutdown()
+        await shuttingDown.value
+        #expect(await completion.completions == 1)
+        #expect(await supervisor.currentAvailability == .stopped)
+    }
+
+    @Test("underlying replay gap publishes one terminal protocol failure")
+    func underlyingReplayGapFailsActiveTurnExactlyOnce() async throws {
+        let threadID = AgentThreadID(rawValue: "thread-1")
+        let turnID = AgentTurnID(rawValue: "turn-1")
+        let generation = ScriptedSupervisorGeneration(
+            startedThreads: [threadID.rawValue],
+            turnIDs: [turnID.rawValue]
+        )
+        let factory = ScriptedSupervisorGenerationFactory(
+            outcomes: [.generation(generation)]
+        )
+        let supervisor = CodexAppServerSupervisor(
+            generationFactory: { try await factory.makeGeneration() }
+        )
+
+        _ = try await supervisor.startThread()
+        _ = try await supervisor.startTurn(
+            threadID: threadID,
+            prompt: "active"
+        )
+        await generation.waitForEventSubscriberCount(1, threadID: threadID)
+        let stream = await supervisor.events(for: threadID, after: nil)
+        var iterator = stream.makeAsyncIterator()
+
+        await generation.emit(
+            .replayGap(after: 7, oldestAvailable: 10),
+            for: threadID
+        )
+        await generation.emit(
+            .replayGap(after: 7, oldestAvailable: 10),
+            for: threadID
+        )
+        await generation.emit(
+            .event(.init(
+                sequence: 10,
+                event: .assistantMessageDelta("after-gap")
+            )),
+            for: threadID
+        )
+
+        #expect(
+            await iterator.next() == .event(.init(
+                sequence: 1,
+                event: .turnFailed(turnID, .protocolFailure)
+            ))
+        )
+        #expect(
+            await iterator.next() == .event(.init(
+                sequence: 2,
+                event: .assistantMessageDelta("after-gap")
+            ))
+        )
+        await supervisor.shutdown()
+    }
+
+    @Test("late old-generation thread creation is compensated")
+    func lateStartThreadDoesNotEscapeDetachedGeneration() async throws {
+        let failed = ScriptedSupervisorGeneration(
+            startedThreads: ["thread-late"],
+            gatedCalls: [.startThread]
+        )
+        let recovered = ScriptedSupervisorGeneration()
+        let factory = ScriptedSupervisorGenerationFactory(outcomes: [
+            .generation(failed),
+            .generation(recovered),
+        ])
+        let supervisor = CodexAppServerSupervisor(
+            generationFactory: { try await factory.makeGeneration() },
+            sleeper: { _ in }
+        )
+
+        let starting = Task { try await supervisor.startThread() }
+        await failed.waitForCallStart(.startThread)
+        await failed.crash()
+        await factory.waitForCreationCount(2)
+        await failed.release(.startThread)
+
+        await #expect(throws: CodexAppServerSupervisorError.unavailable) {
+            try await starting.value
+        }
+        #expect(
+            await failed.recordedCalls.contains(
+                .ensureThreadDeleted(.init(rawValue: "thread-late"))
+            )
+        )
+        await supervisor.shutdown()
+    }
+
+    @Test("late old-generation turn creation is interrupted and rejected")
+    func lateStartTurnDoesNotBecomeActive() async throws {
+        let threadID = AgentThreadID(rawValue: "thread-1")
+        let turnID = AgentTurnID(rawValue: "turn-late")
+        let failed = ScriptedSupervisorGeneration(
+            startedThreads: [threadID.rawValue],
+            turnIDs: [turnID.rawValue],
+            gatedCalls: [.startTurn]
+        )
+        let recovered = ScriptedSupervisorGeneration()
+        let factory = ScriptedSupervisorGenerationFactory(outcomes: [
+            .generation(failed),
+            .generation(recovered),
+        ])
+        let supervisor = CodexAppServerSupervisor(
+            generationFactory: { try await factory.makeGeneration() },
+            sleeper: { _ in }
+        )
+
+        _ = try await supervisor.startThread()
+        let starting = Task {
+            try await supervisor.startTurn(threadID: threadID, prompt: "late")
+        }
+        await failed.waitForCallStart(.startTurn)
+        await failed.crash()
+        await recovered.waitForResumeCount(1)
+        await failed.release(.startTurn)
+
+        await #expect(throws: CodexAppServerSupervisorError.unavailable) {
+            try await starting.value
+        }
+        #expect(
+            await failed.recordedCalls.contains(
+                .interruptTurn(threadID, turnID)
+            )
+        )
+        await supervisor.shutdown()
+    }
+
+    @Test("late old-generation resume completion cannot commit")
+    func lateResumeDoesNotMutateReplacementGeneration() async throws {
+        let threadID = AgentThreadID(rawValue: "thread-1")
+        let failed = ScriptedSupervisorGeneration(
+            startedThreads: [threadID.rawValue],
+            gatedCalls: [.resumeThread]
+        )
+        let recovered = ScriptedSupervisorGeneration()
+        let factory = ScriptedSupervisorGenerationFactory(outcomes: [
+            .generation(failed),
+            .generation(recovered),
+        ])
+        let supervisor = CodexAppServerSupervisor(
+            generationFactory: { try await factory.makeGeneration() },
+            sleeper: { _ in }
+        )
+
+        _ = try await supervisor.startThread()
+        let resuming = Task { try await supervisor.resumeThread(threadID) }
+        await failed.waitForCallStart(.resumeThread)
+        await failed.crash()
+        await recovered.waitForResumeCount(1)
+        await failed.release(.resumeThread)
+
+        await #expect(throws: CodexAppServerSupervisorError.unavailable) {
+            try await resuming.value
+        }
+        await supervisor.shutdown()
+    }
+
+    @Test("late old-generation delete cannot forget replacement mapping")
+    func lateDeleteDoesNotMutateReplacementGeneration() async throws {
+        let threadID = AgentThreadID(rawValue: "thread-1")
+        let failed = ScriptedSupervisorGeneration(
+            startedThreads: [threadID.rawValue],
+            gatedCalls: [.deleteThread]
+        )
+        let recovered = ScriptedSupervisorGeneration(turnIDs: ["turn-2"])
+        let factory = ScriptedSupervisorGenerationFactory(outcomes: [
+            .generation(failed),
+            .generation(recovered),
+        ])
+        let supervisor = CodexAppServerSupervisor(
+            generationFactory: { try await factory.makeGeneration() },
+            sleeper: { _ in }
+        )
+
+        _ = try await supervisor.startThread()
+        let deleting = Task { try await supervisor.deleteThread(threadID) }
+        await failed.waitForCallStart(.deleteThread)
+        await failed.crash()
+        await recovered.waitForResumeCount(1)
+        await failed.release(.deleteThread)
+
+        await #expect(throws: CodexAppServerSupervisorError.unavailable) {
+            try await deleting.value
+        }
+        #expect(
+            try await supervisor.startTurn(
+                threadID: threadID,
+                prompt: "replacement"
+            ) == AgentTurnID(rawValue: "turn-2")
+        )
+        await supervisor.shutdown()
+    }
+
+    @Test("slow subscribers receive a replay gap before post-gap records")
+    func slowSubscriberOverflowIsLossAware() async throws {
+        let threadID = AgentThreadID(rawValue: "thread-1")
+        let generation = ScriptedSupervisorGeneration(
+            startedThreads: [threadID.rawValue]
+        )
+        let factory = ScriptedSupervisorGenerationFactory(
+            outcomes: [.generation(generation)]
+        )
+        let supervisor = CodexAppServerSupervisor(
+            generationFactory: { try await factory.makeGeneration() }
+        )
+
+        _ = try await supervisor.startThread()
+        await generation.waitForEventSubscriberCount(1, threadID: threadID)
+        let stream = await supervisor.events(for: threadID, after: nil)
+        for index in 1...600 {
+            await generation.emit(
+                .event(.init(
+                    sequence: UInt64(index),
+                    event: .assistantMessageDelta("event-\(index)")
+                )),
+                for: threadID
+            )
+        }
+        while await supervisor.eventSequenceForTesting(threadID) < 600 {
+            await Task.yield()
+        }
+        var iterator = stream.makeAsyncIterator()
+
+        #expect(
+            await iterator.next() == .replayGap(
+                after: nil,
+                oldestAvailable: 89
+            )
+        )
+        #expect(await iterator.next() == nil)
+        await supervisor.shutdown()
+    }
+
+    @Test("dropped supervisor event streams release subscriber ownership")
+    func droppedEventStreamRemovesSubscriber() async throws {
+        let threadID = AgentThreadID(rawValue: "thread-1")
+        let generation = ScriptedSupervisorGeneration(
+            startedThreads: [threadID.rawValue]
+        )
+        let factory = ScriptedSupervisorGenerationFactory(
+            outcomes: [.generation(generation)]
+        )
+        let supervisor = CodexAppServerSupervisor(
+            generationFactory: { try await factory.makeGeneration() }
+        )
+
+        _ = try await supervisor.startThread()
+        var stream: AsyncStream<AgentEventDelivery>? = await supervisor.events(
+            for: threadID,
+            after: nil
+        )
+        #expect(await supervisor.eventSubscriberCountForTesting == 1)
+        stream = nil
+        _ = stream
+        while await supervisor.eventSubscriberCountForTesting != 0 {
+            await Task.yield()
+        }
+
+        await supervisor.shutdown()
+    }
+
+    @Test("cancelled event iteration removes subscriber immediately")
+    func cancelledEventIteratorRemovesSubscriber() async throws {
+        let threadID = AgentThreadID(rawValue: "thread-1")
+        let generation = ScriptedSupervisorGeneration(
+            startedThreads: [threadID.rawValue]
+        )
+        let factory = ScriptedSupervisorGenerationFactory(
+            outcomes: [.generation(generation)]
+        )
+        let supervisor = CodexAppServerSupervisor(
+            generationFactory: { try await factory.makeGeneration() }
+        )
+
+        _ = try await supervisor.startThread()
+        let stream = await supervisor.events(for: threadID, after: nil)
+        let consumer = Task {
+            var iterator = stream.makeAsyncIterator()
+            return await iterator.next()
+        }
+        while await supervisor.eventSubscriberCountForTesting != 1 {
+            await Task.yield()
+        }
+        consumer.cancel()
+        _ = await consumer.value
+
+        let removed = await supervisorEventually {
+            await supervisor.eventSubscriberCountForTesting == 0
+        }
+        #expect(removed)
+        _ = stream
+        await supervisor.shutdown()
+    }
+
+    @Test("replacement crash during recovery is consumed and retried")
+    func replacementCrashDuringRecoveryCannotBecomeReady() async throws {
+        let threadID = AgentThreadID(rawValue: "thread-1")
+        let failed = ScriptedSupervisorGeneration(
+            startedThreads: [threadID.rawValue]
+        )
+        let crashedReplacement = ScriptedSupervisorGeneration(
+            gatedCalls: [.resumeThread]
+        )
+        let recovered = ScriptedSupervisorGeneration()
+        let factory = ScriptedSupervisorGenerationFactory(outcomes: [
+            .generation(failed),
+            .generation(crashedReplacement),
+            .generation(recovered),
+        ])
+        let supervisor = CodexAppServerSupervisor(
+            generationFactory: { try await factory.makeGeneration() },
+            sleeper: { _ in }
+        )
+
+        _ = try await supervisor.startThread()
+        await failed.crash()
+        await crashedReplacement.waitForCallStart(.resumeThread)
+        await crashedReplacement.crash()
+        await crashedReplacement.release(.resumeThread)
+
+        let retried = await supervisorEventually {
+            await factory.creationCount == 3
+        }
+        #expect(retried)
+        #expect(await crashedReplacement.shutdownCount == 1)
+        #expect(await supervisor.currentAvailability == .ready)
+        await supervisor.shutdown()
+    }
+
+    @Test("production initialize seam classifies terminal typed failures")
+    func productionInitializeClassifiesTerminalFailures() async {
+        let cases: [(Int, AgentAvailability)] = [
+            (401, .authenticationRequired),
+            (
+                -32601,
+                .capabilityUnavailable(
+                    "Required Codex capability unavailable"
+                )
+            ),
+            (429, .overloaded),
+        ]
+
+        for (code, expected) in cases {
+            let process = ScriptedAppServerProcess()
+            let adapter = CodexAppServerAdapter(
+                transport: JSONLAppServerTransport(process: process),
+                launchConfiguration: supervisorLaunchConfiguration(),
+                toolExecutor: SupervisorNoopToolExecutor()
+            )
+            let supervisor = CodexAppServerSupervisor(
+                generationFactory: {
+                    do {
+                        try await adapter.initializeForSupervision()
+                        return adapter
+                    } catch {
+                        await adapter.shutdown()
+                        throw error
+                    }
+                },
+                sleeper: { _ in }
+            )
+
+            let starting = Task { try await supervisor.startThread() }
+            await process.waitForWriteCount(1)
+            await process.emit(.standardOutput(jsonLine(
+                #"{"id":1,"error":{"code":\#(code),"message":"raw secret must not classify"}}"#
+            )))
+
+            await #expect(throws: CodexAppServerSupervisorError.unavailable) {
+                try await starting.value
+            }
+            #expect(await supervisor.currentAvailability == expected)
+            #expect(await process.lifecycleCounts().wait == 1)
+            await supervisor.shutdown()
+        }
+    }
+
+    @Test("terminal availability detaches generation without retry")
+    func terminalAvailabilityStopsGeneration() async throws {
+        let generation = ScriptedSupervisorGeneration(
+            startedThreads: ["thread-1"]
+        )
+        let factory = ScriptedSupervisorGenerationFactory(
+            outcomes: [.generation(generation)]
+        )
+        let supervisor = CodexAppServerSupervisor(
+            generationFactory: { try await factory.makeGeneration() },
+            sleeper: { _ in }
+        )
+
+        _ = try await supervisor.startThread()
+        await generation.publishAvailability(.overloaded)
+        let cleaned = await supervisorEventually {
+            await generation.shutdownCount == 1
+        }
+
+        #expect(cleaned)
+        #expect(await supervisor.currentAvailability == .overloaded)
+        await #expect(throws: CodexAppServerSupervisorError.unavailable) {
+            try await supervisor.startThread()
+        }
+        #expect(await factory.creationCount == 1)
+        await supervisor.shutdown()
     }
 }

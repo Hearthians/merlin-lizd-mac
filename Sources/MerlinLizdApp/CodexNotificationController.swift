@@ -22,8 +22,9 @@ final class CodexNotificationController {
     private var openConversation: (
         @MainActor @Sendable (TerminalConversationKey) -> Void
     )?
-    private var notificationKeys: [String: TerminalConversationKey] = [:]
-    private var trackedIdentifiers: [String] = []
+    private var tracker = CodexApprovalNotificationTracker(
+        limit: maximumTrackedRequests
+    )
 
     init() {
         delivery = UserNotificationDelivery()
@@ -64,53 +65,26 @@ final class CodexNotificationController {
         delivery.stop()
         foregroundConversation = nil
         openConversation = nil
-        notificationKeys.removeAll()
-        trackedIdentifiers.removeAll()
+        tracker.removeAll()
     }
 
     private func consume(_ event: CodexSessionActivityEvent) {
-        switch event {
-        case let .approvalRequested(key, request, _):
-            notifyIfBackground(key: key, requestID: request.id)
-        case let .approvalResolved(_, requestID, _):
-            forget(identifier: requestID.uuidString)
-        case let .reconciliationRequired(snapshot),
-            let .transitionHistoryGap(snapshot):
-            for state in snapshot.states.values {
-                for request in state.pendingApprovals {
-                    notifyIfBackground(key: state.key, requestID: request.id)
-                }
-            }
-        }
-    }
-
-    private func notifyIfBackground(
-        key: TerminalConversationKey,
-        requestID: UUID
-    ) {
-        guard foregroundConversation?() != key else { return }
-        let identifier = requestID.uuidString
-        guard notificationKeys[identifier] == nil else { return }
-        notificationKeys[identifier] = key
-        trackedIdentifiers.append(identifier)
-        while trackedIdentifiers.count > Self.maximumTrackedRequests {
-            forget(identifier: trackedIdentifiers[0])
-        }
-        delivery.deliver(
-            identifier: identifier,
-            title: "Codex needs approval",
-            body: "Open Merlin Lizd to review this request."
+        let candidates = tracker.consume(
+            event,
+            foreground: foregroundConversation?()
         )
+        for candidate in candidates {
+            delivery.deliver(
+                identifier: candidate.identifier,
+                title: "Codex needs approval",
+                body: "Open Merlin Lizd to review this request."
+            )
+        }
     }
 
     private func openNotification(_ identifier: String) {
-        guard let key = notificationKeys[identifier] else { return }
+        guard let key = tracker.conversation(for: identifier) else { return }
         openConversation?(key)
-    }
-
-    private func forget(identifier: String) {
-        notificationKeys.removeValue(forKey: identifier)
-        trackedIdentifiers.removeAll { $0 == identifier }
     }
 }
 

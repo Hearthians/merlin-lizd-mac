@@ -62,6 +62,13 @@ actor ScriptedSupervisorGenerationFactory {
 }
 
 actor ScriptedSupervisorGeneration: CodexAgentClient {
+    enum Gate: Hashable, Sendable {
+        case startThread
+        case resumeThread
+        case startTurn
+        case deleteThread
+    }
+
     enum Call: Equatable, Sendable {
         case startThread
         case resumeThread(AgentThreadID)
@@ -79,38 +86,65 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
     private var eventContinuations: [
         AgentThreadID: [UUID: AsyncStream<AgentEventDelivery>.Continuation]
     ] = [:]
+    private var eventSubscriberWaiters: [
+        (AgentThreadID, Int, CheckedContinuation<Void, Never>)
+    ] = []
     private var availabilityContinuations: [
         UUID: AsyncStream<AgentAvailability>.Continuation
     ] = [:]
+    private var availabilityValue: AgentAvailability
     private var resumeWaiters: [
         (Int, CheckedContinuation<Void, Never>)
+    ] = []
+    private let gateShutdown: Bool
+    private var shutdownGates: [CheckedContinuation<Void, Never>] = []
+    private var shutdownWaiters: [
+        (Int, CheckedContinuation<Void, Never>)
+    ] = []
+    private let gatedCalls: Set<Gate>
+    private var callStartCounts: [Gate: Int] = [:]
+    private var callGates: [Gate: [CheckedContinuation<Void, Never>]] = [:]
+    private var callStartWaiters: [
+        (Gate, Int, CheckedContinuation<Void, Never>)
     ] = []
     private(set) var recordedCalls: [Call] = []
     private(set) var shutdownCount = 0
 
-    init(startedThreads: [String] = [], turnIDs: [String] = []) {
+    init(
+        startedThreads: [String] = [],
+        turnIDs: [String] = [],
+        gateShutdown: Bool = false,
+        gatedCalls: Set<Gate> = [],
+        availability: AgentAvailability = .ready
+    ) {
         self.startedThreads = startedThreads
         self.turnIDs = turnIDs
+        self.gateShutdown = gateShutdown
+        self.gatedCalls = gatedCalls
+        availabilityValue = availability
     }
 
-    func startThread() throws -> AgentThreadID {
+    func startThread() async throws -> AgentThreadID {
         recordedCalls.append(.startThread)
+        await suspendIfGated(.startThread)
         guard !startedThreads.isEmpty else {
             throw CodexAppServerSupervisorError.unavailable
         }
         return AgentThreadID(rawValue: startedThreads.removeFirst())
     }
 
-    func resumeThread(_ threadID: AgentThreadID) {
+    func resumeThread(_ threadID: AgentThreadID) async {
         recordedCalls.append(.resumeThread(threadID))
         resumeResumeWaiters()
+        await suspendIfGated(.resumeThread)
     }
 
     func startTurn(
         threadID: AgentThreadID,
         prompt: String
-    ) throws -> AgentTurnID {
+    ) async throws -> AgentTurnID {
         recordedCalls.append(.startTurn(threadID, prompt))
+        await suspendIfGated(.startTurn)
         guard !turnIDs.isEmpty else {
             throw CodexAppServerSupervisorError.unavailable
         }
@@ -136,6 +170,7 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
         let id = UUID()
         let pair = AsyncStream<AgentEventDelivery>.makeStream()
         eventContinuations[threadID, default: [:]][id] = pair.continuation
+        resumeEventSubscriberWaiters()
         pair.continuation.onTermination = { [weak self] _ in
             Task { await self?.removeEventContinuation(id, threadID: threadID) }
         }
@@ -147,7 +182,7 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
         let pair = AsyncStream<AgentAvailability>.makeStream(
             bufferingPolicy: .bufferingNewest(1)
         )
-        pair.continuation.yield(.ready)
+        pair.continuation.yield(availabilityValue)
         availabilityContinuations[id] = pair.continuation
         pair.continuation.onTermination = { [weak self] _ in
             Task { await self?.removeAvailabilityContinuation(id) }
@@ -163,16 +198,21 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
         recordedCalls.append(.unarchiveThread(threadID))
     }
 
-    func deleteThread(_ threadID: AgentThreadID) {
+    func deleteThread(_ threadID: AgentThreadID) async {
         recordedCalls.append(.deleteThread(threadID))
+        await suspendIfGated(.deleteThread)
     }
 
     func ensureThreadDeleted(_ threadID: AgentThreadID) {
         recordedCalls.append(.ensureThreadDeleted(threadID))
     }
 
-    func shutdown() {
+    func shutdown() async {
         shutdownCount += 1
+        resumeShutdownWaiters()
+        if gateShutdown {
+            await withCheckedContinuation { shutdownGates.append($0) }
+        }
         for continuations in eventContinuations.values {
             continuations.values.forEach { $0.finish() }
         }
@@ -182,7 +222,55 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
     }
 
     func crash() {
+        availabilityValue = .crashed
         availabilityContinuations.values.forEach { $0.yield(.crashed) }
+    }
+
+    func publishAvailability(_ value: AgentAvailability) {
+        availabilityValue = value
+        availabilityContinuations.values.forEach { $0.yield(value) }
+    }
+
+    func emit(
+        _ delivery: AgentEventDelivery,
+        for threadID: AgentThreadID
+    ) {
+        eventContinuations[threadID]?.values.forEach {
+            $0.yield(delivery)
+        }
+    }
+
+    func waitForEventSubscriberCount(
+        _ count: Int,
+        threadID: AgentThreadID
+    ) async {
+        if eventContinuations[threadID, default: [:]].count >= count { return }
+        await withCheckedContinuation {
+            eventSubscriberWaiters.append((threadID, count, $0))
+        }
+    }
+
+    func waitForShutdownCount(_ count: Int) async {
+        if shutdownCount >= count { return }
+        await withCheckedContinuation { shutdownWaiters.append((count, $0)) }
+    }
+
+    func releaseShutdown() {
+        let gates = shutdownGates
+        shutdownGates.removeAll()
+        gates.forEach { $0.resume() }
+    }
+
+    func waitForCallStart(_ gate: Gate, count: Int = 1) async {
+        if callStartCounts[gate, default: 0] >= count { return }
+        await withCheckedContinuation {
+            callStartWaiters.append((gate, count, $0))
+        }
+    }
+
+    func release(_ gate: Gate) {
+        let gates = callGates.removeValue(forKey: gate) ?? []
+        gates.forEach { $0.resume() }
     }
 
     func waitForResumeCount(_ count: Int) async {
@@ -208,6 +296,55 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
         resumeWaiters = retained
     }
 
+    private func resumeShutdownWaiters() {
+        var retained: [(Int, CheckedContinuation<Void, Never>)] = []
+        for waiter in shutdownWaiters {
+            if shutdownCount >= waiter.0 {
+                waiter.1.resume()
+            } else {
+                retained.append(waiter)
+            }
+        }
+        shutdownWaiters = retained
+    }
+
+    private func resumeEventSubscriberWaiters() {
+        var retained: [(
+            AgentThreadID,
+            Int,
+            CheckedContinuation<Void, Never>
+        )] = []
+        for waiter in eventSubscriberWaiters {
+            if eventContinuations[waiter.0, default: [:]].count >= waiter.1 {
+                waiter.2.resume()
+            } else {
+                retained.append(waiter)
+            }
+        }
+        eventSubscriberWaiters = retained
+    }
+
+    private func suspendIfGated(_ gate: Gate) async {
+        callStartCounts[gate, default: 0] += 1
+        resumeCallStartWaiters()
+        guard gatedCalls.contains(gate) else { return }
+        await withCheckedContinuation {
+            callGates[gate, default: []].append($0)
+        }
+    }
+
+    private func resumeCallStartWaiters() {
+        var retained: [(Gate, Int, CheckedContinuation<Void, Never>)] = []
+        for waiter in callStartWaiters {
+            if callStartCounts[waiter.0, default: 0] >= waiter.1 {
+                waiter.2.resume()
+            } else {
+                retained.append(waiter)
+            }
+        }
+        callStartWaiters = retained
+    }
+
     private func removeEventContinuation(
         _ id: UUID,
         threadID: AgentThreadID
@@ -218,6 +355,43 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
     private func removeAvailabilityContinuation(_ id: UUID) {
         availabilityContinuations.removeValue(forKey: id)
     }
+}
+
+actor SupervisorCompletionProbe {
+    private(set) var completions = 0
+
+    func recordCompletion() { completions += 1 }
+}
+
+func supervisorEventually(
+    timeout: Duration = .milliseconds(200),
+    _ condition: @escaping @Sendable () async -> Bool
+) async -> Bool {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while clock.now < deadline {
+        if await condition() { return true }
+        try? await Task.sleep(for: .milliseconds(1))
+    }
+    return await condition()
+}
+
+struct SupervisorNoopToolExecutor: CodexDynamicToolExecuting {
+    func execute(
+        threadID: AgentThreadID,
+        turnID: AgentTurnID,
+        call: TerminalToolCall
+    ) async throws -> TerminalToolResult {
+        .inputAccepted(.init(acceptedRevision: 1, byteCount: 0))
+    }
+}
+
+func supervisorLaunchConfiguration() -> CodexLaunchConfiguration {
+    CodexLaunchConfiguration(
+        executable: testURL("/codex"),
+        runtimeDirectory: testURL("/runtime"),
+        environment: [:]
+    )
 }
 
 actor RecordingSupervisorSleeper {

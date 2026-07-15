@@ -19,6 +19,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     private let managedTerminalCommands: ManagedTerminalCommandBuilder
     private let runtime: MerlinRemoteRuntime
     private let codexRuntime: CodexRuntime?
+    private let codexFocusArbiter: TerminalEndpointFocusArbiter?
     let tmuxSessionDiscovery: TmuxSessionDiscovery
     private let tmuxSessionController: TmuxSessionController
     private let externalTerminalLauncher = ExternalTerminalLauncher()
@@ -37,6 +38,13 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         )
         self.runtime = runtime
         self.codexRuntime = codexRuntime
+        if let coordinator = codexRuntime?.coordinator {
+            codexFocusArbiter = TerminalEndpointFocusArbiter { endpointID in
+                try? await coordinator.focusEndpoint(endpointID)
+            }
+        } else {
+            codexFocusArbiter = nil
+        }
         tmuxSessionDiscovery = runtime.tmuxDiscovery
         tmuxSessionController = runtime.tmuxController
         self.defaults = defaults
@@ -539,7 +547,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
             let sessionName = currentTab.sessionName
         else { return }
 
-        let endpointID = TerminalEndpointID(rawValue: session.id)
+        let endpointID = TerminalEndpointID(rawValue: UUID())
         let endpoint = TerminalEndpoint(
             id: endpointID,
             conversationKey: TerminalConversationKey(
@@ -567,7 +575,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         }
         codexEndpointIDs[tabID] = endpointID
         if selectedTabID == tabID {
-            try? await coordinator.focusEndpoint(endpointID)
+            await codexFocusArbiter?.requestFocus(endpointID)
         }
     }
 
@@ -583,9 +591,9 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     private func focusSelectedCodexEndpoint() {
         guard let selectedTabID,
             let endpointID = codexEndpointIDs[selectedTabID],
-            let coordinator = codexRuntime?.coordinator
+            let codexFocusArbiter
         else { return }
-        Task { try? await coordinator.focusEndpoint(endpointID) }
+        Task { await codexFocusArbiter.requestFocus(endpointID) }
     }
 
     private func selectConversation(_ key: TerminalConversationKey) {

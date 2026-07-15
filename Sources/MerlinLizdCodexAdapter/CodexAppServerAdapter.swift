@@ -31,6 +31,13 @@ public enum CodexAppServerAdapterError: Error, Equatable, Sendable {
     case stopped
 }
 
+enum CodexAppServerInitializationError: Error, Equatable, Sendable {
+    case authenticationRequired
+    case capabilityUnavailable
+    case overloaded
+    case crashed
+}
+
 /// Process-local proof that a resumable thread was originally created through
 /// this capability-contained adapter. The store can be shared across a process
 /// restart boundary by composition code only after its durable Core mapping has
@@ -78,7 +85,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
 
     private enum StartupOutcome: Sendable {
         case ready
-        case failed
+        case failed(AgentAvailability)
     }
 
     private struct BufferedTurnNotification: Sendable {
@@ -758,10 +765,28 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         }
     }
 
+    func initializeForSupervision() async throws {
+        do {
+            try await ensureReady()
+        } catch {
+            switch availabilityValue {
+            case .authenticationRequired:
+                throw CodexAppServerInitializationError
+                    .authenticationRequired
+            case .capabilityUnavailable:
+                throw CodexAppServerInitializationError.capabilityUnavailable
+            case .overloaded:
+                throw CodexAppServerInitializationError.overloaded
+            default:
+                throw CodexAppServerInitializationError.crashed
+            }
+        }
+    }
+
     private func ensureReady() async throws {
         guard !stopped else { throw CodexAppServerAdapterError.stopped }
         if let startupTask {
-            guard await startupTask.value == .ready else {
+            guard case .ready = await startupTask.value else {
                 throw CodexAppServerAdapterError.invalidResponse
             }
             return
@@ -778,17 +803,48 @@ public actor CodexAppServerAdapter: CodexAgentClient {
                 try configuration.validateInitializeResult(result)
                 try await transport.sendNotification(method: "initialized")
                 return .ready
+            } catch let error as JSONLAppServerTransportError {
+                return .failed(Self.startupAvailability(for: error))
+            } catch is CodexLaunchConfigurationError {
+                return .failed(.capabilityUnavailable(
+                    "Required Codex capability unavailable"
+                ))
             } catch {
-                return .failed
+                return .failed(.crashed)
             }
         }
         startupTask = task
-        guard await task.value == .ready, !stopped else {
-            setAvailability(.crashed)
+        let outcome = await task.value
+        guard case .ready = outcome, !stopped else {
+            if case let .failed(availability) = outcome {
+                setAvailability(availability)
+            } else {
+                setAvailability(.crashed)
+            }
             throw CodexAppServerAdapterError.invalidResponse
         }
         installConsumerIfNeeded()
         setAvailability(.ready)
+    }
+
+    private static func startupAvailability(
+        for error: JSONLAppServerTransportError
+    ) -> AgentAvailability {
+        guard case let .remoteError(_, classification) = error else {
+            return .crashed
+        }
+        switch classification {
+        case .authenticationRequired:
+            return .authenticationRequired
+        case .capabilityUnavailable:
+            return .capabilityUnavailable(
+                "Required Codex capability unavailable"
+            )
+        case .overloaded:
+            return .overloaded
+        default:
+            return .crashed
+        }
     }
 
     private func installConsumerIfNeeded() {

@@ -1,6 +1,27 @@
 import Foundation
 import MerlinLizdCore
 
+private final class SupervisorEventSubscriptionLifetime: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancellation: (@Sendable () -> Void)?
+
+    init(cancellation: @escaping @Sendable () -> Void) {
+        self.cancellation = cancellation
+    }
+
+    func keepAlive() {}
+
+    func cancel() {
+        lock.lock()
+        let cancellation = self.cancellation
+        self.cancellation = nil
+        lock.unlock()
+        cancellation?()
+    }
+
+    deinit { cancel() }
+}
+
 public enum CodexAppServerSupervisorStartupError: Error, Equatable, Sendable {
     case unsupportedVersion(String)
     case authenticationRequired
@@ -37,6 +58,16 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
         let task: Task<Void, Never>
     }
 
+    private struct RecoveryOperation: Sendable {
+        let id: UUID
+        let task: Task<Void, Never>
+    }
+
+    private struct EventSubscriber {
+        var cursor: UInt64?
+        var waiters: [UUID: CheckedContinuation<Void, Never>]
+    }
+
     private static let replayLimit = 512
     private static let restartSeconds: [Int64] = [1, 2, 4, 8, 16, 30]
 
@@ -48,19 +79,21 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
     private var generationThreadIDs: Set<AgentThreadID> = []
     private var startupOperation: StartupOperation?
     private var availabilitySetupTask: Task<
-        AsyncStream<AgentAvailability>, Never
+        AgentAvailability?, Never
     >?
     private var availabilityObserver: Task<Void, Never>?
-    private var restartTask: Task<Void, Never>?
+    private var recoveryOperation: RecoveryOperation?
+    private var shutdownTask: Task<Void, Never>?
     private var mappedThreadIDs: Set<AgentThreadID> = []
     private var activeTurns: [AgentThreadID: AgentTurnID] = [:]
     private var eventForwarders: [AgentThreadID: EventForwarder] = [:]
     private var eventSequences: [AgentThreadID: UInt64] = [:]
     private var eventReplay: [AgentThreadID: [AgentEventRecord]] = [:]
-    private var eventContinuations: [
-        AgentThreadID: [UUID: AsyncStream<AgentEventDelivery>.Continuation]
+    private var eventSubscribers: [
+        AgentThreadID: [UUID: EventSubscriber]
     ] = [:]
     private var availabilityValue: AgentAvailability = .starting
+    private var terminalAvailability: AgentAvailability?
     private var availabilityContinuations: [
         UUID: AsyncStream<AgentAvailability>.Continuation
     ] = [:]
@@ -104,7 +137,7 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
                     throw CodexAppServerSupervisorStartupError.crashed
                 }
             }
-            return CodexAppServerAdapter(
+            let adapter = CodexAppServerAdapter(
                 launchConfiguration: CodexLaunchConfiguration(
                     executable: resolved.executable,
                     runtimeDirectory: runtimeDirectory
@@ -112,13 +145,24 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
                 toolExecutor: toolExecutor,
                 mappingStore: mappingStore
             )
+            do {
+                try await adapter.initializeForSupervision()
+                return adapter
+            } catch {
+                await adapter.shutdown()
+                throw error
+            }
         }
     }
 
     public func startThread() async throws -> AgentThreadID {
-        let client = try await readyClient()
+        let handle = try await readyGeneration()
         do {
-            let threadID = try await client.startThread()
+            let threadID = try await handle.client.startThread()
+            guard owns(handle) else {
+                await compensateLateThread(threadID, owner: handle)
+                throw CodexAppServerSupervisorError.unavailable
+            }
             mappedThreadIDs.insert(threadID)
             generationThreadIDs.insert(threadID)
             installEventForwarder(threadID: threadID)
@@ -132,10 +176,16 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
     }
 
     public func resumeThread(_ threadID: AgentThreadID) async throws {
-        let client = try await readyClient()
+        let handle = try await readyGeneration()
         await mappingStore?.insert(threadID)
+        guard owns(handle) else {
+            throw CodexAppServerSupervisorError.unavailable
+        }
         do {
-            try await client.resumeThread(threadID)
+            try await handle.client.resumeThread(threadID)
+            guard owns(handle) else {
+                throw CodexAppServerSupervisorError.unavailable
+            }
             mappedThreadIDs.insert(threadID)
             generationThreadIDs.insert(threadID)
             installEventForwarder(threadID: threadID)
@@ -151,13 +201,20 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
         threadID: AgentThreadID,
         prompt: String
     ) async throws -> AgentTurnID {
-        let client = try await readyClient()
-        try await loadMappedThreadIfNeeded(threadID, client: client)
+        let handle = try await readyGeneration()
+        try await loadMappedThreadIfNeeded(threadID, handle: handle)
         do {
-            let turnID = try await client.startTurn(
+            let turnID = try await handle.client.startTurn(
                 threadID: threadID,
                 prompt: prompt
             )
+            guard owns(handle) else {
+                await handle.client.interruptTurn(
+                    threadID: threadID,
+                    turnID: turnID
+                )
+                throw CodexAppServerSupervisorError.unavailable
+            }
             activeTurns[threadID] = turnID
             setAvailability(.ready)
             return turnID
@@ -176,13 +233,16 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
         guard activeTurns[threadID] == turnID else {
             throw CodexAppServerSupervisorError.unavailable
         }
-        let client = try await readyClient()
+        let handle = try await readyGeneration()
         do {
-            try await client.steerTurn(
+            try await handle.client.steerTurn(
                 threadID: threadID,
                 turnID: turnID,
                 prompt: prompt
             )
+            guard owns(handle), activeTurns[threadID] == turnID else {
+                throw CodexAppServerSupervisorError.unavailable
+            }
         } catch is CancellationError {
             throw CancellationError()
         } catch {
@@ -202,31 +262,23 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
         for threadID: AgentThreadID,
         after sequence: UInt64?
     ) -> AsyncStream<AgentEventDelivery> {
-        guard !stopped else { return AsyncStream { $0.finish() } }
+        guard !stopped else { return AsyncStream(unfolding: { nil }) }
         let id = UUID()
-        let pair = AsyncStream<AgentEventDelivery>.makeStream(
-            bufferingPolicy: .bufferingNewest(64)
+        eventSubscribers[threadID, default: [:]][id] = EventSubscriber(
+            cursor: sequence,
+            waiters: [:]
         )
-        let replay = eventReplay[threadID] ?? []
-        if let oldest = replay.first?.sequence,
-            isReplayGap(oldest: oldest, after: sequence)
-        {
-            pair.continuation.yield(.replayGap(
-                after: sequence,
-                oldestAvailable: oldest
-            ))
-            pair.continuation.finish()
-            return pair.stream
+        let lifetime = SupervisorEventSubscriptionLifetime { [weak self] in
+            Task { await self?.cancelEventSubscriber(id, for: threadID) }
         }
-        let retained = replay.filter { record in
-            sequence.map { record.sequence > $0 } ?? true
-        }
-        if !retained.isEmpty { pair.continuation.yield(.events(retained)) }
-        eventContinuations[threadID, default: [:]][id] = pair.continuation
-        pair.continuation.onTermination = { [weak self] _ in
-            Task { await self?.removeEventContinuation(id, threadID: threadID) }
-        }
-        return pair.stream
+        return AsyncStream(unfolding: { [weak self, lifetime] in
+            lifetime.keepAlive()
+            return await self?.nextEventDelivery(
+                id: id,
+                waiterID: UUID(),
+                for: threadID
+            )
+        })
     }
 
     public func availability() -> AsyncStream<AgentAvailability> {
@@ -247,10 +299,13 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
     }
 
     public func archiveThread(_ threadID: AgentThreadID) async throws {
-        let client = try await readyClient()
-        try await loadMappedThreadIfNeeded(threadID, client: client)
+        let handle = try await readyGeneration()
+        try await loadMappedThreadIfNeeded(threadID, handle: handle)
         do {
-            try await client.archiveThread(threadID)
+            try await handle.client.archiveThread(threadID)
+            guard owns(handle) else {
+                throw CodexAppServerSupervisorError.unavailable
+            }
         } catch is CancellationError {
             throw CancellationError()
         } catch {
@@ -259,10 +314,13 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
     }
 
     public func unarchiveThread(_ threadID: AgentThreadID) async throws {
-        let client = try await readyClient()
-        try await loadMappedThreadIfNeeded(threadID, client: client)
+        let handle = try await readyGeneration()
+        try await loadMappedThreadIfNeeded(threadID, handle: handle)
         do {
-            try await client.unarchiveThread(threadID)
+            try await handle.client.unarchiveThread(threadID)
+            guard owns(handle) else {
+                throw CodexAppServerSupervisorError.unavailable
+            }
         } catch is CancellationError {
             throw CancellationError()
         } catch {
@@ -271,10 +329,13 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
     }
 
     public func deleteThread(_ threadID: AgentThreadID) async throws {
-        let client = try await readyClient()
-        try await loadMappedThreadIfNeeded(threadID, client: client)
+        let handle = try await readyGeneration()
+        try await loadMappedThreadIfNeeded(threadID, handle: handle)
         do {
-            try await client.deleteThread(threadID)
+            try await handle.client.deleteThread(threadID)
+            guard owns(handle) else {
+                throw CodexAppServerSupervisorError.unavailable
+            }
             forgetThread(threadID)
         } catch is CancellationError {
             throw CancellationError()
@@ -284,10 +345,16 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
     }
 
     public func ensureThreadDeleted(_ threadID: AgentThreadID) async throws {
-        let client = try await readyClient()
+        let handle = try await readyGeneration()
         await mappingStore?.insert(threadID)
+        guard owns(handle) else {
+            throw CodexAppServerSupervisorError.unavailable
+        }
         do {
-            try await client.ensureThreadDeleted(threadID)
+            try await handle.client.ensureThreadDeleted(threadID)
+            guard owns(handle) else {
+                throw CodexAppServerSupervisorError.unavailable
+            }
             forgetThread(threadID)
         } catch is CancellationError {
             throw CancellationError()
@@ -297,11 +364,14 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
     }
 
     public func shutdown() async {
-        guard !stopped else { return }
+        if let shutdownTask {
+            await shutdownTask.value
+            return
+        }
         stopped = true
-        let recovery = restartTask
-        restartTask = nil
-        recovery?.cancel()
+        let recovery = recoveryOperation
+        recoveryOperation = nil
+        recovery?.task.cancel()
         let startup = startupOperation
         startupOperation = nil
         startup?.task.cancel()
@@ -312,8 +382,28 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
         let forwarders = eventForwarders.values.map(\.task)
         eventForwarders.removeAll()
         forwarders.forEach { $0.cancel() }
+        let currentGeneration = generation
+        generation = nil
+        let cleanup = Task<Void, Never> { [weak self] in
+            guard let self else { return }
+            await self.performShutdown(
+                recovery: recovery,
+                startup: startup,
+                generation: currentGeneration,
+                forwarders: forwarders
+            )
+        }
+        shutdownTask = cleanup
+        await cleanup.value
+    }
 
-        if let recovery { await recovery.value }
+    private func performShutdown(
+        recovery: RecoveryOperation?,
+        startup: StartupOperation?,
+        generation: Generation?,
+        forwarders: [Task<Void, Never>]
+    ) async {
+        if let recovery { await recovery.task.value }
         if let startup,
             let uninstalled = try? await startup.task.value,
             generation == nil
@@ -330,7 +420,7 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
             await generation.client.shutdown()
         }
         for task in forwarders { await task.value }
-        generation = nil
+        self.generation = nil
         generationThreadIDs.removeAll()
         activeTurns.removeAll()
         mappedThreadIDs.removeAll()
@@ -340,18 +430,37 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
 
     var currentAvailability: AgentAvailability { availabilityValue }
 
-    private func readyClient() async throws -> any CodexAgentClient {
+    func eventSequenceForTesting(_ threadID: AgentThreadID) -> UInt64 {
+        eventSequences[threadID, default: 0]
+    }
+
+    var eventSubscriberCountForTesting: Int {
+        eventSubscribers.values.reduce(0) { $0 + $1.count }
+    }
+
+    private func readyGeneration() async throws -> Generation {
         guard !stopped else { throw CodexAppServerSupervisorError.stopped }
-        if let generation {
-            if let setup = availabilitySetupTask { _ = await setup.value }
-            return generation.client
+        guard terminalAvailability == nil else {
+            throw CodexAppServerSupervisorError.unavailable
         }
-        if let recovery = restartTask {
-            await recovery.value
-            guard !stopped, let generation else {
-                throw CodexAppServerSupervisorError.unavailable
+        if let handle = generation {
+            if let setup = availabilitySetupTask,
+                let initial = await setup.value
+            {
+                receiveAvailability(initial, generationID: handle.id)
             }
-            return generation.client
+            guard owns(handle) else {
+                if stopped { throw CodexAppServerSupervisorError.stopped }
+                if let recovery = recoveryOperation {
+                    await recovery.task.value
+                }
+                return try await readyGeneration()
+            }
+            return handle
+        }
+        if let recovery = recoveryOperation {
+            await recovery.task.value
+            return try await readyGeneration()
         }
 
         let operation: StartupOperation
@@ -374,9 +483,8 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
                 await client.shutdown()
                 throw CodexAppServerSupervisorError.stopped
             }
-            if let generation {
-                if let setup = availabilitySetupTask { _ = await setup.value }
-                return generation.client
+            if generation != nil {
+                return try await readyGeneration()
             }
             guard startupOperation?.id == operation.id else {
                 await client.shutdown()
@@ -384,14 +492,26 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
             }
             startupOperation = nil
             let installed = installGeneration(client)
-            if let setup = availabilitySetupTask { _ = await setup.value }
-            return installed.client
+            if let setup = availabilitySetupTask,
+                let initial = await setup.value
+            {
+                receiveAvailability(initial, generationID: installed.id)
+            }
+            guard owns(installed) else {
+                if let recovery = recoveryOperation {
+                    await recovery.task.value
+                }
+                return try await readyGeneration()
+            }
+            return installed
         } catch is CancellationError {
             if startupOperation?.id == operation.id { startupOperation = nil }
             throw CancellationError()
         } catch {
             if startupOperation?.id == operation.id { startupOperation = nil }
-            setAvailability(availability(for: error))
+            let mapped = availability(for: error)
+            if isTerminal(mapped) { terminalAvailability = mapped }
+            setAvailability(mapped)
             throw CodexAppServerSupervisorError.unavailable
         }
     }
@@ -402,10 +522,20 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
         let installed = Generation(id: UUID(), client: client)
         generation = installed
         generationThreadIDs.removeAll()
-        let setup = Task { await client.availability() }
+        let setup = Task<AgentAvailability?, Never> {
+            let stream = await client.availability()
+            var iterator = stream.makeAsyncIterator()
+            return await iterator.next()
+        }
         availabilitySetupTask = setup
         let streamTask = Task { [weak self, setup] in
-            let stream = await setup.value
+            if let initial = await setup.value {
+                await self?.receiveAvailability(
+                    initial,
+                    generationID: installed.id
+                )
+            }
+            let stream = await client.availability()
             for await value in stream {
                 guard !Task.isCancelled else { return }
                 await self?.receiveAvailability(
@@ -420,21 +550,44 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
 
     private func loadMappedThreadIfNeeded(
         _ threadID: AgentThreadID,
-        client: any CodexAgentClient
+        handle: Generation
     ) async throws {
         guard !generationThreadIDs.contains(threadID) else { return }
         guard mappedThreadIDs.contains(threadID) else {
             throw CodexAppServerSupervisorError.unavailable
         }
         await mappingStore?.insert(threadID)
+        guard owns(handle) else {
+            throw CodexAppServerSupervisorError.unavailable
+        }
         do {
-            try await client.resumeThread(threadID)
+            try await handle.client.resumeThread(threadID)
+            guard owns(handle) else {
+                throw CodexAppServerSupervisorError.unavailable
+            }
             generationThreadIDs.insert(threadID)
             installEventForwarder(threadID: threadID)
         } catch is CancellationError {
             throw CancellationError()
         } catch {
             throw CodexAppServerSupervisorError.unavailable
+        }
+    }
+
+    private func owns(_ handle: Generation) -> Bool {
+        !stopped && generation?.id == handle.id
+    }
+
+    private func compensateLateThread(
+        _ threadID: AgentThreadID,
+        owner: Generation
+    ) async {
+        await mappingStore?.insert(threadID)
+        do {
+            try await owner.client.ensureThreadDeleted(threadID)
+            await mappingStore?.remove(threadID)
+        } catch {
+            mappedThreadIDs.insert(threadID)
         }
     }
 
@@ -477,7 +630,7 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
         case let .events(records):
             for record in records { publish(record.event, for: threadID) }
         case .replayGap:
-            if let turnID = activeTurns.removeValue(forKey: threadID) {
+            if let turnID = activeTurns[threadID] {
                 publish(.turnFailed(turnID, .protocolFailure), for: threadID)
             }
         }
@@ -486,21 +639,17 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
     private func receiveAvailability(
         _ value: AgentAvailability,
         generationID: UUID
-    ) async {
+    ) {
         guard generation?.id == generationID, !stopped else { return }
         switch value {
         case .crashed:
-            await generationCrashed(generationID)
-        case .unsupportedVersion:
-            setAvailability(.unsupportedVersion("Unsupported Codex version"))
-        case .capabilityUnavailable:
-            setAvailability(.capabilityUnavailable(
-                "Required Codex capability unavailable"
-            ))
-        case .authenticationRequired:
-            setAvailability(.authenticationRequired)
-        case .overloaded:
-            setAvailability(.overloaded)
+            generationCrashed(generationID)
+        case .unsupportedVersion, .capabilityUnavailable,
+            .authenticationRequired, .overloaded:
+            generationBecameTerminal(
+                generationID,
+                availability: sanitized(value)
+            )
         case .ready:
             setAvailability(.ready)
         case .starting:
@@ -510,9 +659,9 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
         }
     }
 
-    private func generationCrashed(_ generationID: UUID) async {
+    private func generationCrashed(_ generationID: UUID) {
         guard let failed = generation, failed.id == generationID,
-            restartTask == nil, !stopped
+            recoveryOperation == nil, !stopped
         else { return }
         generation = nil
         generationThreadIDs.removeAll()
@@ -525,22 +674,81 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
         forwarders.forEach { $0.cancel() }
         let interrupted = activeTurns
         for (threadID, turnID) in interrupted {
+            publish(.turnFailed(turnID, .crashed), for: threadID)
+        }
+        setAvailability(.crashed)
+        let excluded = Set(interrupted.keys)
+        let recoveryID = UUID()
+        let task = Task<Void, Never> { [weak self] in
+            guard let self else { return }
+            await self.recover(
+                id: recoveryID,
+                failed: failed,
+                interrupted: interrupted,
+                forwarders: forwarders,
+                excluding: excluded
+            )
+        }
+        recoveryOperation = RecoveryOperation(id: recoveryID, task: task)
+    }
+
+    private func generationBecameTerminal(
+        _ generationID: UUID,
+        availability: AgentAvailability
+    ) {
+        guard let failed = generation, failed.id == generationID,
+            recoveryOperation == nil, !stopped
+        else { return }
+        terminalAvailability = availability
+        generation = nil
+        generationThreadIDs.removeAll()
+        availabilityObserver?.cancel()
+        availabilityObserver = nil
+        availabilitySetupTask?.cancel()
+        availabilitySetupTask = nil
+        let forwarders = eventForwarders.values.map(\.task)
+        eventForwarders.removeAll()
+        forwarders.forEach { $0.cancel() }
+        let interrupted = activeTurns
+        let failure = agentFailure(for: availability)
+        for (threadID, turnID) in interrupted {
+            publish(.turnFailed(turnID, failure), for: threadID)
+        }
+        setAvailability(availability)
+        let operationID = UUID()
+        let task = Task<Void, Never> { [weak self] in
+            for (threadID, turnID) in interrupted {
+                await failed.client.interruptTurn(
+                    threadID: threadID,
+                    turnID: turnID
+                )
+            }
+            await failed.client.shutdown()
+            for forwarder in forwarders { await forwarder.value }
+            await self?.clearRecovery(operationID)
+        }
+        recoveryOperation = RecoveryOperation(id: operationID, task: task)
+    }
+
+    private func recover(
+        id: UUID,
+        failed: Generation,
+        interrupted: [AgentThreadID: AgentTurnID],
+        forwarders: [Task<Void, Never>],
+        excluding excluded: Set<AgentThreadID>
+    ) async {
+        for (threadID, turnID) in interrupted {
             await failed.client.interruptTurn(
                 threadID: threadID,
                 turnID: turnID
             )
-            publish(.turnFailed(turnID, .crashed), for: threadID)
         }
         await failed.client.shutdown()
-        setAvailability(.crashed)
-        guard !stopped else { return }
-        let excluded = Set(interrupted.keys)
-        restartTask = Task { [weak self] in
-            await self?.recover(excluding: excluded)
+        for forwarder in forwarders { await forwarder.value }
+        guard !Task.isCancelled, !stopped else {
+            clearRecovery(id)
+            return
         }
-    }
-
-    private func recover(excluding excluded: Set<AgentThreadID>) async {
         var attempt = 0
         while !Task.isCancelled, !stopped {
             let delayIndex = min(attempt, Self.restartSeconds.count - 1)
@@ -553,29 +761,60 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
                     await client.shutdown()
                     return
                 }
-                let installed = installGeneration(client)
-                if let setup = availabilitySetupTask { _ = await setup.value }
                 do {
+                    var resumedThreadIDs: [AgentThreadID] = []
                     for threadID in mappedThreadIDs.subtracting(excluded) {
                         await mappingStore?.insert(threadID)
-                        try await installed.client.resumeThread(threadID)
-                        generationThreadIDs.insert(threadID)
+                        try Task.checkCancellation()
+                        try await client.resumeThread(threadID)
+                        try Task.checkCancellation()
+                        guard !stopped else { throw CancellationError() }
+                        resumedThreadIDs.append(threadID)
+                    }
+                    let initial = await initialAvailability(of: client)
+                    guard !Task.isCancelled, !stopped else {
+                        throw CancellationError()
+                    }
+                    switch initial {
+                    case .crashed, .stopped, nil:
+                        throw CodexAppServerSupervisorStartupError.crashed
+                    case .unsupportedVersion:
+                        throw CodexAppServerSupervisorStartupError
+                            .unsupportedVersion("sanitized")
+                    case .authenticationRequired:
+                        throw CodexAppServerSupervisorStartupError
+                            .authenticationRequired
+                    case .capabilityUnavailable:
+                        throw CodexAppServerSupervisorStartupError
+                            .capabilityUnavailable("sanitized")
+                    case .overloaded:
+                        throw CodexAppServerSupervisorStartupError.overloaded
+                    case .ready, .starting:
+                        break
+                    }
+                    _ = installGeneration(client)
+                    generationThreadIDs = Set(resumedThreadIDs)
+                    for threadID in resumedThreadIDs {
                         installEventForwarder(threadID: threadID)
                     }
-                    setAvailability(.ready)
-                    restartTask = nil
+                    setAvailability(initial == .ready ? .ready : .starting)
+                    clearRecovery(id)
                     return
                 } catch {
-                    if generation?.id == installed.id { generation = nil }
-                    generationThreadIDs.removeAll()
-                    availabilityObserver?.cancel()
-                    availabilityObserver = nil
-                    availabilitySetupTask?.cancel()
-                    availabilitySetupTask = nil
-                    await installed.client.shutdown()
-                    setAvailability(.crashed)
+                    await client.shutdown()
+                    let mapped = availability(for: error)
+                    setAvailability(mapped)
+                    switch mapped {
+                    case .crashed:
+                        break
+                    default:
+                        terminalAvailability = mapped
+                        clearRecovery(id)
+                        return
+                    }
                 }
             } catch is CancellationError {
+                clearRecovery(id)
                 return
             } catch {
                 let mapped = availability(for: error)
@@ -584,16 +823,44 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
                 case .crashed:
                     break
                 default:
-                    restartTask = nil
+                    terminalAvailability = mapped
+                    clearRecovery(id)
                     return
                 }
             }
             attempt += 1
         }
-        restartTask = nil
+        clearRecovery(id)
+    }
+
+    private func initialAvailability(
+        of client: any CodexAgentClient
+    ) async -> AgentAvailability? {
+        let stream = await client.availability()
+        var iterator = stream.makeAsyncIterator()
+        return await iterator.next()
+    }
+
+    private func clearRecovery(_ id: UUID) {
+        guard recoveryOperation?.id == id else { return }
+        recoveryOperation = nil
     }
 
     private func availability(for error: any Error) -> AgentAvailability {
+        if let initialization = error as? CodexAppServerInitializationError {
+            switch initialization {
+            case .authenticationRequired:
+                return .authenticationRequired
+            case .capabilityUnavailable:
+                return .capabilityUnavailable(
+                    "Required Codex capability unavailable"
+                )
+            case .overloaded:
+                return .overloaded
+            case .crashed:
+                return .crashed
+            }
+        }
         guard let startup = error as? CodexAppServerSupervisorStartupError else {
             return .crashed
         }
@@ -609,6 +876,46 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
         case .overloaded:
             return .overloaded
         case .crashed:
+            return .crashed
+        }
+    }
+
+    private func isTerminal(_ availability: AgentAvailability) -> Bool {
+        switch availability {
+        case .unsupportedVersion, .authenticationRequired,
+            .capabilityUnavailable, .overloaded:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func sanitized(
+        _ availability: AgentAvailability
+    ) -> AgentAvailability {
+        switch availability {
+        case .unsupportedVersion:
+            return .unsupportedVersion("Unsupported Codex version")
+        case .capabilityUnavailable:
+            return .capabilityUnavailable(
+                "Required Codex capability unavailable"
+            )
+        default:
+            return availability
+        }
+    }
+
+    private func agentFailure(
+        for availability: AgentAvailability
+    ) -> AgentFailure {
+        switch availability {
+        case .authenticationRequired:
+            return .authenticationRequired
+        case .overloaded:
+            return .overloaded
+        case .capabilityUnavailable, .unsupportedVersion:
+            return .capabilityUnavailable
+        default:
             return .crashed
         }
     }
@@ -637,9 +944,7 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
             replay.removeFirst(replay.count - Self.replayLimit)
         }
         eventReplay[threadID] = replay
-        for continuation in eventContinuations[threadID]?.values ?? [:].values {
-            continuation.yield(.event(record))
-        }
+        wakeEventSubscribers(for: threadID)
     }
 
     private func forgetThread(_ threadID: AgentThreadID) {
@@ -649,8 +954,7 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
         eventForwarders.removeValue(forKey: threadID)?.task.cancel()
         eventReplay.removeValue(forKey: threadID)
         eventSequences.removeValue(forKey: threadID)
-        let continuations = eventContinuations.removeValue(forKey: threadID)
-        continuations?.values.forEach { $0.finish() }
+        finishEvents(for: threadID)
     }
 
     private func isReplayGap(oldest: UInt64, after cursor: UInt64?) -> Bool {
@@ -662,19 +966,124 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
     private func setAvailability(_ value: AgentAvailability) {
         guard availabilityValue != value else { return }
         availabilityValue = value
-        for continuation in availabilityContinuations.values {
-            continuation.yield(value)
+        let continuations = availabilityContinuations
+        for (id, continuation) in continuations {
+            if case .terminated = continuation.yield(value) {
+                availabilityContinuations.removeValue(forKey: id)
+            }
         }
     }
 
-    private func removeEventContinuation(
-        _ id: UUID,
-        threadID: AgentThreadID
-    ) {
-        eventContinuations[threadID]?.removeValue(forKey: id)
-        if eventContinuations[threadID]?.isEmpty == true {
-            eventContinuations.removeValue(forKey: threadID)
+    private func nextEventDelivery(
+        id: UUID,
+        waiterID: UUID,
+        for threadID: AgentThreadID
+    ) async -> AgentEventDelivery? {
+        while true {
+            guard !Task.isCancelled else {
+                cancelEventSubscriber(id, for: threadID)
+                return nil
+            }
+            guard var subscriber = eventSubscribers[threadID]?[id] else {
+                return nil
+            }
+            let replay = eventReplay[threadID] ?? []
+            if subscriber.cursor == UInt64.max {
+                cancelEventSubscriber(id, for: threadID)
+                return nil
+            }
+            if let oldest = replay.first?.sequence,
+                isReplayGap(oldest: oldest, after: subscriber.cursor)
+            {
+                cancelEventSubscriber(id, for: threadID)
+                return .replayGap(
+                    after: subscriber.cursor,
+                    oldestAvailable: oldest
+                )
+            }
+            if let record = replay.first(where: { record in
+                subscriber.cursor.map { record.sequence > $0 } ?? true
+            }) {
+                subscriber.cursor = record.sequence
+                eventSubscribers[threadID]?[id] = subscriber
+                return .event(record)
+            }
+            guard !stopped else {
+                cancelEventSubscriber(id, for: threadID)
+                return nil
+            }
+            await waitForEvent(
+                id: id,
+                waiterID: waiterID,
+                threadID: threadID
+            )
         }
+    }
+
+    private func waitForEvent(
+        id: UUID,
+        waiterID: UUID,
+        threadID: AgentThreadID
+    ) async {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation(isolation: self) { continuation in
+                guard !Task.isCancelled,
+                    var subscriber = eventSubscribers[threadID]?[id]
+                else {
+                    continuation.resume()
+                    return
+                }
+                subscriber.waiters[waiterID] = continuation
+                eventSubscribers[threadID]?[id] = subscriber
+            }
+        } onCancel: {
+            Task {
+                await self.cancelEventWaiter(
+                    id: id,
+                    waiterID: waiterID,
+                    for: threadID
+                )
+            }
+        }
+    }
+
+    private func wakeEventSubscribers(for threadID: AgentThreadID) {
+        guard var subscribers = eventSubscribers[threadID] else { return }
+        var waiters: [CheckedContinuation<Void, Never>] = []
+        for id in subscribers.keys {
+            guard var subscriber = subscribers[id] else { continue }
+            waiters.append(contentsOf: subscriber.waiters.values)
+            subscriber.waiters.removeAll()
+            subscribers[id] = subscriber
+        }
+        eventSubscribers[threadID] = subscribers
+        waiters.forEach { $0.resume() }
+    }
+
+    private func cancelEventSubscriber(
+        _ id: UUID,
+        for threadID: AgentThreadID
+    ) {
+        let waiters = eventSubscribers[threadID]?
+            .removeValue(forKey: id)?.waiters.values ?? [:].values
+        if eventSubscribers[threadID]?.isEmpty == true {
+            eventSubscribers.removeValue(forKey: threadID)
+        }
+        waiters.forEach { $0.resume() }
+    }
+
+    private func cancelEventWaiter(
+        id: UUID,
+        waiterID: UUID,
+        for threadID: AgentThreadID
+    ) {
+        eventSubscribers[threadID]?[id]?
+            .waiters.removeValue(forKey: waiterID)?.resume()
+    }
+
+    private func finishEvents(for threadID: AgentThreadID) {
+        let subscribers = eventSubscribers.removeValue(forKey: threadID) ?? [:]
+        subscribers.values.flatMap { $0.waiters.values }.forEach { $0.resume() }
     }
 
     private func removeAvailabilityContinuation(_ id: UUID) {
@@ -682,10 +1091,10 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
     }
 
     private func finishStreams() {
-        for continuations in eventContinuations.values {
-            continuations.values.forEach { $0.finish() }
-        }
-        eventContinuations.removeAll()
+        let subscribers = eventSubscribers
+        eventSubscribers.removeAll()
+        subscribers.values.flatMap(\.values).flatMap { $0.waiters.values }
+            .forEach { $0.resume() }
         availabilityContinuations.values.forEach { $0.finish() }
         availabilityContinuations.removeAll()
     }
