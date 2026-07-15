@@ -1443,6 +1443,226 @@ struct CodexAppServerContractTests {
         await adapter.shutdown()
     }
 
+    @Test("resume rejects in-progress turns without one nonempty id")
+    func resumeRejectsMalformedActiveTurnIDs() async throws {
+        for turn in [
+            #"{"status":"inProgress","items":[{"type":"agentMessage","text":"must not publish"}]}"#,
+            #"{"id":null,"status":"inProgress","items":[{"type":"agentMessage","text":"must not publish"}]}"#,
+            #"{"id":"","status":"inProgress","items":[{"type":"agentMessage","text":"must not publish"}]}"#,
+        ] {
+            let fixture = try await startCodexMappedThreadFixture()
+            let resuming = Task {
+                try await fixture.adapter.resumeThread(fixture.threadID)
+            }
+            await fixture.process.waitForWriteCount(4)
+            let requestID = try await lastRequestID(from: fixture.process)
+            await fixture.process.emit(.standardOutput(jsonLine(
+                #"{"id":\#(requestID),"result":{"thread":{"id":"thread-1","turns":[\#(turn)]}}}"#
+            )))
+
+            await #expect(throws: CodexAppServerAdapterError.invalidResponse) {
+                try await resuming.value
+            }
+            #expect(
+                await fixture.adapter.replayedEventsForTesting(fixture.threadID)
+                    == []
+            )
+            let counts = await fixture.adapter.stateCountsForTesting
+            #expect(counts.activeTurns == 0)
+            #expect(counts.pendingResumes == 0)
+            await fixture.adapter.shutdown()
+        }
+    }
+
+    @Test("a malformed second active turn cannot replace or publish over its exact owner")
+    func malformedSecondActiveTurnRecoversExactPriorOwner() async throws {
+        let fixture = try await startCodexActiveResumeFixture(
+            turnID: "strict-owner"
+        )
+        await bufferDelta("preserved", fixture: fixture)
+        await fixture.adapter.handleNotificationForTesting(
+            method: "turn/completed",
+            params: completedTurnParams(
+                threadID: fixture.threadID,
+                turnID: fixture.turnID
+            )
+        )
+        let requestID = try await lastRequestID(from: fixture.process)
+        await fixture.process.emit(.standardOutput(jsonLine(
+            #"{"id":\#(requestID),"result":{"thread":{"id":"thread-1","turns":[{"id":"strict-owner","status":"inProgress","items":[{"type":"agentMessage","text":"must not publish"}]},{"status":"inProgress","items":[]}]}}}"#
+        )))
+
+        await #expect(throws: CodexAppServerAdapterError.invalidResponse) {
+            try await fixture.resuming.value
+        }
+        #expect(
+            await fixture.adapter.replayedEventsForTesting(fixture.threadID)
+                == fixture.eventsBeforeResume + [
+                    .assistantMessageDelta("preserved"),
+                    .turnCompleted(fixture.turnID),
+                ]
+        )
+        let counts = await fixture.adapter.stateCountsForTesting
+        #expect(counts.activeTurns == 0)
+        #expect(counts.pendingResumes == 0)
+        await fixture.adapter.shutdown()
+    }
+
+    @Test("resume rejects missing unknown and malformed turn ownership fields")
+    func resumeRejectsMalformedTurnOwnershipEntries() async throws {
+        for turn in [
+            #"{"id":"missing-status","items":[]}"#,
+            #"{"id":"unknown-status","status":"queued","items":[]}"#,
+            #"{"id":"","status":"completed","items":[]}"#,
+            "null",
+            "17",
+        ] {
+            let fixture = try await startCodexMappedThreadFixture()
+            let resuming = Task {
+                try await fixture.adapter.resumeThread(fixture.threadID)
+            }
+            await fixture.process.waitForWriteCount(4)
+            let requestID = try await lastRequestID(from: fixture.process)
+            await fixture.process.emit(.standardOutput(jsonLine(
+                #"{"id":\#(requestID),"result":{"thread":{"id":"thread-1","turns":[\#(turn)]}}}"#
+            )))
+
+            await #expect(throws: CodexAppServerAdapterError.invalidResponse) {
+                try await resuming.value
+            }
+            #expect(
+                await fixture.adapter.replayedEventsForTesting(fixture.threadID)
+                    == []
+            )
+            let counts = await fixture.adapter.stateCountsForTesting
+            #expect(counts.activeTurns == 0)
+            #expect(counts.pendingResumes == 0)
+            await fixture.adapter.shutdown()
+        }
+    }
+
+    @Test("resume accepts every frozen turn status")
+    func resumeAcceptsFrozenTurnStatuses() async throws {
+        let fixture = try await startCodexMappedThreadFixture()
+        let resuming = Task {
+            try await fixture.adapter.resumeThread(fixture.threadID)
+        }
+        await fixture.process.waitForWriteCount(4)
+        let requestID = try await lastRequestID(from: fixture.process)
+        await fixture.process.emit(.standardOutput(jsonLine(
+            #"{"id":\#(requestID),"result":{"thread":{"id":"thread-1","turns":[{"id":"completed","status":"completed","items":[{"type":"agentMessage","text":"done"}]},{"id":"interrupted","status":"interrupted","items":[{"type":"agentMessage","text":"stopped"}]},{"id":"failed","status":"failed","items":[{"type":"agentMessage","text":"failed"}]},{"id":"active","status":"inProgress","items":[{"type":"agentMessage","text":"working"}]}]}}}"#
+        )))
+
+        try await resuming.value
+        #expect(
+            await fixture.adapter.replayedEventsForTesting(fixture.threadID)
+                == [.history([
+                    .init(role: .assistant, text: "done"),
+                    .init(role: .assistant, text: "stopped"),
+                    .init(role: .assistant, text: "failed"),
+                    .init(role: .assistant, text: "working"),
+                ])]
+        )
+        let counts = await fixture.adapter.stateCountsForTesting
+        #expect(counts.activeTurns == 1)
+        #expect(counts.pendingResumes == 0)
+        await fixture.adapter.shutdown()
+    }
+
+    @Test("cancellation after resume response publishes no owner or history")
+    func lateCancelledIdleResumeFailsBeforeLocalCommit() async throws {
+        let process = ScriptedAppServerProcess()
+        let gate = CodexResumePreCommitGate()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor(),
+            resumePreCommitSuspensionForTesting: { await gate.suspend() }
+        )
+        let threadID = try await startMappedThread(
+            adapter: adapter,
+            process: process
+        )
+        let resuming = Task { try await adapter.resumeThread(threadID) }
+        await process.waitForWriteCount(4)
+        let requestID = try await lastRequestID(from: process)
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":\#(requestID),"result":{"thread":{"id":"thread-1","turns":[{"id":"late-active","status":"inProgress","items":[{"type":"agentMessage","text":"must not publish"}]}]}}}"#
+        )))
+        await gate.waitUntilSuspended()
+
+        resuming.cancel()
+        await gate.release()
+        await #expect(throws: CancellationError.self) {
+            try await resuming.value
+        }
+        #expect(await adapter.replayedEventsForTesting(threadID) == [])
+        let counts = await adapter.stateCountsForTesting
+        #expect(counts.activeTurns == 0)
+        #expect(counts.pendingResumes == 0)
+        await adapter.shutdown()
+    }
+
+    @Test("late cancelled resume recovers exact prior owner events")
+    func lateCancelledResumeRecoversExactPriorOwner() async throws {
+        let process = ScriptedAppServerProcess()
+        let gate = CodexResumePreCommitGate()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor(),
+            resumePreCommitSuspensionForTesting: { await gate.suspend() }
+        )
+        let threadID = try await startMappedThread(
+            adapter: adapter,
+            process: process
+        )
+        let turnID = try await startMappedTurn(
+            adapter: adapter,
+            process: process,
+            threadID: threadID,
+            turnID: "late-owner",
+            requestID: 3,
+            writeCount: 4
+        )
+        let before = await adapter.replayedEventsForTesting(threadID)
+        let resuming = Task { try await adapter.resumeThread(threadID) }
+        await process.waitForWriteCount(5)
+        await adapter.handleNotificationForTesting(
+            method: "item/agentMessage/delta",
+            params: .object([
+                "threadId": .string(threadID.rawValue),
+                "turnId": .string(turnID.rawValue),
+                "delta": .string("preserved"),
+            ])
+        )
+        await adapter.handleNotificationForTesting(
+            method: "turn/completed",
+            params: completedTurnParams(threadID: threadID, turnID: turnID)
+        )
+        let requestID = try await lastRequestID(from: process)
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":\#(requestID),"result":{"thread":{"id":"thread-1","turns":[{"id":"late-owner","status":"inProgress","items":[{"type":"agentMessage","text":"must not publish"}]}]}}}"#
+        )))
+        await gate.waitUntilSuspended()
+
+        resuming.cancel()
+        await gate.release()
+        await #expect(throws: CancellationError.self) {
+            try await resuming.value
+        }
+        #expect(
+            await adapter.replayedEventsForTesting(threadID) == before + [
+                .assistantMessageDelta("preserved"),
+                .turnCompleted(turnID),
+            ]
+        )
+        let counts = await adapter.stateCountsForTesting
+        #expect(counts.activeTurns == 0)
+        #expect(counts.pendingResumes == 0)
+        await adapter.shutdown()
+    }
+
     @Test("tool requests are decoded before execution and return one sanitized inputText")
     func toolRequestsFailClosedAndSanitizeFailures() async throws {
         let executor = RecordingCodexToolExecutor()
@@ -2794,6 +3014,32 @@ private actor RecordingCodexToolExecutor: CodexDynamicToolExecuting {
     ) async throws -> TerminalToolResult {
         calls.append(call)
         return .inputAccepted(.init(acceptedRevision: 1, byteCount: 0))
+    }
+}
+
+private actor CodexResumePreCommitGate {
+    private var suspended = false
+    private var suspensionWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func suspend() async {
+        precondition(!suspended && releaseContinuation == nil)
+        suspended = true
+        let waiters = suspensionWaiters
+        suspensionWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+        await withCheckedContinuation { releaseContinuation = $0 }
+        suspended = false
+    }
+
+    func waitUntilSuspended() async {
+        if suspended { return }
+        await withCheckedContinuation { suspensionWaiters.append($0) }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
     }
 }
 

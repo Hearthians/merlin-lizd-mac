@@ -114,6 +114,8 @@ public actor CodexAppServerAdapter: CodexAgentClient {
     private let maximumInFlightToolRequests: Int
     private let completedServerRequestTombstoneLimit: Int
     private let toolRequestDrainTimeout: Duration
+    private let resumePreCommitSuspensionForTesting:
+        (@Sendable () async -> Void)?
 
     private var startupTask: Task<StartupOutcome, Never>?
     private var consumerTask: Task<Void, Never>?
@@ -152,6 +154,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         completedServerRequestTombstoneLimit = Self
             .productionCompletedServerRequestTombstoneLimit
         toolRequestDrainTimeout = Self.productionToolRequestDrainTimeout
+        resumePreCommitSuspensionForTesting = nil
     }
 
     init(
@@ -174,6 +177,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         self.completedServerRequestTombstoneLimit
             = completedServerRequestTombstoneLimit
         self.toolRequestDrainTimeout = toolRequestDrainTimeout
+        resumePreCommitSuspensionForTesting = nil
     }
 
     init(
@@ -193,6 +197,28 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         completedServerRequestTombstoneLimit = Self
             .productionCompletedServerRequestTombstoneLimit
         self.toolRequestDrainTimeout = toolRequestDrainTimeout
+        resumePreCommitSuspensionForTesting = nil
+    }
+
+    init(
+        transport: JSONLAppServerTransport,
+        launchConfiguration: CodexLaunchConfiguration,
+        toolExecutor: any CodexDynamicToolExecuting,
+        mappingStore: CodexAppServerThreadMappingStore = .init(),
+        resumePreCommitSuspensionForTesting:
+            @escaping @Sendable () async -> Void
+    ) {
+        self.transport = transport
+        self.launchConfiguration = launchConfiguration
+        self.toolExecutor = toolExecutor
+        self.mappingStore = mappingStore
+        maximumInFlightToolRequests = Self
+            .productionMaximumInFlightToolRequests
+        completedServerRequestTombstoneLimit = Self
+            .productionCompletedServerRequestTombstoneLimit
+        toolRequestDrainTimeout = Self.productionToolRequestDrainTimeout
+        self.resumePreCommitSuspensionForTesting
+            = resumePreCommitSuspensionForTesting
     }
 
     public init(
@@ -213,6 +239,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         completedServerRequestTombstoneLimit = Self
             .productionCompletedServerRequestTombstoneLimit
         toolRequestDrainTimeout = Self.productionToolRequestDrainTimeout
+        resumePreCommitSuspensionForTesting = nil
     }
 
     public func startThread() async throws -> AgentThreadID {
@@ -283,6 +310,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
             } onCancel: {
                 requestTask.cancel()
             }
+            try Task.checkCancellation()
             guard let pending = pendingResumes[threadID],
                 pending.token == token,
                 pendingDeletes[threadID] == nil,
@@ -303,6 +331,9 @@ public actor CodexAppServerAdapter: CodexAgentClient {
                 }
             }
             let resumedHistory = try history(in: result)
+            if let resumePreCommitSuspensionForTesting {
+                await resumePreCommitSuspensionForTesting()
+            }
             guard await mappingStore.contains(threadID),
                 let current = pendingResumes[threadID],
                 current.token == token,
@@ -321,6 +352,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
                     throw CodexAppServerAdapterError.invalidResponse
                 }
             }
+            try Task.checkCancellation()
             knownThreads.insert(threadID)
             publish(.history(resumedHistory), for: threadID)
             if current.priorActiveTurnID == nil, let resumedTurnID {
@@ -1447,17 +1479,25 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         guard case let .array(turnValues) = turnsValue else {
             throw CodexAppServerAdapterError.invalidResponse
         }
-        let active = turnValues.compactMap { value -> AgentTurnID? in
+        var activeTurnID: AgentTurnID?
+        for value in turnValues {
             guard case let .object(turn) = value,
-                turn["status"]?.nonemptyString == "inProgress",
-                let rawValue = turn["id"]?.nonemptyString
-            else { return nil }
-            return AgentTurnID(rawValue: rawValue)
+                let rawID = turn["id"]?.nonemptyString,
+                let status = turn["status"]?.nonemptyString
+            else { throw CodexAppServerAdapterError.invalidResponse }
+            switch status {
+            case "completed", "interrupted", "failed":
+                break
+            case "inProgress":
+                guard activeTurnID == nil else {
+                    throw CodexAppServerAdapterError.invalidResponse
+                }
+                activeTurnID = AgentTurnID(rawValue: rawID)
+            default:
+                throw CodexAppServerAdapterError.invalidResponse
+            }
         }
-        guard active.count <= 1 else {
-            throw CodexAppServerAdapterError.invalidResponse
-        }
-        return active.first
+        return activeTurnID
     }
 
     private func history(in result: JSONValue) throws -> [AgentMessage] {
