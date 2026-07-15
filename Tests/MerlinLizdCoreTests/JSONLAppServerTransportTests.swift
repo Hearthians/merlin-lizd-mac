@@ -905,6 +905,101 @@ struct JSONLAppServerTransportTests {
         await transport.shutdown()
     }
 
+    @Test("remote absence classification requires the correlated thread ID")
+    func classifiesOnlyExactCorrelatedThreadAbsence() async throws {
+        struct Case: Sendable {
+            let method: String
+            let requestedThreadID: String
+            let code: Int
+            let message: String
+            let expected: JSONLAppServerTransportError.RemoteClassification
+        }
+        let cases = [
+            Case(
+                method: "thread/read",
+                requestedThreadID: "thread-read",
+                code: -32600,
+                message: "thread not loaded: thread-read",
+                expected: .threadNotLoaded
+            ),
+            Case(
+                method: "thread/delete",
+                requestedThreadID: "thread-delete",
+                code: -32600,
+                message: "no rollout found for thread id thread-delete",
+                expected: .noRolloutFound
+            ),
+            Case(
+                method: "thread/read",
+                requestedThreadID: "thread-read",
+                code: -32600,
+                message: "thread not loaded: another-thread",
+                expected: .other
+            ),
+            Case(
+                method: "thread/delete",
+                requestedThreadID: "thread-delete",
+                code: -32600,
+                message: "no rollout found for thread id another-thread",
+                expected: .other
+            ),
+            Case(
+                method: "thread/read",
+                requestedThreadID: "thread-read",
+                code: -32600,
+                message: " thread not loaded: thread-read",
+                expected: .other
+            ),
+            Case(
+                method: "thread/read",
+                requestedThreadID: "thread-read",
+                code: -32600,
+                message: "thread not loaded: thread-read ",
+                expected: .other
+            ),
+            Case(
+                method: "thread/start",
+                requestedThreadID: "thread-read",
+                code: -32600,
+                message: "thread not loaded: thread-read",
+                expected: .other
+            ),
+            Case(
+                method: "thread/read",
+                requestedThreadID: "thread-read",
+                code: -32000,
+                message: "thread not loaded: thread-read",
+                expected: .other
+            ),
+        ]
+
+        for testCase in cases {
+            let process = ScriptedAppServerProcess()
+            let transport = JSONLAppServerTransport(process: process)
+            try await transport.start()
+            let request = Task {
+                try await transport.request(
+                    method: testCase.method,
+                    params: .object([
+                        "threadId": .string(testCase.requestedThreadID),
+                    ])
+                )
+            }
+            await process.waitForWriteCount(1)
+            await process.emit(.standardOutput(jsonLine(
+                "{\"id\":1,\"error\":{\"code\":\(testCase.code),\"message\":\"\(testCase.message)\"}}"
+            )))
+
+            await #expect(throws: JSONLAppServerTransportError.remoteError(
+                code: testCase.code,
+                classification: testCase.expected
+            )) {
+                try await request.value
+            }
+            await transport.shutdown()
+        }
+    }
+
     @Test("server message buffering fails explicitly instead of growing without bound")
     func boundsServerMessages() async throws {
         let process = ScriptedAppServerProcess()

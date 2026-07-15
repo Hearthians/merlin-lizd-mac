@@ -105,3 +105,129 @@ server-side idempotency key or transactional create API.
 The review's deferred minors remain deferred: assistant/envelope byte bounds,
 cancel-and-drain deadline helpers, cancellation-aware generic gates, and a
 future extraction of the coordinator's per-key lifecycle/activity projection.
+
+---
+
+# Task 9 final-review repair addendum
+
+Base: `17b54a7`
+
+## Outcome
+
+All six Critical and Important findings in
+`task-9-final-review-findings.md` are repaired in the Task 9 Core/adapter
+boundary. Core remains protocol-neutral. No files under `Sources/MerlinLizdApp`
+or `Vendor` changed.
+
+## Repairs and design decisions
+
+1. The transport now retains the requested `threadId` in the exact correlated
+   pending request and recognizes only the real Codex 0.144.2 shapes
+   `thread not loaded: <id>` and
+   `no rollout found for thread id <id>`. Classification requires the exact
+   response ID, method, `-32600` code, requested thread ID, and byte-exact
+   message. Wrong IDs, codes, methods, and whitespace remain `.other`; raw
+   remote text remains transport-internal. The fresh-adapter deletion retry
+   fixture now uses the real response shape.
+2. `CodexConversationStoring` now exposes an exclusive
+   `recoverDurableSnapshot()` decision boundary. The file store takes the
+   exclusive lock, rereads the authoritative envelope, and successfully
+   `fsync`s its containing directory before returning the winner. Creation
+   recovery never accepts a shared-read observation, and never compensates a
+   candidate when exclusive reread/resync fails. It retries only after durable
+   recovery proves the mapping absent; candidate compensation occurs only
+   after a successful durable recovery proves that candidate is not the
+   winner.
+3. Event replay uses one bounded stream slot. Initial retained records are one
+   bounded batch backed by the existing 512-record ring. A nil cursor receives
+   an explicit terminal gap if the ring is already truncated. For live
+   overflow, `.dropped` is decoded as the actual missing delivery; the gap
+   replaces the buffered post-gap delivery and the stream terminates, so a
+   consumer observes exactly one truthful gap before any later data. Core
+   reduces a replay batch record-by-record with its existing sequence checks.
+4. Stop and Delete now share the exact admitted `StopOperation` per key.
+   Deletion joins that operation before durable deletion and cannot run a
+   second teardown around a suspended Stop. Exact operation IDs make cleanup
+   idempotent for both waiters, preventing a late Stop from recreating deleted
+   session state.
+5. Stop/Delete admission synchronously cancels the current pending start, and
+   teardown joins it before event-consumer drain. Each `PendingStart` carries
+   its start ID and lifecycle revision. Ownership is revalidated after thread
+   resolution, router preparation, registry reconciliation, remote start, and
+   router confirmation; stopping, deletion, shutdown, or token replacement
+   blocks every later commit. Deterministic tests suspend the terminal keyboard
+   transition after router preparation is installed but before `beginTurn`
+   returns, then join the submitting task to prove no remote `startTurn` call.
+6. Steer-failure termination ownership is now released unconditionally with a
+   `defer` around the lifecycle-revision-guarded state publication. Shutdown
+   can therefore drain the exact termination token after it invalidates the
+   stale state writer, reaches `agent.shutdown()`, and returns.
+
+## RED-to-GREEN commands and observed output
+
+`MerlinLizdCoreTests` is an executable target, so `swift test --filter` cannot
+select individual Swift Testing cases in this repository. Every focused
+checkpoint therefore used the repository command `./scripts/test.sh`; the
+named cases execute sequentially inside the coordinator, transport, and
+contract suites.
+
+- Exact absence classification: RED was 629 tests with three issues (the fresh
+  adapter remained tombstoned and both real message classifications were
+  `.other`). GREEN was 629/629, including
+  `remote absence classification requires the correlated thread ID` and
+  `fresh adapter completes Core retry after remote delete stage persistence
+  fails`.
+- Durable recovery: RED failed
+  `repeated post-rename sync failure stays indeterminate` by accepting the
+  visible winner and failed
+  `authoritative reread failure never compensates an unknown winner` by
+  deleting it. GREEN was 631/631; the strengthened successful-recovery case
+  also proved two sync calls and normal resume/start progress.
+- Replay overflow: RED was 632 tests with two issues: the slow subscriber
+  consumed a record before a gap and the nil cursor silently received retained
+  replay. GREEN was 632/632, including exact-cursor 512-record replay,
+  nil-cursor exhaustion, and slow live overflow.
+- Shared Stop/Delete and router-prepared start ownership: RED was 635 tests
+  with six issues. Deletion completed around a suspended Stop and resurrected
+  state; both Stop and Delete allowed `startTurn` through the router-prepared
+  gap. GREEN passed all three new cases and the full coordinator suite.
+- Shutdown/steer cleanup: RED failed
+  `shutdown drains stale steer-failure termination ownership` because shutdown
+  never completed after the lifecycle revision changed. GREEN completed
+  shutdown and recorded exactly one agent shutdown call.
+
+The exact new or strengthened regression cases are:
+
+- `remote absence classification requires the correlated thread ID`
+- `fresh adapter completes Core retry after remote delete stage persistence
+  fails`
+- `post-rename sync ambiguity never compensates the durable winner`
+- `repeated post-rename sync failure stays indeterminate`
+- `authoritative reread failure never compensates an unknown winner`
+- `slow live streams expose one gap before buffered post-gap records`
+- `nil event cursors report truncated replay before any record`
+- `deletion joins an admitted stop before removing durable state`
+- `stop cancels a router-prepared start before remote turn creation`
+- `deletion cancels a router-prepared start before remote turn creation`
+- `shutdown drains stale steer-failure termination ownership`
+
+## Final verification
+
+- `./scripts/test.sh 2>&1 | rg 'recorded an issue|Test run with|Suite
+  "app-server transport"|Suite "Codex session coordinator"'`:
+  `app-server transport` passed, `Codex session coordinator` passed, and all
+  **636 tests in 43 suites passed** in 1.564 seconds.
+- One preceding parallel full run reproduced the review's deferred descriptor
+  lifetime flake in `app-server transport`; the immediate final full rerun
+  above was clean. No product change was made for that pre-existing Minor.
+- `/usr/bin/swift build`: passed; `Build complete! (0.08s)`.
+- `git diff --check`: exited 0 with no output.
+- Self-review of `17b54a7..HEAD`: no additional Critical/Important defects
+  found; no App or Vendor files changed.
+
+## Deferred Minor follow-up
+
+As directed, the final review's Minors remain outside this repair wave:
+assistant and envelope byte bounds, generic gate/deadline cancellation drain,
+the parallel descriptor-lifetime test determinism concern, and future
+extraction of the coordinator's per-key lifecycle owner.

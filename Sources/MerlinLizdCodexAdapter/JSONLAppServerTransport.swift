@@ -60,6 +60,7 @@ public actor JSONLAppServerTransport {
     private struct PendingRequest {
         let token: UUID
         let method: String
+        let requestedThreadID: String?
         let continuation: CheckedContinuation<JSONValue, Error>
         let writeTask: Task<RequestWriteOutcome, Never>
     }
@@ -265,6 +266,10 @@ public actor JSONLAppServerTransport {
                 pending[requestID] = PendingRequest(
                     token: token,
                     method: method,
+                    requestedThreadID: Self.requestedThreadID(
+                        method: method,
+                        params: params
+                    ),
                     continuation: continuation,
                     writeTask: writeTask
                 )
@@ -593,7 +598,8 @@ public actor JSONLAppServerTransport {
                     classification: Self.classifyRemoteError(
                         method: request.method,
                         code: error.code,
-                        message: error.message
+                        message: error.message,
+                        requestedThreadID: request.requestedThreadID
                     )
                 )
             )
@@ -608,16 +614,33 @@ public actor JSONLAppServerTransport {
     private static func classifyRemoteError(
         method: String,
         code: Int,
-        message: String
+        message: String,
+        requestedThreadID: String?
     ) -> JSONLAppServerTransportError.RemoteClassification {
-        guard code == -32600 else { return .other }
-        if method == "thread/read", message == "thread not loaded" {
+        guard code == -32600, let requestedThreadID else { return .other }
+        if method == "thread/read",
+            message == "thread not loaded: \(requestedThreadID)"
+        {
             return .threadNotLoaded
         }
-        if method == "thread/delete", message == "no rollout found" {
+        if method == "thread/delete",
+            message == "no rollout found for thread id \(requestedThreadID)"
+        {
             return .noRolloutFound
         }
         return .other
+    }
+
+    private static func requestedThreadID(
+        method: String,
+        params: JSONValue?
+    ) -> String? {
+        guard method == "thread/read" || method == "thread/delete",
+            case let .object(fields)? = params,
+            case let .string(threadID)? = fields["threadId"],
+            !threadID.isEmpty
+        else { return nil }
+        return threadID
     }
 
     private func enqueue(_ message: CodexServerMessage) {

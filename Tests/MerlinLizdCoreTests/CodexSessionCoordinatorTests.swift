@@ -519,6 +519,79 @@ struct CodexSessionCoordinatorTests {
         #expect(await coordinator.snapshot()[key]?.activeTurnID == nil)
     }
 
+    @Test("shutdown drains stale steer-failure termination ownership")
+    func shutdownDrainsSteerFailureAcrossLifecycleRevisionChange() async throws {
+        let fixture = try CodexSessionPersistenceFixture()
+        defer { fixture.remove() }
+        let key = codexTestKey()
+        let threadID = AgentThreadID(rawValue: "shutdown-steer-thread")
+        let turnID = AgentTurnID(rawValue: "shutdown-steer-turn")
+        let terminationGate = CodexSessionTestGate()
+        let calls = CodexSessionCallProbe()
+        let agent = FakeCodexSessionAgent(threadIDs: [threadID])
+        await agent.enqueueTurn(turnID, for: threadID)
+        let store = try FileCodexConversationStore(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        let registry = TerminalEndpointRegistry()
+        let journal = CodexSessionJournalSpy()
+        let router = TerminalToolRouter(
+            registry: registry,
+            approvalBroker: TerminalApprovalBroker(),
+            journal: journal
+        )
+        let coordinator = CodexSessionCoordinator(
+            agent: agent,
+            store: store,
+            registry: registry,
+            router: router,
+            journal: journal
+        )
+        try await coordinator.registerEndpoint(codexTestEndpoint(
+            key: key,
+            port: FakeTerminalToolPort(
+                snapshot: TerminalToolFixtures.screen(revision: 1)
+            )
+        ))
+        await coordinator.submit("first", for: key)
+        await agent.setFailure(.steer)
+        await router.setTurnTerminationHookForTesting {
+            await calls.record("steer-terminating")
+            await terminationGate.wait()
+        }
+
+        let steering = Task { await coordinator.submit("fails", for: key) }
+        try await codexSessionWithDeadline {
+            await calls.wait(for: "steer-terminating")
+        }
+        let shutdown = Task {
+            await coordinator.shutdown()
+            await calls.record("shutdown-complete")
+        }
+
+        while true {
+            let stream = await coordinator.states()
+            var iterator = stream.makeAsyncIterator()
+            if await iterator.next() == nil { break }
+            await Task.yield()
+        }
+        await terminationGate.open()
+        var shutdownCompleted = false
+        do {
+            try await codexSessionWithDeadline(timeout: .milliseconds(250)) {
+                await calls.wait(for: "shutdown-complete")
+            }
+            shutdownCompleted = true
+        } catch {
+            shutdown.cancel()
+        }
+        #expect(shutdownCompleted)
+
+        await shutdown.value
+        await steering.value
+        #expect(await agent.recordedCallCount("shutdown") == 1)
+    }
+
     @Test("two coordinators keep one mapping and compensate the losing thread")
     func concurrentCoordinatorsCompareInsertAndCompensateLoser() async throws {
         let fixture = try CodexSessionPersistenceFixture()
@@ -598,13 +671,114 @@ struct CodexSessionCoordinatorTests {
         let store = try FileCodexConversationStore(
             applicationSupportDirectory: fixture.applicationSupportDirectory
         )
-        await store.setPostRenameSyncHookForTesting {
-            throw CodexConversationStoreError.posixFailure(
-                operation: "fsync",
-                path: "CodexConversations",
-                code: 5
+        let agent = FakeCodexSessionAgent(threadIDs: [threadID])
+        let startGate = CodexSessionTestGate()
+        await agent.blockStartThread(on: startGate)
+        await agent.enqueueTurn(turnID, for: threadID)
+        let registry = TerminalEndpointRegistry()
+        let journal = CodexSessionJournalSpy()
+        let coordinator = CodexSessionCoordinator(
+            agent: agent,
+            store: store,
+            registry: registry,
+            router: TerminalToolRouter(
+                registry: registry,
+                approvalBroker: TerminalApprovalBroker(),
+                journal: journal
+            ),
+            journal: journal
+        )
+        try await coordinator.registerEndpoint(codexTestEndpoint(
+            key: key,
+            port: FakeTerminalToolPort(
+                snapshot: TerminalToolFixtures.screen(revision: 1)
             )
+        ))
+
+        let submitting = Task {
+            await coordinator.submit("keep the winner", for: key)
         }
+        try await codexSessionWithDeadline {
+            await agent.waitForCall("startThread")
+        }
+        let sync = CodexSynchronousFailureScript(failures: 1)
+        await store.setPostRenameSyncHookForTesting { try sync.call() }
+        await startGate.open()
+        await submitting.value
+
+        #expect(try await store.snapshot().records[key]?.threadID == threadID)
+        #expect(await agent.recordedDeleteCalls().isEmpty)
+        #expect(await agent.recordedResumeCalls() == [threadID])
+        #expect(await agent.recordedStartCalls().count == 1)
+        #expect(sync.calls() == 2)
+    }
+
+    @Test("repeated post-rename sync failure stays indeterminate")
+    func repeatedPostRenameSyncFailureNeverAcceptsOrDeletesCandidate() async throws {
+        let fixture = try CodexSessionPersistenceFixture()
+        defer { fixture.remove() }
+        let key = codexTestKey()
+        let threadID = AgentThreadID(rawValue: "post-rename-indeterminate")
+        let turnID = AgentTurnID(rawValue: "post-rename-indeterminate-turn")
+        let store = try FileCodexConversationStore(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        let agent = FakeCodexSessionAgent(threadIDs: [threadID])
+        let startGate = CodexSessionTestGate()
+        await agent.blockStartThread(on: startGate)
+        await agent.enqueueTurn(turnID, for: threadID)
+        let registry = TerminalEndpointRegistry()
+        let journal = CodexSessionJournalSpy()
+        let coordinator = CodexSessionCoordinator(
+            agent: agent,
+            store: store,
+            registry: registry,
+            router: TerminalToolRouter(
+                registry: registry,
+                approvalBroker: TerminalApprovalBroker(),
+                journal: journal
+            ),
+            journal: journal
+        )
+        try await coordinator.registerEndpoint(codexTestEndpoint(
+            key: key,
+            port: FakeTerminalToolPort(
+                snapshot: TerminalToolFixtures.screen(revision: 1)
+            )
+        ))
+
+        let submitting = Task {
+            await coordinator.submit("fail closed", for: key)
+        }
+        try await codexSessionWithDeadline {
+            await agent.waitForCall("startThread")
+        }
+        let sync = CodexSynchronousFailureScript(failures: .max)
+        await store.setPostRenameSyncHookForTesting { try sync.call() }
+        await startGate.open()
+        await submitting.value
+
+        #expect(
+            await coordinator.snapshot()[key]?.phase
+                == .failed(.persistenceUnavailable)
+        )
+        #expect(await agent.recordedDeleteCalls().isEmpty)
+        #expect(await agent.recordedResumeCalls().isEmpty)
+        #expect(await agent.recordedStartCalls().isEmpty)
+        #expect(sync.calls() >= 2)
+    }
+
+    @Test("authoritative reread failure never compensates an unknown winner")
+    func authoritativeRereadFailureNeverDeletesCandidate() async throws {
+        let fixture = try CodexSessionPersistenceFixture()
+        defer { fixture.remove() }
+        let key = codexTestKey()
+        let threadID = AgentThreadID(rawValue: "reread-indeterminate")
+        let turnID = AgentTurnID(rawValue: "reread-indeterminate-turn")
+        let base = try FileCodexConversationStore(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        let store = IndeterminateRereadCodexConversationStore(base: base)
         let agent = FakeCodexSessionAgent(threadIDs: [threadID])
         await agent.enqueueTurn(turnID, for: threadID)
         let registry = TerminalEndpointRegistry()
@@ -627,12 +801,16 @@ struct CodexSessionCoordinatorTests {
             )
         ))
 
-        await coordinator.submit("keep the winner", for: key)
+        await coordinator.submit("preserve unknown winner", for: key)
 
-        #expect(try await store.snapshot().records[key]?.threadID == threadID)
+        #expect(
+            await coordinator.snapshot()[key]?.phase
+                == .failed(.persistenceUnavailable)
+        )
+        #expect(try await base.snapshot().records[key]?.threadID == threadID)
         #expect(await agent.recordedDeleteCalls().isEmpty)
-        #expect(await agent.recordedResumeCalls() == [threadID])
-        #expect(await agent.recordedStartCalls().count == 1)
+        #expect(await agent.recordedResumeCalls().isEmpty)
+        #expect(await agent.recordedStartCalls().isEmpty)
     }
 
     @Test("an already-open coordinator observes another store's deletion")
@@ -2544,6 +2722,214 @@ struct CodexSessionCoordinatorTests {
         await #expect(throws: TerminalToolRouterError.self) {
             try await operation.value
         }
+        await stateProbe.stop()
+    }
+
+    @Test("deletion joins an admitted stop before removing durable state")
+    func deletionJoinsAdmittedStopWithoutLateStateResurrection() async throws {
+        let fixture = try CodexSessionPersistenceFixture()
+        defer { fixture.remove() }
+        let key = codexTestKey()
+        let threadID = AgentThreadID(rawValue: "stop-delete-shared-thread")
+        let turnID = AgentTurnID(rawValue: "stop-delete-shared-turn")
+        let firstDrainGate = CodexSessionTestGate()
+        let calls = CodexSessionCallProbe()
+        let agent = FakeCodexSessionAgent(threadIDs: [threadID])
+        await agent.enqueueTurn(turnID, for: threadID)
+        let store = try FileCodexConversationStore(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        let registry = TerminalEndpointRegistry()
+        let journal = CodexSessionJournalSpy()
+        let coordinator = CodexSessionCoordinator(
+            agent: agent,
+            store: store,
+            registry: registry,
+            router: TerminalToolRouter(
+                registry: registry,
+                approvalBroker: TerminalApprovalBroker(),
+                journal: journal
+            ),
+            journal: journal
+        )
+        await coordinator.setEventConsumerCancellationHookForTesting {
+            await calls.record("event-drain")
+            if await calls.count("event-drain") == 1 {
+                await firstDrainGate.wait()
+            }
+        }
+        try await coordinator.registerEndpoint(codexTestEndpoint(
+            key: key,
+            port: FakeTerminalToolPort(
+                snapshot: TerminalToolFixtures.screen(revision: 1)
+            )
+        ))
+        await coordinator.submit("start", for: key)
+
+        let stopping = Task { await coordinator.stopAndTakeOver(key) }
+        try await codexSessionWithDeadline {
+            await calls.wait(for: "event-drain")
+        }
+        let deleting = Task {
+            do {
+                try await coordinator.deleteConversation(
+                    key,
+                    confirmation: .confirmed
+                )
+                await calls.record("delete-complete")
+            } catch {
+                await calls.record("delete-failed")
+            }
+        }
+
+        var deletionCompletedBeforeAdmittedStop = false
+        do {
+            try await codexSessionWithDeadline(timeout: .milliseconds(100)) {
+                await calls.wait(for: "delete-complete")
+            }
+            deletionCompletedBeforeAdmittedStop = true
+        } catch {}
+        #expect(!deletionCompletedBeforeAdmittedStop)
+
+        await firstDrainGate.open()
+        await stopping.value
+        await deleting.value
+
+        #expect(await calls.count("delete-failed") == 0)
+        #expect(await calls.count("event-drain") == 1)
+        #expect(try await store.snapshot().records[key] == nil)
+        #expect(await coordinator.snapshot()[key] == nil)
+    }
+
+    @Test("stop cancels a router-prepared start before remote turn creation")
+    func stopCancelsStartSuspendedInsideRouterBeginTurn() async throws {
+        let fixture = try CodexSessionPersistenceFixture()
+        defer { fixture.remove() }
+        let key = codexTestKey()
+        let threadID = AgentThreadID(rawValue: "stop-router-prepared-thread")
+        let turnID = AgentTurnID(rawValue: "stop-router-prepared-turn")
+        let preparationGate = TerminalToolTestGate()
+        let drainGate = CodexSessionTestGate()
+        let calls = CodexSessionCallProbe()
+        let agent = FakeCodexSessionAgent(threadIDs: [threadID])
+        await agent.enqueueTurn(turnID, for: threadID)
+        let store = try FileCodexConversationStore(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        let registry = TerminalEndpointRegistry()
+        let journal = CodexSessionJournalSpy()
+        let router = TerminalToolRouter(
+            registry: registry,
+            approvalBroker: TerminalApprovalBroker(),
+            journal: journal
+        )
+        let coordinator = CodexSessionCoordinator(
+            agent: agent,
+            store: store,
+            registry: registry,
+            router: router,
+            journal: journal
+        )
+        await coordinator.setEventConsumerCancellationHookForTesting {
+            await calls.record("event-drain")
+            await drainGate.wait()
+        }
+        let port = FakeTerminalToolPort(
+            snapshot: TerminalToolFixtures.screen(revision: 1)
+        )
+        await port.blockKeyboardOwner(.codex, on: preparationGate)
+        try await coordinator.registerEndpoint(codexTestEndpoint(
+            key: key,
+            port: port
+        ))
+        let stateProbe = CodexSessionStateProbe()
+        await stateProbe.start(await coordinator.states())
+
+        let submitting = Task { await coordinator.submit("start", for: key) }
+        await port.waitForKeyboardOwnerStart(.codex)
+        let stopping = Task { await coordinator.stopAndTakeOver(key) }
+        _ = try await codexSessionWithDeadline {
+            await stateProbe.wait(for: key, phase: .interrupted)
+        }
+
+        await preparationGate.open()
+        await submitting.value
+        #expect(await agent.recordedStartCalls().isEmpty)
+
+        await drainGate.open()
+        await stopping.value
+        #expect(await agent.recordedStartCalls().isEmpty)
+        #expect(await router.testingStateSnapshot().preparedTurnCount == 0)
+        #expect(await coordinator.snapshot()[key]?.phase == .interrupted)
+        await stateProbe.stop()
+    }
+
+    @Test("deletion cancels a router-prepared start before remote turn creation")
+    func deletionCancelsStartSuspendedInsideRouterBeginTurn() async throws {
+        let fixture = try CodexSessionPersistenceFixture()
+        defer { fixture.remove() }
+        let key = codexTestKey()
+        let threadID = AgentThreadID(rawValue: "delete-router-prepared-thread")
+        let turnID = AgentTurnID(rawValue: "delete-router-prepared-turn")
+        let preparationGate = TerminalToolTestGate()
+        let drainGate = CodexSessionTestGate()
+        let calls = CodexSessionCallProbe()
+        let agent = FakeCodexSessionAgent(threadIDs: [threadID])
+        await agent.enqueueTurn(turnID, for: threadID)
+        let store = try FileCodexConversationStore(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        let registry = TerminalEndpointRegistry()
+        let journal = CodexSessionJournalSpy()
+        let router = TerminalToolRouter(
+            registry: registry,
+            approvalBroker: TerminalApprovalBroker(),
+            journal: journal
+        )
+        let coordinator = CodexSessionCoordinator(
+            agent: agent,
+            store: store,
+            registry: registry,
+            router: router,
+            journal: journal
+        )
+        await coordinator.setEventConsumerCancellationHookForTesting {
+            await calls.record("event-drain")
+            await drainGate.wait()
+        }
+        let port = FakeTerminalToolPort(
+            snapshot: TerminalToolFixtures.screen(revision: 1)
+        )
+        await port.blockKeyboardOwner(.codex, on: preparationGate)
+        try await coordinator.registerEndpoint(codexTestEndpoint(
+            key: key,
+            port: port
+        ))
+        let stateProbe = CodexSessionStateProbe()
+        await stateProbe.start(await coordinator.states())
+
+        let submitting = Task { await coordinator.submit("start", for: key) }
+        await port.waitForKeyboardOwnerStart(.codex)
+        let deleting = Task {
+            try await coordinator.deleteConversation(
+                key,
+                confirmation: .confirmed
+            )
+        }
+        _ = try await codexSessionWithDeadline {
+            await stateProbe.wait(for: key, phase: .interrupted)
+        }
+
+        await preparationGate.open()
+        await submitting.value
+        #expect(await agent.recordedStartCalls().isEmpty)
+
+        await drainGate.open()
+        try await deleting.value
+        #expect(await agent.recordedStartCalls().isEmpty)
+        #expect(await router.testingStateSnapshot().preparedTurnCount == 0)
+        #expect(try await store.snapshot().records[key] == nil)
+        #expect(await coordinator.snapshot()[key] == nil)
         await stateProbe.stop()
     }
 

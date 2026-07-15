@@ -46,6 +46,36 @@ enum CodexSessionStoreFailure: Error {
     case injected
 }
 
+final class CodexSynchronousFailureScript: @unchecked Sendable {
+    private let lock = NSLock()
+    private var remainingFailures: Int
+    private var callCount = 0
+
+    init(failures: Int) {
+        remainingFailures = failures
+    }
+
+    func call() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        callCount += 1
+        if remainingFailures > 0 {
+            remainingFailures -= 1
+            throw CodexConversationStoreError.posixFailure(
+                operation: "fsync",
+                path: "CodexConversations",
+                code: 5
+            )
+        }
+    }
+
+    func calls() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return callCount
+    }
+}
+
 enum CodexSessionStoreMutationKind: Hashable, Sendable {
     case insertIfAbsent
     case recordOrphan
@@ -68,6 +98,10 @@ actor FaultInjectingCodexConversationStore: CodexConversationStoring {
 
     func snapshot() async throws -> CodexConversationStoreSnapshot {
         try await base.snapshot()
+    }
+
+    func recoverDurableSnapshot() async throws -> CodexConversationStoreSnapshot {
+        try await base.recoverDurableSnapshot()
     }
 
     func apply(
@@ -103,6 +137,37 @@ actor FaultInjectingCodexConversationStore: CodexConversationStoring {
         default:
             nil
         }
+    }
+}
+
+actor IndeterminateRereadCodexConversationStore: CodexConversationStoring {
+    private let base: any CodexConversationStoring
+    private var didPersist = false
+
+    init(base: any CodexConversationStoring) {
+        self.base = base
+    }
+
+    func snapshot() async throws -> CodexConversationStoreSnapshot {
+        guard !didPersist else { throw CodexSessionStoreFailure.injected }
+        return try await base.snapshot()
+    }
+
+    func recoverDurableSnapshot() async throws -> CodexConversationStoreSnapshot {
+        guard !didPersist else { throw CodexSessionStoreFailure.injected }
+        return try await base.recoverDurableSnapshot()
+    }
+
+    func apply(
+        _ mutation: CodexConversationStoreMutation
+    ) async throws -> CodexConversationStoreSnapshot {
+        _ = try await base.apply(mutation)
+        didPersist = true
+        throw CodexConversationStoreError.posixFailure(
+            operation: "fsync",
+            path: "CodexConversations",
+            code: 5
+        )
     }
 }
 

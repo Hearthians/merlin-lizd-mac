@@ -492,11 +492,11 @@ public actor CodexAppServerAdapter: CodexAgentClient {
     ) -> AsyncStream<AgentEventDelivery> {
         let id = UUID()
         let pair = AsyncStream<AgentEventDelivery>.makeStream(
-            bufferingPolicy: .bufferingNewest(Self.eventReplayLimit)
+            bufferingPolicy: .bufferingNewest(1)
         )
         let replay = eventReplay[threadID] ?? []
-        if let sequence, let oldest = replay.first?.sequence,
-            oldest > sequence &+ 1
+        if let oldest = replay.first?.sequence,
+            sequence.map { oldest > $0 &+ 1 } ?? (oldest > 1)
         {
             _ = pair.continuation.yield(.replayGap(
                 after: sequence,
@@ -505,9 +505,11 @@ public actor CodexAppServerAdapter: CodexAgentClient {
             pair.continuation.finish()
             return pair.stream
         }
-        for record in replay {
-            if let sequence, record.sequence <= sequence { continue }
-            guard case .enqueued = pair.continuation.yield(.event(record)) else {
+        let retained = replay.filter { record in
+            sequence.map { record.sequence > $0 } ?? true
+        }
+        if !retained.isEmpty {
+            guard case .enqueued = pair.continuation.yield(.events(retained)) else {
                 pair.continuation.finish()
                 return pair.stream
             }
@@ -1493,10 +1495,13 @@ public actor CodexAppServerAdapter: CodexAgentClient {
             switch continuation.yield(.event(record)) {
             case .enqueued:
                 continue
-            case .dropped:
+            case let .dropped(dropped):
+                let firstMissing = firstSequence(in: dropped)
+                    ?? record.sequence
+                let oldestRetained = replay.first?.sequence ?? firstMissing
                 _ = continuation.yield(.replayGap(
-                    after: record.sequence &- 1,
-                    oldestAvailable: record.sequence
+                    after: firstMissing == 0 ? nil : firstMissing - 1,
+                    oldestAvailable: max(firstMissing, oldestRetained)
                 ))
                 continuation.finish()
                 removeEventContinuation(id, for: threadID)
@@ -1507,6 +1512,17 @@ public actor CodexAppServerAdapter: CodexAgentClient {
                 continuation.finish()
                 removeEventContinuation(id, for: threadID)
             }
+        }
+    }
+
+    private func firstSequence(in delivery: AgentEventDelivery) -> UInt64? {
+        switch delivery {
+        case let .event(record):
+            record.sequence
+        case let .events(records):
+            records.first?.sequence
+        case .replayGap:
+            nil
         }
     }
 

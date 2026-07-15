@@ -55,6 +55,7 @@ public struct AgentEventRecord: Equatable, Sendable {
 
 public enum AgentEventDelivery: Equatable, Sendable {
     case event(AgentEventRecord)
+    case events([AgentEventRecord])
     case replayGap(after: UInt64?, oldestAvailable: UInt64)
 }
 

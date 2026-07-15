@@ -366,7 +366,7 @@ struct CodexAppServerContractTests {
         )))
         await freshProcess.waitForWriteCount(3)
         await freshProcess.emit(.standardOutput(jsonLine(
-            #"{"id":2,"error":{"code":-32600,"message":"thread not loaded"}}"#
+            #"{"id":2,"error":{"code":-32600,"message":"thread not loaded: thread-1"}}"#
         )))
         try await retrying.value
 
@@ -2994,7 +2994,7 @@ struct CodexAppServerContractTests {
         await adapter.shutdown()
     }
 
-    @Test("slow streams stay bounded and require resubscription after event loss")
+    @Test("slow live streams expose one gap before buffered post-gap records")
     func streamsAreBoundedAndResynchronizable() async throws {
         let process = ScriptedAppServerProcess()
         let adapter = CodexAppServerAdapter(
@@ -3026,6 +3026,18 @@ struct CodexAppServerContractTests {
         #expect(await adapter.stateCountsForTesting.eventSubscribers == 0)
         #expect(await adapter.stateCountsForTesting.replayEvents == 512)
 
+        var slowIterator = slow.makeAsyncIterator()
+        guard case let .replayGap(liveAfter, liveOldest)? =
+            await slowIterator.next()
+        else {
+            Issue.record("slow subscriber consumed a post-gap record first")
+            await adapter.shutdown()
+            return
+        }
+        #expect(liveAfter == 0)
+        #expect(liveOldest == 1)
+        #expect(await slowIterator.next() == nil)
+
         let exhausted = await adapter.events(for: threadID, after: 0)
         var exhaustedIterator = exhausted.makeAsyncIterator()
         guard case let .replayGap(after, oldestAvailable)? =
@@ -3039,15 +3051,70 @@ struct CodexAppServerContractTests {
         #expect(oldestAvailable > 1)
         #expect(await exhaustedIterator.next() == nil)
 
-        let replacement = await adapter.events(for: threadID, after: nil)
+        let replacement = await adapter.events(
+            for: threadID,
+            after: oldestAvailable &- 1
+        )
         var iterator = replacement.makeAsyncIterator()
-        #expect(await iterator.next() != nil)
+        guard case let .events(records)? = await iterator.next(),
+            let firstRecord = records.first
+        else {
+            Issue.record("expected retained replay after the exact cursor")
+            await adapter.shutdown()
+            return
+        }
+        #expect(firstRecord.sequence == oldestAvailable)
+        #expect(records.count == 512)
+        #expect(records.last?.sequence == firstRecord.sequence + 511)
         #expect(await adapter.stateCountsForTesting.eventSubscribers == 1)
 
         let availability = await adapter.availability()
         await adapter.consumerFailedForTesting()
         var availabilityIterator = availability.makeAsyncIterator()
         #expect(await availabilityIterator.next() == .crashed)
+        await adapter.shutdown()
+    }
+
+    @Test("nil event cursors report truncated replay before any record")
+    func nilCursorReportsTruncatedReplayFirst() async throws {
+        let process = ScriptedAppServerProcess()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor()
+        )
+        let threadID = try await startMappedThread(adapter: adapter, process: process)
+        let turnID = try await startMappedTurn(
+            adapter: adapter,
+            process: process,
+            threadID: threadID,
+            turnID: "nil-cursor-turn",
+            requestID: 3,
+            writeCount: 4
+        )
+        for index in 0..<600 {
+            await adapter.handleNotificationForTesting(
+                method: "item/agentMessage/delta",
+                params: .object([
+                    "threadId": .string(threadID.rawValue),
+                    "turnId": .string(turnID.rawValue),
+                    "delta": .string("\(index)"),
+                ])
+            )
+        }
+
+        let stream = await adapter.events(for: threadID, after: nil)
+        var iterator = stream.makeAsyncIterator()
+        guard case let .replayGap(after, oldestAvailable)? =
+            await iterator.next()
+        else {
+            Issue.record("nil cursor silently started in truncated replay")
+            await adapter.shutdown()
+            return
+        }
+        #expect(after == nil)
+        #expect(oldestAvailable > 1)
+        #expect(await iterator.next() == nil)
         await adapter.shutdown()
     }
 }

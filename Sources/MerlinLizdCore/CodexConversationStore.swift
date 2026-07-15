@@ -222,6 +222,9 @@ public enum CodexConversationStoreMutation: Sendable {
 
 public protocol CodexConversationStoring: Sendable {
     func snapshot() async throws -> CodexConversationStoreSnapshot
+    /// Exclusively rereads the authoritative envelope and makes any observed
+    /// rename durable before returning it to a lifecycle decision.
+    func recoverDurableSnapshot() async throws -> CodexConversationStoreSnapshot
     func apply(
         _ mutation: CodexConversationStoreMutation
     ) async throws -> CodexConversationStoreSnapshot
@@ -353,6 +356,23 @@ public actor FileCodexConversationStore: CodexConversationStoring {
         )
         try Self.reduce(mutation, into: &latest)
         try persist(latest)
+        state = latest
+        return latest
+    }
+
+    public func recoverDurableSnapshot() throws -> CodexConversationStoreSnapshot {
+        try Self.lock(
+            lockDescriptor,
+            operation: LOCK_EX,
+            path: rootDirectory.appendingPathComponent(Self.lockName).path
+        )
+        defer { flock(lockDescriptor, LOCK_UN) }
+        let latest = try Self.readEnvelope(
+            rootDescriptor: rootDescriptor,
+            root: rootDirectory,
+            decoder: decoder
+        )
+        try syncRootDirectory()
         state = latest
         return latest
     }
@@ -560,6 +580,10 @@ public actor FileCodexConversationStore: CodexConversationStoring {
             throw Self.posixError("renameat", storeURL.path)
         }
         shouldRemove = false
+        try syncRootDirectory()
+    }
+
+    private func syncRootDirectory() throws {
         try postRenameSyncHookForTesting?()
         guard fsync(rootDescriptor) == 0 else {
             throw Self.posixError("fsync", rootDirectory.path)
