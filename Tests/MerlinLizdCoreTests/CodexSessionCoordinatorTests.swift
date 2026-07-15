@@ -603,6 +603,83 @@ struct CodexSessionCoordinatorTests {
         #expect(await agent.recordedCallCount("shutdown") == 1)
     }
 
+    @Test("canceled shutdown registers one resistant exact termination drain")
+    func canceledShutdownDoesNotSpinOnTerminationOwner() async throws {
+        let fixture = try CodexSessionPersistenceFixture()
+        defer { fixture.remove() }
+        let key = codexTestKey()
+        let threadID = AgentThreadID(rawValue: "canceled-shutdown-thread")
+        let turnID = AgentTurnID(rawValue: "canceled-shutdown-turn")
+        let terminationGate = CodexSessionTestGate()
+        let calls = CodexSessionCallProbe()
+        let agent = FakeCodexSessionAgent(threadIDs: [threadID])
+        await agent.enqueueTurn(turnID, for: threadID)
+        let store = try FileCodexConversationStore(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        let registry = TerminalEndpointRegistry()
+        let journal = CodexSessionJournalSpy()
+        let router = TerminalToolRouter(
+            registry: registry,
+            approvalBroker: TerminalApprovalBroker(),
+            journal: journal
+        )
+        let coordinator = CodexSessionCoordinator(
+            agent: agent,
+            store: store,
+            registry: registry,
+            router: router,
+            journal: journal
+        )
+        await coordinator.setTerminationWaitHookForTesting {
+            await calls.record("termination-wait")
+        }
+        try await coordinator.registerEndpoint(codexTestEndpoint(
+            key: key,
+            port: FakeTerminalToolPort(
+                snapshot: TerminalToolFixtures.screen(revision: 1)
+            )
+        ))
+        await coordinator.submit("first", for: key)
+        await agent.setFailure(.steer)
+        await router.setTurnTerminationHookForTesting {
+            await calls.record("steer-terminating")
+            await terminationGate.wait()
+        }
+
+        let steering = Task { await coordinator.submit("fails", for: key) }
+        try await codexSessionWithDeadline {
+            await calls.wait(for: "steer-terminating")
+        }
+        let shutdown = Task {
+            await coordinator.shutdown()
+            await calls.record("shutdown-complete")
+        }
+        shutdown.cancel()
+
+        try await codexSessionWithDeadline {
+            while true {
+                let state = await coordinator.terminationStateForTesting()
+                let waitCalls = await calls.count("termination-wait")
+                if state.waiterCount == 1
+                    || waitCalls >= 2
+                {
+                    return
+                }
+                await Task.yield()
+            }
+        }
+        #expect(await calls.count("termination-wait") == 1)
+        #expect(await coordinator.terminationStateForTesting().waiterCount == 1)
+        #expect(await calls.count("shutdown-complete") == 0)
+
+        await terminationGate.open()
+        await steering.value
+        await shutdown.value
+        #expect(await calls.count("shutdown-complete") == 1)
+        #expect(await agent.recordedCallCount("shutdown") == 1)
+    }
+
     @Test("Stop and shutdown join the exact suspended steer termination")
     func stopAndShutdownDrainExactSteerTerminationOwner() async throws {
         let fixture = try CodexSessionPersistenceFixture()
@@ -716,6 +793,9 @@ struct CodexSessionCoordinatorTests {
             router: router,
             journal: journal
         )
+        await coordinator.setTerminationWaitHookForTesting {
+            await calls.record("termination-wait")
+        }
         try await coordinator.registerEndpoint(codexTestEndpoint(
             key: key,
             port: FakeTerminalToolPort(
@@ -745,14 +825,10 @@ struct CodexSessionCoordinatorTests {
             }
         }
 
-        var remoteDeleteStartedBeforeTermination = false
-        do {
-            try await codexSessionWithDeadline(timeout: .milliseconds(150)) {
-                await agent.waitForCall("delete:\(threadID.rawValue)")
-            }
-            remoteDeleteStartedBeforeTermination = true
-        } catch {}
-        #expect(!remoteDeleteStartedBeforeTermination)
+        try await codexSessionWithDeadline {
+            await calls.wait(for: "termination-wait")
+        }
+        #expect(await agent.recordedDeleteCalls().isEmpty)
 
         await terminationGate.open()
         await steering.value
@@ -2538,6 +2614,255 @@ struct CodexSessionCoordinatorTests {
         #expect(snapshot.states[key]?.pendingApprovals.isEmpty == true)
     }
 
+    @Test("two activity iterators wait independently and cancel one exact pull")
+    func concurrentActivityIteratorsOwnExactWaiters() async throws {
+        let fixture = try CodexSessionPersistenceFixture()
+        defer { fixture.remove() }
+        let store = try FileCodexConversationStore(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        let registry = TerminalEndpointRegistry()
+        let journal = CodexSessionJournalSpy()
+        let coordinator = CodexSessionCoordinator(
+            agent: FakeCodexSessionAgent(threadIDs: []),
+            store: store,
+            registry: registry,
+            router: TerminalToolRouter(
+                registry: registry,
+                approvalBroker: TerminalApprovalBroker(),
+                journal: journal
+            ),
+            journal: journal
+        )
+        let stream = await coordinator.activityEvents(after: 0)
+        let first = Task {
+            var iterator = stream.makeAsyncIterator()
+            return await iterator.next()
+        }
+        let second = Task {
+            var iterator = stream.makeAsyncIterator()
+            return await iterator.next()
+        }
+        try await codexSessionWithDeadline {
+            while await coordinator.activityHistoryForTesting().waiterCount != 2 {
+                await Task.yield()
+            }
+        }
+
+        first.cancel()
+        #expect(await first.value == nil)
+        try await codexSessionWithDeadline {
+            while await coordinator.activityHistoryForTesting().waiterCount != 1 {
+                await Task.yield()
+            }
+        }
+        #expect(
+            await coordinator.activityHistoryForTesting().subscriberCount == 1
+        )
+
+        await coordinator.shutdown()
+        #expect(try await codexSessionWithDeadline { await second.value } == nil)
+        let final = await coordinator.activityHistoryForTesting()
+        #expect(final.subscriberCount == 0)
+        #expect(final.waiterCount == 0)
+    }
+
+    @Test("activity stream deinit owns drop, early break, and late cleanup")
+    func activityStreamLifetimeIsExplicitAndIdempotent() async throws {
+        let fixture = try CodexSessionPersistenceFixture()
+        defer { fixture.remove() }
+        let store = try FileCodexConversationStore(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        let registry = TerminalEndpointRegistry()
+        let journal = CodexSessionJournalSpy()
+        let coordinator = CodexSessionCoordinator(
+            agent: FakeCodexSessionAgent(threadIDs: []),
+            store: store,
+            registry: registry,
+            router: TerminalToolRouter(
+                registry: registry,
+                approvalBroker: TerminalApprovalBroker(),
+                journal: journal
+            ),
+            journal: journal
+        )
+
+        do {
+            let stream = await coordinator.activityEvents(after: 0)
+            #expect(
+                await coordinator.activityHistoryForTesting().subscriberCount == 1
+            )
+            _ = stream
+        }
+        try await codexSessionWithDeadline {
+            while await coordinator.activityHistoryForTesting().subscriberCount != 0 {
+                await Task.yield()
+            }
+        }
+
+        func consumeInitialReconciliation() async {
+            let stream = await coordinator.activityEvents()
+            for await _ in stream { break }
+        }
+        await consumeInitialReconciliation()
+        try await codexSessionWithDeadline {
+            while await coordinator.activityHistoryForTesting().subscriberCount != 0 {
+                await Task.yield()
+            }
+        }
+
+        var retained: AsyncStream<CodexSessionActivityEvent>? = await coordinator
+            .activityEvents(after: 0)
+        #expect(
+            await coordinator.activityHistoryForTesting().subscriberCount == 1
+        )
+        await coordinator.shutdown()
+        retained = nil
+        _ = retained
+        for _ in 0..<20 { await Task.yield() }
+        let final = await coordinator.activityHistoryForTesting()
+        #expect(final.subscriberCount == 0)
+        #expect(final.waiterCount == 0)
+    }
+
+    @Test("maximum activity cursor ends without a lower reconciliation revision")
+    func maximumActivityCursorEndsFailClosed() async throws {
+        let fixture = try CodexSessionPersistenceFixture()
+        defer { fixture.remove() }
+        let store = try FileCodexConversationStore(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        let registry = TerminalEndpointRegistry()
+        let journal = CodexSessionJournalSpy()
+        let coordinator = CodexSessionCoordinator(
+            agent: FakeCodexSessionAgent(threadIDs: []),
+            store: store,
+            registry: registry,
+            router: TerminalToolRouter(
+                registry: registry,
+                approvalBroker: TerminalApprovalBroker(),
+                journal: journal
+            ),
+            journal: journal
+        )
+        let stream = await coordinator.activityEvents(after: UInt64.max)
+        let ending = Task {
+            var iterator = stream.makeAsyncIterator()
+            return await iterator.next()
+        }
+        let ended: CodexSessionActivityEvent?
+        do {
+            ended = try await codexSessionWithDeadline { await ending.value }
+        } catch {
+            ending.cancel()
+            _ = await ending.value
+            throw error
+        }
+        #expect(ended == nil)
+        let state = await coordinator.activityHistoryForTesting()
+        #expect(state.subscriberCount == 0)
+        #expect(state.revision == 0)
+        await coordinator.shutdown()
+    }
+
+    @Test("activity publisher reaches UInt64.max then reconciles and ends")
+    func activityPublisherExhaustionIsTerminal() async throws {
+        let fixture = try CodexSessionPersistenceFixture()
+        defer { fixture.remove() }
+        let key = codexTestKey()
+        let threadID = AgentThreadID(rawValue: "activity-counter-thread")
+        let turnID = AgentTurnID(rawValue: "activity-counter-turn")
+        let agent = FakeCodexSessionAgent(threadIDs: [threadID])
+        await agent.enqueueTurn(turnID, for: threadID)
+        let store = try FileCodexConversationStore(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        let registry = TerminalEndpointRegistry()
+        let journal = CodexSessionJournalSpy()
+        let router = TerminalToolRouter(
+            registry: registry,
+            approvalBroker: TerminalApprovalBroker(),
+            journal: journal
+        )
+        let coordinator = CodexSessionCoordinator(
+            agent: agent,
+            store: store,
+            registry: registry,
+            router: router,
+            journal: journal
+        )
+        try await coordinator.registerEndpoint(codexTestEndpoint(
+            key: key,
+            port: FakeTerminalToolPort(
+                snapshot: TerminalToolFixtures.screen(revision: 9)
+            )
+        ))
+        await coordinator.submit("start", for: key)
+        await coordinator.setActivityRevisionForTesting(UInt64.max - 1)
+        let stream = await coordinator.activityEvents(after: UInt64.max - 1)
+        let operation = Task {
+            try await router.execute(
+                threadID: threadID,
+                turnID: turnID,
+                call: .sendInput(TerminalToolFixtures.input(
+                    revision: 9,
+                    text: "sudo reboot",
+                    purpose: "exhaust",
+                    risk: .high
+                ))
+            )
+        }
+        let approval = try await codexSessionWithDeadline {
+            while true {
+                if let approval = await router.activitySnapshot()
+                    .approvals.values.first
+                {
+                    return approval
+                }
+                await Task.yield()
+            }
+        }
+        #expect(await router.denyApproval(approval.request.id))
+        await #expect(throws: TerminalToolRouterError.self) {
+            try await operation.value
+        }
+
+        let consuming = Task {
+            var iterator = stream.makeAsyncIterator()
+            return (
+                await iterator.next(),
+                await iterator.next(),
+                await iterator.next()
+            )
+        }
+        let events: (
+            CodexSessionActivityEvent?,
+            CodexSessionActivityEvent?,
+            CodexSessionActivityEvent?
+        )
+        do {
+            events = try await codexSessionWithDeadline { await consuming.value }
+        } catch {
+            consuming.cancel()
+            _ = await consuming.value
+            throw error
+        }
+        guard case .approvalRequested(key, approval.request, UInt64.max)? = events.0,
+            case let .transitionHistoryGap(snapshot)? = events.1
+        else {
+            Issue.record("counter exhaustion did not reconcile at UInt64.max")
+            return
+        }
+        #expect(snapshot.revision == UInt64.max)
+        #expect(snapshot.states[key]?.pendingApprovals.isEmpty == true)
+        #expect(events.2 == nil)
+        let history = await coordinator.activityHistoryForTesting()
+        #expect(history.revision == UInt64.max)
+        #expect(history.subscriberCount == 0)
+        await coordinator.shutdown()
+    }
+
     @Test("archive preserves identity and journal while staged delete retries locally")
     func archiveAndRetryableDeletionReconcile() async throws {
         let fixture = try CodexSessionPersistenceFixture()
@@ -3579,6 +3904,56 @@ struct CodexSessionCoordinatorTests {
         await coordinator.submit("resume after EOF", for: key)
         #expect(await agent.recordedResumeCalls() == [threadID, threadID])
         #expect(await coordinator.snapshot()[key]?.activeTurnID == replacementTurn)
+        await probe.stop()
+    }
+
+    @Test("crash terminal event survives the following owned stream end")
+    func crashTerminalStateIsNotOverwrittenByEOF() async throws {
+        let fixture = try CodexSessionPersistenceFixture()
+        defer { fixture.remove() }
+        let key = codexTestKey()
+        let threadID = AgentThreadID(rawValue: "crash-terminal-thread")
+        let turnID = AgentTurnID(rawValue: "crash-terminal-turn")
+        let agent = FakeCodexSessionAgent(threadIDs: [threadID])
+        await agent.enqueueTurn(turnID, for: threadID)
+        let store = try FileCodexConversationStore(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        let registry = TerminalEndpointRegistry()
+        let journal = CodexSessionJournalSpy()
+        let router = TerminalToolRouter(
+            registry: registry,
+            approvalBroker: TerminalApprovalBroker(),
+            journal: journal
+        )
+        let coordinator = CodexSessionCoordinator(
+            agent: agent,
+            store: store,
+            registry: registry,
+            router: router,
+            journal: journal
+        )
+        try await coordinator.registerEndpoint(codexTestEndpoint(
+            key: key,
+            port: FakeTerminalToolPort(
+                snapshot: TerminalToolFixtures.screen(revision: 1)
+            )
+        ))
+        await coordinator.submit("start", for: key)
+        let probe = CodexSessionStateProbe()
+        await probe.start(await coordinator.states())
+
+        await agent.emit(.turnFailed(turnID, .crashed), for: threadID)
+        await agent.finishEvents(for: threadID)
+        _ = try await codexSessionWithDeadline {
+            await probe.wait(for: key, phase: .failed(.crashed))
+        }
+        for _ in 0..<50 { await Task.yield() }
+
+        #expect(await coordinator.snapshot()[key]?.phase == .failed(.crashed))
+        #expect(await coordinator.snapshot()[key]?.activeTurnID == nil)
+        #expect(await router.testingStateSnapshot().turnLifecycleCount == 0)
+        #expect(await agent.recordedInterruptCalls().isEmpty)
         await probe.stop()
     }
 

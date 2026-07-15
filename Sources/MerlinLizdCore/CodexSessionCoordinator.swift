@@ -1,5 +1,26 @@
 import Foundation
 
+private final class CodexActivitySubscriptionLifetime: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancellation: (@Sendable () -> Void)?
+
+    init(cancellation: @escaping @Sendable () -> Void) {
+        self.cancellation = cancellation
+    }
+
+    func keepAlive() {}
+
+    func cancel() {
+        lock.lock()
+        let cancellation = self.cancellation
+        self.cancellation = nil
+        lock.unlock()
+        cancellation?()
+    }
+
+    deinit { cancel() }
+}
+
 public enum CodexConversationDeletionConfirmation: Sendable {
     case confirmed
 }
@@ -61,7 +82,8 @@ public actor CodexSessionCoordinator {
     private struct ActivitySubscriber {
         var cursor: UInt64
         var needsInitialReconciliation: Bool
-        var waiter: CheckedContinuation<Void, Never>?
+        var deliveredCounterExhaustion: Bool
+        var waiters: [UUID: CheckedContinuation<Void, Never>]
     }
 
     private static let stateStreamCapacity = 1
@@ -82,6 +104,7 @@ public actor CodexSessionCoordinator {
     private var pendingStarts: [TerminalConversationKey: PendingStart] = [:]
     private var resumedThreads: Set<AgentThreadID> = []
     private var eventConsumers: [AgentThreadID: EventConsumer] = [:]
+    private var terminalEventConsumerIDs: Set<UUID> = []
     private var threadOwners: [AgentThreadID: TerminalConversationKey] = [:]
     private var pendingTerminalEvents: [AgentThreadID: AgentEvent] = [:]
     private var lastAgentEventSequences: [AgentThreadID: UInt64] = [:]
@@ -133,6 +156,7 @@ public actor CodexSessionCoordinator {
     private var activitySubscribers: [UUID: ActivitySubscriber] = [:]
     private var activityRevision: UInt64 = 0
     private var activityTransitions: [CodexSessionActivityEvent] = []
+    private var activityCounterExhausted = false
     private var registryEventHook: (
         @Sendable (TerminalEndpointRegistryEvent) async -> Void
     )?
@@ -372,6 +396,22 @@ public actor CodexSessionCoordinator {
         }
     }
 
+    private func drainTermination(
+        of key: TerminalConversationKey
+    ) async {
+        guard let operation = terminationOperations[key] else { return }
+        await terminationWaitHook?()
+        let waiterID = UUID()
+        await withCheckedContinuation { continuation in
+            guard terminationOperations[key]?.id == operation.id else {
+                continuation.resume()
+                return
+            }
+            terminationWaiters[operation.id, default: [:]][waiterID]
+                = continuation
+        }
+    }
+
     private func cancelTerminationWaiter(
         operationID: UUID,
         waiterID: UUID
@@ -458,7 +498,7 @@ public actor CodexSessionCoordinator {
     private func performStopAndTakeOver(
         _ key: TerminalConversationKey
     ) async {
-        await waitForTermination(of: key)
+        await drainTermination(of: key)
         let active = activeTurns.removeValue(forKey: key)
         let termination = active.map { _ in beginTermination(of: key) }
         defer {
@@ -759,16 +799,19 @@ public actor CodexSessionCoordinator {
         activitySubscribers[id] = ActivitySubscriber(
             cursor: revision ?? activityRevision,
             needsInitialReconciliation: revision == nil,
-            waiter: nil
+            deliveredCounterExhaustion: false,
+            waiters: [:]
         )
-        return AsyncStream(
-            unfolding: { [weak self] in
-                await self?.nextActivityEvent(subscriberID: id)
-            },
-            onCancel: { [weak self] in
-                Task { await self?.cancelActivitySubscriber(id) }
-            }
-        )
+        let lifetime = CodexActivitySubscriptionLifetime { [weak self] in
+            Task { await self?.cancelActivitySubscriber(id) }
+        }
+        return AsyncStream(unfolding: { [weak self, lifetime] in
+            lifetime.keepAlive()
+            return await self?.nextActivityEvent(
+                subscriberID: id,
+                waiterID: UUID()
+            )
+        })
     }
 
     public func snapshot() -> [TerminalConversationKey: CodexSessionState] {
@@ -810,9 +853,32 @@ public actor CodexSessionCoordinator {
     func activityHistoryForTesting() -> (
         revision: UInt64,
         count: Int,
-        limit: Int
+        limit: Int,
+        subscriberCount: Int,
+        waiterCount: Int
     ) {
-        (activityRevision, activityTransitions.count, Self.activityTransitionLimit)
+        (
+            activityRevision,
+            activityTransitions.count,
+            Self.activityTransitionLimit,
+            activitySubscribers.count,
+            activitySubscribers.values.reduce(0) { $0 + $1.waiters.count }
+        )
+    }
+
+    func terminationStateForTesting() -> (
+        operationCount: Int,
+        waiterCount: Int
+    ) {
+        (
+            terminationOperations.count,
+            terminationWaiters.values.reduce(0) { $0 + $1.count }
+        )
+    }
+
+    func setActivityRevisionForTesting(_ revision: UInt64) {
+        activityRevision = revision
+        activityCounterExhausted = false
     }
 
     func routerActivityStateForTesting() -> (
@@ -842,7 +908,7 @@ public actor CodexSessionCoordinator {
         }
 
         while let key = terminationOperations.keys.first {
-            await waitForTermination(of: key)
+            await drainTermination(of: key)
         }
         let active = activeTurns
         activeTurns.removeAll()
@@ -895,6 +961,7 @@ public actor CodexSessionCoordinator {
         restorationTask = nil
         let consumers = Array(eventConsumers.values)
         eventConsumers.removeAll()
+        terminalEventConsumerIDs.removeAll()
         for consumer in consumers { consumer.task.cancel() }
         if let registrySubscriberID {
             await registry.cancelSubscription(registrySubscriberID)
@@ -924,13 +991,15 @@ public actor CodexSessionCoordinator {
         }
         if let restoration { _ = try? await restoration.value }
         while let key = terminationOperations.keys.first {
-            await waitForTermination(of: key)
+            await drainTermination(of: key)
         }
         stateSubscribers.values.forEach {
             $0.onTermination = nil
             $0.finish()
         }
-        let activityWaiters = activitySubscribers.values.compactMap(\.waiter)
+        let activityWaiters = activitySubscribers.values.flatMap {
+            $0.waiters.values
+        }
         stateSubscribers.removeAll()
         activitySubscribers.removeAll()
         activityWaiters.forEach { $0.resume() }
@@ -1437,6 +1506,7 @@ public actor CodexSessionCoordinator {
         guard let consumer = eventConsumers.removeValue(
             forKey: threadID
         ) else { return }
+        terminalEventConsumerIDs.remove(consumer.id)
         await eventConsumerCancellationHook?()
         consumer.task.cancel()
         await consumer.task.value
@@ -1455,11 +1525,16 @@ public actor CodexSessionCoordinator {
         _ = reason
         guard eventConsumers[threadID]?.id == id else { return }
         eventConsumers.removeValue(forKey: threadID)
+        let reducedTerminal = terminalEventConsumerIDs.remove(id) != nil
         guard !isShuttingDown,
             let key = threadOwners.removeValue(forKey: threadID),
             !stoppingKeys.contains(key),
             !deletingKeys.contains(key)
         else { return }
+        if reducedTerminal {
+            resumedThreads.remove(threadID)
+            return
+        }
         pendingStarts[key]?.task.cancel()
         if let active = activeTurns.removeValue(forKey: key) {
             let termination = beginTermination(of: key)
@@ -1497,8 +1572,9 @@ public actor CodexSessionCoordinator {
             !deletingKeys.contains(key)
         else { return true }
         if let previous = lastAgentEventSequences[threadID] {
+            guard previous < UInt64.max else { return false }
             if record.sequence <= previous { return true }
-            guard record.sequence == previous &+ 1 else { return false }
+            guard record.sequence == previous + 1 else { return false }
         }
         lastAgentEventSequences[threadID] = record.sequence
         await consumeEvent(
@@ -1570,6 +1646,8 @@ public actor CodexSessionCoordinator {
                 }
                 return
             }
+            let ownsCrashTerminal = failure == .crashed
+                && (turnID == nil || activeTurns[key]?.turnID == turnID)
             let phase: CodexSessionPhase = failure == .interrupted
                 ? .interrupted
                 : .failed(mapFailure(failure))
@@ -1579,6 +1657,9 @@ public actor CodexSessionCoordinator {
                 phase: phase,
                 termination: failure == .crashed ? .crash : .interrupt
             )
+            if ownsCrashTerminal {
+                terminalEventConsumerIDs.insert(consumerID)
+            }
         }
     }
 
@@ -1733,7 +1814,9 @@ public actor CodexSessionCoordinator {
     ) async {
         await routerActivityEventHook?(event)
         guard event.revision > routerActivityRevision else { return }
-        guard event.revision == routerActivityRevision &+ 1 else {
+        guard let expectedRevision = checkedSuccessor(
+            after: routerActivityRevision
+        ), event.revision == expectedRevision else {
             await reconcileRouterActivity(after: routerActivityRevision)
             return
         }
@@ -1747,7 +1830,9 @@ public actor CodexSessionCoordinator {
     private func applyRouterActivityTransition(
         _ event: TerminalToolActivityEvent
     ) {
-        guard event.revision == routerActivityRevision &+ 1 else { return }
+        guard let expectedRevision = checkedSuccessor(
+            after: routerActivityRevision
+        ), event.revision == expectedRevision else { return }
         routerActivityRevision = event.revision
         switch event {
         case let .operationUpserted(activity, _):
@@ -1803,7 +1888,9 @@ public actor CodexSessionCoordinator {
             guard snapshot.revision >= routerActivityRevision else { return }
             for event in transitions {
                 if event.revision <= routerActivityRevision { continue }
-                guard event.revision == routerActivityRevision &+ 1 else {
+                guard let expectedRevision = checkedSuccessor(
+                    after: routerActivityRevision
+                ), event.revision == expectedRevision else {
                     publishActivityHistoryGap()
                     reconcileRouterActivity(snapshot)
                     return
@@ -1821,6 +1908,11 @@ public actor CodexSessionCoordinator {
             }
             reconcileRouterActivity(snapshot)
         }
+    }
+
+    private func checkedSuccessor(after revision: UInt64) -> UInt64? {
+        guard revision < UInt64.max else { return nil }
+        return revision + 1
     }
 
     private func reconcileRouterActivity(
@@ -2122,13 +2214,23 @@ public actor CodexSessionCoordinator {
     }
 
     private func cancelActivitySubscriber(_ id: UUID) {
-        activitySubscribers.removeValue(forKey: id)?.waiter?.resume()
+        let waiters = activitySubscribers
+            .removeValue(forKey: id)?.waiters.values ?? [:].values
+        waiters.forEach { $0.resume() }
     }
 
     private func nextActivityEvent(
-        subscriberID: UUID
+        subscriberID: UUID,
+        waiterID: UUID
     ) async -> CodexSessionActivityEvent? {
-        while !Task.isCancelled {
+        while true {
+            guard !Task.isCancelled else {
+                cancelActivityWaiter(
+                    subscriberID: subscriberID,
+                    waiterID: waiterID
+                )
+                return nil
+            }
             guard var subscriber = activitySubscribers[subscriberID] else {
                 return nil
             }
@@ -2136,15 +2238,24 @@ public actor CodexSessionCoordinator {
                 let snapshot = activitySnapshot()
                 subscriber.cursor = snapshot.revision
                 subscriber.needsInitialReconciliation = false
+                subscriber.deliveredCounterExhaustion =
+                    activityCounterExhausted
                 activitySubscribers[subscriberID] = subscriber
                 return .reconciliationRequired(snapshot)
             }
             if activityRevision > subscriber.cursor {
                 let snapshot = activitySnapshot()
+                guard subscriber.cursor < UInt64.max else {
+                    cancelActivitySubscriber(subscriberID)
+                    return nil
+                }
+                let successor = subscriber.cursor + 1
                 guard let oldest = activityTransitions.first?.revision,
-                    oldest <= subscriber.cursor &+ 1
+                    oldest <= successor
                 else {
                     subscriber.cursor = snapshot.revision
+                    subscriber.deliveredCounterExhaustion =
+                        activityCounterExhausted
                     activitySubscribers[subscriberID] = subscriber
                     return .transitionHistoryGap(snapshot)
                 }
@@ -2156,20 +2267,41 @@ public actor CodexSessionCoordinator {
                     return event
                 }
                 subscriber.cursor = snapshot.revision
+                subscriber.deliveredCounterExhaustion =
+                    activityCounterExhausted
                 activitySubscribers[subscriberID] = subscriber
                 return .transitionHistoryGap(snapshot)
+            }
+            if activityCounterExhausted {
+                guard !subscriber.deliveredCounterExhaustion else {
+                    cancelActivitySubscriber(subscriberID)
+                    return nil
+                }
+                let snapshot = activitySnapshot()
+                subscriber.cursor = snapshot.revision
+                subscriber.deliveredCounterExhaustion = true
+                activitySubscribers[subscriberID] = subscriber
+                return .transitionHistoryGap(snapshot)
+            }
+            guard subscriber.cursor < UInt64.max else {
+                cancelActivitySubscriber(subscriberID)
+                return nil
             }
             guard !isShuttingDown else {
                 cancelActivitySubscriber(subscriberID)
                 return nil
             }
-            await waitForActivity(subscriberID: subscriberID)
+            await waitForActivity(
+                subscriberID: subscriberID,
+                waiterID: waiterID
+            )
         }
-        cancelActivitySubscriber(subscriberID)
-        return nil
     }
 
-    private func waitForActivity(subscriberID: UUID) async {
+    private func waitForActivity(
+        subscriberID: UUID,
+        waiterID: UUID
+    ) async {
         await withTaskCancellationHandler {
             await withCheckedContinuation(isolation: self) { continuation in
                 guard !Task.isCancelled,
@@ -2178,41 +2310,71 @@ public actor CodexSessionCoordinator {
                     continuation.resume()
                     return
                 }
-                precondition(subscriber.waiter == nil)
-                subscriber.waiter = continuation
+                subscriber.waiters[waiterID] = continuation
                 activitySubscribers[subscriberID] = subscriber
             }
         } onCancel: {
-            Task { await self.cancelActivitySubscriber(subscriberID) }
+            Task {
+                await self.cancelActivityWaiter(
+                    subscriberID: subscriberID,
+                    waiterID: waiterID
+                )
+            }
         }
     }
 
     private func wakeActivitySubscribers() {
         var waiters: [CheckedContinuation<Void, Never>] = []
         for id in Array(activitySubscribers.keys) {
-            guard var subscriber = activitySubscribers[id],
-                let waiter = subscriber.waiter
-            else { continue }
-            subscriber.waiter = nil
+            guard var subscriber = activitySubscribers[id] else { continue }
+            waiters.append(contentsOf: subscriber.waiters.values)
+            subscriber.waiters.removeAll()
             activitySubscribers[id] = subscriber
-            waiters.append(waiter)
         }
         waiters.forEach { $0.resume() }
+    }
+
+    private func cancelActivityWaiter(
+        subscriberID: UUID,
+        waiterID: UUID
+    ) {
+        activitySubscribers[subscriberID]?
+            .waiters.removeValue(forKey: waiterID)?.resume()
     }
 
     private func publishActivity(
         _ makeEvent: (UInt64) -> CodexSessionActivityEvent
     ) {
-        activityRevision &+= 1
-        let event = makeEvent(activityRevision)
+        guard let revision = nextActivityRevision() else {
+            wakeActivitySubscribers()
+            return
+        }
+        let event = makeEvent(revision)
         recordAndPublishActivity(event)
     }
 
     private func publishActivityHistoryGap() {
-        activityRevision &+= 1
+        guard nextActivityRevision() != nil else {
+            wakeActivitySubscribers()
+            return
+        }
         recordAndPublishActivity(
             .transitionHistoryGap(activitySnapshot())
         )
+    }
+
+    private func nextActivityRevision() -> UInt64? {
+        guard !activityCounterExhausted,
+            activityRevision < UInt64.max
+        else {
+            activityCounterExhausted = true
+            return nil
+        }
+        activityRevision += 1
+        if activityRevision == UInt64.max {
+            activityCounterExhausted = true
+        }
+        return activityRevision
     }
 
     private func recordAndPublishActivity(

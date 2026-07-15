@@ -318,3 +318,81 @@ As directed, the final review's Minors remain outside this repair wave:
 assistant and envelope byte bounds, generic gate/deadline cancellation drain,
 the parallel descriptor-lifetime test determinism concern, and future
 extraction of the coordinator's per-key lifecycle owner.
+
+---
+
+# Task 9 pull-stream review repair addendum
+
+Base: `2d69b12`
+
+## Outcome
+
+All five Important findings in `task-9-pull-review-findings.md` are repaired in
+one TDD wave. The repair remains confined to the Task 9 Core/coordinator,
+Codex adapter, and their tests. No App, Vendor, packaging, or Task 10 files
+changed.
+
+## RED
+
+The new regressions were run before their production seams existed:
+
+- The six non-trapping adapter regressions all failed with seven recorded
+  issues: dropped and early-break streams retained subscribers, active and
+  idle crash consumers timed out, the maximum cursor timed out, and the
+  near-maximum publisher produced an incoherent gap. The separate two-iterator
+  empty-ring regression exited 133 at the public `precondition` in
+  `CodexAppServerAdapter`.
+- The five non-trapping coordinator regressions all failed with six recorded
+  issues: canceled shutdown repeated its termination hook without registering
+  a waiter, stream lifetime leaked, maximum-cursor and near-maximum publisher
+  pulls timed out, and Core overwrote the reduced crash state on EOF. The
+  separate two-iterator activity regression exited 133 at the corresponding
+  coordinator `precondition`.
+- In total, all 13 new Important regressions were RED: 13 recorded assertion
+  issues plus the two intentional process traps. The first lifetime RED was
+  independently observed after 250 ms with one subscriber still registered,
+  proving that unfolding `onCancel` is not a deallocation callback.
+
+## GREEN implementation and invariants
+
+1. AgentEvent and coordinator activity subscribers now own dictionaries of
+   exact waiter UUIDs. Concurrent pulls cannot trap; task cancellation removes
+   and resumes only its exact waiter, while subscriber teardown resumes every
+   remaining waiter idempotently.
+2. Each unfolding stream captures a lock-protected, idempotent lifetime token.
+   Token deinit asynchronously cancels the exact subscriber even before the
+   first pull or after a normal early break. Delete/shutdown removes the state
+   first, so a late token deinit is a harmless no-op.
+3. Public/submission termination waits remain cancellation-aware. Internal
+   Stop, Delete, and shutdown drains use a cancellation-resistant checked
+   continuation bound to the captured termination operation UUID, so an
+   already-canceled shutdown suspends rather than synchronously spinning.
+4. Adapter process failure publishes one final crash record for every active
+   turn, marks all affected thread streams terminal, and wakes idle waiters.
+   An active subscriber pulls the crash record exactly once and then ends; an
+   idle subscriber ends immediately. Terminal replay is removed when its last
+   observer leaves. Core records which exact consumer reduced the crash and
+   preserves that state on the following EOF; an EOF without such a terminal
+   record still fails closed.
+5. AgentEvent sequence and coordinator activity revision publication use
+   checked comparisons and increments. `UInt64.max` is emitted at most once;
+   publishers never wrap to zero. Maximum cursors end, and activity exhaustion
+   emits one current reconciliation boundary before ending.
+
+The overflow regression now proves one waiter is registered before a 600-event
+burst crosses the 512-record ring in a single actor turn. The Delete regression
+uses exact termination-wait observation instead of a 150 ms absence sleep.
+
+## GREEN and final verification
+
+- The seven new adapter regressions passed together in 0.007 seconds after the
+  implementation change.
+- The coordinator suite passed all new exact-waiter, lifetime, canceled-drain,
+  crash-preservation, and counter-exhaustion regressions.
+- Final `./scripts/test.sh`: **656 tests in 43 suites passed** in 2.629 seconds;
+  both `Codex app-server 0.144.2 contract` and `Codex session coordinator`
+  suites passed.
+- Final `/usr/bin/swift build`: passed; `Build complete! (0.20s)`.
+- `git diff --check`: exited 0 with no output after this report append.
+- Scope and self-review of `2d69b12..HEAD`: no additional Critical or Important
+  defect found; no App, Vendor, packaging, or Task 10 file changed.

@@ -500,8 +500,7 @@ struct CodexAppServerContractTests {
         ])
 
         await adapter.consumerFailedForTesting()
-        #expect(await adapter.replayedEventsForTesting(threadID).last ==
-            .turnCompleted(turnID))
+        #expect(await adapter.replayedEventsForTesting(threadID).isEmpty)
         #expect(String(describing: await adapter.replayedEventsForTesting(threadID))
             .contains("private transient diagnostic") == false)
         await adapter.shutdown()
@@ -582,7 +581,7 @@ struct CodexAppServerContractTests {
         await adapter.shutdown()
     }
 
-    @Test("process crash fails active turns but leaves idle threads untouched")
+    @Test("process crash terminally cleans active and idle thread replay")
     func crashFailsOnlyActiveTurnsOnce() async throws {
         let process = ScriptedAppServerProcess()
         let adapter = CodexAppServerAdapter(
@@ -625,10 +624,8 @@ struct CodexAppServerContractTests {
 
         await adapter.consumerFailedForTesting()
         let afterCrash = await adapter.replayedEventsForTesting(activeThreadID)
-        #expect(afterCrash.last == .turnFailed(turnID, .crashed))
-        #expect(await adapter.replayedEventsForTesting(idleThreadID) == [
-            .history([]),
-        ])
+        #expect(afterCrash.isEmpty)
+        #expect(await adapter.replayedEventsForTesting(idleThreadID).isEmpty)
         await adapter.consumerFailedForTesting()
         #expect(await adapter.replayedEventsForTesting(activeThreadID) ==
             afterCrash)
@@ -751,7 +748,7 @@ struct CodexAppServerContractTests {
                 ])
             )
             await adapter.consumerFailedForTesting()
-            #expect(await adapter.replayedEventsForTesting(threadID) == failed)
+            #expect(await adapter.replayedEventsForTesting(threadID).isEmpty)
             await adapter.shutdown()
         }
     }
@@ -2606,9 +2603,7 @@ struct CodexAppServerContractTests {
                 #expect(
                     await fixture.adapter.replayedEventsForTesting(
                         fixture.threadID
-                    ) == fixture.eventsBeforeDelete + [
-                        .turnFailed(fixture.turnID, .crashed),
-                    ]
+                    ).isEmpty
                 )
             } else {
                 await fixture.adapter.shutdown()
@@ -2733,9 +2728,7 @@ struct CodexAppServerContractTests {
 
         #expect(
             await fixture.adapter.replayedEventsForTesting(fixture.threadID)
-                == fixture.eventsBeforeResume + [
-                    .turnFailed(fixture.turnID, .crashed),
-                ]
+                .isEmpty
         )
         #expect(await fixture.adapter.stateCountsForTesting.activeTurns == 0)
         #expect(await fixture.adapter.stateCountsForTesting.pendingResumes == 0)
@@ -3130,7 +3123,7 @@ struct CodexAppServerContractTests {
             toolExecutor: RecordingCodexToolExecutor()
         )
         let threadID = try await startMappedThread(adapter: adapter, process: process)
-        let turnID = try await startMappedTurn(
+        _ = try await startMappedTurn(
             adapter: adapter,
             process: process,
             threadID: threadID,
@@ -3138,30 +3131,23 @@ struct CodexAppServerContractTests {
             requestID: 3,
             writeCount: 4
         )
-        let stream = await adapter.events(for: threadID, after: nil)
-        let consumerGate = CodexSessionTestGate()
-        let calls = CodexSessionCallProbe()
+        let cursor = await adapter.eventSequenceForTesting(threadID)
+        let stream = await adapter.events(for: threadID, after: cursor)
         let consuming = Task {
             var iterator = stream.makeAsyncIterator()
-            await calls.record("consumer-suspended")
-            await consumerGate.wait()
             return await iterator.next()
         }
-        await calls.wait(for: "consumer-suspended")
-
-        for index in 0..<600 {
-            await adapter.handleNotificationForTesting(
-                method: "item/agentMessage/delta",
-                params: .object([
-                    "threadId": .string(threadID.rawValue),
-                    "turnId": .string(turnID.rawValue),
-                    "delta": .string("\(index)"),
-                ])
-            )
+        try await codexSessionWithDeadline {
+            while await adapter.stateCountsForTesting.eventWaiters != 1 {
+                await Task.yield()
+            }
         }
+        await adapter.publishEventsForTesting(
+            (0..<600).map { .assistantMessageDelta("\($0)") },
+            for: threadID
+        )
 
         #expect(await adapter.stateCountsForTesting.eventSubscribers == 1)
-        await consumerGate.open()
         guard case let .replayGap(after, oldestAvailable)? =
             await consuming.value
         else {
@@ -3169,8 +3155,276 @@ struct CodexAppServerContractTests {
             await adapter.shutdown()
             return
         }
-        #expect(after == nil)
-        #expect(oldestAvailable > 1)
+        #expect(after == cursor)
+        #expect(oldestAvailable > cursor + 1)
+        #expect(await adapter.stateCountsForTesting.eventSubscribers == 0)
+        await adapter.shutdown()
+    }
+
+    @Test("dropping an event stream before first pull releases its subscriber")
+    func droppedEventStreamCancelsSubscriptionLifetime() async throws {
+        let process = ScriptedAppServerProcess()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor()
+        )
+        let threadID = try await startMappedThread(adapter: adapter, process: process)
+
+        do {
+            let stream = await adapter.events(for: threadID, after: nil)
+            #expect(await adapter.stateCountsForTesting.eventSubscribers == 1)
+            _ = stream
+        }
+
+        try await codexSessionWithDeadline {
+            while await adapter.stateCountsForTesting.eventSubscribers != 0 {
+                await Task.yield()
+            }
+        }
+        await adapter.shutdown()
+    }
+
+    @Test("two event iterators wait independently and cancel one exact pull")
+    func concurrentEventIteratorsOwnExactWaiters() async throws {
+        let process = ScriptedAppServerProcess()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor()
+        )
+        let threadID = try await startMappedThread(adapter: adapter, process: process)
+        let stream = await adapter.events(for: threadID, after: nil)
+        let first = Task {
+            var iterator = stream.makeAsyncIterator()
+            return await iterator.next()
+        }
+        let second = Task {
+            var iterator = stream.makeAsyncIterator()
+            return await iterator.next()
+        }
+        try await codexSessionWithDeadline {
+            while await adapter.stateCountsForTesting.eventWaiters != 2 {
+                await Task.yield()
+            }
+        }
+
+        first.cancel()
+        #expect(await first.value == nil)
+        try await codexSessionWithDeadline {
+            while await adapter.stateCountsForTesting.eventWaiters != 1 {
+                await Task.yield()
+            }
+        }
+        #expect(await adapter.stateCountsForTesting.eventSubscribers == 1)
+
+        await adapter.consumerFailedForTesting()
+        #expect(try await codexSessionWithDeadline { await second.value } == nil)
+        #expect(await adapter.stateCountsForTesting.eventSubscribers == 0)
+        #expect(await adapter.stateCountsForTesting.eventWaiters == 0)
+        await adapter.shutdown()
+    }
+
+    @Test("normal event iteration break releases its lifetime exactly once")
+    func earlyEventBreakAndLateDeinitAreLeakFree() async throws {
+        let process = ScriptedAppServerProcess()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor()
+        )
+        let threadID = try await startMappedThread(adapter: adapter, process: process)
+        _ = try await startMappedTurn(
+            adapter: adapter,
+            process: process,
+            threadID: threadID,
+            turnID: "early-break-turn",
+            requestID: 3,
+            writeCount: 4
+        )
+
+        func consumeOne() async {
+            let stream = await adapter.events(for: threadID, after: 0)
+            for await _ in stream { break }
+        }
+        await consumeOne()
+        try await codexSessionWithDeadline {
+            while await adapter.stateCountsForTesting.eventSubscribers != 0 {
+                await Task.yield()
+            }
+        }
+
+        var retained: AsyncStream<AgentEventDelivery>? = await adapter.events(
+            for: threadID,
+            after: 2
+        )
+        #expect(await adapter.stateCountsForTesting.eventSubscribers == 1)
+        await adapter.shutdown()
+        #expect(await adapter.stateCountsForTesting.eventSubscribers == 0)
+        retained = nil
+        _ = retained
+        for _ in 0..<20 { await Task.yield() }
+        #expect(await adapter.stateCountsForTesting.eventSubscribers == 0)
+    }
+
+    @Test("crash delivers one final active failure then closes and cleans replay")
+    func crashTerminatesActiveEventSubscription() async throws {
+        let process = ScriptedAppServerProcess()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor()
+        )
+        let threadID = try await startMappedThread(adapter: adapter, process: process)
+        let turnID = try await startMappedTurn(
+            adapter: adapter,
+            process: process,
+            threadID: threadID,
+            turnID: "terminal-crash-turn",
+            requestID: 3,
+            writeCount: 4
+        )
+        let stream = await adapter.events(for: threadID, after: 2)
+        let consuming = Task {
+            var iterator = stream.makeAsyncIterator()
+            return (await iterator.next(), await iterator.next())
+        }
+        try await codexSessionWithDeadline {
+            while await adapter.stateCountsForTesting.eventWaiters != 1 {
+                await Task.yield()
+            }
+        }
+
+        await adapter.consumerFailedForTesting()
+        let deliveries: (AgentEventDelivery?, AgentEventDelivery?)
+        do {
+            deliveries = try await codexSessionWithDeadline {
+                await consuming.value
+            }
+        } catch {
+            consuming.cancel()
+            _ = await consuming.value
+            throw error
+        }
+        guard case let .event(record)? = deliveries.0 else {
+            Issue.record("active crash subscriber missed its terminal record")
+            return
+        }
+        #expect(record.sequence == 3)
+        #expect(record.event == .turnFailed(turnID, .crashed))
+        #expect(deliveries.1 == nil)
+        #expect(await adapter.stateCountsForTesting.eventSubscribers == 0)
+        #expect(await adapter.stateCountsForTesting.eventWaiters == 0)
+        #expect(await adapter.stateCountsForTesting.replayEvents == 0)
+        await adapter.shutdown()
+    }
+
+    @Test("crash closes an idle event subscriber without a stranded waiter")
+    func crashTerminatesIdleEventSubscription() async throws {
+        let process = ScriptedAppServerProcess()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor()
+        )
+        let threadID = try await startMappedThread(adapter: adapter, process: process)
+        let stream = await adapter.events(for: threadID, after: nil)
+        let consuming = Task {
+            var iterator = stream.makeAsyncIterator()
+            return await iterator.next()
+        }
+        try await codexSessionWithDeadline {
+            while await adapter.stateCountsForTesting.eventWaiters != 1 {
+                await Task.yield()
+            }
+        }
+
+        await adapter.consumerFailedForTesting()
+        #expect(try await codexSessionWithDeadline { await consuming.value } == nil)
+        #expect(await adapter.stateCountsForTesting.eventSubscribers == 0)
+        #expect(await adapter.stateCountsForTesting.eventWaiters == 0)
+        await adapter.shutdown()
+    }
+
+    @Test("maximum event cursor ends fail-closed without an incoherent gap")
+    func maximumEventCursorEndsFailClosed() async throws {
+        let process = ScriptedAppServerProcess()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor()
+        )
+        let threadID = try await startMappedThread(adapter: adapter, process: process)
+        let stream = await adapter.events(for: threadID, after: UInt64.max)
+        let ending = Task {
+            var iterator = stream.makeAsyncIterator()
+            return await iterator.next()
+        }
+        let ended: AgentEventDelivery?
+        do {
+            ended = try await codexSessionWithDeadline { await ending.value }
+        } catch {
+            ending.cancel()
+            _ = await ending.value
+            throw error
+        }
+        #expect(ended == nil)
+        #expect(await adapter.stateCountsForTesting.eventSubscribers == 0)
+        await adapter.shutdown()
+    }
+
+    @Test("event publisher emits UInt64.max once then ends without wrapping")
+    func eventPublisherExhaustionIsTerminal() async throws {
+        let process = ScriptedAppServerProcess()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor()
+        )
+        let threadID = try await startMappedThread(adapter: adapter, process: process)
+        await adapter.setEventSequenceForTesting(UInt64.max - 2, for: threadID)
+        let stream = await adapter.events(for: threadID, after: UInt64.max - 2)
+        let turnID = try await startMappedTurn(
+            adapter: adapter,
+            process: process,
+            threadID: threadID,
+            turnID: "counter-exhaustion-turn",
+            requestID: 3,
+            writeCount: 4
+        )
+        let consuming = Task {
+            var iterator = stream.makeAsyncIterator()
+            return (
+                await iterator.next(),
+                await iterator.next(),
+                await iterator.next()
+            )
+        }
+        let deliveries: (
+            AgentEventDelivery?,
+            AgentEventDelivery?,
+            AgentEventDelivery?
+        )
+        do {
+            deliveries = try await codexSessionWithDeadline {
+                await consuming.value
+            }
+        } catch {
+            consuming.cancel()
+            _ = await consuming.value
+            throw error
+        }
+        guard case let .event(first)? = deliveries.0,
+            case let .event(second)? = deliveries.1
+        else {
+            Issue.record("counter exhaustion lost retained terminal records")
+            return
+        }
+        #expect(first.sequence == UInt64.max - 1)
+        #expect(first.event == .userMessage("prompt"))
+        #expect(second.sequence == UInt64.max)
+        #expect(second.event == .turnStarted(turnID))
+        #expect(deliveries.2 == nil)
         #expect(await adapter.stateCountsForTesting.eventSubscribers == 0)
         await adapter.shutdown()
     }
