@@ -34,54 +34,13 @@ public protocol CodexDynamicToolExecuting: Sendable {
     ) async throws -> TerminalToolResult
 }
 
-public enum CodexTerminalToolExecutorError: Error, Equatable, Sendable {
-    case mismatchedThread
-    case bindingExists
-    case bindingUnavailable
-}
-
-/// Bridges the adapter boundary to Core without teaching Core about Dynamic
-/// Tools. A prepared binding can be installed before `turn/start`; therefore a
-/// server tool request racing that continuation still activates the exact
-/// prepared router generation.
-public actor CodexTerminalToolExecutor: CodexDynamicToolExecuting {
-    private struct Binding: Sendable {
-        let handle: AgentTurnHandle
-        let conversationKey: TerminalConversationKey
-    }
-
+/// Keeps Dynamic Tool wire concerns outside Core while delegating turn identity,
+/// authorization, activation, and serialization to the protocol-neutral router.
+public struct CodexTerminalToolExecutor: CodexDynamicToolExecuting {
     private let router: TerminalToolRouter
-    private var bindings: [AgentThreadID: Binding] = [:]
 
     public init(router: TerminalToolRouter) {
         self.router = router
-    }
-
-    public func bindPreparedTurn(
-        threadID: AgentThreadID,
-        handle: AgentTurnHandle,
-        conversationKey: TerminalConversationKey
-    ) throws {
-        guard handle.threadID == threadID else {
-            throw CodexTerminalToolExecutorError.mismatchedThread
-        }
-        if let existing = bindings[threadID] {
-            guard existing.handle == handle,
-                existing.conversationKey == conversationKey
-            else {
-                throw CodexTerminalToolExecutorError.bindingExists
-            }
-            return
-        }
-        bindings[threadID] = Binding(
-            handle: handle,
-            conversationKey: conversationKey
-        )
-    }
-
-    public func unbind(threadID: AgentThreadID, handle: AgentTurnHandle) {
-        guard bindings[threadID]?.handle == handle else { return }
-        bindings.removeValue(forKey: threadID)
     }
 
     public func execute(
@@ -89,13 +48,9 @@ public actor CodexTerminalToolExecutor: CodexDynamicToolExecuting {
         turnID: AgentTurnID,
         call: TerminalToolCall
     ) async throws -> TerminalToolResult {
-        guard let binding = bindings[threadID] else {
-            throw CodexTerminalToolExecutorError.bindingUnavailable
-        }
         return try await router.execute(
-            handle: binding.handle,
+            threadID: threadID,
             turnID: turnID,
-            conversationKey: binding.conversationKey,
             call: call
         )
     }

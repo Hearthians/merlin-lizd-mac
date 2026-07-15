@@ -70,9 +70,15 @@ struct TerminalToolRouterStateSnapshot: Equatable, Sendable {
     let turnLifecycleCount: Int
     let terminationTaskCount: Int
     let terminationReasonCount: Int
+    let observedTurnIdentityCount: Int
 }
 
 public actor TerminalToolRouter {
+    private struct ThreadTurnIdentity: Hashable, Sendable {
+        let threadID: AgentThreadID
+        let turnID: AgentTurnID
+    }
+
     private struct TurnKey: Hashable, Sendable {
         let handle: AgentTurnHandle
         let turnID: AgentTurnID
@@ -166,6 +172,9 @@ public actor TerminalToolRouter {
     private var activeBindings: [TurnKey: TerminalEndpointBinding] = [:]
     private var terminationTasks: [TurnKey: TerminationTask] = [:]
     private var terminationReasons: [TurnKey: TemporaryPaneRetentionReason] = [:]
+    private var turnIdentityOwners: [
+        ThreadTurnIdentity: AgentTurnHandle
+    ] = [:]
 
     public init(
         registry: TerminalEndpointRegistry,
@@ -298,6 +307,59 @@ public actor TerminalToolRouter {
         }
     }
 
+    public func execute(
+        threadID: AgentThreadID,
+        turnID: AgentTurnID,
+        call: TerminalToolCall
+    ) async throws -> TerminalToolResult {
+        let identity = ThreadTurnIdentity(
+            threadID: threadID,
+            turnID: turnID
+        )
+        let candidates = turnLifecycles.keys.filter {
+            $0.threadID == threadID && $0.turnID == turnID
+        }
+        guard candidates.count <= 1 else {
+            throw TerminalToolRouterError.turnUnavailable
+        }
+
+        if let turn = candidates.first {
+            guard turnIdentityOwners[identity] == turn.handle else {
+                throw TerminalToolRouterError.turnUnavailable
+            }
+            let conversationKey: TerminalConversationKey?
+            switch turnLifecycles[turn] {
+            case .activating:
+                conversationKey = activationTasks[turn]?.conversationKey
+            case .active:
+                conversationKey = activeBindings[turn]?.conversationKey
+            case .terminating, nil:
+                throw TerminalToolRouterError.turnUnavailable
+            }
+            guard let conversationKey else {
+                throw TerminalToolRouterError.turnUnavailable
+            }
+            return try await execute(
+                handle: turn.handle,
+                turnID: turnID,
+                conversationKey: conversationKey,
+                call: call
+            )
+        }
+
+        guard turnIdentityOwners[identity] == nil,
+            let prepared = preparedTurns[threadID]
+        else {
+            throw TerminalToolRouterError.turnUnavailable
+        }
+        return try await execute(
+            handle: prepared.handle,
+            turnID: turnID,
+            conversationKey: prepared.conversationKey,
+            call: call
+        )
+    }
+
     public func pendingApprovals() async -> [TerminalApprovalRequest] {
         await approvalBroker.pendingRequests()
     }
@@ -310,8 +372,31 @@ public actor TerminalToolRouter {
             activeBindingCount: activeBindings.count,
             turnLifecycleCount: turnLifecycles.count,
             terminationTaskCount: terminationTasks.count,
-            terminationReasonCount: terminationReasons.count
+            terminationReasonCount: terminationReasons.count,
+            observedTurnIdentityCount: turnIdentityOwners.count
         )
+    }
+
+    /// Releases stale-turn protection only after the owning coordinator has
+    /// deleted a thread and fully terminated every one of its terminal turns.
+    public func forgetThread(_ threadID: AgentThreadID) throws {
+        let hasTurnState = preparedTurns[threadID] != nil
+            || turnLifecycles.keys.contains { $0.threadID == threadID }
+            || activationTasks.keys.contains { $0.threadID == threadID }
+            || activeBindings.keys.contains { $0.threadID == threadID }
+            || terminationTasks.keys.contains { $0.threadID == threadID }
+            || terminationReasons.keys.contains { $0.threadID == threadID }
+            || activeOperations.values.contains {
+                $0.turn.threadID == threadID
+            }
+            || leases.keys.contains { $0.turn.threadID == threadID }
+            || mutationAuditBlocks.keys.contains { $0.threadID == threadID }
+        guard !hasTurnState else {
+            throw TerminalToolRouterError.turnUnavailable
+        }
+        turnIdentityOwners = turnIdentityOwners.filter {
+            $0.key.threadID != threadID
+        }
     }
 
     @discardableResult
@@ -2836,6 +2921,13 @@ public actor TerminalToolRouter {
                 ) != nil
             else {
                 throw TerminalToolRouterError.turnUnavailable
+            }
+            let identity = ThreadTurnIdentity(
+                threadID: turn.threadID,
+                turnID: turn.turnID
+            )
+            if turnIdentityOwners[identity] == nil {
+                turnIdentityOwners[identity] = turn.handle
             }
             turnLifecycles[turn] = .activating
             let token = UUID()

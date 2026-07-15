@@ -46,7 +46,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
     private var startupTask: Task<StartupOutcome, Never>?
     private var consumerTask: Task<Void, Never>?
     private var stopped = false
-    private var knownThreads: Set<AgentThreadID> = []
+    private var activeTurns: [AgentThreadID: AgentTurnID] = [:]
     private var eventReplay: [AgentThreadID: [AgentEvent]] = [:]
     private var eventContinuations: [
         AgentThreadID: [UUID: AsyncStream<AgentEvent>.Continuation]
@@ -93,7 +93,6 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         guard let threadID = threadID(in: result) else {
             throw CodexAppServerAdapterError.invalidResponse
         }
-        knownThreads.insert(threadID)
         await mappingStore.insert(threadID)
         return threadID
     }
@@ -113,7 +112,6 @@ public actor CodexAppServerAdapter: CodexAgentClient {
             guard self.threadID(in: result) == threadID else {
                 throw CodexAppServerAdapterError.invalidResponse
             }
-            knownThreads.insert(threadID)
             publish(.history(try history(in: result)), for: threadID)
             resumingThreads.remove(threadID)
             let buffered = bufferedLiveEvents.removeValue(forKey: threadID) ?? []
@@ -143,6 +141,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         guard let turnID = turnID(in: result) else {
             throw CodexAppServerAdapterError.invalidResponse
         }
+        activeTurns[threadID] = turnID
         publish(.userMessage(prompt), for: threadID)
         publish(.turnStarted(turnID), for: threadID)
         return turnID
@@ -231,7 +230,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
 
     public func deleteThread(_ threadID: AgentThreadID) async throws {
         try await threadMutation("thread/delete", threadID: threadID)
-        knownThreads.remove(threadID)
+        activeTurns.removeValue(forKey: threadID)
         await mappingStore.remove(threadID)
         finishEvents(for: threadID)
     }
@@ -245,6 +244,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         self.consumerTask = nil
         startupTask?.cancel()
         startupTask = nil
+        activeTurns.removeAll()
         setAvailability(.stopped)
         for threadID in Array(eventContinuations.keys) {
             finishEvents(for: threadID)
@@ -479,6 +479,9 @@ public actor CodexAppServerAdapter: CodexAgentClient {
             }
             let threadID = AgentThreadID(rawValue: threadText)
             let turnID = AgentTurnID(rawValue: turnText)
+            guard takeActiveTurn(threadID: threadID, turnID: turnID) else {
+                return
+            }
             switch turn["status"]?.nonemptyString {
             case "completed", nil:
                 publishLive(.turnCompleted(turnID), for: threadID)
@@ -500,6 +503,9 @@ public actor CodexAppServerAdapter: CodexAgentClient {
             }
             let threadID = AgentThreadID(rawValue: threadText)
             let turnID = AgentTurnID(rawValue: turnText)
+            guard activeTurns[threadID] == turnID else { return }
+            if fields["willRetry"]?.boolValue == true { return }
+            activeTurns.removeValue(forKey: threadID)
             switch error["codexErrorInfo"]?.nonemptyString {
             case "serverOverloaded", "usageLimitExceeded":
                 setAvailability(.overloaded)
@@ -545,14 +551,21 @@ public actor CodexAppServerAdapter: CodexAgentClient {
 
     private func consumerFailed() {
         guard !stopped else { return }
+        let failedTurns = activeTurns
+        activeTurns.removeAll()
         setAvailability(.crashed)
-        failKnownThreads(.crashed)
+        for (threadID, turnID) in failedTurns {
+            publishLive(.turnFailed(turnID, .crashed), for: threadID)
+        }
     }
 
-    private func failKnownThreads(_ failure: AgentFailure) {
-        for threadID in knownThreads {
-            publishLive(.turnFailed(nil, failure), for: threadID)
-        }
+    private func takeActiveTurn(
+        threadID: AgentThreadID,
+        turnID: AgentTurnID
+    ) -> Bool {
+        guard activeTurns[threadID] == turnID else { return false }
+        activeTurns.removeValue(forKey: threadID)
+        return true
     }
 
     private func publishLive(_ event: AgentEvent, for threadID: AgentThreadID) {

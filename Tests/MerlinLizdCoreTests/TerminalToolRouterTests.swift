@@ -4250,6 +4250,332 @@ struct TerminalToolRouterTests {
         #expect(snapshot.terminationReasonCount == 0)
     }
 
+    @Test("protocol route activates the exact prepared turn before confirmation")
+    func protocolRouteActivatesPreparedTurnBeforeConfirmation() async throws {
+        let screen = TerminalToolFixtures.screen(revision: 141)
+        let port = FakeTerminalToolPort(snapshot: screen)
+        let registry = TerminalEndpointRegistry()
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: TerminalToolFixtures.newID(),
+                port: port,
+                controller: FakeTerminalSurfaceController(
+                    surface: TerminalToolFixtures.surface()
+                )
+            )
+        )
+        let router = TerminalToolRouter(
+            registry: registry,
+            approvalBroker: TerminalApprovalBroker(),
+            journal: MemoryTerminalToolJournal()
+        )
+        let threadID = AgentThreadID(rawValue: "protocol-prepared-thread")
+        let turnID = AgentTurnID(rawValue: "protocol-prepared-turn")
+        let handle = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+
+        #expect(
+            try await router.execute(
+                threadID: threadID,
+                turnID: turnID,
+                call: .observeScreen
+            ) == .screen(screen)
+        )
+        try await router.confirmTurnID(handle: handle, turnID: turnID)
+        #expect(await port.keyboardOwners() == [.codex])
+
+        try await router.endTurn(handle: handle, turnID: turnID)
+    }
+
+    @Test("protocol route joins an already confirmed exact turn")
+    func protocolRouteJoinsConfirmedTurn() async throws {
+        let (router, handle, turnID) = try await makeRouter(
+            port: FakeTerminalToolPort(
+                snapshot: TerminalToolFixtures.screen(revision: 142)
+            ),
+            surfaces: FakeTerminalSurfaceController(
+                surface: TerminalToolFixtures.surface()
+            ),
+            journal: MemoryTerminalToolJournal()
+        )
+        try await router.confirmTurnID(handle: handle, turnID: turnID)
+
+        #expect(
+            try await router.execute(
+                threadID: handle.threadID,
+                turnID: turnID,
+                call: .observeScreen
+            ) == .screen(TerminalToolFixtures.screen(revision: 142))
+        )
+
+        try await router.endTurn(handle: handle, turnID: turnID)
+    }
+
+    @Test("protocol route rejects wrong thread and wrong turn identities")
+    func protocolRouteRejectsWrongIdentities() async throws {
+        let (router, handle, turnID) = try await makeRouter(
+            port: FakeTerminalToolPort(
+                snapshot: TerminalToolFixtures.screen(revision: 143)
+            ),
+            surfaces: FakeTerminalSurfaceController(
+                surface: TerminalToolFixtures.surface()
+            ),
+            journal: MemoryTerminalToolJournal()
+        )
+        try await router.confirmTurnID(handle: handle, turnID: turnID)
+
+        await #expect(throws: TerminalToolRouterError.turnUnavailable) {
+            try await router.execute(
+                threadID: .init(rawValue: "other-thread"),
+                turnID: turnID,
+                call: .observeScreen
+            )
+        }
+        await #expect(throws: TerminalToolRouterError.turnUnavailable) {
+            try await router.execute(
+                threadID: handle.threadID,
+                turnID: .init(rawValue: "other-turn"),
+                call: .observeScreen
+            )
+        }
+
+        try await router.endTurn(handle: handle, turnID: turnID)
+    }
+
+    @Test("protocol route cannot reuse a terminated identity for a successor")
+    func protocolRouteRejectsTerminatedAndStaleTurns() async throws {
+        let screen = TerminalToolFixtures.screen(revision: 144)
+        let port = FakeTerminalToolPort(snapshot: screen)
+        let registry = TerminalEndpointRegistry()
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: TerminalToolFixtures.newID(),
+                port: port,
+                controller: FakeTerminalSurfaceController(
+                    surface: TerminalToolFixtures.surface()
+                )
+            )
+        )
+        let router = TerminalToolRouter(
+            registry: registry,
+            approvalBroker: TerminalApprovalBroker(),
+            journal: MemoryTerminalToolJournal()
+        )
+        let threadID = AgentThreadID(rawValue: "protocol-stale-thread")
+        let terminatedTurnID = AgentTurnID(rawValue: "terminated-turn")
+        let terminatedHandle = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        _ = try await router.execute(
+            threadID: threadID,
+            turnID: terminatedTurnID,
+            call: .observeScreen
+        )
+        try await router.endTurn(
+            handle: terminatedHandle,
+            turnID: terminatedTurnID
+        )
+
+        let successorHandle = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        await #expect(throws: TerminalToolRouterError.turnUnavailable) {
+            try await router.execute(
+                threadID: threadID,
+                turnID: terminatedTurnID,
+                call: .observeScreen
+            )
+        }
+        let successorTurnID = AgentTurnID(rawValue: "successor-turn")
+        #expect(
+            try await router.execute(
+                threadID: threadID,
+                turnID: successorTurnID,
+                call: .observeScreen
+            ) == .screen(screen)
+        )
+        try await router.endTurn(
+            handle: successorHandle,
+            turnID: successorTurnID
+        )
+    }
+
+    @Test("protocol route rejects a reused turn ID across handle generations")
+    func protocolRouteRejectsAmbiguousReusedIdentity() async throws {
+        let screen = TerminalToolFixtures.screen(revision: 147)
+        let port = FakeTerminalToolPort(snapshot: screen)
+        let registry = TerminalEndpointRegistry()
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: TerminalToolFixtures.newID(),
+                port: port,
+                controller: FakeTerminalSurfaceController(
+                    surface: TerminalToolFixtures.surface()
+                )
+            )
+        )
+        let router = TerminalToolRouter(
+            registry: registry,
+            approvalBroker: TerminalApprovalBroker(),
+            journal: MemoryTerminalToolJournal()
+        )
+        let threadID = AgentThreadID(rawValue: "protocol-reuse-thread")
+        let reusedTurnID = AgentTurnID(rawValue: "protocol-reused-turn")
+        let firstHandle = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        try await router.confirmTurnID(
+            handle: firstHandle,
+            turnID: reusedTurnID
+        )
+        try await router.endTurn(handle: firstHandle, turnID: reusedTurnID)
+
+        let secondHandle = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        try await router.confirmTurnID(
+            handle: secondHandle,
+            turnID: reusedTurnID
+        )
+        await #expect(throws: TerminalToolRouterError.turnUnavailable) {
+            try await router.execute(
+                threadID: threadID,
+                turnID: reusedTurnID,
+                call: .observeScreen
+            )
+        }
+        #expect(
+            try await router.execute(
+                handle: secondHandle,
+                turnID: reusedTurnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .observeScreen
+            ) == .screen(screen)
+        )
+        try await router.endTurn(handle: secondHandle, turnID: reusedTurnID)
+    }
+
+    @Test("protocol route and confirmation share one exact activation")
+    func protocolRouteAndConfirmationActivateExactlyOnce() async throws {
+        let gate = TerminalToolTestGate()
+        let validation = TerminalBindingValidationGate(
+            blockedCall: 1,
+            gate: gate
+        )
+        let screen = TerminalToolFixtures.screen(revision: 145)
+        let port = FakeTerminalToolPort(snapshot: screen)
+        let registry = TerminalEndpointRegistry(
+            claimPreparedTurnHook: { await validation.validate() }
+        )
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: TerminalToolFixtures.newID(),
+                port: port,
+                controller: FakeTerminalSurfaceController(
+                    surface: TerminalToolFixtures.surface()
+                )
+            )
+        )
+        let router = TerminalToolRouter(
+            registry: registry,
+            approvalBroker: TerminalApprovalBroker(),
+            journal: MemoryTerminalToolJournal()
+        )
+        let threadID = AgentThreadID(rawValue: "protocol-race-thread")
+        let turnID = AgentTurnID(rawValue: "protocol-race-turn")
+        let handle = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+
+        let tool = Task {
+            try await router.execute(
+                threadID: threadID,
+                turnID: turnID,
+                call: .observeScreen
+            )
+        }
+        while await validation.count() < 1 { await Task.yield() }
+        let confirmation = Task {
+            try await router.confirmTurnID(handle: handle, turnID: turnID)
+        }
+        for _ in 0..<20 { await Task.yield() }
+        #expect(await validation.count() == 1)
+        await gate.open()
+
+        #expect(try await tool.value == .screen(screen))
+        try await confirmation.value
+        #expect(await validation.count() == 1)
+        #expect(await port.keyboardOwners() == [.codex])
+        try await router.endTurn(handle: handle, turnID: turnID)
+    }
+
+    @Test("protocol identity history clears only after a quiescent thread reset")
+    func protocolIdentityHistoryRequiresQuiescentReset() async throws {
+        let screen = TerminalToolFixtures.screen(revision: 146)
+        let port = FakeTerminalToolPort(snapshot: screen)
+        let registry = TerminalEndpointRegistry()
+        try await registry.register(
+            TerminalToolFixtures.endpoint(
+                id: TerminalToolFixtures.newID(),
+                port: port,
+                controller: FakeTerminalSurfaceController(
+                    surface: TerminalToolFixtures.surface()
+                )
+            )
+        )
+        let router = TerminalToolRouter(
+            registry: registry,
+            approvalBroker: TerminalApprovalBroker(),
+            journal: MemoryTerminalToolJournal()
+        )
+        let threadID = AgentThreadID(rawValue: "protocol-reset-thread")
+        let reusedTurnID = AgentTurnID(rawValue: "reused-after-reset")
+        let firstHandle = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        _ = try await router.execute(
+            threadID: threadID,
+            turnID: reusedTurnID,
+            call: .observeScreen
+        )
+        try await router.endTurn(handle: firstHandle, turnID: reusedTurnID)
+
+        let pendingHandle = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        await #expect(throws: TerminalToolRouterError.turnUnavailable) {
+            try await router.forgetThread(threadID)
+        }
+        try await router.endTurn(
+            handle: pendingHandle,
+            turnID: .init(rawValue: "cancel-pending-turn")
+        )
+        try await router.forgetThread(threadID)
+        #expect(await router.testingStateSnapshot().observedTurnIdentityCount == 0)
+
+        let freshHandle = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        #expect(
+            try await router.execute(
+                threadID: threadID,
+                turnID: reusedTurnID,
+                call: .observeScreen
+            ) == .screen(screen)
+        )
+        try await router.endTurn(handle: freshHandle, turnID: reusedTurnID)
+    }
+
     private func makeRouter(
         port: FakeTerminalToolPort,
         surfaces: FakeTerminalSurfaceController,

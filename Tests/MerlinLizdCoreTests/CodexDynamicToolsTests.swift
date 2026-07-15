@@ -4,76 +4,37 @@ import Testing
 
 @Suite("Codex Dynamic Tools")
 struct CodexDynamicToolsTests {
-    @Test("terminal executor binds idempotently and rejects conflicting routes")
-    func executorBindingIdentityIsExact() async throws {
+    @Test("terminal executor routes a prepared Core turn without adapter binding")
+    func executorUsesProtocolNeutralRouterIdentity() async throws {
+        let screen = TerminalToolFixtures.screen(revision: 6)
+        let registry = TerminalEndpointRegistry()
+        try await registry.register(TerminalToolFixtures.endpoint(
+            id: TerminalToolFixtures.newID(),
+            port: FakeTerminalToolPort(snapshot: screen),
+            controller: FakeTerminalSurfaceController(
+                surface: TerminalToolFixtures.surface()
+            )
+        ))
         let router = TerminalToolRouter(
-            registry: TerminalEndpointRegistry(),
+            registry: registry,
             approvalBroker: TerminalApprovalBroker(),
             journal: MemoryTerminalToolJournal()
         )
         let executor = CodexTerminalToolExecutor(router: router)
-        let threadID = AgentThreadID(rawValue: "thread")
-        let otherThreadID = AgentThreadID(rawValue: "other")
-        let handle = AgentTurnHandle(threadID: threadID)
-        let conflictingHandle = AgentTurnHandle(threadID: threadID)
-        let otherKey = TerminalConversationKey(
-            target: .local,
-            tmux: .init(serverSessionID: "$8", createdAtEpoch: 2)
-        )
-
-        await #expect(throws: CodexTerminalToolExecutorError.mismatchedThread) {
-            try await executor.bindPreparedTurn(
-                threadID: otherThreadID,
-                handle: handle,
-                conversationKey: TerminalToolFixtures.key
-            )
-        }
-        try await executor.bindPreparedTurn(
+        let threadID = AgentThreadID(rawValue: "adapter-free-thread")
+        let turnID = AgentTurnID(rawValue: "adapter-free-turn")
+        let handle = try await router.beginTurn(
             threadID: threadID,
-            handle: handle,
             conversationKey: TerminalToolFixtures.key
         )
-        try await executor.bindPreparedTurn(
-            threadID: threadID,
-            handle: handle,
-            conversationKey: TerminalToolFixtures.key
-        )
-        await #expect(throws: CodexTerminalToolExecutorError.bindingExists) {
-            try await executor.bindPreparedTurn(
-                threadID: threadID,
-                handle: conflictingHandle,
-                conversationKey: TerminalToolFixtures.key
-            )
-        }
-        await #expect(throws: CodexTerminalToolExecutorError.bindingExists) {
-            try await executor.bindPreparedTurn(
-                threadID: threadID,
-                handle: handle,
-                conversationKey: otherKey
-            )
-        }
 
-        await executor.unbind(
+        #expect(try await executor.execute(
             threadID: threadID,
-            handle: conflictingHandle
-        )
-        await #expect(throws: TerminalToolRouterError.turnUnavailable) {
-            try await executor.execute(
-                threadID: threadID,
-                turnID: .init(rawValue: "turn"),
-                call: .observeScreen
-            )
-        }
-        await executor.unbind(threadID: threadID, handle: handle)
-        await #expect(
-            throws: CodexTerminalToolExecutorError.bindingUnavailable
-        ) {
-            try await executor.execute(
-                threadID: threadID,
-                turnID: .init(rawValue: "turn"),
-                call: .observeScreen
-            )
-        }
+            turnID: turnID,
+            call: .observeScreen
+        ) == .screen(screen))
+
+        try await router.endTurn(handle: handle, turnID: turnID)
     }
 
     @Test("prepared tool requests activate one exact turn before confirmation")
@@ -101,12 +62,6 @@ struct CodexDynamicToolsTests {
             threadID: threadID,
             conversationKey: TerminalToolFixtures.key
         )
-        try await executor.bindPreparedTurn(
-            threadID: threadID,
-            handle: handle,
-            conversationKey: TerminalToolFixtures.key
-        )
-
         #expect(try await executor.execute(
             threadID: threadID,
             turnID: turnID,
@@ -121,7 +76,6 @@ struct CodexDynamicToolsTests {
         }
 
         try await router.endTurn(handle: handle, turnID: turnID)
-        await executor.unbind(threadID: threadID, handle: handle)
     }
 
     @Test("catalog exposes exactly six closed tools in one namespace")

@@ -233,7 +233,376 @@ struct CodexAppServerContractTests {
         await adapter.shutdown()
     }
 
-    @Test("unknown and failure notifications map without raw diagnostics")
+    @Test("retryable errors keep the exact turn active for later output")
+    func retryableErrorDoesNotTerminateTurn() async throws {
+        let process = ScriptedAppServerProcess()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor()
+        )
+        let threadID = try await startMappedThread(
+            adapter: adapter,
+            process: process
+        )
+        let turnID = try await startMappedTurn(
+            adapter: adapter,
+            process: process,
+            threadID: threadID,
+            turnID: "retry-turn",
+            requestID: 3,
+            writeCount: 4
+        )
+        let beforeRetry = await adapter.replayedEventsForTesting(threadID)
+
+        await adapter.handleNotificationForTesting(
+            method: "error",
+            params: .object([
+                "error": .object([
+                    "message": .string("private transient diagnostic"),
+                    "codexErrorInfo": .string("serverOverloaded"),
+                ]),
+                "threadId": .string(threadID.rawValue),
+                "turnId": .string(turnID.rawValue),
+                "willRetry": .bool(true),
+            ])
+        )
+        #expect(await adapter.replayedEventsForTesting(threadID) == beforeRetry)
+
+        await adapter.handleNotificationForTesting(
+            method: "item/agentMessage/delta",
+            params: .object([
+                "threadId": .string(threadID.rawValue),
+                "turnId": .string(turnID.rawValue),
+                "delta": .string("continued"),
+            ])
+        )
+        await adapter.handleNotificationForTesting(
+            method: "turn/completed",
+            params: .object([
+                "threadId": .string(threadID.rawValue),
+                "turn": .object([
+                    "id": .string(turnID.rawValue),
+                    "status": .string("completed"),
+                ]),
+            ])
+        )
+        #expect(await adapter.replayedEventsForTesting(threadID).suffix(2) == [
+            .assistantMessageDelta("continued"),
+            .turnCompleted(turnID),
+        ])
+
+        await adapter.consumerFailedForTesting()
+        #expect(await adapter.replayedEventsForTesting(threadID).last ==
+            .turnCompleted(turnID))
+        #expect(String(describing: await adapter.replayedEventsForTesting(threadID))
+            .contains("private transient diagnostic") == false)
+        await adapter.shutdown()
+    }
+
+    @Test("final errors fail only the exact active turn once")
+    func finalErrorRequiresExactActiveTurn() async throws {
+        let process = ScriptedAppServerProcess()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor()
+        )
+        let threadID = try await startMappedThread(
+            adapter: adapter,
+            process: process
+        )
+        let turnID = try await startMappedTurn(
+            adapter: adapter,
+            process: process,
+            threadID: threadID,
+            turnID: "exact-error-turn",
+            requestID: 3,
+            writeCount: 4
+        )
+        let before = await adapter.replayedEventsForTesting(threadID)
+
+        for (wrongThread, wrongTurn) in [
+            (threadID.rawValue, "wrong-turn"),
+            ("wrong-thread", turnID.rawValue),
+        ] {
+            await adapter.handleNotificationForTesting(
+                method: "error",
+                params: .object([
+                    "error": .object([
+                        "message": .string("private wrong identity"),
+                        "codexErrorInfo": .string("unauthorized"),
+                    ]),
+                    "threadId": .string(wrongThread),
+                    "turnId": .string(wrongTurn),
+                    "willRetry": .bool(false),
+                ])
+            )
+        }
+        #expect(await adapter.availabilityForTesting == .ready)
+        #expect(await adapter.replayedEventsForTesting(threadID) == before)
+
+        await adapter.handleNotificationForTesting(
+            method: "error",
+            params: .object([
+                "error": .object([
+                    "message": .string("private overload diagnostic"),
+                    "codexErrorInfo": .string("serverOverloaded"),
+                ]),
+                "threadId": .string(threadID.rawValue),
+                "turnId": .string(turnID.rawValue),
+                "willRetry": .bool(false),
+            ])
+        )
+        let afterFinal = await adapter.replayedEventsForTesting(threadID)
+        #expect(afterFinal.last == .turnFailed(turnID, .overloaded))
+        #expect(await adapter.availabilityForTesting == .overloaded)
+
+        await adapter.handleNotificationForTesting(
+            method: "error",
+            params: .object([
+                "error": .object([
+                    "message": .string("private duplicate diagnostic"),
+                    "codexErrorInfo": .string("unauthorized"),
+                ]),
+                "threadId": .string(threadID.rawValue),
+                "turnId": .string(turnID.rawValue),
+                "willRetry": .bool(false),
+            ])
+        )
+        #expect(await adapter.replayedEventsForTesting(threadID) == afterFinal)
+        #expect(await adapter.availabilityForTesting == .overloaded)
+        await adapter.shutdown()
+    }
+
+    @Test("process crash fails active turns but leaves idle threads untouched")
+    func crashFailsOnlyActiveTurnsOnce() async throws {
+        let process = ScriptedAppServerProcess()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor()
+        )
+        let activeThreadID = try await startMappedThread(
+            adapter: adapter,
+            process: process
+        )
+        let idleStarting = Task { try await adapter.startThread() }
+        await process.waitForWriteCount(4)
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":3,"result":{"thread":{"id":"idle-thread"}}}"#
+        )))
+        let idleThreadID = try await idleStarting.value
+
+        let archiving = Task { try await adapter.archiveThread(idleThreadID) }
+        await process.waitForWriteCount(5)
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":4,"result":{}}"#
+        )))
+        try await archiving.value
+        let resuming = Task { try await adapter.resumeThread(idleThreadID) }
+        await process.waitForWriteCount(6)
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":5,"result":{"thread":{"id":"idle-thread","turns":[]}}}"#
+        )))
+        try await resuming.value
+
+        let turnID = try await startMappedTurn(
+            adapter: adapter,
+            process: process,
+            threadID: activeThreadID,
+            turnID: "crash-turn",
+            requestID: 6,
+            writeCount: 7
+        )
+
+        await adapter.consumerFailedForTesting()
+        let afterCrash = await adapter.replayedEventsForTesting(activeThreadID)
+        #expect(afterCrash.last == .turnFailed(turnID, .crashed))
+        #expect(await adapter.replayedEventsForTesting(idleThreadID) == [
+            .history([]),
+        ])
+        await adapter.consumerFailedForTesting()
+        #expect(await adapter.replayedEventsForTesting(activeThreadID) ==
+            afterCrash)
+
+        await adapter.handleNotificationForTesting(
+            method: "turn/completed",
+            params: .object([
+                "threadId": .string(activeThreadID.rawValue),
+                "turn": .object([
+                    "id": .string(turnID.rawValue),
+                    "status": .string("completed"),
+                ]),
+            ])
+        )
+        #expect(await adapter.replayedEventsForTesting(activeThreadID) ==
+            afterCrash)
+        await adapter.shutdown()
+    }
+
+    @Test("late terminal events cannot clear a newer active turn")
+    func staleCompletionDoesNotClearNewTurn() async throws {
+        let process = ScriptedAppServerProcess()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor()
+        )
+        let threadID = try await startMappedThread(
+            adapter: adapter,
+            process: process
+        )
+        let oldTurnID = try await startMappedTurn(
+            adapter: adapter,
+            process: process,
+            threadID: threadID,
+            turnID: "old-turn",
+            requestID: 3,
+            writeCount: 4
+        )
+        let newTurnID = try await startMappedTurn(
+            adapter: adapter,
+            process: process,
+            threadID: threadID,
+            turnID: "new-turn",
+            requestID: 4,
+            writeCount: 5
+        )
+        let beforeStale = await adapter.replayedEventsForTesting(threadID)
+
+        await adapter.handleNotificationForTesting(
+            method: "turn/completed",
+            params: .object([
+                "threadId": .string(threadID.rawValue),
+                "turn": .object([
+                    "id": .string(oldTurnID.rawValue),
+                    "status": .string("completed"),
+                ]),
+            ])
+        )
+        #expect(await adapter.replayedEventsForTesting(threadID) == beforeStale)
+
+        await adapter.handleNotificationForTesting(
+            method: "turn/completed",
+            params: .object([
+                "threadId": .string(threadID.rawValue),
+                "turn": .object([
+                    "id": .string(newTurnID.rawValue),
+                    "status": .string("completed"),
+                ]),
+            ])
+        )
+        #expect(await adapter.replayedEventsForTesting(threadID).last ==
+            .turnCompleted(newTurnID))
+        await adapter.shutdown()
+    }
+
+    @Test("deleting a thread clears its active turn before late events")
+    func deleteClearsActiveTurn() async throws {
+        let process = ScriptedAppServerProcess()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor()
+        )
+        let threadID = try await startMappedThread(
+            adapter: adapter,
+            process: process
+        )
+        let turnID = try await startMappedTurn(
+            adapter: adapter,
+            process: process,
+            threadID: threadID,
+            turnID: "deleted-turn",
+            requestID: 3,
+            writeCount: 4
+        )
+        let deleting = Task { try await adapter.deleteThread(threadID) }
+        await process.waitForWriteCount(5)
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":4,"result":{}}"#
+        )))
+        try await deleting.value
+
+        await adapter.handleNotificationForTesting(
+            method: "turn/completed",
+            params: .object([
+                "threadId": .string(threadID.rawValue),
+                "turn": .object([
+                    "id": .string(turnID.rawValue),
+                    "status": .string("completed"),
+                ]),
+            ])
+        )
+        await adapter.consumerFailedForTesting()
+        #expect(await adapter.replayedEventsForTesting(threadID) == [])
+        await adapter.shutdown()
+    }
+
+    @Test("real executor handles a tool call while turn start is suspended")
+    func appServerToolRaceUsesPreparedCoreTurn() async throws {
+        let screen = TerminalToolFixtures.screen(revision: 8)
+        let registry = TerminalEndpointRegistry()
+        try await registry.register(TerminalToolFixtures.endpoint(
+            id: TerminalToolFixtures.newID(),
+            port: FakeTerminalToolPort(snapshot: screen),
+            controller: FakeTerminalSurfaceController(
+                surface: TerminalToolFixtures.surface()
+            )
+        ))
+        let router = TerminalToolRouter(
+            registry: registry,
+            approvalBroker: TerminalApprovalBroker(),
+            journal: MemoryTerminalToolJournal()
+        )
+        let process = ScriptedAppServerProcess()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: CodexTerminalToolExecutor(router: router)
+        )
+        let threadID = try await startMappedThread(
+            adapter: adapter,
+            process: process
+        )
+        let handle = try await router.beginTurn(
+            threadID: threadID,
+            conversationKey: TerminalToolFixtures.key
+        )
+        let starting = Task {
+            try await adapter.startTurn(threadID: threadID, prompt: "observe")
+        }
+        await process.waitForWriteCount(4)
+
+        let response = try await adapter.handleServerRequestForTesting(
+            method: "item/tool/call",
+            params: .object([
+                "arguments": .object([:]),
+                "callId": .string("racing-core-call"),
+                "threadId": .string(threadID.rawValue),
+                "tool": .string("observe_screen"),
+                "turnId": .string("racing-core-turn"),
+                "namespace": .string("merlin_tmux"),
+            ])
+        )
+        guard case let .object(responseFields) = response else {
+            Issue.record("tool response was not an object")
+            return
+        }
+        #expect(responseFields["success"] == .bool(true))
+        #expect(String(describing: response).contains("\\\"revision\\\":8"))
+
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":3,"result":{"turn":{"id":"racing-core-turn"}}}"#
+        )))
+        let turnID = try await starting.value
+        try await router.confirmTurnID(handle: handle, turnID: turnID)
+        try await router.endTurn(handle: handle, turnID: turnID)
+        await adapter.shutdown()
+    }
+
+    @Test("unknown and inactive failure notifications stay bounded")
     func notificationFailuresAreBounded() async throws {
         let process = ScriptedAppServerProcess()
         let adapter = CodexAppServerAdapter(
@@ -265,6 +634,9 @@ struct CodexAppServerContractTests {
         #expect(await adapter.replayedEventsForTesting(threadID) == [
             .turnFailed(nil, .protocolFailure),
         ])
+        let beforeInactiveErrors = await adapter.replayedEventsForTesting(
+            threadID
+        )
 
         await adapter.handleNotificationForTesting(
             method: "error",
@@ -279,10 +651,6 @@ struct CodexAppServerContractTests {
                 "willRetry": .bool(false),
             ])
         )
-        #expect(await adapter.availabilityForTesting == .overloaded)
-        #expect(await adapter.replayedEventsForTesting(threadID).last ==
-            .turnFailed(.init(rawValue: "turn-overloaded"), .overloaded))
-
         await adapter.handleNotificationForTesting(
             method: "error",
             params: .object([
@@ -295,9 +663,6 @@ struct CodexAppServerContractTests {
                 "willRetry": .bool(false),
             ])
         )
-        #expect(await adapter.replayedEventsForTesting(threadID).last ==
-            .turnFailed(.init(rawValue: "turn-limit"), .overloaded))
-
         await adapter.handleNotificationForTesting(
             method: "error",
             params: .object([
@@ -310,9 +675,9 @@ struct CodexAppServerContractTests {
                 "willRetry": .bool(false),
             ])
         )
-        #expect(await adapter.availabilityForTesting == .authenticationRequired)
-        #expect(await adapter.replayedEventsForTesting(threadID).last ==
-            .turnFailed(.init(rawValue: "turn-auth"), .authenticationRequired))
+        #expect(await adapter.availabilityForTesting == .ready)
+        #expect(await adapter.replayedEventsForTesting(threadID) ==
+            beforeInactiveErrors)
 
         await adapter.consumerFailedForTesting()
         #expect(await adapter.availabilityForTesting == .crashed)
@@ -613,6 +978,24 @@ private func startMappedThread(
     await process.waitForWriteCount(3)
     await process.emit(.standardOutput(jsonLine(
         #"{"id":2,"result":{"thread":{"id":"thread-1"}}}"#
+    )))
+    return try await starting.value
+}
+
+private func startMappedTurn(
+    adapter: CodexAppServerAdapter,
+    process: ScriptedAppServerProcess,
+    threadID: AgentThreadID,
+    turnID: String,
+    requestID: Int,
+    writeCount: Int
+) async throws -> AgentTurnID {
+    let starting = Task {
+        try await adapter.startTurn(threadID: threadID, prompt: "prompt")
+    }
+    await process.waitForWriteCount(writeCount)
+    await process.emit(.standardOutput(jsonLine(
+        #"{"id":\#(requestID),"result":{"turn":{"id":"\#(turnID)"}}}"#
     )))
     return try await starting.value
 }
