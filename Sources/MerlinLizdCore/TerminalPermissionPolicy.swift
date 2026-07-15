@@ -51,7 +51,7 @@ public struct TerminalApprovalScope: Codable, Hashable, Sendable {
             payloadDigest: Self.sha256Hex(bytes),
             endpointID: endpointID,
             screenRevision: screen.revision,
-            context: TerminalApprovalContext(
+            context: try TerminalApprovalContext(
                 surface: surface,
                 screen: TerminalApprovalScreenContext(snapshot: screen)
             )
@@ -76,15 +76,142 @@ public struct TerminalApprovalScope: Codable, Hashable, Sendable {
 }
 
 public struct TerminalApprovalContext: Codable, Equatable, Hashable, Sendable {
-    public let surface: TmuxSurface
+    public let surface: TerminalApprovalSurfaceContext
     public let screen: TerminalApprovalScreenContext
 
     public init(
-        surface: TmuxSurface,
+        surface: TerminalApprovalSurfaceContext,
         screen: TerminalApprovalScreenContext
     ) {
         self.surface = surface
         self.screen = screen
+    }
+
+    public init(
+        surface: TmuxSurface,
+        screen: TerminalApprovalScreenContext
+    ) throws {
+        self.init(
+            surface: try TerminalApprovalSurfaceContext(surface: surface),
+            screen: screen
+        )
+    }
+}
+
+public struct TerminalApprovalSurfaceContext:
+    Codable, Equatable, Hashable, Sendable
+{
+    public static let maximumIdentifierByteCount = 64
+    public static let maximumCurrentCommandByteCount = 512
+
+    public let sessionIdentity: TmuxSessionIdentity
+    public let windowID: String
+    public let paneID: String
+    public let currentCommand: String
+    public let isCurrentCommandTruncated: Bool
+
+    public init(surface: TmuxSurface) throws {
+        guard Self.hasValidLocation(
+            sessionIdentity: surface.sessionIdentity,
+            windowID: surface.windowID,
+            paneID: surface.paneID
+        ) else {
+            throw TerminalApprovalCanonicalizationError.invalidContext
+        }
+        let bounded = TerminalApprovalUTF8.bounded(
+            surface.currentCommand,
+            maximumByteCount: Self.maximumCurrentCommandByteCount
+        )
+        sessionIdentity = surface.sessionIdentity
+        windowID = surface.windowID
+        paneID = surface.paneID
+        currentCommand = bounded.text
+        isCurrentCommandTruncated = bounded.truncated
+    }
+
+    public func matchesLocation(of surface: TmuxSurface) -> Bool {
+        sessionIdentity == surface.sessionIdentity
+            && windowID == surface.windowID
+            && paneID == surface.paneID
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionIdentity
+        case windowID
+        case paneID
+        case currentCommand
+        case isCurrentCommandTruncated
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let sessionIdentity = try container.decode(
+            TmuxSessionIdentity.self,
+            forKey: .sessionIdentity
+        )
+        let windowID = try container.decode(String.self, forKey: .windowID)
+        let paneID = try container.decode(String.self, forKey: .paneID)
+        let currentCommand = try container.decode(
+            String.self,
+            forKey: .currentCommand
+        )
+        let isTruncated = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .isCurrentCommandTruncated
+        ) ?? false
+        guard Self.hasValidLocation(
+            sessionIdentity: sessionIdentity,
+            windowID: windowID,
+            paneID: paneID
+        ), currentCommand.utf8.count <= Self.maximumCurrentCommandByteCount
+        else {
+            throw DecodingError.dataCorrupted(
+                .init(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "Invalid terminal approval surface context"
+                )
+            )
+        }
+        self.sessionIdentity = sessionIdentity
+        self.windowID = windowID
+        self.paneID = paneID
+        self.currentCommand = currentCommand
+        isCurrentCommandTruncated = isTruncated
+    }
+
+    private static func hasValidLocation(
+        sessionIdentity: TmuxSessionIdentity,
+        windowID: String,
+        paneID: String
+    ) -> Bool {
+        isValidPersistedIdentifier(
+            sessionIdentity.serverSessionID,
+            prefix: 0x24
+        )
+            && isValidPersistedIdentifier(windowID, prefix: 0x40)
+            && isValidPersistedIdentifier(paneID, prefix: 0x25)
+    }
+
+    /// Surface IDs are already obtained through the stricter tmux parser in
+    /// production. The approval projection additionally enforces a bounded,
+    /// display-safe opaque representation without narrowing the domain type to
+    /// today's numeric tmux spelling.
+    private static func isValidPersistedIdentifier(
+        _ value: String,
+        prefix: UInt8
+    ) -> Bool {
+        let bytes = Array(value.utf8)
+        guard (2...maximumIdentifierByteCount).contains(bytes.count),
+            bytes[0] == prefix
+        else { return false }
+        return bytes.dropFirst().allSatisfy {
+            (0x30...0x39).contains($0)
+                || (0x41...0x5A).contains($0)
+                || (0x61...0x7A).contains($0)
+                || $0 == 0x2D
+                || $0 == 0x2E
+                || $0 == 0x5F
+        }
     }
 }
 
@@ -107,7 +234,7 @@ public struct TerminalApprovalScreenContext:
         rows = snapshot.rows
         cursor = snapshot.cursor
         mode = snapshot.mode
-        let bounded = Self.boundedUTF8(
+        let bounded = TerminalApprovalUTF8.bounded(
             snapshot.text,
             maximumByteCount: Self.maximumTextByteCount
         )
@@ -115,7 +242,46 @@ public struct TerminalApprovalScreenContext:
         isTextTruncated = bounded.truncated
     }
 
-    private static func boundedUTF8(
+    private enum CodingKeys: String, CodingKey {
+        case revision
+        case columns
+        case rows
+        case cursor
+        case mode
+        case text
+        case isTextTruncated
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        revision = try container.decode(UInt64.self, forKey: .revision)
+        columns = try container.decode(Int.self, forKey: .columns)
+        rows = try container.decode(Int.self, forKey: .rows)
+        cursor = try container.decode(TerminalCursor.self, forKey: .cursor)
+        mode = try container.decode(TerminalScreenMode.self, forKey: .mode)
+        text = try container.decode(String.self, forKey: .text)
+        isTextTruncated = try container.decode(
+            Bool.self,
+            forKey: .isTextTruncated
+        )
+        guard text.utf8.count <= Self.maximumTextByteCount else {
+            throw DecodingError.dataCorrupted(
+                .init(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "Terminal approval screen text exceeds its byte limit"
+                )
+            )
+        }
+    }
+}
+
+public enum TerminalApprovalCanonicalizationError: Error, Equatable, Sendable {
+    case encodingFailed
+    case invalidContext
+}
+
+private enum TerminalApprovalUTF8 {
+    static func bounded(
         _ value: String,
         maximumByteCount: Int
     ) -> (text: String, truncated: Bool) {
@@ -130,10 +296,6 @@ public struct TerminalApprovalScreenContext:
         }
         return ("", true)
     }
-}
-
-public enum TerminalApprovalCanonicalizationError: Error, Equatable, Sendable {
-    case encodingFailed
 }
 
 public struct TerminalApprovalRequest: Codable, Equatable, Identifiable, Sendable {

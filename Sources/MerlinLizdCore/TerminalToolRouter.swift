@@ -2024,6 +2024,11 @@ public actor TerminalToolRouter {
         case .allow:
             break
         case let .requireApproval(request):
+            guard let approvalSurface = initialSurface else {
+                throw TerminalToolRouterError.denied(
+                    reason: "Verified tmux surface unavailable"
+                )
+            }
             let grant: TerminalApprovalGrant
             upsertApprovalActivity(
                 turn: turn,
@@ -2033,6 +2038,9 @@ public actor TerminalToolRouter {
             do {
                 grant = try await approvalBroker.awaitApproval(
                     for: request,
+                    endpointID: binding.endpoint.id,
+                    screen: initialScreen,
+                    surface: approvalSurface,
                     turnID: brokerTurnID(turn)
                 )
                 removeApprovalActivity(request.id)

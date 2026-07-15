@@ -98,7 +98,8 @@ struct TerminalOperationJournalTests {
             try await reopened.entries(for: terminalTestConversationKey())
                 == events
         )
-        #expect(scope.context?.surface == surface)
+        #expect(scope.context?.surface == (try
+            TerminalApprovalSurfaceContext(surface: surface)))
         #expect(scope.context?.screen == TerminalApprovalScreenContext(
             snapshot: screen
         ))
@@ -1086,6 +1087,80 @@ struct TerminalOperationJournalTests {
         #expect(await journal.appendCount() == 0)
     }
 
+    @Test("high-risk auditor requires context bound to trusted surface evidence")
+    func validatesHighRiskApprovalAgainstTrustedSurface() async throws {
+        let turnID = "trusted-surface"
+        let batch = terminalTestBatch(
+            events: [.text("git push origin main")],
+            purpose: "audit",
+            risk: .high
+        )
+        let screen = terminalTestScreen()
+        let trustedSurface = terminalApprovalAuditSurface()
+        let endpointID = terminalTestEndpoint()
+        let validScope = try TerminalApprovalScope(
+            batch: batch,
+            endpointID: endpointID,
+            screen: screen,
+            surface: trustedSurface
+        )
+        let valid = terminalHighPreActionEvents(
+            turnID: turnID,
+            batch: batch,
+            screen: screen,
+            endpointID: endpointID,
+            scope: validScope
+        )
+        let validJournal = ScriptedTerminalJournal(failingAppendNumbers: [])
+        let validAuditor = TerminalMutationAuditor(journal: validJournal)
+
+        try await validAuditor.appendBeforeSideEffect(
+            valid,
+            trustedSurface: trustedSurface,
+            turnID: turnID
+        )
+        #expect(await validJournal.appendCount() == valid.count)
+
+        let legacyScope = try TerminalApprovalScope(
+            batch: batch,
+            endpointID: endpointID,
+            screenRevision: screen.revision
+        )
+        let forgedSurface = TmuxSurface(
+            sessionIdentity: trustedSurface.sessionIdentity,
+            windowID: "@9",
+            paneID: "%9",
+            currentCommand: "bash"
+        )
+        let forgedScope = try TerminalApprovalScope(
+            batch: batch,
+            endpointID: endpointID,
+            screen: screen,
+            surface: forgedSurface
+        )
+
+        for (index, scope) in [legacyScope, forgedScope].enumerated() {
+            let journal = ScriptedTerminalJournal(failingAppendNumbers: [])
+            let auditor = TerminalMutationAuditor(journal: journal)
+            await #expect(throws: TerminalMutationAuditError.denied(
+                reason: "Required pre-action audit events are missing or out of order"
+            )) {
+                try await auditor.appendBeforeSideEffect(
+                    terminalHighPreActionEvents(
+                        turnID: "\(turnID)-\(index)",
+                        batch: batch,
+                        screen: screen,
+                        endpointID: endpointID,
+                        scope: scope
+                    ),
+                    trustedSurface: trustedSurface,
+                    turnID: "\(turnID)-\(index)"
+                )
+            }
+            #expect(await journal.appendCount() == 0)
+        }
+    }
+
     @Test("post-action audit must match a prepared operation in the same turn")
     func validatesPostActionAuditIdentity() async throws {
         let journal = ScriptedTerminalJournal(failingAppendNumbers: [])
@@ -1193,10 +1268,13 @@ struct TerminalOperationJournalTests {
             events: [.text("git push origin main")],
             risk: .high
         )
+        let highScreen = terminalTestScreen()
+        let highSurface = terminalApprovalAuditSurface()
         let scope = try TerminalApprovalScope(
             batch: highBatch,
             endpointID: terminalTestEndpoint(),
-            screenRevision: highBatch.expectedRevision
+            screen: highScreen,
+            surface: highSurface
         )
         let operationID = terminalUUID("10000000-0000-0000-0000-000000000009")
         let highEvents: [TerminalJournalEvent] = [
@@ -1208,7 +1286,7 @@ struct TerminalOperationJournalTests {
             terminalTestJournalEvent(
                 operationID: operationID,
                 turnID: turnID,
-                kind: .screen(terminalTestScreen())
+                kind: .screen(highScreen)
             ),
             terminalTestJournalEvent(
                 operationID: operationID,
@@ -1241,7 +1319,11 @@ struct TerminalOperationJournalTests {
         ]
         let validJournal = ScriptedTerminalJournal(failingAppendNumbers: [])
         let validAuditor = TerminalMutationAuditor(journal: validJournal)
-        try await validAuditor.appendBeforeSideEffect(highEvents, turnID: turnID)
+        try await validAuditor.appendBeforeSideEffect(
+            highEvents,
+            trustedSurface: highSurface,
+            turnID: turnID
+        )
         #expect(await validJournal.appendCount() == highEvents.count)
 
         var forgedHigh = highEvents
@@ -1257,6 +1339,7 @@ struct TerminalOperationJournalTests {
         )) {
             try await forgedAuditor.appendBeforeSideEffect(
                 forgedHigh,
+                trustedSurface: highSurface,
                 turnID: turnID
             )
         }
@@ -1388,5 +1471,64 @@ struct TerminalOperationJournalTests {
                 kind: .emittedBatch(batch)
             ),
         ]
+    }
+
+    private func terminalHighPreActionEvents(
+        turnID: String,
+        batch: TerminalInputBatch,
+        screen: TerminalScreenSnapshot,
+        endpointID: TerminalEndpointID,
+        scope: TerminalApprovalScope
+    ) -> [TerminalJournalEvent] {
+        let operationID = terminalUUID()
+        return [
+            terminalTestJournalEvent(
+                operationID: operationID,
+                turnID: turnID,
+                kind: .request(operation: "sendInput", purpose: batch.purpose)
+            ),
+            terminalTestJournalEvent(
+                operationID: operationID,
+                turnID: turnID,
+                kind: .screen(screen)
+            ),
+            terminalTestJournalEvent(
+                operationID: operationID,
+                turnID: turnID,
+                kind: .risk(
+                    agentDeclared: .high,
+                    deterministic: .routine,
+                    effective: .high
+                )
+            ),
+            terminalTestJournalEvent(
+                operationID: operationID,
+                turnID: turnID,
+                kind: .approval(
+                    requestID: terminalUUID(),
+                    scope: scope,
+                    outcome: .approvedOnce
+                )
+            ),
+            terminalTestJournalEvent(
+                operationID: operationID,
+                turnID: turnID,
+                kind: .endpoint(endpointID)
+            ),
+            terminalTestJournalEvent(
+                operationID: operationID,
+                turnID: turnID,
+                kind: .emittedBatch(batch)
+            ),
+        ]
+    }
+
+    private func terminalApprovalAuditSurface() -> TmuxSurface {
+        TmuxSurface(
+            sessionIdentity: terminalTestConversationKey().tmux,
+            windowID: "@1",
+            paneID: "%1",
+            currentCommand: "zsh"
+        )
     }
 }

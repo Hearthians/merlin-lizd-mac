@@ -22,10 +22,10 @@ struct CodexApprovalCardView: View {
                     "\(request.scope.endpointID.rawValue.uuidString) · session "
                         + "\(context.surface.sessionIdentity.serverSessionID) · window "
                         + "\(context.surface.windowID) · pane \(context.surface.paneID) · command "
-                        + CodexBoundedText.string(
-                            context.surface.currentCommand,
-                            maximumCharacterCount: 256
-                        )
+                        + context.surface.currentCommand
+                        + (context.surface.isCurrentCommandTruncated
+                            ? "… [command context truncated]"
+                            : "")
                 )
                 detail(
                     "Screen context",

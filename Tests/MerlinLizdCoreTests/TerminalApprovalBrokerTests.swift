@@ -12,7 +12,11 @@ struct TerminalApprovalBrokerTests {
             timeout: .seconds(1)
         )
         let waiter = Task {
-            try await broker.awaitApproval(for: request, turnID: "observed")
+            try await awaitLiveApproval(
+                broker,
+                request: request,
+                turnID: "observed"
+            )
         }
 
         #expect(await observed)
@@ -59,7 +63,11 @@ struct TerminalApprovalBrokerTests {
         let broker = TerminalApprovalBroker()
         let request = try approvalRequest()
         let waiter = Task {
-            try await broker.awaitApproval(for: request, turnID: "turn-1")
+            try await awaitLiveApproval(
+                broker,
+                request: request,
+                turnID: "turn-1"
+            )
         }
         #expect(await waitForPendingApproval(request.id, in: broker))
 
@@ -102,8 +110,9 @@ struct TerminalApprovalBrokerTests {
                 reason: "high risk"
             )
             let waiter = Task {
-                try await broker.awaitApproval(
-                    for: candidate,
+                try await awaitLiveApproval(
+                    broker,
+                    request: candidate,
                     turnID: "turn-\(index)"
                 )
             }
@@ -126,10 +135,18 @@ struct TerminalApprovalBrokerTests {
             id: "20000000-0000-0000-0000-000000000003"
         )
         let routeWaiter = Task {
-            try await broker.awaitApproval(for: routeRequest, turnID: "route")
+            try await awaitLiveApproval(
+                broker,
+                request: routeRequest,
+                turnID: "route"
+            )
         }
         let screenWaiter = Task {
-            try await broker.awaitApproval(for: screenRequest, turnID: "screen")
+            try await awaitLiveApproval(
+                broker,
+                request: screenRequest,
+                turnID: "screen"
+            )
         }
         #expect(await waitForPendingApproval(routeRequest.id, in: broker))
         #expect(await waitForPendingApproval(screenRequest.id, in: broker))
@@ -151,7 +168,11 @@ struct TerminalApprovalBrokerTests {
             id: "20000000-0000-0000-0000-000000000004"
         )
         let approvedWaiter = Task {
-            try await broker.awaitApproval(for: approved, turnID: "approved")
+            try await awaitLiveApproval(
+                broker,
+                request: approved,
+                turnID: "approved"
+            )
         }
         #expect(await waitForPendingApproval(approved.id, in: broker))
         #expect(await broker.approveOnce(approved.id))
@@ -173,11 +194,16 @@ struct TerminalApprovalBrokerTests {
             id: "20000000-0000-0000-0000-000000000006"
         )
         let deniedWaiter = Task {
-            try await broker.awaitApproval(for: denied, turnID: "turn-denied")
+            try await awaitLiveApproval(
+                broker,
+                request: denied,
+                turnID: "turn-denied"
+            )
         }
         let cancelledWaiter = Task {
-            try await broker.awaitApproval(
-                for: cancelled,
+            try await awaitLiveApproval(
+                broker,
+                request: cancelled,
                 turnID: "turn-cancelled"
             )
         }
@@ -201,12 +227,20 @@ struct TerminalApprovalBrokerTests {
         let broker = TerminalApprovalBroker()
         let request = try approvalRequest()
         let first = Task {
-            try await broker.awaitApproval(for: request, turnID: "turn-1")
+            try await awaitLiveApproval(
+                broker,
+                request: request,
+                turnID: "turn-1"
+            )
         }
         #expect(await waitForPendingApproval(request.id, in: broker))
 
         await #expect(throws: TerminalApprovalError.duplicateRequest) {
-            try await broker.awaitApproval(for: request, turnID: "turn-2")
+            try await awaitLiveApproval(
+                broker,
+                request: request,
+                turnID: "turn-2"
+            )
         }
         await broker.cancelTurn("turn-1")
         await #expect(throws: TerminalApprovalError.cancelled) {
@@ -229,10 +263,104 @@ struct TerminalApprovalBrokerTests {
         )
 
         await #expect(throws: TerminalApprovalError.invalidRequest) {
-            try await broker.awaitApproval(for: forged, turnID: "forged")
+            try await awaitLiveApproval(
+                broker,
+                request: forged,
+                turnID: "forged"
+            )
         }
         #expect(await broker.pendingRequests().isEmpty)
         #expect(await !broker.approveOnce(forged.id))
+    }
+
+    @Test("live approval rejects legacy context before becoming pending")
+    func rejectsLegacyLiveApproval() async throws {
+        let broker = TerminalApprovalBroker()
+        let valid = try approvalRequest()
+        let legacy = TerminalApprovalRequest(
+            id: valid.id,
+            scope: try TerminalApprovalScope(
+                batch: valid.batch,
+                endpointID: valid.scope.endpointID,
+                screenRevision: valid.scope.screenRevision
+            ),
+            batch: valid.batch,
+            reason: valid.reason
+        )
+
+        await #expect(throws: TerminalApprovalError.invalidRequest) {
+            try await broker.awaitApproval(
+                for: legacy,
+                endpointID: legacy.scope.endpointID,
+                screen: approvalScreen(),
+                surface: approvalSurface(),
+                turnID: "legacy"
+            )
+        }
+        #expect(await broker.pendingRequests().isEmpty)
+    }
+
+    @Test("live approval rejects forged endpoint revision screen or surface")
+    func rejectsForgedLiveContext() async throws {
+        let broker = TerminalApprovalBroker()
+        let valid = try approvalRequest()
+        let forgedScreen = terminalTestScreen(
+            revision: valid.batch.expectedRevision,
+            text: "forged approval-time screen"
+        )
+        let forgedSurface = TmuxSurface(
+            sessionIdentity: approvalSurface().sessionIdentity,
+            windowID: "@9",
+            paneID: "%9",
+            currentCommand: "bash"
+        )
+        let forgedScopes = [
+            try TerminalApprovalScope(
+                batch: valid.batch,
+                endpointID: terminalTestEndpoint(
+                    "00000000-0000-0000-0000-000000000002"
+                ),
+                screen: approvalScreen(),
+                surface: approvalSurface()
+            ),
+            try TerminalApprovalScope(
+                batch: valid.batch,
+                endpointID: valid.scope.endpointID,
+                screen: terminalTestScreen(
+                    revision: valid.scope.screenRevision + 1
+                ),
+                surface: approvalSurface()
+            ),
+            try TerminalApprovalScope(
+                batch: valid.batch,
+                endpointID: valid.scope.endpointID,
+                screen: forgedScreen,
+                surface: approvalSurface()
+            ),
+            try TerminalApprovalScope(
+                batch: valid.batch,
+                endpointID: valid.scope.endpointID,
+                screen: approvalScreen(),
+                surface: forgedSurface
+            ),
+        ]
+
+        for scope in forgedScopes {
+            let forged = TerminalApprovalRequest(
+                id: terminalUUID(),
+                scope: scope,
+                batch: valid.batch,
+                reason: valid.reason
+            )
+            await #expect(throws: TerminalApprovalError.invalidRequest) {
+                try await awaitLiveApproval(
+                    broker,
+                    request: forged,
+                    turnID: "forged-context"
+                )
+            }
+            #expect(await broker.pendingRequests().isEmpty)
+        }
     }
 
     @Test("direct task cancellation revokes a racing allow-once grant")
@@ -242,7 +370,11 @@ struct TerminalApprovalBrokerTests {
             id: "20000000-0000-0000-0000-000000000008"
         )
         let waiter = Task {
-            try await broker.awaitApproval(for: request, turnID: "race")
+            try await awaitLiveApproval(
+                broker,
+                request: request,
+                turnID: "race"
+            )
         }
         #expect(await waitForPendingApproval(request.id, in: broker))
 
@@ -268,10 +400,38 @@ struct TerminalApprovalBrokerTests {
             scope: try TerminalApprovalScope(
                 batch: batch,
                 endpointID: terminalTestEndpoint(),
-                screenRevision: batch.expectedRevision
+                screen: approvalScreen(),
+                surface: approvalSurface()
             ),
             batch: batch,
             reason: "git push changes a remote repository"
+        )
+    }
+
+    private func awaitLiveApproval(
+        _ broker: TerminalApprovalBroker,
+        request: TerminalApprovalRequest,
+        turnID: String
+    ) async throws -> TerminalApprovalGrant {
+        try await broker.awaitApproval(
+            for: request,
+            endpointID: terminalTestEndpoint(),
+            screen: approvalScreen(),
+            surface: approvalSurface(),
+            turnID: turnID
+        )
+    }
+
+    private func approvalScreen() -> TerminalScreenSnapshot {
+        terminalTestScreen(revision: 7)
+    }
+
+    private func approvalSurface() -> TmuxSurface {
+        TmuxSurface(
+            sessionIdentity: terminalTestConversationKey().tmux,
+            windowID: "@1",
+            paneID: "%1",
+            currentCommand: "zsh"
         )
     }
 }

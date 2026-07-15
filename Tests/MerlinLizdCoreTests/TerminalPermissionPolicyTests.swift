@@ -422,7 +422,8 @@ struct TerminalPermissionPolicyTests {
             screen: screen,
             surface: surface
         )))
-        #expect(request.scope.context?.surface == surface)
+        #expect(request.scope.context?.surface == (try
+            TerminalApprovalSurfaceContext(surface: surface)))
         #expect(request.scope.context?.screen.revision == screen.revision)
         #expect(request.scope.context?.screen.columns == screen.columns)
         #expect(request.scope.context?.screen.rows == screen.rows)
@@ -438,6 +439,49 @@ struct TerminalPermissionPolicyTests {
         #expect(structural.deterministicRisk == .high)
         #expect(structural.effectiveRisk == .high)
         assertRequiresApproval(structural, context: "structural boundary")
+    }
+
+    @Test("approval context bounds command text and validates exact tmux IDs")
+    func boundsApprovalSurfaceContext() throws {
+        let longCommand = String(repeating: "终", count: 400)
+        let surface = TmuxSurface(
+            sessionIdentity: terminalTestApprovalSurface().sessionIdentity,
+            windowID: "@123",
+            paneID: "%456",
+            currentCommand: longCommand
+        )
+        let context = try TerminalApprovalSurfaceContext(surface: surface)
+
+        #expect(context.sessionIdentity == surface.sessionIdentity)
+        #expect(context.windowID == surface.windowID)
+        #expect(context.paneID == surface.paneID)
+        #expect(context.currentCommand.utf8.count
+            <= TerminalApprovalSurfaceContext.maximumCurrentCommandByteCount)
+        #expect(context.isCurrentCommandTruncated)
+        #expect(context.matchesLocation(of: surface))
+
+        let invalid = TmuxSurface(
+            sessionIdentity: surface.sessionIdentity,
+            windowID: "window-123",
+            paneID: surface.paneID,
+            currentCommand: "zsh"
+        )
+        #expect(throws: TerminalApprovalCanonicalizationError.invalidContext) {
+            try TerminalApprovalSurfaceContext(surface: invalid)
+        }
+    }
+
+    @Test("approval context decoding rejects oversized screen and surface text")
+    func rejectsOversizedDecodedApprovalContext() throws {
+        let batch = terminalTestBatch(risk: .high)
+        let scope = try TerminalApprovalScope(
+            batch: batch,
+            endpointID: terminalTestEndpoint(),
+            screen: terminalTestScreen(),
+            surface: terminalTestApprovalSurface()
+        )
+        #expect(try terminalApprovalDecodeRejectsOversizedSurface(scope))
+        #expect(try terminalApprovalDecodeRejectsOversizedScreen(scope))
     }
 
     @Test("stale oversized and unencodable batches deny")

@@ -157,32 +157,83 @@ struct CodexDrawerStateTests {
     func reducesEndpointRegistrationRaces() {
         let first = terminalUUID("10000000-0000-0000-0000-000000000001")
         let second = terminalUUID("10000000-0000-0000-0000-000000000002")
+        let originalRoute = Self.endpointRoute(sessionName: "original")
+        let renamedRoute = Self.endpointRoute(sessionName: "renamed")
         var registration = CodexDrawerEndpointRegistration()
 
-        registration.begin(generationID: first)
+        registration.begin(generationID: first, route: originalRoute)
         #expect(registration.readiness == .registering)
         registration.detach()
-        let lateSuccess = registration.succeed(generationID: first)
+        let lateSuccess = registration.succeed(
+            generationID: first,
+            route: originalRoute
+        )
         #expect(!lateSuccess)
         #expect(registration.readiness == .detached)
 
-        registration.begin(generationID: second)
-        let staleFailure = registration.fail(generationID: first)
+        registration.begin(generationID: second, route: renamedRoute)
+        let staleFailure = registration.fail(
+            generationID: first,
+            route: originalRoute
+        )
         #expect(!staleFailure)
         #expect(registration.readiness == .registering)
-        let exactFailure = registration.fail(generationID: second)
+        let staleRouteSuccess = registration.succeed(
+            generationID: second,
+            route: originalRoute
+        )
+        #expect(!staleRouteSuccess)
+        #expect(registration.readiness == .registering)
+        let exactFailure = registration.fail(
+            generationID: second,
+            route: renamedRoute
+        )
         #expect(exactFailure)
         #expect(registration.readiness == .registrationFailed)
 
-        registration.begin(generationID: first)
-        let exactSuccess = registration.succeed(generationID: first)
+        registration.begin(generationID: first, route: originalRoute)
+        let exactSuccess = registration.succeed(
+            generationID: first,
+            route: originalRoute
+        )
         #expect(exactSuccess)
         #expect(registration.readiness == .registered)
+        #expect(registration.route == originalRoute)
+    }
+
+    @Test("endpoint route diff invalidates rename but ignores cosmetic title")
+    func classifiesEndpointRouteChangesPerTab() {
+        let identity = Self.key(1).tmux
+        let previous = [
+            Self.tab("first", key: Self.key(1), sessionName: "old"),
+            Self.tab("duplicate", key: Self.key(1), sessionName: "old"),
+            Self.tab("cosmetic", key: Self.key(2), sessionName: "stable"),
+        ]
+        var current = previous
+        current[0].sessionName = "renamed"
+        current[1].sessionName = "renamed"
+        current[2].title = "A nicer title"
+
+        #expect(
+            CodexDrawerEndpointRouteChange.changedTabIDs(
+                from: previous,
+                to: current
+            ) == Set(["first", "duplicate"])
+        )
+        #expect(CodexDrawerEndpointRouteDescriptor(tab: current[0]) ==
+            CodexDrawerEndpointRouteDescriptor(
+                target: .local,
+                sessionName: "renamed",
+                tmuxIdentity: identity
+            ))
     }
 
     @Test("takeover keeps Codex ownership until interruption completes")
     func sequencesTakeoverCompletion() {
         let key = Self.key(1)
+        let operationID = terminalUUID(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        )
         var state = CodexDrawerState(availability: .ready)
         state.reduce(.selectTerminal(.connected(key)))
         state.reduce(.receiveSessions([
@@ -190,17 +241,45 @@ struct CodexDrawerStateTests {
         ]))
 
         #expect(state.keyboardOwnership == .codex)
-        #expect(state.reduce(.requestTakeover) == [.stopAndTakeOver(key)])
-        #expect(state.keyboardOwnership == .takeoverPending)
-        #expect(state.reduce(.requestTakeover).isEmpty)
+        #expect(state.reduce(.requestTakeover(operationID)) == [
+            .stopAndTakeOver(key, operationID),
+        ])
+        #expect(state.keyboardOwnership == .takeoverPending(operationID))
+        #expect(state.reduce(.requestTakeover(operationID)).isEmpty)
 
-        state.reduce(.takeoverCompleted(key))
+        state.reduce(.takeoverCompleted(key, operationID))
         #expect(state.keyboardOwnership == .user)
+    }
+
+    @Test("takeover pending blocks sends without discarding the draft")
+    func blocksSendWhileTakeoverIsPending() {
+        let key = Self.key(1)
+        let operationID = terminalUUID(
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        )
+        var state = CodexDrawerState(availability: .ready)
+        state.reduce(.selectTerminal(.connected(key)))
+        state.reduce(.receiveSessions([
+            key: Self.session(key, phase: .controlling, active: true),
+        ]))
+        state.reduce(.editComposer("keep this draft"))
+
+        #expect(state.reduce(.requestTakeover(operationID)) == [
+            .stopAndTakeOver(key, operationID),
+        ])
+        #expect(!state.canSend)
+        #expect(state.reduce(.sendComposer).isEmpty)
+        #expect(state.composerText == "keep this draft")
+        #expect(state.keyboardOwnership == .takeoverPending(operationID))
     }
 
     @Test("disconnected active turns remain stoppable without a terminal")
     func stopsDisconnectedActiveTurn() {
         let key = Self.key(1)
+        let otherKey = Self.key(2)
+        let operationID = terminalUUID(
+            "cccccccc-cccc-cccc-cccc-cccccccccccc"
+        )
         var state = CodexDrawerState(availability: .ready)
         state.reduce(.selectTerminal(.disconnected(key)))
         state.reduce(.receiveSessions([
@@ -208,9 +287,15 @@ struct CodexDrawerStateTests {
         ]))
 
         #expect(state.canTakeOver)
-        #expect(state.reduce(.requestTakeover) == [.stopAndTakeOver(key)])
-        #expect(state.keyboardOwnership == .takeoverPending)
-        #expect(state.reduce(.requestTakeover).isEmpty)
+        #expect(state.reduce(.requestTakeover(operationID)) == [
+            .stopAndTakeOver(key, operationID),
+        ])
+        #expect(state.keyboardOwnership == .takeoverPending(operationID))
+        #expect(state.reduce(.requestTakeover(operationID)).isEmpty)
+
+        state.reduce(.selectTerminal(.connected(otherKey)))
+        state.reduce(.selectTerminal(.disconnected(key)))
+        #expect(state.keyboardOwnership == .takeoverPending(operationID))
 
         state.reduce(.receiveSessions([
             key: Self.session(
@@ -219,19 +304,52 @@ struct CodexDrawerStateTests {
                 active: false
             ),
         ]))
-        #expect(state.keyboardOwnership == .takeoverPending)
-        state.reduce(.takeoverCompleted(key))
+        #expect(state.keyboardOwnership == .takeoverPending(operationID))
+        state.reduce(.takeoverCompleted(key, operationID))
+        #expect(state.keyboardOwnership == .user)
+    }
+
+    @Test("stale takeover completion cannot finish a newer operation")
+    func rejectsStaleTakeoverCompletion() {
+        let key = Self.key(1)
+        let firstOperationID = terminalUUID(
+            "dddddddd-dddd-dddd-dddd-dddddddddddd"
+        )
+        let secondOperationID = terminalUUID(
+            "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+        )
+        var state = CodexDrawerState(availability: .ready)
+        state.reduce(.selectTerminal(.connected(key)))
+        state.reduce(.receiveSessions([
+            key: Self.session(key, phase: .controlling, active: true),
+        ]))
+
+        state.reduce(.requestTakeover(firstOperationID))
+        state.reduce(.takeoverCompleted(key, firstOperationID))
+        state.reduce(.receiveSessions([
+            key: Self.session(key, phase: .controlling, active: true),
+        ]))
+        state.reduce(.requestTakeover(secondOperationID))
+
+        state.reduce(.takeoverCompleted(key, firstOperationID))
+        #expect(state.keyboardOwnership ==
+            .takeoverPending(secondOperationID))
+        state.reduce(.takeoverCompleted(key, secondOperationID))
         #expect(state.keyboardOwnership == .user)
     }
 
     @Test("takeover completion action is sequenced after coordinator stop")
     func sequencesAsyncTakeoverCommand() async {
         let key = Self.key(1)
+        let operationID = terminalUUID(
+            "ffffffff-ffff-ffff-ffff-ffffffffffff"
+        )
         let gate = AsyncStartGate()
         let completion = AsyncCompletionProbe()
         let execution = Task {
             let action = await CodexDrawerCommandSequencer.stopAndTakeOver(
-                key
+                key,
+                operationID: operationID
             ) {
                 await gate.wait()
             }
@@ -242,7 +360,8 @@ struct CodexDrawerStateTests {
         await gate.waitUntilEntered()
         #expect(await completion.count() == 0)
         await gate.open()
-        #expect(await execution.value == .takeoverCompleted(key))
+        #expect(await execution.value ==
+            .takeoverCompleted(key, operationID))
         #expect(await completion.count() == 1)
     }
 
@@ -401,14 +520,25 @@ struct CodexDrawerStateTests {
 
     private static func tab(
         _ id: String,
-        key: TerminalConversationKey
+        key: TerminalConversationKey,
+        sessionName: String = "session"
     ) -> TerminalTabRecord {
         TerminalTabRecord(
             id: id,
             title: id,
             target: .local,
-            sessionName: "session",
+            sessionName: sessionName,
             tmuxIdentity: key.tmux
+        )
+    }
+
+    private static func endpointRoute(
+        sessionName: String
+    ) -> CodexDrawerEndpointRouteDescriptor {
+        CodexDrawerEndpointRouteDescriptor(
+            target: .local,
+            sessionName: sessionName,
+            tmuxIdentity: key(1).tmux
         )
     }
 

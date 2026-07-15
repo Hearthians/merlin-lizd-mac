@@ -614,10 +614,12 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         }
         let token = UUID()
         codexEndpointTokens[tab.id] = token
-        var registration = codexEndpointRegistrations[tab.id] ?? .init()
-        registration.begin(generationID: token)
-        codexEndpointRegistrations[tab.id] = registration
-        refreshCodexTerminalContext()
+        if let route = CodexDrawerEndpointRouteDescriptor(tab: tab) {
+            var registration = codexEndpointRegistrations[tab.id] ?? .init()
+            registration.begin(generationID: token, route: route)
+            codexEndpointRegistrations[tab.id] = registration
+            refreshCodexTerminalContext()
+        }
         codexEndpointTasks[tab.id]?.cancel()
         codexEndpointTasks[tab.id] = Task { [weak self, weak session] in
             guard let self else { return }
@@ -628,17 +630,31 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
             }
             guard let session else { return }
             guard let identity = await self.resolveTmuxIdentity(for: tab) else {
-                self.failCodexEndpointRegistration(
+                self.failCodexEndpointPreparation(
                     tabID: tab.id,
                     token: token,
-                    session: session
+                    session: session,
+                    expectedTarget: tab.target,
+                    expectedSessionName: tab.sessionName
                 )
                 return
             }
+            guard codexEndpointTokens[tab.id] == token,
+                sessions[tab.id] === session,
+                let currentTab = tabs.first(where: { $0.id == tab.id }),
+                currentTab.target == tab.target,
+                currentTab.sessionName == tab.sessionName,
+                let route = CodexDrawerEndpointRouteDescriptor(tab: currentTab),
+                route.tmuxIdentity == identity
+            else { return }
+            var registration = codexEndpointRegistrations[tab.id] ?? .init()
+            registration.begin(generationID: token, route: route)
+            codexEndpointRegistrations[tab.id] = registration
+            refreshCodexTerminalContext()
             await self.finishCodexEndpointRegistration(
                 tabID: tab.id,
                 token: token,
-                identity: identity,
+                route: route,
                 session: session,
                 coordinator: codexRuntime.coordinator,
                 surfaces: codexRuntime.tmuxController
@@ -649,7 +665,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     private func finishCodexEndpointRegistration(
         tabID: String,
         token: UUID,
-        identity: TmuxSessionIdentity,
+        route: CodexDrawerEndpointRouteDescriptor,
         session: TerminalSession,
         coordinator: CodexSessionCoordinator,
         surfaces: TmuxSessionController
@@ -657,23 +673,24 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         guard codexEndpointTokens[tabID] == token,
             sessions[tabID] === session,
             let currentTab = tabs.first(where: { $0.id == tabID }),
-            currentTab.tmuxIdentity == identity,
-            let sessionName = currentTab.sessionName
+            CodexDrawerEndpointRouteDescriptor(tab: currentTab) == route,
+            codexEndpointRegistrations[tabID]?.generationID == token,
+            codexEndpointRegistrations[tabID]?.route == route
         else { return }
 
         let endpointID = TerminalEndpointID(rawValue: UUID())
         let endpoint = TerminalEndpoint(
             id: endpointID,
             conversationKey: TerminalConversationKey(
-                terminalTarget: currentTab.target,
-                tmux: identity
+                terminalTarget: route.target,
+                tmux: route.tmuxIdentity
             ),
             terminal: session.terminalDriver,
             surfaces: surfaces,
             route: TmuxRoute(
-                target: currentTab.target,
-                sessionName: sessionName,
-                expectedIdentity: identity
+                target: route.target,
+                sessionName: route.sessionName,
+                expectedIdentity: route.tmuxIdentity
             )
         )
         do {
@@ -682,19 +699,22 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
             failCodexEndpointRegistration(
                 tabID: tabID,
                 token: token,
+                route: route,
                 session: session
             )
             return
         }
         guard codexEndpointTokens[tabID] == token,
-            sessions[tabID] === session
+            sessions[tabID] === session,
+            let currentTab = tabs.first(where: { $0.id == tabID }),
+            CodexDrawerEndpointRouteDescriptor(tab: currentTab) == route
         else {
             await coordinator.unregisterEndpoint(endpointID)
             return
         }
         codexEndpointIDs[tabID] = endpointID
         var registration = codexEndpointRegistrations[tabID] ?? .init()
-        guard registration.succeed(generationID: token) else {
+        guard registration.succeed(generationID: token, route: route) else {
             await coordinator.unregisterEndpoint(endpointID)
             return
         }
@@ -722,13 +742,38 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     private func failCodexEndpointRegistration(
         tabID: String,
         token: UUID,
+        route: CodexDrawerEndpointRouteDescriptor,
         session: TerminalSession
     ) {
         guard codexEndpointTokens[tabID] == token,
-            sessions[tabID] === session
+            sessions[tabID] === session,
+            let currentTab = tabs.first(where: { $0.id == tabID }),
+            CodexDrawerEndpointRouteDescriptor(tab: currentTab) == route
         else { return }
         var registration = codexEndpointRegistrations[tabID] ?? .init()
-        guard registration.fail(generationID: token) else { return }
+        guard registration.fail(generationID: token, route: route) else {
+            return
+        }
+        codexEndpointRegistrations[tabID] = registration
+        codexReconnectingTabIDs.remove(tabID)
+        refreshCodexTerminalContext()
+    }
+
+    private func failCodexEndpointPreparation(
+        tabID: String,
+        token: UUID,
+        session: TerminalSession,
+        expectedTarget: TerminalTarget,
+        expectedSessionName: String?
+    ) {
+        guard codexEndpointTokens[tabID] == token,
+            sessions[tabID] === session,
+            let currentTab = tabs.first(where: { $0.id == tabID }),
+            currentTab.target == expectedTarget,
+            currentTab.sessionName == expectedSessionName
+        else { return }
+        var registration = codexEndpointRegistrations[tabID] ?? .init()
+        registration.failPreparation()
         codexEndpointRegistrations[tabID] = registration
         codexReconnectingTabIDs.remove(tabID)
         refreshCodexTerminalContext()
@@ -769,8 +814,49 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     }
 
     func replaceTerminalTabs(_ tabs: [TerminalTabRecord]) {
+        let previous = self.tabs
+        let changedRoutes = CodexDrawerEndpointRouteChange.changedTabIDs(
+            from: previous,
+            to: tabs
+        )
         self.tabs = tabs
+        for tabID in changedRoutes {
+            replaceCodexEndpointRoute(for: tabID)
+        }
         refreshCodexTerminalContext()
+    }
+
+    private func replaceCodexEndpointRoute(for tabID: String) {
+        codexEndpointTokens.removeValue(forKey: tabID)
+        codexEndpointTasks.removeValue(forKey: tabID)?.cancel()
+        var registration = codexEndpointRegistrations[tabID] ?? .init()
+        registration.detach()
+        codexEndpointRegistrations[tabID] = registration
+        let oldEndpointID = codexEndpointIDs.removeValue(forKey: tabID)
+        let coordinator = codexRuntime?.coordinator
+        refreshCodexTerminalContext()
+
+        guard let session = sessions[tabID],
+            let expectedTab = tabs.first(where: { $0.id == tabID }),
+            CodexDrawerEndpointRouteDescriptor(tab: expectedTab) != nil
+        else {
+            if let oldEndpointID, let coordinator {
+                Task { await coordinator.unregisterEndpoint(oldEndpointID) }
+            }
+            return
+        }
+        Task { [weak self, weak session] in
+            if let oldEndpointID, let coordinator {
+                await coordinator.unregisterEndpoint(oldEndpointID)
+            }
+            guard let self, let session,
+                self.sessions[tabID] === session,
+                let currentTab = self.tabs.first(where: { $0.id == tabID }),
+                CodexDrawerEndpointRouteDescriptor(tab: currentTab)
+                    == CodexDrawerEndpointRouteDescriptor(tab: expectedTab)
+            else { return }
+            self.registerCodexEndpoint(for: currentTab, session: session)
+        }
     }
 
     func persistTerminalTabs() {

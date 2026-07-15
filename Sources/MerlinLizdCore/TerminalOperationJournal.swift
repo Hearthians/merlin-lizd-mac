@@ -1458,6 +1458,7 @@ public actor TerminalMutationAuditor {
 
     public func appendBeforeSideEffect(
         _ events: [TerminalJournalEvent],
+        trustedSurface: TmuxSurface? = nil,
         turnID: String
     ) async throws {
         await acquireSerialAccess()
@@ -1465,7 +1466,11 @@ public actor TerminalMutationAuditor {
         guard !blockedTurns.contains(turnID) else {
             throw TerminalMutationAuditError.auditUnavailable
         }
-        guard validPreActionBundle(events, turnID: turnID) else {
+        guard validPreActionBundle(
+            events,
+            trustedSurface: trustedSurface,
+            turnID: turnID
+        ) else {
             blockedTurns.insert(turnID)
             throw TerminalMutationAuditError.denied(
                 reason: "Required pre-action audit events are missing or out of order"
@@ -1520,6 +1525,7 @@ public actor TerminalMutationAuditor {
 
     private func validPreActionBundle(
         _ events: [TerminalJournalEvent],
+        trustedSurface: TmuxSurface?,
         turnID: String
     ) -> Bool {
         guard events.count >= 3,
@@ -1566,29 +1572,25 @@ public actor TerminalMutationAuditor {
             batch: batch,
             endpointID: endpointID,
             screen: screen,
-            surface: approval?.scope.context?.surface
+            surface: trustedSurface
         ), recomputed.deterministicRisk == deterministic,
             recomputed.effectiveRisk == effective
         else { return false }
-        if case .deny = recomputed.decision,
-            !(effective == .high && approval?.scope.context == nil)
-        {
-            return false
-        }
+        if case .deny = recomputed.decision { return false }
 
         if let approval {
-            guard approval.outcome == .approvedOnce,
+            guard let trustedSurface,
+                trustedSurface.sessionIdentity == first.key.tmux,
+                approval.outcome == .approvedOnce,
                 approval.scope.endpointID == endpointID,
                 approval.scope.screenRevision == screen.revision,
                 let expectedScope = try? TerminalApprovalScope(
                     batch: batch,
                     endpointID: endpointID,
-                    screenRevision: screen.revision
+                    screen: screen,
+                    surface: trustedSurface
                 ),
-                approval.scope.payloadDigest == expectedScope.payloadDigest,
-                approval.scope.context == nil
-                    || approval.scope.context?.screen
-                        == TerminalApprovalScreenContext(snapshot: screen)
+                approval.scope == expectedScope
             else { return false }
         }
         return true

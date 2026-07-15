@@ -319,7 +319,8 @@ struct TerminalToolRouterTests {
         let request = try await pendingRequest(router: router)
         #expect(request.scope.endpointID != terminalTestEndpoint())
         #expect(request.scope.screenRevision == screen.revision)
-        #expect(request.scope.context?.surface == original)
+        #expect(request.scope.context?.surface == (try
+            TerminalApprovalSurfaceContext(surface: original)))
         #expect(request.scope.context?.screen.revision == screen.revision)
         #expect(request.scope.context?.screen.columns == 91)
         #expect(request.scope.context?.screen.rows == 24)

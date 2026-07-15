@@ -68,17 +68,18 @@ public actor TerminalApprovalBroker {
 
     public func awaitApproval(
         for request: TerminalApprovalRequest,
+        endpointID: TerminalEndpointID,
+        screen: TerminalScreenSnapshot,
+        surface: TmuxSurface,
         turnID: String
     ) async throws -> TerminalApprovalGrant {
         guard let canonicalScope = try? TerminalApprovalScope(
             batch: request.batch,
-            endpointID: request.scope.endpointID,
-            screenRevision: request.scope.screenRevision
-        ), canonicalScope.payloadDigest == request.scope.payloadDigest,
-            request.batch.expectedRevision == request.scope.screenRevision,
-            request.scope.context == nil
-                || request.scope.context?.screen.revision
-                    == request.scope.screenRevision
+            endpointID: endpointID,
+            screen: screen,
+            surface: surface
+        ), canonicalScope == request.scope,
+            request.batch.expectedRevision == screen.revision
         else {
             throw TerminalApprovalError.invalidRequest
         }

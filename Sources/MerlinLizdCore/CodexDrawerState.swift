@@ -65,43 +65,108 @@ public enum CodexDrawerEndpointReadiness: Equatable, Sendable {
     case detached
 }
 
+public struct CodexDrawerEndpointRouteDescriptor:
+    Equatable, Hashable, Sendable
+{
+    public let target: TerminalTarget
+    public let sessionName: String
+    public let tmuxIdentity: TmuxSessionIdentity
+
+    public init(
+        target: TerminalTarget,
+        sessionName: String,
+        tmuxIdentity: TmuxSessionIdentity
+    ) {
+        self.target = target
+        self.sessionName = sessionName
+        self.tmuxIdentity = tmuxIdentity
+    }
+
+    public init?(tab: TerminalTabRecord) {
+        guard let sessionName = tab.sessionName,
+            let tmuxIdentity = tab.tmuxIdentity
+        else { return nil }
+        self.init(
+            target: tab.target,
+            sessionName: sessionName,
+            tmuxIdentity: tmuxIdentity
+        )
+    }
+}
+
+public enum CodexDrawerEndpointRouteChange {
+    public static func changedTabIDs(
+        from previous: [TerminalTabRecord],
+        to current: [TerminalTabRecord]
+    ) -> Set<String> {
+        let tabIDs = Set(previous.map(\.id)).union(current.map(\.id))
+        return Set(tabIDs.filter { tabID in
+            let old = previous.first(where: { $0.id == tabID })
+                .flatMap(CodexDrawerEndpointRouteDescriptor.init(tab:))
+            let new = current.first(where: { $0.id == tabID })
+                .flatMap(CodexDrawerEndpointRouteDescriptor.init(tab:))
+            return old != new
+        })
+    }
+}
+
 public struct CodexDrawerEndpointRegistration: Equatable, Sendable {
     public private(set) var readiness: CodexDrawerEndpointReadiness
     public private(set) var generationID: UUID?
+    public private(set) var route: CodexDrawerEndpointRouteDescriptor?
 
     public init(
         readiness: CodexDrawerEndpointReadiness = .notStarted
     ) {
         self.readiness = readiness
         generationID = nil
+        route = nil
     }
 
-    public mutating func begin(generationID: UUID) {
+    public mutating func begin(
+        generationID: UUID,
+        route: CodexDrawerEndpointRouteDescriptor
+    ) {
         self.generationID = generationID
+        self.route = route
         readiness = .registering
     }
 
     @discardableResult
-    public mutating func succeed(generationID: UUID) -> Bool {
-        guard self.generationID == generationID else { return false }
+    public mutating func succeed(
+        generationID: UUID,
+        route: CodexDrawerEndpointRouteDescriptor
+    ) -> Bool {
+        guard readiness == .registering,
+            self.generationID == generationID,
+            self.route == route
+        else { return false }
         readiness = .registered
         return true
     }
 
     @discardableResult
-    public mutating func fail(generationID: UUID) -> Bool {
-        guard self.generationID == generationID else { return false }
+    public mutating func fail(
+        generationID: UUID,
+        route: CodexDrawerEndpointRouteDescriptor
+    ) -> Bool {
+        guard readiness == .registering,
+            self.generationID == generationID,
+            self.route == route
+        else { return false }
         readiness = .registrationFailed
         return true
     }
 
     public mutating func failPreparation() {
         generationID = nil
+        route = nil
         readiness = .registrationFailed
     }
 
     public mutating func detach() {
         generationID = nil
+        route = nil
         readiness = .detached
     }
 }
@@ -120,7 +185,7 @@ public enum CodexDrawerComposerMode: Equatable, Sendable {
 public enum CodexDrawerKeyboardOwnership: Equatable, Sendable {
     case user
     case codex
-    case takeoverPending
+    case takeoverPending(UUID)
 }
 
 public enum CodexDrawerBadgePhase: Equatable, Sendable {
@@ -175,8 +240,8 @@ public enum CodexDrawerAction: Equatable, Sendable {
     case sendComposer
     case setExpanded(Bool)
     case resizeExpanded(fraction: Double)
-    case requestTakeover
-    case takeoverCompleted(TerminalConversationKey)
+    case requestTakeover(UUID)
+    case takeoverCompleted(TerminalConversationKey, UUID)
     case allowOnce(UUID)
     case deny(UUID)
     case retryAvailability
@@ -185,7 +250,7 @@ public enum CodexDrawerAction: Equatable, Sendable {
 public enum CodexDrawerCommand: Equatable, Sendable {
     case submit(prompt: String, key: TerminalConversationKey)
     case steer(prompt: String, key: TerminalConversationKey)
-    case stopAndTakeOver(TerminalConversationKey)
+    case stopAndTakeOver(TerminalConversationKey, UUID)
     case allowOnce(UUID)
     case deny(UUID)
     case retryAvailability
@@ -194,10 +259,11 @@ public enum CodexDrawerCommand: Equatable, Sendable {
 public enum CodexDrawerCommandSequencer {
     public static func stopAndTakeOver(
         _ key: TerminalConversationKey,
+        operationID: UUID,
         stop: @escaping @Sendable () async -> Void
     ) async -> CodexDrawerAction {
         await stop()
-        return .takeoverCompleted(key)
+        return .takeoverCompleted(key, operationID)
     }
 }
 
@@ -265,13 +331,14 @@ public struct CodexDrawerState: Equatable, Sendable {
     }
 
     public var canTakeOver: Bool {
-        selectedConversationKey != nil
-            && isActive
-            && keyboardOwnership != .takeoverPending
+        guard selectedConversationKey != nil, isActive else { return false }
+        if case .takeoverPending = keyboardOwnership { return false }
+        return true
     }
 
     public var canSend: Bool {
         guard case .connected = terminalContext else { return false }
+        if case .takeoverPending = keyboardOwnership { return false }
         guard !composerText.trimmingCharacters(in: .whitespacesAndNewlines)
             .isEmpty else { return false }
         switch availability {
@@ -466,12 +533,15 @@ public struct CodexDrawerState: Equatable, Sendable {
         case let .resizeExpanded(fraction):
             isExpanded = true
             expandedFraction = Self.clamp(fraction)
-        case .requestTakeover:
+        case let .requestTakeover(operationID):
             guard let key = selectedConversationKey, canTakeOver
             else { break }
-            ownership[key] = .takeoverPending
-            return [.stopAndTakeOver(key)]
-        case let .takeoverCompleted(key):
+            ownership[key] = .takeoverPending(operationID)
+            return [.stopAndTakeOver(key, operationID)]
+        case let .takeoverCompleted(key, operationID):
+            guard ownership[key] == .takeoverPending(operationID) else {
+                break
+            }
             ownership[key] = .user
         case let .allowOnce(requestID):
             guard case .connected = terminalContext,
@@ -496,7 +566,7 @@ public struct CodexDrawerState: Equatable, Sendable {
     private mutating func reconcileOwnership() {
         let knownKeys = Set(sessions.keys).union(ownership.keys)
         for key in knownKeys {
-            if ownership[key] == .takeoverPending { continue }
+            if case .takeoverPending = ownership[key] { continue }
             ownership[key] = sessions[key].map(Self.isActive) == true
                 ? .codex
                 : .user

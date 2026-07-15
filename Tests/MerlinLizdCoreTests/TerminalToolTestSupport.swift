@@ -1,6 +1,61 @@
 import Foundation
 @testable import MerlinLizdCore
 
+func terminalApprovalDecodeRejectsOversizedSurface(
+    _ scope: TerminalApprovalScope
+) throws -> Bool {
+    try terminalApprovalMutatedDecodeFails(scope) { context in
+        guard var surface = context["surface"] as? [String: Any] else {
+            return false
+        }
+        surface["currentCommand"] = String(
+            repeating: "x",
+            count: TerminalApprovalSurfaceContext
+                .maximumCurrentCommandByteCount + 1
+        )
+        context["surface"] = surface
+        return true
+    }
+}
+
+func terminalApprovalDecodeRejectsOversizedScreen(
+    _ scope: TerminalApprovalScope
+) throws -> Bool {
+    try terminalApprovalMutatedDecodeFails(scope) { context in
+        guard var screen = context["screen"] as? [String: Any] else {
+            return false
+        }
+        screen["text"] = String(
+            repeating: "界",
+            count: TerminalApprovalScreenContext.maximumTextByteCount
+        )
+        context["screen"] = screen
+        return true
+    }
+}
+
+private func terminalApprovalMutatedDecodeFails(
+    _ scope: TerminalApprovalScope,
+    mutate: (inout [String: Any]) -> Bool
+) throws -> Bool {
+    let encoded = try JSONEncoder().encode(scope)
+    guard var root = try JSONSerialization.jsonObject(with: encoded)
+        as? [String: Any],
+        var context = root["context"] as? [String: Any],
+        mutate(&context)
+    else { return false }
+    root["context"] = context
+    let data = try JSONSerialization.data(withJSONObject: root)
+    do {
+        _ = try JSONDecoder().decode(TerminalApprovalScope.self, from: data)
+        return false
+    } catch is DecodingError {
+        return true
+    } catch {
+        return false
+    }
+}
+
 actor TerminalToolTestGate {
     private var isOpen = false
     private var waiters: [CheckedContinuation<Void, Never>] = []

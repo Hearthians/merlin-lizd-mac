@@ -124,7 +124,8 @@ final class CodexDrawerModel: ObservableObject {
     }
 
     func stopAndTakeOver() {
-        apply(.requestTakeover)
+        guard coordinator != nil else { return }
+        apply(.requestTakeover(UUID()))
     }
 
     func allowOnce(_ requestID: UUID) {
@@ -155,17 +156,14 @@ final class CodexDrawerModel: ObservableObject {
         case let .submit(prompt, key), let .steer(prompt, key):
             guard let coordinator else { return }
             Task { await coordinator.submit(prompt, for: key) }
-        case let .stopAndTakeOver(key):
-            guard let coordinator else {
-                apply(.takeoverCompleted(key), executeCommands: false)
-                return
-            }
+        case let .stopAndTakeOver(key, operationID):
+            guard let coordinator else { return }
             Task { [weak self] in
                 // The coordinator returns only after router interruption has
                 // restored terminal keyboard ownership. No terminal bytes or
                 // process lifecycle action belongs on this path.
                 let completion = await CodexDrawerCommandSequencer
-                    .stopAndTakeOver(key) {
+                    .stopAndTakeOver(key, operationID: operationID) {
                         await coordinator.stopAndTakeOver(key)
                     }
                 self?.apply(completion, executeCommands: false)
