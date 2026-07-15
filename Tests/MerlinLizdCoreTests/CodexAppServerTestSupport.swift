@@ -6,6 +6,7 @@ actor ScriptedAppServerProcess: AppServerProcessRunning {
     private let failStart: Bool
     private let gateStart: Bool
     private let writeError: AppServerProcessError?
+    private let failWriteAt: Int?
     private var started = false
     private var terminated = false
     private var writes: [Data] = []
@@ -26,11 +27,13 @@ actor ScriptedAppServerProcess: AppServerProcessRunning {
     init(
         failStart: Bool = false,
         gateStart: Bool = false,
-        writeError: AppServerProcessError? = nil
+        writeError: AppServerProcessError? = nil,
+        failWriteAt: Int? = nil
     ) {
         self.failStart = failStart
         self.gateStart = gateStart
         self.writeError = writeError
+        self.failWriteAt = failWriteAt
     }
 
     func start() async throws {
@@ -48,6 +51,9 @@ actor ScriptedAppServerProcess: AppServerProcessRunning {
             throw ScriptedAppServerProcessError.notWritable
         }
         if let writeError { throw writeError }
+        if failWriteAt == writes.count + 1 {
+            throw ScriptedAppServerProcessError.notWritable
+        }
         writes.append(data)
         resumeWriteWaiters()
     }
@@ -488,7 +494,7 @@ func testSuffix(_ data: Data, count: Int) -> Data { Data(data.suffix(count)) }
 
 func notificationLines(count: Int) -> Data {
     Data((0..<count).map {
-        "{\"jsonrpc\":\"2.0\",\"method\":\"event/\($0)\"}\n"
+        "{\"method\":\"event/\($0)\"}\n"
     }.joined().utf8)
 }
 

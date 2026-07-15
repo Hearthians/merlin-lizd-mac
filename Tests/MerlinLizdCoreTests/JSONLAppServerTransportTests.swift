@@ -297,15 +297,95 @@ struct JSONLAppServerTransportTests {
         let secondID = try #require(methodsByID.first(where: { $0.value == "second" })?.key)
 
         await process.emit(.standardOutput(jsonLine(
-            "{\"jsonrpc\":\"2.0\",\"id\":\(secondID),\"result\":{\"value\":2},\"extra\":true}"
+            "{\"id\":\(secondID),\"result\":{\"value\":2},\"extra\":true}"
         )))
         await process.emit(.standardOutput(jsonLine(
-            "{\"jsonrpc\":\"2.0\",\"id\":\(firstID),\"result\":{\"value\":1}}"
+            "{\"id\":\(firstID),\"result\":{\"value\":1}}"
         )))
 
         #expect(try await first.value == .object(["value": .number(1)]))
         #expect(try await second.value == .object(["value": .number(2)]))
         await transport.shutdown()
+    }
+
+    @Test("0.144.2 requests and responses omit JSON-RPC version headers")
+    func appServerWireOmitsJSONRPCHeader() async throws {
+        let process = ScriptedAppServerProcess()
+        let transport = JSONLAppServerTransport(process: process)
+        try await transport.start()
+
+        let request = Task {
+            try await transport.request(
+                method: "initialize",
+                params: .object(["capabilities": .object([:])])
+            )
+        }
+        await process.waitForWriteCount(1)
+        let outbound = try jsonObject(from: await process.writtenData()[0])
+        #expect(outbound["jsonrpc"] == nil)
+        #expect(outbound["id"] as? Int == 1)
+        #expect(outbound["method"] as? String == "initialize")
+
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":1,"result":{"ready":true}}"#
+        )))
+        #expect(try await request.value == .object(["ready": .bool(true)]))
+
+        try await transport.respond(to: .string("tool-1"), result: .object([:]))
+        try await transport.respondError(
+            to: .string("tool-2"),
+            code: -32601,
+            message: "Method not found"
+        )
+        let responses = await process.writtenData()
+        #expect(try jsonObject(from: responses[1])["jsonrpc"] == nil)
+        #expect(try jsonObject(from: responses[2])["jsonrpc"] == nil)
+        await transport.shutdown()
+    }
+
+    @Test("notifications omit ids params and JSON-RPC headers when absent")
+    func sendsHeaderlessNotification() async throws {
+        let process = ScriptedAppServerProcess()
+        let transport = JSONLAppServerTransport(process: process)
+        try await transport.start()
+
+        try await transport.sendNotification(method: "initialized")
+
+        let object = try jsonObject(from: await process.writtenData()[0])
+        #expect(Set(object.keys) == ["method"])
+        #expect(object["method"] as? String == "initialized")
+        await transport.shutdown()
+    }
+
+    @Test("legacy JSON-RPC header is optional but must be 2.0")
+    func validatesOptionalLegacyJSONRPCHeader() async throws {
+        let compatibleProcess = ScriptedAppServerProcess()
+        let compatible = JSONLAppServerTransport(process: compatibleProcess)
+        try await compatible.start()
+        let compatibleRequest = Task {
+            try await compatible.request(method: "legacy-compatible")
+        }
+        await compatibleProcess.waitForWriteCount(1)
+        await compatibleProcess.emit(.standardOutput(jsonLine(
+            #"{"jsonrpc":"2.0","id":1,"result":true}"#
+        )))
+        #expect(try await compatibleRequest.value == .bool(true))
+        await compatible.shutdown()
+
+        for invalidHeader in [#""1.0""#, "null"] {
+            let process = ScriptedAppServerProcess()
+            let transport = JSONLAppServerTransport(process: process)
+            try await transport.start()
+            let request = Task { try await transport.request(method: "legacy") }
+            await process.waitForWriteCount(1)
+            await process.emit(.standardOutput(jsonLine(
+                "{\"jsonrpc\":\(invalidHeader),\"id\":1,\"result\":true}"
+            )))
+
+            await #expect(throws: JSONLAppServerTransportError.invalidMessage) {
+                try await request.value
+            }
+        }
     }
 
     @Test("string response ID never correlates an integer request ID")
@@ -317,14 +397,14 @@ struct JSONLAppServerTransportTests {
         await process.waitForWriteCount(1)
 
         await process.emit(.standardOutput(jsonLine(
-            "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"result\":\"wrong\"}"
+            "{\"id\":\"1\",\"result\":\"wrong\"}"
         )))
         while await transport.processedLineCountForTesting == 0 {
             await Task.yield()
         }
         #expect(await transport.pendingRequestCountForTesting == 1)
         await process.emit(.standardOutput(jsonLine(
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"right\"}"
+            "{\"id\":1,\"result\":\"right\"}"
         )))
         #expect(try await request.value == .string("right"))
         await transport.shutdown()
@@ -343,10 +423,10 @@ struct JSONLAppServerTransportTests {
         await process.waitForWriteCount(3)
 
         await process.emit(.standardOutput(testData(
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"res"
+            "{\"id\":1,\"res"
         )))
         await process.emit(.standardOutput(testData(
-            "ult\":1}\r\n{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":2}\n{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":3}"
+            "ult\":1}\r\n{\"id\":2,\"result\":2}\n{\"id\":3,\"result\":3}"
         )))
         await process.emit(.terminated(exitCode: 0))
 
@@ -365,13 +445,13 @@ struct JSONLAppServerTransportTests {
         try await transport.start()
 
         await process.emit(.standardOutput(jsonLine(
-            "{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{\"turn\":\"t\"},\"future\":7}"
+            "{\"method\":\"turn/completed\",\"params\":{\"turn\":\"t\"},\"future\":7}"
         )))
         await process.emit(.standardOutput(jsonLine(
-            "{\"jsonrpc\":\"2.0\",\"id\":\"server-1\",\"method\":\"item/tool/call\",\"params\":{\"callId\":\"c\"},\"future\":7}"
+            "{\"id\":\"server-1\",\"method\":\"item/tool/call\",\"params\":{\"callId\":\"c\"},\"future\":7}"
         )))
         await process.emit(.standardOutput(jsonLine(
-            "{\"jsonrpc\":\"2.0\",\"method\":\"turn/null\",\"params\":null,\"future\":7}"
+            "{\"method\":\"turn/null\",\"params\":null,\"future\":7}"
         )))
 
         let first = try await transport.nextServerMessage()
@@ -399,7 +479,7 @@ struct JSONLAppServerTransportTests {
         )
         try await transport.start()
         await process.emit(.standardOutput(jsonLine(
-            "{\"jsonrpc\":\"2.0\",\"id\":9007199254740993,\"method\":\"item/tool/call\"}"
+            "{\"id\":9007199254740993,\"method\":\"item/tool/call\"}"
         )))
 
         #expect(try await transport.nextServerMessage() == .request(
@@ -418,7 +498,7 @@ struct JSONLAppServerTransportTests {
         let stream = transport.messages()
         var iterator = stream.makeAsyncIterator()
         await process.emit(.standardOutput(jsonLine(
-            "{\"jsonrpc\":\"2.0\",\"method\":\"turn/started\"}"
+            "{\"method\":\"turn/started\"}"
         )))
 
         #expect(try await iterator.next() == .notification(
@@ -434,7 +514,7 @@ struct JSONLAppServerTransportTests {
         let transport = JSONLAppServerTransport(process: process)
         try await transport.start()
         await process.emit(.standardOutput(jsonLine(
-            "{\"jsonrpc\":\"2.0\",\"method\":\"future/event\",\"params\":{\"x\":1}}"
+            "{\"method\":\"future/event\",\"params\":{\"x\":1}}"
         )))
 
         #expect(try await transport.nextServerMessage() == .notification(
@@ -454,7 +534,7 @@ struct JSONLAppServerTransportTests {
         )
         try await transport.start()
         await process.emit(.standardOutput(jsonLine(
-            "{\"jsonrpc\":\"2.0\",\"id\":\"future-9\",\"method\":\"future/request\",\"params\":{}}"
+            "{\"id\":\"future-9\",\"method\":\"future/request\",\"params\":{}}"
         )))
         await process.waitForWriteCount(1)
 
@@ -494,7 +574,7 @@ struct JSONLAppServerTransportTests {
         )
         try await transport.start()
         await process.emit(.standardOutput(jsonLine(
-            "{\"jsonrpc\":\"2.0\",\"id\":\"queued\",\"method\":\"item/tool/call\"}"
+            "{\"id\":\"queued\",\"method\":\"item/tool/call\"}"
         )))
         await process.emit(.standardOutput(testData("malformed\n")))
         while await transport.processedLineCountForTesting < 2 {
@@ -513,7 +593,7 @@ struct JSONLAppServerTransportTests {
         let transport = JSONLAppServerTransport(process: process)
         try await transport.start()
         await process.emit(.standardOutput(jsonLine(
-            "{\"jsonrpc\":\"2.0\",\"method\":\"queued\"}"
+            "{\"method\":\"queued\"}"
         )))
         while await transport.processedLineCountForTesting == 0 {
             await Task.yield()
@@ -534,7 +614,7 @@ struct JSONLAppServerTransportTests {
         let first = transport.messages()
         var firstIterator = first.makeAsyncIterator()
         await process.emit(.standardOutput(jsonLine(
-            "{\"jsonrpc\":\"2.0\",\"method\":\"first\"}"
+            "{\"method\":\"first\"}"
         )))
         _ = try await firstIterator.next()
 
@@ -589,7 +669,7 @@ struct JSONLAppServerTransportTests {
     @Test("inbound line limit accepts the exact boundary")
     func acceptsExactInboundLineBoundary() async throws {
         let response = testData(
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":true}"
+            "{\"id\":1,\"result\":true}"
         )
         let process = ScriptedAppServerProcess()
         let transport = JSONLAppServerTransport(
@@ -616,7 +696,7 @@ struct JSONLAppServerTransportTests {
         let accepted = Task {
             try await exact.request(
                 method: "m",
-                params: .string(String(repeating: "x", count: 14))
+                params: .string(String(repeating: "x", count: 30))
             )
         }
         await exactProcess.waitForWriteCount(1)
@@ -638,7 +718,7 @@ struct JSONLAppServerTransportTests {
         ) {
             try await rejected.request(
                 method: "m",
-                params: .string(String(repeating: "x", count: 15))
+                params: .string(String(repeating: "x", count: 31))
             )
         }
         #expect((await rejectedProcess.writtenData()).isEmpty)
@@ -655,7 +735,7 @@ struct JSONLAppServerTransportTests {
         await process.emit(.standardError(testPrefix(stderr, count: 40 * 1_024)))
         await process.emit(.standardError(testDropFirst(stderr, count: 40 * 1_024)))
         await process.emit(.standardOutput(jsonLine(
-            "{\"jsonrpc\":\"2.0\",\"method\":\"ok\"}"
+            "{\"method\":\"ok\"}"
         )))
         _ = try await transport.nextServerMessage()
 
@@ -778,7 +858,7 @@ struct JSONLAppServerTransportTests {
         }
         #expect(await transport.pendingRequestCountForTesting == 0)
         await process.emit(.standardOutput(jsonLine(
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}"
+            "{\"id\":1,\"result\":{}}"
         )))
         #expect(await transport.isRunningForTesting)
         await transport.shutdown()
@@ -812,10 +892,10 @@ struct JSONLAppServerTransportTests {
         let succeeded = Task { try await transport.request(method: "succeeded") }
         await process.waitForWriteCount(2)
         await process.emit(.standardOutput(jsonLine(
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"raw secret omitted\",\"data\":{\"token\":\"x\"}}}"
+            "{\"id\":1,\"error\":{\"code\":-32000,\"message\":\"raw secret omitted\",\"data\":{\"token\":\"x\"}}}"
         )))
         await process.emit(.standardOutput(jsonLine(
-            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":true}"
+            "{\"id\":2,\"result\":true}"
         )))
 
         await #expect(throws: JSONLAppServerTransportError.self) {

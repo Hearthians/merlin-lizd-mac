@@ -157,7 +157,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
             throw CodexAppServerAdapterError.unmappedThread
         }
         try await ensureReady()
-        _ = try await request(
+        let result = try await request(
             method: "turn/steer",
             params: .object([
                 "threadId": .string(threadID.rawValue),
@@ -165,6 +165,9 @@ public actor CodexAppServerAdapter: CodexAgentClient {
                 "input": textInput(prompt),
             ])
         )
+        guard case let .object(fields) = result,
+            fields["turnId"]?.nonemptyString == turnID.rawValue
+        else { throw CodexAppServerAdapterError.invalidResponse }
         publish(.userMessage(prompt), for: threadID)
     }
 
@@ -294,6 +297,7 @@ public actor CodexAppServerAdapter: CodexAgentClient {
                     params: configuration.initializeParams
                 )
                 try configuration.validateInitializeResult(result)
+                try await transport.sendNotification(method: "initialized")
                 return .ready
             } catch {
                 return .failed
@@ -443,13 +447,27 @@ public actor CodexAppServerAdapter: CodexAgentClient {
         case "item/completed":
             guard let (threadID, _, fields) = notificationIdentity(params),
                 case let .object(item)? = fields["item"],
-                item["type"]?.nonemptyString == "agentMessage",
-                let text = item["text"]?.nonemptyString
+                let itemType = item["type"]?.nonemptyString
             else {
                 publishProtocolFailure(from: params)
                 return
             }
-            publishLive(.assistantMessageCompleted(text), for: threadID)
+            switch itemType {
+            case "agentMessage":
+                guard let text = item["text"]?.nonemptyString else {
+                    publishProtocolFailure(from: params)
+                    return
+                }
+                publishLive(.assistantMessageCompleted(text), for: threadID)
+            case "dynamicToolCall":
+                // The request path already executed and answered this call.
+                // Completion is protocol bookkeeping, not a second action.
+                return
+            default:
+                // ThreadItem is additive. Items not represented by Core are
+                // safely ignored without surfacing their content.
+                return
+            }
         case "turn/completed":
             guard case let .object(fields)? = params,
                 let threadText = fields["threadId"]?.nonemptyString,
@@ -470,14 +488,31 @@ public actor CodexAppServerAdapter: CodexAgentClient {
                 publishLive(.turnFailed(turnID, .protocolFailure), for: threadID)
             }
         case "error":
-            guard case let .object(fields)? = params else { return }
-            if fields["code"]?.nonemptyString == "usageLimitExceeded" {
-                setAvailability(.overloaded)
-                failKnownThreads(.overloaded)
+            guard case let .object(fields)? = params,
+                let threadText = fields["threadId"]?.nonemptyString,
+                let turnText = fields["turnId"]?.nonemptyString,
+                fields["willRetry"]?.boolValue != nil,
+                case let .object(error)? = fields["error"],
+                error["message"]?.nonemptyString != nil
+            else {
+                publishProtocolFailure(from: params)
+                return
             }
-        case "account/authentication/required":
-            setAvailability(.authenticationRequired)
-            failKnownThreads(.authenticationRequired)
+            let threadID = AgentThreadID(rawValue: threadText)
+            let turnID = AgentTurnID(rawValue: turnText)
+            switch error["codexErrorInfo"]?.nonemptyString {
+            case "serverOverloaded", "usageLimitExceeded":
+                setAvailability(.overloaded)
+                publishLive(.turnFailed(turnID, .overloaded), for: threadID)
+            case "unauthorized":
+                setAvailability(.authenticationRequired)
+                publishLive(
+                    .turnFailed(turnID, .authenticationRequired),
+                    for: threadID
+                )
+            default:
+                publishLive(.turnFailed(turnID, .protocolFailure), for: threadID)
+            }
         default:
             // Additive/unknown notifications are deliberately ignored.
             return
@@ -613,7 +648,8 @@ public actor CodexAppServerAdapter: CodexAgentClient {
                         guard case let .object(fields) = contentValue else {
                             throw CodexAppServerAdapterError.invalidResponse
                         }
-                        if fields["type"]?.nonemptyString == "inputText",
+                        if let contentType = fields["type"]?.nonemptyString,
+                            ["text", "inputText"].contains(contentType),
                             let text = fields["text"]?.nonemptyString
                         {
                             messages.append(.init(role: .user, text: text))

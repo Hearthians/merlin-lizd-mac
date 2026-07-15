@@ -7,3 +7,8 @@ codex app-server generate-json-schema --out /tmp/merlinhub-codex-schema-01442 --
 ```
 
 They intentionally freeze only the protocol surface consumed by Merlin Lizd. They are not a copy of the full generated schema. Updating the supported range requires regenerating and reviewing these fixtures. Tests replay these records through in-memory process doubles; they never launch Codex and never require authentication or an API key.
+
+Codex app-server 0.144.2 uses headerless JSONL envelopes: requests,
+responses, notifications, and server requests do not contain a `jsonrpc`
+member. Initialization is complete only after the client sends the headerless
+`{"method":"initialized"}` notification.

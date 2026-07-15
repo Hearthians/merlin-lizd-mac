@@ -19,11 +19,15 @@ struct CodexLaunchConfigurationTests {
         #expect(configuration.arguments.first == "app-server")
         #expect(configuration.environment == environment)
         #expect(configuration.arguments.contains("mcp_servers={}"))
-        for capability in CodexLaunchConfiguration.disabledCapabilities {
-            #expect(configuration.arguments.contains("features.\(capability)=false"))
+        #expect(configuration.arguments.contains(#"web_search="disabled""#))
+        for feature in CodexLaunchConfiguration.disabledFeatureFlags {
+            #expect(configuration.arguments.contains("features.\(feature)=false"))
         }
+        #expect(configuration.arguments.contains("features.web_search=false") == false)
+        #expect(configuration.arguments.contains("features.connectors=false") == false)
         #expect(configuration.arguments.joined(separator: " ").contains("api-key") == false)
         #expect(configuration.arguments.joined(separator: " ").contains("OPENAI_API_KEY") == false)
+        #expect(configuration.arguments.joined(separator: " ").contains("model=") == false)
     }
 
     @Test("initialize enables the experimental API and validates platform metadata")
@@ -65,22 +69,34 @@ struct CodexLaunchConfigurationTests {
             environment: [:]
         )
         let params = configuration.threadStartParams
-        let expected: JSONValue = .object([
-            "approvalPolicy": .string("never"),
-            "cwd": .string("/runtime"),
-            "sandbox": .string("read-only"),
-            "environments": .array([]),
-            "runtimeWorkspaceRoots": .array([]),
-            "selectedCapabilityRoots": .array([]),
-            "ephemeral": .bool(false),
-            "dynamicTools": .array([.object([
-                "type": .string("namespace"),
-                "name": .string("merlin_tmux"),
-                "tools": .array([]),
-            ])]),
-        ])
-        #expect(params == expected)
         guard case let .object(fields) = params else { return }
+        #expect(fields["approvalPolicy"] == .string("never"))
+        #expect(fields["cwd"] == .string("/runtime"))
+        #expect(fields["sandbox"] == .string("read-only"))
+        #expect(fields["environments"] == .array([]))
+        #expect(fields["runtimeWorkspaceRoots"] == .array([]))
+        #expect(fields["selectedCapabilityRoots"] == .array([]))
+        #expect(fields["ephemeral"] == .bool(false))
         #expect(fields["model"] == nil)
+        guard case let .array(dynamicTools)? = fields["dynamicTools"],
+            dynamicTools.count == 1,
+            case let .object(namespace) = dynamicTools[0],
+            case let .array(tools)? = namespace["tools"]
+        else {
+            Issue.record("missing merlin_tmux namespace")
+            return
+        }
+        #expect(namespace["type"] == .string("namespace"))
+        #expect(namespace["name"] == .string("merlin_tmux"))
+        #expect(namespace["description"]?.nonemptyString != nil)
+        #expect(tools.count == 6)
+        #expect(tools.compactMap { value -> String? in
+            guard case let .object(tool) = value,
+                tool["type"] == .string("function"),
+                tool["description"]?.nonemptyString != nil,
+                tool["inputSchema"] != nil
+            else { return nil }
+            return tool["name"]?.nonemptyString
+        } == CodexDynamicToolCatalog.tools.map(\.name))
     }
 }

@@ -5,12 +5,75 @@ import Testing
 
 @Suite("Codex app-server 0.144.2 contract", .serialized)
 struct CodexAppServerContractTests {
+    @Test("initialize is acknowledged before any thread request")
+    func sendsInitializedBeforeReady() async throws {
+        let process = ScriptedAppServerProcess()
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor()
+        )
+
+        let starting = Task { try await adapter.startThread() }
+        await process.waitForWriteCount(1)
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":1,"result":{"codexHome":"/Users/test/.codex","platformFamily":"unix","platformOs":"macos","userAgent":"codex-cli/0.144.2"}}"#
+        )))
+        await process.waitForWriteCount(2)
+        let initialized = try jsonObject(from: await process.writtenData()[1])
+        #expect(Set(initialized.keys) == ["method"])
+        #expect(initialized["method"] as? String == "initialized")
+        guard initialized["method"] as? String == "initialized" else {
+            starting.cancel()
+            await adapter.shutdown()
+            return
+        }
+
+        await process.waitForWriteCount(3)
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":2,"result":{"thread":{"id":"thread-1"}}}"#
+        )))
+        #expect(try await starting.value == .init(rawValue: "thread-1"))
+        await adapter.shutdown()
+    }
+
+    @Test("failed initialized notification leaves the adapter unavailable")
+    func initializedWriteFailureFailsStartup() async throws {
+        let process = ScriptedAppServerProcess(failWriteAt: 2)
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(process: process),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor()
+        )
+
+        let starting = Task { try await adapter.startThread() }
+        await process.waitForWriteCount(1)
+        await process.emit(.standardOutput(jsonLine(
+            #"{"id":1,"result":{"codexHome":"/Users/test/.codex","platformFamily":"unix","platformOs":"macos","userAgent":"codex-cli/0.144.2"}}"#
+        )))
+
+        await #expect(throws: CodexAppServerAdapterError.invalidResponse) {
+            try await starting.value
+        }
+        #expect(await adapter.availabilityForTesting == .crashed)
+        #expect((await process.writtenData()).count == 1)
+        await adapter.shutdown()
+    }
+
     @Test("checked-in fixtures cover the complete frozen V1 method surface")
     func fixtureCoverage() throws {
+        let initialize = try fixtureText("initialize")
         let thread = try fixtureText("thread-start-resume")
         let turn = try fixtureText("turn-stream")
         let dynamic = try fixtureText("dynamic-tools")
         let errors = try fixtureText("errors")
+        #expect(initialize.contains(#"{"method":"initialized"}"#))
+        for fixture in [initialize, thread, turn, dynamic, errors] {
+            for line in fixture.split(separator: "\n") {
+                let object = try jsonObject(from: testData(String(line)))
+                #expect(object["jsonrpc"] == nil)
+            }
+        }
         for method in [
             "thread/start", "thread/resume", "thread/archive",
             "thread/unarchive", "thread/delete", "turn/start",
@@ -27,10 +90,30 @@ struct CodexAppServerContractTests {
         #expect(dynamic.contains(#""contentItems":[{"type":"inputText""#))
         #expect(dynamic.contains(#""success":true"#))
         #expect(errors.contains(#""method":"future/unknown""#))
-        #expect(errors.contains(#""code":"usageLimitExceeded""#))
+        #expect(errors.contains(#""codexErrorInfo":"serverOverloaded""#))
+        #expect(errors.contains(#""codexErrorInfo":"unauthorized""#))
         #expect(errors.contains(#""threadId":17"#))
-        #expect(errors.contains(#""method":"account/authentication/required""#))
+        #expect(errors.contains(#""willRetry":false"#))
         #expect(errors.contains(#""fixture":"processCrash""#))
+
+        let threadStart = try jsonObject(from: testData(String(
+            try #require(thread.split(separator: "\n").first)
+        )))
+        let params = try #require(threadStart["params"] as? [String: Any])
+        let namespaces = try #require(params["dynamicTools"] as? [[String: Any]])
+        #expect(namespaces.count == 1)
+        #expect((namespaces[0]["description"] as? String)?.isEmpty == false)
+        let fixtureTools = try #require(
+            namespaces[0]["tools"] as? [[String: Any]]
+        )
+        #expect(fixtureTools.compactMap { $0["name"] as? String } ==
+            CodexDynamicToolCatalog.tools.map(\.name))
+        #expect(fixtureTools.allSatisfy {
+            $0["type"] as? String == "function"
+                && ($0["description"] as? String)?.isEmpty == false
+                && $0["inputSchema"] != nil
+        })
+        #expect(dynamic.contains(#""type":"dynamicToolCall""#))
     }
 
     @Test("turn and thread lifecycle methods use only frozen request fields")
@@ -53,7 +136,7 @@ struct CodexAppServerContractTests {
         let turnStart = Task {
             try await adapter.startTurn(threadID: threadID, prompt: "hello")
         }
-        await process.waitForWriteCount(3)
+        await process.waitForWriteCount(4)
         let racingToolResult = try await adapter.handleServerRequestForTesting(
             method: "item/tool/call",
             params: .object([
@@ -72,7 +155,7 @@ struct CodexAppServerContractTests {
         #expect(racingFields["success"] == .bool(true))
         #expect(await executor.calls == [.observeScreen])
         await process.emit(.standardOutput(jsonLine(
-            #"{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}"#
+            #"{"id":3,"result":{"turn":{"id":"turn-1"}}}"#
         )))
         let turnID = try await turnStart.value
 
@@ -83,44 +166,50 @@ struct CodexAppServerContractTests {
                 prompt: "more"
             )
         }
-        await process.waitForWriteCount(4)
+        await process.waitForWriteCount(5)
         await process.emit(.standardOutput(jsonLine(
-            #"{"jsonrpc":"2.0","id":4,"result":{}}"#
+            #"{"id":4,"result":{"turnId":"turn-1"}}"#
         )))
         try await steer.value
 
         let interrupt = Task {
             await adapter.interruptTurn(threadID: threadID, turnID: turnID)
         }
-        await process.waitForWriteCount(5)
+        await process.waitForWriteCount(6)
         await process.emit(.standardOutput(jsonLine(
-            #"{"jsonrpc":"2.0","id":5,"result":{}}"#
+            #"{"id":5,"result":{}}"#
         )))
         await interrupt.value
 
         let archive = Task { try await adapter.archiveThread(threadID) }
-        await process.waitForWriteCount(6)
+        await process.waitForWriteCount(7)
         await process.emit(.standardOutput(jsonLine(
-            #"{"jsonrpc":"2.0","id":6,"result":{}}"#
+            #"{"id":6,"result":{}}"#
         )))
         try await archive.value
 
         let unarchive = Task { try await adapter.unarchiveThread(threadID) }
-        await process.waitForWriteCount(7)
+        await process.waitForWriteCount(8)
         await process.emit(.standardOutput(jsonLine(
-            #"{"jsonrpc":"2.0","id":7,"result":{}}"#
+            #"{"id":7,"result":{}}"#
         )))
         try await unarchive.value
 
         let delete = Task { try await adapter.deleteThread(threadID) }
-        await process.waitForWriteCount(8)
+        await process.waitForWriteCount(9)
         await process.emit(.standardOutput(jsonLine(
-            #"{"jsonrpc":"2.0","id":8,"result":{}}"#
+            #"{"id":8,"result":{}}"#
         )))
         try await delete.value
 
         let writes = await process.writtenData()
-        let requests = try writes.map(jsonObject)
+        let allMessages = try writes.map(jsonObject)
+        #expect(allMessages.compactMap { $0["method"] as? String } == [
+            "initialize", "initialized", "thread/start", "turn/start",
+            "turn/steer", "turn/interrupt", "thread/archive",
+            "thread/unarchive", "thread/delete",
+        ])
+        let requests = allMessages.filter { $0["id"] != nil }
         #expect(requests.compactMap { $0["method"] as? String } == [
             "initialize", "thread/start", "turn/start", "turn/steer",
             "turn/interrupt", "thread/archive", "thread/unarchive",
@@ -180,23 +269,161 @@ struct CodexAppServerContractTests {
         await adapter.handleNotificationForTesting(
             method: "error",
             params: .object([
-                "code": .string("usageLimitExceeded"),
-                "message": .string("private diagnostic"),
+                "error": .object([
+                    "message": .string("private diagnostic"),
+                    "additionalDetails": .string("private details"),
+                    "codexErrorInfo": .string("serverOverloaded"),
+                ]),
+                "threadId": .string(threadID.rawValue),
+                "turnId": .string("turn-overloaded"),
+                "willRetry": .bool(false),
             ])
         )
         #expect(await adapter.availabilityForTesting == .overloaded)
+        #expect(await adapter.replayedEventsForTesting(threadID).last ==
+            .turnFailed(.init(rawValue: "turn-overloaded"), .overloaded))
 
         await adapter.handleNotificationForTesting(
-            method: "account/authentication/required",
-            params: .object([:])
+            method: "error",
+            params: .object([
+                "error": .object([
+                    "message": .string("private limit diagnostic"),
+                    "codexErrorInfo": .string("usageLimitExceeded"),
+                ]),
+                "threadId": .string(threadID.rawValue),
+                "turnId": .string("turn-limit"),
+                "willRetry": .bool(false),
+            ])
+        )
+        #expect(await adapter.replayedEventsForTesting(threadID).last ==
+            .turnFailed(.init(rawValue: "turn-limit"), .overloaded))
+
+        await adapter.handleNotificationForTesting(
+            method: "error",
+            params: .object([
+                "error": .object([
+                    "message": .string("secret auth diagnostic"),
+                    "codexErrorInfo": .string("unauthorized"),
+                ]),
+                "threadId": .string(threadID.rawValue),
+                "turnId": .string("turn-auth"),
+                "willRetry": .bool(false),
+            ])
         )
         #expect(await adapter.availabilityForTesting == .authenticationRequired)
+        #expect(await adapter.replayedEventsForTesting(threadID).last ==
+            .turnFailed(.init(rawValue: "turn-auth"), .authenticationRequired))
 
         await adapter.consumerFailedForTesting()
         #expect(await adapter.availabilityForTesting == .crashed)
         #expect(String(describing: await adapter.replayedEventsForTesting(threadID))
             .contains("private diagnostic") == false)
+        #expect(String(describing: await adapter.replayedEventsForTesting(threadID))
+            .contains("secret auth diagnostic") == false)
         await adapter.shutdown()
+    }
+
+    @Test("completed Dynamic Tool and additive items do not fail the turn")
+    func completedNonMessageItemsAreAdditive() async {
+        let threadID = AgentThreadID(rawValue: "thread-1")
+        let adapter = CodexAppServerAdapter(
+            transport: JSONLAppServerTransport(
+                process: ScriptedAppServerProcess(),
+                knownServerRequestMethods: ["item/tool/call"]
+            ),
+            launchConfiguration: testLaunchConfiguration(),
+            toolExecutor: RecordingCodexToolExecutor(),
+            mappingStore: .init(threadIDs: [threadID])
+        )
+
+        await adapter.handleNotificationForTesting(
+            method: "item/completed",
+            params: .object([
+                "threadId": .string(threadID.rawValue),
+                "turnId": .string("turn-1"),
+                "item": .object([
+                    "id": .string("call-1"),
+                    "type": .string("dynamicToolCall"),
+                    "tool": .string("observe_screen"),
+                    "arguments": .object([:]),
+                ]),
+            ])
+        )
+        await adapter.handleNotificationForTesting(
+            method: "item/completed",
+            params: .object([
+                "threadId": .string(threadID.rawValue),
+                "turnId": .string("turn-1"),
+                "item": .object([
+                    "id": .string("future-1"),
+                    "type": .string("futureItem"),
+                    "secret": .string("never publish"),
+                ]),
+            ])
+        )
+
+        #expect(await adapter.replayedEventsForTesting(threadID) == [])
+        await adapter.handleNotificationForTesting(
+            method: "item/completed",
+            params: .object([
+                "threadId": .string(threadID.rawValue),
+                "turnId": .string("turn-1"),
+                "item": .object([
+                    "id": .string("message-1"),
+                    "type": .string("agentMessage"),
+                    "text": .string("visible answer"),
+                ]),
+            ])
+        )
+        #expect(await adapter.replayedEventsForTesting(threadID) == [
+            .assistantMessageCompleted("visible answer"),
+        ])
+        await adapter.shutdown()
+    }
+
+    @Test("steer publishes only after the server confirms the exact active turn")
+    func steerRequiresMatchingTurnID() async throws {
+        for result in [
+            #"{"turnId":"other-turn"}"#,
+            #"{}"#,
+        ] {
+            let process = ScriptedAppServerProcess()
+            let adapter = CodexAppServerAdapter(
+                transport: JSONLAppServerTransport(process: process),
+                launchConfiguration: testLaunchConfiguration(),
+                toolExecutor: RecordingCodexToolExecutor()
+            )
+            let threadID = try await startMappedThread(
+                adapter: adapter,
+                process: process
+            )
+            let starting = Task {
+                try await adapter.startTurn(threadID: threadID, prompt: "hello")
+            }
+            await process.waitForWriteCount(4)
+            await process.emit(.standardOutput(jsonLine(
+                #"{"id":3,"result":{"turn":{"id":"turn-1"}}}"#
+            )))
+            let turnID = try await starting.value
+            let before = await adapter.replayedEventsForTesting(threadID)
+
+            let steering = Task {
+                try await adapter.steerTurn(
+                    threadID: threadID,
+                    turnID: turnID,
+                    prompt: "must-not-publish"
+                )
+            }
+            await process.waitForWriteCount(5)
+            await process.emit(.standardOutput(jsonLine(
+                "{\"id\":4,\"result\":\(result)}"
+            )))
+            await #expect(throws: CodexAppServerAdapterError.invalidResponse) {
+                try await steering.value
+            }
+            #expect(await adapter.replayedEventsForTesting(threadID) == before)
+            await adapter.shutdown()
+        }
     }
 
     @Test("start and resume use exact boundaries and replay history before live deltas")
@@ -217,11 +444,11 @@ struct CodexAppServerContractTests {
         let starting = Task { try await adapter.startThread() }
         await process.waitForWriteCount(1)
         await process.emit(.standardOutput(jsonLine(
-            #"{"jsonrpc":"2.0","id":1,"result":{"codexHome":"/Users/test/.codex","platformFamily":"unix","platformOs":"macos","userAgent":"codex-cli/0.144.2"}}"#
+            #"{"id":1,"result":{"codexHome":"/Users/test/.codex","platformFamily":"unix","platformOs":"macos","userAgent":"codex-cli/0.144.2"}}"#
         )))
-        await process.waitForWriteCount(2)
+        await process.waitForWriteCount(3)
         await process.emit(.standardOutput(jsonLine(
-            #"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}"#
+            #"{"id":2,"result":{"thread":{"id":"thread-1"}}}"#
         )))
         let threadID = try await starting.value
         #expect(threadID == AgentThreadID(rawValue: "thread-1"))
@@ -236,12 +463,12 @@ struct CodexAppServerContractTests {
             return events
         }
         let resuming = Task { try await adapter.resumeThread(threadID) }
-        await process.waitForWriteCount(3)
+        await process.waitForWriteCount(4)
         await process.emit(.standardOutput(jsonLine(
-            #"{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"live-turn","delta":"live"}}"#
+            #"{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"live-turn","delta":"live"}}"#
         )))
         await process.emit(.standardOutput(jsonLine(
-            #"{"jsonrpc":"2.0","id":3,"result":{"thread":{"id":"thread-1","turns":[{"id":"old-turn","items":[{"type":"userMessage","content":[{"type":"inputText","text":"old prompt"}]},{"type":"agentMessage","text":"old answer"}]}]}}}"#
+            #"{"id":3,"result":{"thread":{"id":"thread-1","turns":[{"id":"old-turn","items":[{"id":"user-1","type":"userMessage","content":[{"type":"text","text":"old prompt"}]},{"id":"agent-1","type":"agentMessage","text":"old answer"}]}]}}}"#
         )))
         try await resuming.value
         let events = await collected.value
@@ -254,7 +481,7 @@ struct CodexAppServerContractTests {
         ])
 
         let writes = await process.writtenData()
-        let resume = try jsonObject(from: writes[2])
+        let resume = try jsonObject(from: writes[3])
         let resumeParams = resume["params"] as! [String: Any]
         #expect(resumeParams["threadId"] as? String == "thread-1")
         #expect(resumeParams["dynamicTools"] == nil)
@@ -381,11 +608,11 @@ private func startMappedThread(
     let starting = Task { try await adapter.startThread() }
     await process.waitForWriteCount(1)
     await process.emit(.standardOutput(jsonLine(
-        #"{"jsonrpc":"2.0","id":1,"result":{"codexHome":"/Users/test/.codex","platformFamily":"unix","platformOs":"macos","userAgent":"codex-cli/0.144.2"}}"#
+        #"{"id":1,"result":{"codexHome":"/Users/test/.codex","platformFamily":"unix","platformOs":"macos","userAgent":"codex-cli/0.144.2"}}"#
     )))
-    await process.waitForWriteCount(2)
+    await process.waitForWriteCount(3)
     await process.emit(.standardOutput(jsonLine(
-        #"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}"#
+        #"{"id":2,"result":{"thread":{"id":"thread-1"}}}"#
     )))
     return try await starting.value
 }

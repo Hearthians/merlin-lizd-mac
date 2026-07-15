@@ -274,6 +274,19 @@ public actor JSONLAppServerTransport {
         try await writeLine(JSONRPCResultResponse(id: id, result: result))
     }
 
+    /// Sends the app-server's headerless notification shape through the same
+    /// bounded, serialized process write lane as requests and responses.
+    public func sendNotification(
+        method: String,
+        params: JSONValue? = nil
+    ) async throws {
+        guard case .running = state else { throw currentTerminalError }
+        try await writeLine(JSONRPCNotificationEnvelope(
+            method: method,
+            params: params
+        ))
+    }
+
     public func respondError(
         to id: JSONRPCID,
         code: Int,
@@ -506,7 +519,7 @@ public actor JSONLAppServerTransport {
                 JSONRPCInboundEnvelope.self,
                 from: line
             ),
-            envelope.jsonrpc == "2.0"
+            envelope.jsonrpc == nil || envelope.jsonrpc == "2.0"
         else {
             fail(.invalidMessage)
             return
@@ -734,7 +747,6 @@ private final class AppServerTransportProcessOwner: @unchecked Sendable {
 }
 
 private struct JSONRPCResultResponse: Encodable {
-    let jsonrpc = "2.0"
     let id: JSONRPCID
     let result: JSONValue
 }

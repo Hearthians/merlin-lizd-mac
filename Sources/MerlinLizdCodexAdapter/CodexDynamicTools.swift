@@ -66,7 +66,9 @@ public actor CodexTerminalToolExecutor: CodexDynamicToolExecuting {
             throw CodexTerminalToolExecutorError.mismatchedThread
         }
         if let existing = bindings[threadID] {
-            guard existing.handle == handle else {
+            guard existing.handle == handle,
+                existing.conversationKey == conversationKey
+            else {
                 throw CodexTerminalToolExecutorError.bindingExists
             }
             return
@@ -101,6 +103,10 @@ public actor CodexTerminalToolExecutor: CodexDynamicToolExecuting {
 
 public enum CodexDynamicToolCatalog {
     public static let namespace = "merlin_tmux"
+    public static let namespaceDescription = "Guarded operations for the "
+        + "current visible tmux pane. Observe before acting; hidden panes are "
+        + "never read, mutations require an exact screen revision, and user "
+        + "approval may pause execution."
     private static let maximumArgumentsBytes = 32 * 1_024
     private static let maximumEvents = 256
     private static let maximumPurposeScalars = 500
@@ -228,8 +234,11 @@ public enum CodexDynamicToolCatalog {
                 declaredRisk: risk
             ))
         case "wait_for_screen":
-            try requireExactKeys(
+            try requireKeys(
                 fields,
+                required: [
+                    "condition", "afterRevision", "timeoutMilliseconds",
+                ],
                 allowed: [
                     "condition", "afterRevision", "stableMilliseconds",
                     "timeoutMilliseconds",
@@ -266,8 +275,9 @@ public enum CodexDynamicToolCatalog {
                 timeout: .milliseconds(timeout)
             ))
         case "select_visible_surface":
-            try requireExactKeys(
+            try requireKeys(
                 fields,
+                required: ["selection", "expectedRevision"],
                 allowed: ["selection", "windowIndex", "expectedRevision"]
             )
             guard let name = fields["selection"]?.nonemptyString,
@@ -426,7 +436,16 @@ public enum CodexDynamicToolCatalog {
         _ fields: [String: JSONValue],
         allowed: Set<String>
     ) throws {
-        guard Set(fields.keys) == allowed else {
+        try requireKeys(fields, required: allowed, allowed: allowed)
+    }
+
+    private static func requireKeys(
+        _ fields: [String: JSONValue],
+        required: Set<String>,
+        allowed: Set<String>
+    ) throws {
+        let keys = Set(fields.keys)
+        guard required.isSubset(of: keys), keys.isSubset(of: allowed) else {
             throw CodexDynamicToolError.invalidArguments
         }
     }

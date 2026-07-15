@@ -105,7 +105,7 @@ struct JSONRPCInboundEnvelope: Decodable {
         let code: Int
     }
 
-    let jsonrpc: String
+    let jsonrpc: String?
     let id: JSONRPCID?
     let hasID: Bool
     let method: String?
@@ -126,7 +126,9 @@ struct JSONRPCInboundEnvelope: Decodable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        jsonrpc = try container.decode(String.self, forKey: .jsonrpc)
+        jsonrpc = container.contains(.jsonrpc)
+            ? try container.decode(String.self, forKey: .jsonrpc)
+            : nil
         hasID = container.contains(.id)
         id = hasID ? try container.decode(JSONRPCID.self, forKey: .id) : nil
         method = container.contains(.method)
@@ -147,8 +149,12 @@ struct JSONRPCInboundEnvelope: Decodable {
 }
 
 struct JSONRPCRequestEnvelope: Encodable {
-    let jsonrpc = "2.0"
     let id: JSONRPCID
+    let method: String
+    let params: JSONValue?
+}
+
+struct JSONRPCNotificationEnvelope: Encodable {
     let method: String
     let params: JSONValue?
 }
@@ -159,7 +165,6 @@ struct JSONRPCErrorResponseEnvelope: Encodable {
         let message: String
     }
 
-    let jsonrpc = "2.0"
     let id: JSONRPCID
     let error: Body
 }

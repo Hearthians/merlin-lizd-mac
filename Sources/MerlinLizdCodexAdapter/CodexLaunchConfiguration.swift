@@ -8,6 +8,9 @@ public enum CodexLaunchConfigurationError: Error, Equatable, Sendable {
 /// Authentication and model selection deliberately remain in the inherited
 /// local Codex environment/configuration.
 public struct CodexLaunchConfiguration: Sendable {
+    /// Capability concepts that must remain unavailable at this boundary.
+    /// Some concepts use canonical top-level settings or containment through
+    /// another stable feature instead of a feature flag with the same name.
     public static let disabledCapabilities = [
         "shell_tool",
         "unified_exec",
@@ -25,6 +28,27 @@ public struct CodexLaunchConfiguration: Sendable {
         "plugins",
     ]
 
+    /// Feature keys accepted by Codex 0.144.2. Web search uses the canonical
+    /// top-level setting; connectors are contained by apps/plugins plus an
+    /// empty MCP server table instead of relying on a nonexistent flag.
+    public static let disabledFeatureFlags = [
+        "shell_tool",
+        "unified_exec",
+        "apply_patch_freeform",
+        "apps",
+        "image_generation",
+        "browser_use",
+        "in_app_browser",
+        "computer_use",
+        "multi_agent",
+        "js_repl",
+        "code_mode",
+        "tool_search",
+        "plugins",
+        "remote_plugin",
+        "tool_suggest",
+    ]
+
     public let executable: URL
     public let runtimeDirectory: URL
     public let environment: [String: String]
@@ -38,8 +62,12 @@ public struct CodexLaunchConfiguration: Sendable {
         self.executable = executable
         self.runtimeDirectory = runtimeDirectory
         self.environment = environment
-        var arguments = ["app-server", "-c", "mcp_servers={}"]
-        for capability in Self.disabledCapabilities {
+        var arguments = [
+            "app-server",
+            "-c", "mcp_servers={}",
+            "-c", #"web_search="disabled""#,
+        ]
+        for capability in Self.disabledFeatureFlags {
             arguments.append(contentsOf: [
                 "-c", "features.\(capability)=false",
             ])
@@ -81,7 +109,17 @@ public struct CodexLaunchConfiguration: Sendable {
             "dynamicTools": .array([.object([
                 "type": .string("namespace"),
                 "name": .string(CodexDynamicToolCatalog.namespace),
-                "tools": .array([]),
+                "description": .string(
+                    CodexDynamicToolCatalog.namespaceDescription
+                ),
+                "tools": .array(CodexDynamicToolCatalog.tools.map {
+                    .object([
+                        "type": .string("function"),
+                        "name": .string($0.name),
+                        "description": .string($0.description),
+                        "inputSchema": $0.inputSchema,
+                    ])
+                }),
             ])]),
         ])
     }
@@ -99,6 +137,11 @@ public struct CodexLaunchConfiguration: Sendable {
 extension JSONValue {
     var nonemptyString: String? {
         guard case let .string(value) = self, !value.isEmpty else { return nil }
+        return value
+    }
+
+    var boolValue: Bool? {
+        guard case let .bool(value) = self else { return nil }
         return value
     }
 }
