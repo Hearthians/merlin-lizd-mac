@@ -74,8 +74,11 @@ public actor TerminalApprovalBroker {
             batch: request.batch,
             endpointID: request.scope.endpointID,
             screenRevision: request.scope.screenRevision
-        ), canonicalScope == request.scope,
-            request.batch.expectedRevision == request.scope.screenRevision
+        ), canonicalScope.payloadDigest == request.scope.payloadDigest,
+            request.batch.expectedRevision == request.scope.screenRevision,
+            request.scope.context == nil
+                || request.scope.context?.screen.revision
+                    == request.scope.screenRevision
         else {
             throw TerminalApprovalError.invalidRequest
         }

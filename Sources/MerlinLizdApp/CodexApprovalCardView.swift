@@ -14,18 +14,50 @@ struct CodexApprovalCardView: View {
                 .font(.headline)
                 .foregroundStyle(.orange)
 
-            detail("Reason", request.reason)
+            detail("Reason", CodexBoundedText.string(request.reason))
             detail("Proposed input", CodexTerminalPayloadFormatter.batch(request.batch))
+            if let context = request.scope.context {
+                detail(
+                    "Endpoint / tmux surface",
+                    "\(request.scope.endpointID.rawValue.uuidString) · session "
+                        + "\(context.surface.sessionIdentity.serverSessionID) · window "
+                        + "\(context.surface.windowID) · pane \(context.surface.paneID) · command "
+                        + CodexBoundedText.string(
+                            context.surface.currentCommand,
+                            maximumCharacterCount: 256
+                        )
+                )
+                detail(
+                    "Screen context",
+                    "Revision \(context.screen.revision) · "
+                        + "\(context.screen.columns)×\(context.screen.rows) · cursor "
+                        + "\(context.screen.cursor.row):\(context.screen.cursor.column) "
+                        + "(\(context.screen.cursor.isVisible ? "visible" : "hidden")) · "
+                        + "\(context.screen.mode.isAlternateScreen ? "alternate" : "normal") screen · "
+                        + "keyboard \(keyboardMode(context.screen.mode.keyboardMode))"
+                )
+                detail(
+                    "Visible screen at approval",
+                    CodexBoundedText.string(context.screen.text)
+                        + (context.screen.isTextTruncated ? "\n… [screen context truncated]" : "")
+                )
+            } else {
+                detail(
+                    "Endpoint / surface",
+                    "\(request.scope.endpointID.rawValue.uuidString) · tmux "
+                        + conversationKey.tmux.serverSessionID
+                )
+                detail(
+                    "Screen context",
+                    "Revision \(request.scope.screenRevision) · legacy approval context unavailable"
+                )
+            }
             detail(
-                "Endpoint / surface",
-                "\(request.scope.endpointID.rawValue.uuidString) · tmux "
-                    + conversationKey.tmux.serverSessionID
-            )
-            detail(
-                "Screen context",
-                "Revision \(request.scope.screenRevision) · "
-                    + "expected payload revision \(request.batch.expectedRevision) · "
-                    + request.batch.purpose
+                "Purpose",
+                CodexBoundedText.string(
+                    request.batch.purpose,
+                    maximumCharacterCount: 500
+                )
             )
             detail("Payload digest", request.scope.payloadDigest)
 
@@ -57,11 +89,20 @@ struct CodexApprovalCardView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
+
+    private func keyboardMode(_ mode: TerminalKeyboardMode) -> String {
+        switch mode {
+        case .normal: "normal"
+        case .applicationCursor: "application-cursor"
+        }
+    }
 }
 
 enum CodexTerminalPayloadFormatter {
     static func batch(_ batch: TerminalInputBatch) -> String {
-        batch.events.map(event).joined(separator: "\n")
+        CodexBoundedText.string(
+            batch.events.map(event).joined(separator: "\n")
+        )
     }
 
     static func event(_ event: TerminalInputEvent) -> String {
@@ -101,5 +142,17 @@ enum CodexTerminalPayloadFormatter {
         if modifiers.contains(.option) { names.append("option") }
         if modifiers.contains(.command) { names.append("command") }
         return names.isEmpty ? "none" : names.joined(separator: "+")
+    }
+}
+
+enum CodexBoundedText {
+    static let maximumCharacterCount = 4_096
+
+    static func string(
+        _ value: String,
+        maximumCharacterCount: Int = maximumCharacterCount
+    ) -> String {
+        guard value.count > maximumCharacterCount else { return value }
+        return String(value.prefix(maximumCharacterCount)) + "… [truncated]"
     }
 }

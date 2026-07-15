@@ -1,6 +1,6 @@
 import Foundation
 
-public struct TmuxSurface: Codable, Equatable, Sendable {
+public struct TmuxSurface: Codable, Equatable, Hashable, Sendable {
     public let sessionIdentity: TmuxSessionIdentity
     public let windowID: String
     public let paneID: String

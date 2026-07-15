@@ -1,4 +1,4 @@
-public struct TerminalCursor: Codable, Equatable, Sendable {
+public struct TerminalCursor: Codable, Equatable, Hashable, Sendable {
     public let row: Int
     public let column: Int
     public let isVisible: Bool
@@ -10,12 +10,12 @@ public struct TerminalCursor: Codable, Equatable, Sendable {
     }
 }
 
-public enum TerminalKeyboardMode: Codable, Equatable, Sendable {
+public enum TerminalKeyboardMode: Codable, Equatable, Hashable, Sendable {
     case normal
     case applicationCursor
 }
 
-public struct TerminalScreenMode: Codable, Equatable, Sendable {
+public struct TerminalScreenMode: Codable, Equatable, Hashable, Sendable {
     public static let normal = TerminalScreenMode(
         isAlternateScreen: false,
         keyboardMode: .normal

@@ -395,10 +395,77 @@ public struct TerminalJournalEvent: Codable, Equatable, Sendable {
     }
 }
 
+public struct TerminalJournalPageCursor: Codable, Equatable, Sendable {
+    public let endOffset: Int64
+    public let isSkippingOversizedEntry: Bool
+
+    public init(
+        endOffset: Int64,
+        isSkippingOversizedEntry: Bool = false
+    ) {
+        self.endOffset = max(0, endOffset)
+        self.isSkippingOversizedEntry = isSkippingOversizedEntry
+    }
+}
+
+public struct TerminalJournalReadPageRequest: Equatable, Sendable {
+    public static let maximumAllowedEventCount = 400
+    public static let maximumAllowedByteCount = 1024 * 1024
+
+    public let maximumEventCount: Int
+    public let maximumByteCount: Int
+    public let before: TerminalJournalPageCursor?
+
+    public init(
+        maximumEventCount: Int,
+        maximumByteCount: Int,
+        before: TerminalJournalPageCursor? = nil
+    ) {
+        self.maximumEventCount = min(
+            Self.maximumAllowedEventCount,
+            max(1, maximumEventCount)
+        )
+        self.maximumByteCount = min(
+            Self.maximumAllowedByteCount,
+            max(1, maximumByteCount)
+        )
+        self.before = before
+    }
+}
+
+public struct TerminalJournalReadPage: Equatable, Sendable {
+    public let entries: [TerminalJournalEvent]
+    public let olderCursor: TerminalJournalPageCursor?
+    public let encodedBytesRead: Int
+    public let didOmitOversizedEntry: Bool
+
+    public init(
+        entries: [TerminalJournalEvent],
+        olderCursor: TerminalJournalPageCursor?,
+        encodedBytesRead: Int,
+        didOmitOversizedEntry: Bool
+    ) {
+        self.entries = entries
+        self.olderCursor = olderCursor
+        self.encodedBytesRead = encodedBytesRead
+        self.didOmitOversizedEntry = didOmitOversizedEntry
+    }
+
+    public var hasOlderEntries: Bool { olderCursor != nil }
+    public var hasTruncatedHistory: Bool {
+        hasOlderEntries || didOmitOversizedEntry
+    }
+}
+
 public protocol TerminalOperationJournalReading: Sendable {
     func entries(
         for key: TerminalConversationKey
     ) async throws -> [TerminalJournalEvent]
+
+    func recentEntries(
+        for key: TerminalConversationKey,
+        request: TerminalJournalReadPageRequest
+    ) async throws -> TerminalJournalReadPage
 }
 
 public protocol TerminalOperationJournaling:
@@ -421,6 +488,7 @@ public enum TerminalOperationJournalError: Error, Equatable, Sendable {
 enum TerminalJournalOperation: Equatable, Sendable {
     case append
     case entries
+    case recentEntries
     case delete
 }
 
@@ -435,17 +503,20 @@ struct TerminalOperationJournalHooks: Sendable {
         @Sendable (TerminalConversationLockEvent) async throws -> Void
     )?
     let directorySync: (@Sendable (Int32, String) throws -> Void)?
+    let recentReadChunk: (@Sendable () async throws -> Void)?
 
     init(
         beforeMappingPublish: (@Sendable () async throws -> Void)? = nil,
         conversationLockEvent: (
             @Sendable (TerminalConversationLockEvent) async throws -> Void
         )? = nil,
-        directorySync: (@Sendable (Int32, String) throws -> Void)? = nil
+        directorySync: (@Sendable (Int32, String) throws -> Void)? = nil,
+        recentReadChunk: (@Sendable () async throws -> Void)? = nil
     ) {
         self.beforeMappingPublish = beforeMappingPublish
         self.conversationLockEvent = conversationLockEvent
         self.directorySync = directorySync
+        self.recentReadChunk = recentReadChunk
     }
 }
 
@@ -602,6 +673,47 @@ public actor FileTerminalOperationJournal: TerminalOperationJournaling {
             key: key,
             storageID: storageID,
             decoder: decoder,
+            path: path
+        )
+    }
+
+    public func recentEntries(
+        for key: TerminalConversationKey,
+        request: TerminalJournalReadPageRequest
+    ) async throws -> TerminalJournalReadPage {
+        try Task.checkCancellation()
+        let storageID = try Self.storageID(for: key)
+        let conversationLock = try await acquireConversationLock(
+            storageID: storageID,
+            operation: .recentEntries
+        )
+        defer { Self.releaseLock(conversationLock) }
+        let name = "\(storageID).jsonl"
+        let path = journalURL(for: key).path
+        let descriptor = openat(
+            journalsDescriptor,
+            name,
+            O_RDONLY | O_CLOEXEC | O_NOFOLLOW
+        )
+        if descriptor < 0, errno == ENOENT {
+            return TerminalJournalReadPage(
+                entries: [],
+                olderCursor: nil,
+                encodedBytesRead: 0,
+                didOmitOversizedEntry: false
+            )
+        }
+        guard descriptor >= 0 else { throw Self.posixError("openat", path) }
+        defer { close(descriptor) }
+        try Self.validatePrivateFile(descriptor, path: path)
+        try Self.lock(descriptor, operation: LOCK_SH, path: path)
+        defer { flock(descriptor, LOCK_UN) }
+        try validateMapping(for: key, storageID: storageID)
+        return try await decodeRecentJournal(
+            descriptor: descriptor,
+            key: key,
+            storageID: storageID,
+            request: request,
             path: path
         )
     }
@@ -986,6 +1098,176 @@ public actor FileTerminalOperationJournal: TerminalOperationJournaling {
         }
     }
 
+    private func decodeRecentJournal(
+        descriptor: Int32,
+        key: TerminalConversationKey,
+        storageID: String,
+        request: TerminalJournalReadPageRequest,
+        path: String
+    ) async throws -> TerminalJournalReadPage {
+        var information = stat()
+        guard fstat(descriptor, &information) == 0 else {
+            throw Self.posixError("fstat", path)
+        }
+        let fileSize = max(Int64(0), Int64(information.st_size))
+        let requestedEnd = min(
+            fileSize,
+            max(0, request.before?.endOffset ?? fileSize)
+        )
+        guard requestedEnd > 0 else {
+            return TerminalJournalReadPage(
+                entries: [],
+                olderCursor: nil,
+                encodedBytesRead: 0,
+                didOmitOversizedEntry: false
+            )
+        }
+
+        let byteCount = min(request.maximumByteCount, Int(requestedEnd))
+        let startOffset = requestedEnd - Int64(byteCount)
+        var bytes = [UInt8](repeating: 0, count: byteCount)
+        var totalRead = 0
+        while totalRead < byteCount {
+            try Task.checkCancellation()
+            let count = bytes.withUnsafeMutableBytes { rawBuffer -> Int in
+                guard let baseAddress = rawBuffer.baseAddress else { return 0 }
+                return pread(
+                    descriptor,
+                    baseAddress.advanced(by: totalRead),
+                    byteCount - totalRead,
+                    off_t(startOffset) + off_t(totalRead)
+                )
+            }
+            if count < 0, errno == EINTR { continue }
+            guard count > 0 else {
+                throw Self.posixError("pread", path)
+            }
+            totalRead += count
+            try await hooks.recentReadChunk?()
+            try Task.checkCancellation()
+        }
+
+        var parseEnd = totalRead
+        var omittedOversized = request.before?.isSkippingOversizedEntry == true
+        if request.before?.isSkippingOversizedEntry == true {
+            guard let boundary = bytes[..<parseEnd].lastIndex(of: 0x0A) else {
+                let cursor = startOffset > 0
+                    ? TerminalJournalPageCursor(
+                        endOffset: startOffset,
+                        isSkippingOversizedEntry: true
+                    )
+                    : nil
+                return TerminalJournalReadPage(
+                    entries: [],
+                    olderCursor: cursor,
+                    encodedBytesRead: totalRead,
+                    didOmitOversizedEntry: true
+                )
+            }
+            // The boundary terminates the record immediately before the
+            // oversized entry. Return that exact boundary as a normal cursor;
+            // the next page can then decode the older record from its start
+            // without ever treating an intentional middle fragment as JSON.
+            return TerminalJournalReadPage(
+                entries: [],
+                olderCursor: TerminalJournalPageCursor(
+                    endOffset: startOffset + Int64(boundary + 1)
+                ),
+                encodedBytesRead: totalRead,
+                didOmitOversizedEntry: true
+            )
+        } else if bytes[parseEnd - 1] != 0x0A {
+            // A bounded tail can intentionally begin or end within a JSONL
+            // record. Ignore that fragment instead of labelling the journal
+            // corrupt; the complete entries API retains strict corruption
+            // checks for audit/recovery callers.
+            omittedOversized = true
+            guard let boundary = bytes[..<parseEnd].lastIndex(of: 0x0A) else {
+                return TerminalJournalReadPage(
+                    entries: [],
+                    olderCursor: nil,
+                    encodedBytesRead: totalRead,
+                    didOmitOversizedEntry: true
+                )
+            }
+            parseEnd = boundary + 1
+        }
+
+        let newlineIndexes = bytes[..<parseEnd].indices.filter {
+            bytes[$0] == 0x0A
+        }
+        var newestFirst: [TerminalJournalEvent] = []
+        newestFirst.reserveCapacity(request.maximumEventCount)
+        var olderCursor: TerminalJournalPageCursor?
+
+        for position in newlineIndexes.indices.reversed() {
+            let lineEnd = newlineIndexes[position]
+            let lineStart: Int?
+            if position > newlineIndexes.startIndex {
+                lineStart = newlineIndexes[newlineIndexes.index(before: position)] + 1
+            } else if startOffset == 0 {
+                lineStart = 0
+            } else {
+                lineStart = nil
+            }
+
+            guard let lineStart else {
+                let incompleteEnd = startOffset + Int64(lineEnd + 1)
+                if newestFirst.isEmpty && lineEnd + 1 == parseEnd {
+                    omittedOversized = true
+                    olderCursor = startOffset > 0
+                        ? TerminalJournalPageCursor(
+                            endOffset: startOffset,
+                            isSkippingOversizedEntry: true
+                        )
+                        : nil
+                } else {
+                    olderCursor = TerminalJournalPageCursor(
+                        endOffset: incompleteEnd
+                    )
+                }
+                break
+            }
+
+            guard lineStart < lineEnd,
+                let event = try? decoder.decode(
+                    TerminalJournalEvent.self,
+                    from: Data(bytes[lineStart..<lineEnd])
+                ),
+                event.key == key
+            else {
+                throw TerminalOperationJournalError.corruptRecord(
+                    storageID: storageID,
+                    line: 0
+                )
+            }
+            newestFirst.append(event)
+            if newestFirst.count == request.maximumEventCount {
+                let previousEnd = startOffset + Int64(lineStart)
+                olderCursor = previousEnd > 0
+                    ? TerminalJournalPageCursor(endOffset: previousEnd)
+                    : nil
+                break
+            }
+        }
+
+        if olderCursor == nil, startOffset > 0,
+            newestFirst.count < request.maximumEventCount
+        {
+            olderCursor = TerminalJournalPageCursor(
+                endOffset: startOffset,
+                isSkippingOversizedEntry: true
+            )
+            omittedOversized = true
+        }
+        return TerminalJournalReadPage(
+            entries: Array(newestFirst.reversed()),
+            olderCursor: olderCursor,
+            encodedBytesRead: totalRead,
+            didOmitOversizedEntry: omittedOversized
+        )
+    }
+
     private static func decodeJournal(
         descriptor: Int32,
         key: TerminalConversationKey,
@@ -1283,11 +1565,16 @@ public actor TerminalMutationAuditor {
         guard let recomputed = try? TerminalPermissionPolicy().evaluate(
             batch: batch,
             endpointID: endpointID,
-            screen: screen
+            screen: screen,
+            surface: approval?.scope.context?.surface
         ), recomputed.deterministicRisk == deterministic,
             recomputed.effectiveRisk == effective
         else { return false }
-        if case .deny = recomputed.decision { return false }
+        if case .deny = recomputed.decision,
+            !(effective == .high && approval?.scope.context == nil)
+        {
+            return false
+        }
 
         if let approval {
             guard approval.outcome == .approvedOnce,
@@ -1298,7 +1585,10 @@ public actor TerminalMutationAuditor {
                     endpointID: endpointID,
                     screenRevision: screen.revision
                 ),
-                approval.scope == expectedScope
+                approval.scope.payloadDigest == expectedScope.payloadDigest,
+                approval.scope.context == nil
+                    || approval.scope.context?.screen
+                        == TerminalApprovalScreenContext(snapshot: screen)
             else { return false }
         }
         return true

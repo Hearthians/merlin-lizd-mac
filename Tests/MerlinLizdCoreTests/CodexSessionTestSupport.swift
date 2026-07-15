@@ -554,6 +554,16 @@ actor CodexSessionJournalSpy: TerminalOperationJournaling {
         events.filter { $0.key == key }
     }
 
+    func recentEntries(
+        for key: TerminalConversationKey,
+        request: TerminalJournalReadPageRequest
+    ) async throws -> TerminalJournalReadPage {
+        terminalInMemoryRecentPage(
+            events.filter { $0.key == key },
+            request: request
+        )
+    }
+
     func deleteJournal(for key: TerminalConversationKey) async throws {
         if failDelete { throw Failure.delete }
         deletedKeys.append(key)

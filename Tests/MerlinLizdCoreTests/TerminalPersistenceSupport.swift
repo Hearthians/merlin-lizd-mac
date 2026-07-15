@@ -273,6 +273,16 @@ actor ScriptedTerminalJournal: TerminalOperationJournaling {
         stored.filter { $0.key == key }
     }
 
+    func recentEntries(
+        for key: TerminalConversationKey,
+        request: TerminalJournalReadPageRequest
+    ) async throws -> TerminalJournalReadPage {
+        terminalInMemoryRecentPage(
+            stored.filter { $0.key == key },
+            request: request
+        )
+    }
+
     func deleteJournal(for key: TerminalConversationKey) async throws {
         stored.removeAll { $0.key == key }
     }
@@ -308,11 +318,37 @@ actor GatedFailingTerminalJournal: TerminalOperationJournaling {
         []
     }
 
+    func recentEntries(
+        for key: TerminalConversationKey,
+        request: TerminalJournalReadPageRequest
+    ) async throws -> TerminalJournalReadPage {
+        terminalInMemoryRecentPage([], request: request)
+    }
+
     func deleteJournal(for key: TerminalConversationKey) async throws {}
 
     func appendCount() -> Int {
         count
     }
+}
+
+func terminalInMemoryRecentPage(
+    _ events: [TerminalJournalEvent],
+    request: TerminalJournalReadPageRequest
+) -> TerminalJournalReadPage {
+    let requestedEnd = min(
+        events.count,
+        max(0, Int(request.before?.endOffset ?? Int64(events.count)))
+    )
+    let start = max(0, requestedEnd - request.maximumEventCount)
+    return TerminalJournalReadPage(
+        entries: Array(events[start..<requestedEnd]),
+        olderCursor: start > 0
+            ? TerminalJournalPageCursor(endOffset: Int64(start))
+            : nil,
+        encodedBytesRead: 0,
+        didOmitOversizedEntry: false
+    )
 }
 
 func terminalEncodeTemporaryPaneEvent(

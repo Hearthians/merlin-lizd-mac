@@ -94,7 +94,7 @@ struct CodexDrawerView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .disabled(model.state.keyboardOwnership == .takeoverPending)
+                .disabled(!model.canTakeOver)
             }
             HStack(spacing: 8) {
                 composerField(prompt: "Steer the active Codex turn…")
@@ -120,7 +120,7 @@ struct CodexDrawerView: View {
                     }
                     .buttonStyle(.bordered)
                     .disabled(
-                        model.state.keyboardOwnership == .takeoverPending
+                        !model.canTakeOver
                     )
                 }
             }
@@ -141,7 +141,8 @@ struct CodexDrawerView: View {
                             CodexApprovalCardView(
                                 request: request,
                                 conversationKey: key,
-                                canAllowOnce: terminalIsConnected,
+                                canAllowOnce: terminalIsConnected
+                                    && request.scope.context != nil,
                                 onAllowOnce: { model.allowOnce(request.id) },
                                 onDeny: { model.deny(request.id) }
                             )
@@ -157,6 +158,9 @@ struct CodexDrawerView: View {
                         }
                     } else if let notice = model.journalNotice {
                         noticeRow(notice, symbol: "doc.text.magnifyingglass")
+                    }
+                    if let notice = model.journalHistoryNotice {
+                        noticeRow(notice, symbol: "clock.arrow.circlepath")
                     }
                 }
                 .padding(.horizontal, 10)

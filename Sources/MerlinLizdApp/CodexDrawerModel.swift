@@ -28,6 +28,7 @@ final class CodexDrawerModel: ObservableObject {
     @Published private(set) var state: CodexDrawerState
     @Published private(set) var operations: [CodexOperationRecord] = []
     @Published private(set) var journalNotice: String?
+    @Published private(set) var journalHistoryNotice: String?
 
     private let coordinator: CodexSessionCoordinator?
     private let supervisor: CodexAppServerSupervisor?
@@ -88,6 +89,7 @@ final class CodexDrawerModel: ObservableObject {
     }
 
     var composer: String { state.composerText }
+    var canTakeOver: Bool { coordinator != nil && state.canTakeOver }
 
     var backgroundActivity: CodexDrawerBackgroundActivity {
         state.backgroundActivity(excluding: state.selectedConversationKey)
@@ -162,8 +164,11 @@ final class CodexDrawerModel: ObservableObject {
                 // The coordinator returns only after router interruption has
                 // restored terminal keyboard ownership. No terminal bytes or
                 // process lifecycle action belongs on this path.
-                await coordinator.stopAndTakeOver(key)
-                self?.apply(.takeoverCompleted(key), executeCommands: false)
+                let completion = await CodexDrawerCommandSequencer
+                    .stopAndTakeOver(key) {
+                        await coordinator.stopAndTakeOver(key)
+                    }
+                self?.apply(completion, executeCommands: false)
             }
         case let .allowOnce(requestID):
             guard let coordinator else { return }
@@ -185,18 +190,29 @@ final class CodexDrawerModel: ObservableObject {
         else {
             operations = []
             journalNotice = nil
+            journalHistoryNotice = nil
             return
         }
         journalTask = Task { [weak self] in
             do {
-                let entries = try await journal.entries(for: key)
+                let page = try await journal.recentEntries(
+                    for: key,
+                    request: TerminalJournalReadPageRequest(
+                        maximumEventCount: 400,
+                        maximumByteCount: 256 * 1024
+                    )
+                )
                 try Task.checkCancellation()
-                self?.operations = Self.group(entries)
+                self?.operations = Self.group(page.entries)
                 self?.journalNotice = nil
+                self?.journalHistoryNotice = page.hasTruncatedHistory
+                    ? "Showing recent journal history. Older or oversized details remain in the complete audit log."
+                    : nil
             } catch is CancellationError {
                 return
             } catch {
                 self?.operations = []
+                self?.journalHistoryNotice = nil
                 self?.journalNotice =
                     "The operation journal is temporarily unavailable."
             }
@@ -206,10 +222,9 @@ final class CodexDrawerModel: ObservableObject {
     private static func group(
         _ entries: [TerminalJournalEvent]
     ) -> [CodexOperationRecord] {
-        let bounded = Array(entries.suffix(400))
         var order: [UUID] = []
         var groups: [UUID: [TerminalJournalEvent]] = [:]
-        for entry in bounded {
+        for entry in entries {
             if groups[entry.operationID] == nil { order.append(entry.operationID) }
             groups[entry.operationID, default: []].append(entry)
         }

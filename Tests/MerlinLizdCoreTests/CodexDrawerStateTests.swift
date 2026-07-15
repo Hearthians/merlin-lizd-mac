@@ -60,6 +60,13 @@ struct CodexDrawerStateTests {
         for context in [
             CodexDrawerTerminalContext.plainLocalShell,
             .unresolvedTmux,
+            .notStarted(key),
+            .endpointRegistering(key),
+            .registrationFailed(key),
+            .detached(key),
+            .exited(key),
+            .closed(key),
+            .reconnecting(key),
             .disconnected(key),
             .noSelection,
         ] {
@@ -68,6 +75,109 @@ struct CodexDrawerStateTests {
             #expect(state.reduce(.sendComposer).isEmpty)
             #expect(!state.canSend)
         }
+    }
+
+    @Test("endpoint readiness fails closed until exact registration succeeds")
+    func projectsEndpointReadiness() {
+        let key = Self.key(1)
+
+        #expect(CodexDrawerTerminalContext.project(
+            key: key,
+            session: .missing,
+            endpoint: .notStarted,
+            isReconnecting: false
+        ) == .notStarted(key))
+        #expect(CodexDrawerTerminalContext.project(
+            key: key,
+            session: .running,
+            endpoint: .registering,
+            isReconnecting: false
+        ) == .endpointRegistering(key))
+        #expect(CodexDrawerTerminalContext.project(
+            key: key,
+            session: .running,
+            endpoint: .registrationFailed,
+            isReconnecting: false
+        ) == .registrationFailed(key))
+        #expect(CodexDrawerTerminalContext.project(
+            key: key,
+            session: .running,
+            endpoint: .registered,
+            isReconnecting: false
+        ) == .connected(key))
+
+        // A restored identity with no live session and a late detach must never
+        // project as connected merely because the key is known.
+        #expect(CodexDrawerTerminalContext.project(
+            key: key,
+            session: .missing,
+            endpoint: .registrationFailed,
+            isReconnecting: false
+        ) == .registrationFailed(key))
+        #expect(CodexDrawerTerminalContext.project(
+            key: key,
+            session: .running,
+            endpoint: .detached,
+            isReconnecting: false
+        ) == .detached(key))
+        #expect(CodexDrawerTerminalContext.project(
+            key: key,
+            session: .exited,
+            endpoint: .registered,
+            isReconnecting: false
+        ) == .exited(key))
+        #expect(CodexDrawerTerminalContext.project(
+            key: key,
+            session: .closed,
+            endpoint: .registered,
+            isReconnecting: false
+        ) == .closed(key))
+        #expect(CodexDrawerTerminalContext.project(
+            key: key,
+            session: .running,
+            endpoint: .registering,
+            isReconnecting: true
+        ) == .reconnecting(key))
+
+        let preparing = CodexDrawerState(
+            terminalContext: .endpointRegistering(key)
+        ).terminalNotice
+        let retrying = CodexDrawerState(
+            terminalContext: .reconnecting(key)
+        ).terminalNotice
+        let failed = CodexDrawerState(
+            terminalContext: .registrationFailed(key)
+        ).terminalNotice
+        #expect(preparing != retrying)
+        #expect(preparing != failed)
+        #expect(retrying != failed)
+    }
+
+    @Test("endpoint registration ignores late failure and detach races")
+    func reducesEndpointRegistrationRaces() {
+        let first = terminalUUID("10000000-0000-0000-0000-000000000001")
+        let second = terminalUUID("10000000-0000-0000-0000-000000000002")
+        var registration = CodexDrawerEndpointRegistration()
+
+        registration.begin(generationID: first)
+        #expect(registration.readiness == .registering)
+        registration.detach()
+        let lateSuccess = registration.succeed(generationID: first)
+        #expect(!lateSuccess)
+        #expect(registration.readiness == .detached)
+
+        registration.begin(generationID: second)
+        let staleFailure = registration.fail(generationID: first)
+        #expect(!staleFailure)
+        #expect(registration.readiness == .registering)
+        let exactFailure = registration.fail(generationID: second)
+        #expect(exactFailure)
+        #expect(registration.readiness == .registrationFailed)
+
+        registration.begin(generationID: first)
+        let exactSuccess = registration.succeed(generationID: first)
+        #expect(exactSuccess)
+        #expect(registration.readiness == .registered)
     }
 
     @Test("takeover keeps Codex ownership until interruption completes")
@@ -86,6 +196,54 @@ struct CodexDrawerStateTests {
 
         state.reduce(.takeoverCompleted(key))
         #expect(state.keyboardOwnership == .user)
+    }
+
+    @Test("disconnected active turns remain stoppable without a terminal")
+    func stopsDisconnectedActiveTurn() {
+        let key = Self.key(1)
+        var state = CodexDrawerState(availability: .ready)
+        state.reduce(.selectTerminal(.disconnected(key)))
+        state.reduce(.receiveSessions([
+            key: Self.session(key, phase: .controlling, active: true),
+        ]))
+
+        #expect(state.canTakeOver)
+        #expect(state.reduce(.requestTakeover) == [.stopAndTakeOver(key)])
+        #expect(state.keyboardOwnership == .takeoverPending)
+        #expect(state.reduce(.requestTakeover).isEmpty)
+
+        state.reduce(.receiveSessions([
+            key: Self.session(
+                key,
+                phase: .failed(.interrupted),
+                active: false
+            ),
+        ]))
+        #expect(state.keyboardOwnership == .takeoverPending)
+        state.reduce(.takeoverCompleted(key))
+        #expect(state.keyboardOwnership == .user)
+    }
+
+    @Test("takeover completion action is sequenced after coordinator stop")
+    func sequencesAsyncTakeoverCommand() async {
+        let key = Self.key(1)
+        let gate = AsyncStartGate()
+        let completion = AsyncCompletionProbe()
+        let execution = Task {
+            let action = await CodexDrawerCommandSequencer.stopAndTakeOver(
+                key
+            ) {
+                await gate.wait()
+            }
+            await completion.complete()
+            return action
+        }
+
+        await gate.waitUntilEntered()
+        #expect(await completion.count() == 0)
+        await gate.open()
+        #expect(await execution.value == .takeoverCompleted(key))
+        #expect(await completion.count() == 1)
     }
 
     @Test("only pending approval requests can be allowed once or denied")
@@ -114,6 +272,27 @@ struct CodexDrawerStateTests {
         state.reduce(.selectTerminal(.disconnected(key)))
         #expect(state.reduce(.allowOnce(request.id)).isEmpty)
         #expect(state.reduce(.deny(request.id)) == [.deny(request.id)])
+
+        let legacy = TerminalApprovalRequest(
+            scope: try TerminalApprovalScope(
+                batch: request.batch,
+                endpointID: request.scope.endpointID,
+                screenRevision: request.scope.screenRevision
+            ),
+            batch: request.batch,
+            reason: "Legacy request without verified context"
+        )
+        state.reduce(.selectTerminal(.connected(key)))
+        state.reduce(.receiveSessions([
+            key: CodexSessionState(
+                key: key,
+                activeTurnID: .init(rawValue: "turn"),
+                phase: .awaitingApproval,
+                pendingApprovals: [legacy]
+            ),
+        ]))
+        #expect(state.reduce(.allowOnce(legacy.id)).isEmpty)
+        #expect(state.reduce(.deny(legacy.id)) == [.deny(legacy.id)])
     }
 
     @Test("matching tmux tabs share badges while other sessions stay independent")
@@ -243,11 +422,31 @@ struct CodexDrawerStateTests {
             purpose: "Remove generated files",
             declaredRisk: .high
         )
+        let screen = TerminalScreenSnapshot(
+            revision: 42,
+            columns: 80,
+            rows: 24,
+            cursor: TerminalCursor(row: 3, column: 9, isVisible: true),
+            mode: .normal,
+            text: "dangerous input\nProceed? [y/N]",
+            significantRuns: [],
+            changedRows: [3]
+        )
+        let surface = TmuxSurface(
+            sessionIdentity: TmuxSessionIdentity(
+                serverSessionID: "$1",
+                createdAtEpoch: 1
+            ),
+            windowID: "@1",
+            paneID: "%1",
+            currentCommand: "zsh"
+        )
         return TerminalApprovalRequest(
             scope: try TerminalApprovalScope(
                 batch: batch,
                 endpointID: endpointID,
-                screenRevision: 42
+                screen: screen,
+                surface: surface
             ),
             batch: batch,
             reason: "Destructive terminal input"

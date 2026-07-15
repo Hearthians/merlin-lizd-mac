@@ -43,11 +43,15 @@ struct CodexOperationView: View {
     private func describe(_ kind: TerminalJournalEventKind) -> String {
         switch kind {
         case let .request(operation, purpose):
-            "Request: \(operation)\nPurpose: \(purpose)"
+            CodexBoundedText.string(
+                "Request: \(operation)\nPurpose: \(purpose)"
+            )
         case let .screen(screen):
-            "Screen revision \(screen.revision), \(screen.columns)×\(screen.rows), "
+            CodexBoundedText.string(
+                "Screen revision \(screen.revision), \(screen.columns)×\(screen.rows), "
                 + "cursor \(screen.cursor.row):\(screen.cursor.column)\n"
                 + screen.text
+            )
         case let .risk(agent, deterministic, effective):
             "Risk: agent=\(risk(agent)), deterministic=\(risk(deterministic)), "
                 + "effective=\(risk(effective))"
@@ -58,8 +62,10 @@ struct CodexOperationView: View {
         case let .endpoint(endpointID):
             "Endpoint: \(endpointID.rawValue.uuidString)"
         case let .emittedBatch(batch):
-            "Emitted input at revision \(batch.expectedRevision):\n"
+            CodexBoundedText.string(
+                "Emitted input at revision \(batch.expectedRevision):\n"
                 + CodexTerminalPayloadFormatter.batch(batch)
+            )
         case let .result(result):
             describe(result)
         case let .temporaryPane(event):
@@ -93,7 +99,7 @@ struct CodexOperationView: View {
             }
             return "Succeeded"
         case let .failure(reason):
-            return "Failed: \(reason)"
+            return CodexBoundedText.string("Failed: \(reason)")
         case .auditUnavailable:
             return "Failed closed: audit unavailable"
         }

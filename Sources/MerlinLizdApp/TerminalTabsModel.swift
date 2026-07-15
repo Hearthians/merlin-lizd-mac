@@ -31,6 +31,10 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     private var codexEndpointTokens: [String: UUID] = [:]
     private var codexEndpointTasks: [String: Task<Void, Never>] = [:]
     private var codexEndpointIDs: [String: TerminalEndpointID] = [:]
+    private var codexEndpointRegistrations: [
+        String: CodexDrawerEndpointRegistration
+    ] = [:]
+    private var codexReconnectingTabIDs: Set<String> = []
     private var codexSessionObservers: [String: AnyCancellable] = [:]
     private var codexFocusRevision: UInt64 = 0
 
@@ -205,6 +209,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
 
     func reconnect(_ id: String) {
         guard tabs.contains(where: { $0.id == id }) else { return }
+        codexReconnectingTabIDs.insert(id)
         detachCodexEndpoint(for: id)
         codexSessionObservers.removeValue(forKey: id)?.cancel()
         sessions.removeValue(forKey: id)?.close()
@@ -232,13 +237,26 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
             )
             sessions[id] = session
             codexSessionObservers[id] = session.$state.sink {
-                [weak self] _ in
-                self?.refreshCodexTerminalContext()
+                [weak self, weak session] state in
+                guard let self, let session,
+                    self.sessions[id] === session
+                else { return }
+                switch state {
+                case .exited, .closed:
+                    self.detachCodexEndpoint(for: id)
+                case .idle, .running:
+                    self.refreshCodexTerminalContext()
+                }
             }
             registerCodexEndpoint(for: tab, session: session)
             refreshCodexTerminalContext()
             return session
         } catch {
+            codexReconnectingTabIDs.remove(id)
+            var registration = codexEndpointRegistrations[id] ?? .init()
+            registration.failPreparation()
+            codexEndpointRegistrations[id] = registration
+            refreshCodexTerminalContext()
             return nil
         }
     }
@@ -253,11 +271,13 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
 
     func close(_ id: String) {
         detachCodexEndpoint(for: id)
+        codexReconnectingTabIDs.remove(id)
         codexSessionObservers.removeValue(forKey: id)?.cancel()
         sessions.removeValue(forKey: id)?.close()
         guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
         let wasSelected = selectedTabID == id
         tabs.remove(at: index)
+        codexEndpointRegistrations.removeValue(forKey: id)
         if wasSelected {
             if tabs.indices.contains(index) {
                 selectedTabID = tabs[index].id
@@ -560,12 +580,21 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
             }
             return
         }
+        let sessionReadiness: CodexDrawerTerminalSessionReadiness
         switch sessions[selectedTab.id]?.state {
-        case .exited, .closed:
-            context = .disconnected(key)
-        case .idle, .running, nil:
-            context = .connected(key)
+        case .idle: sessionReadiness = .idle
+        case .running: sessionReadiness = .running
+        case .exited: sessionReadiness = .exited
+        case .closed: sessionReadiness = .closed
+        case nil: sessionReadiness = .missing
         }
+        context = CodexDrawerTerminalContext.project(
+            key: key,
+            session: sessionReadiness,
+            endpoint: codexEndpointRegistrations[selectedTab.id]?.readiness
+                ?? .notStarted,
+            isReconnecting: codexReconnectingTabIDs.contains(selectedTab.id)
+        )
         if codexTerminalContext != context {
             codexTerminalContext = context
         }
@@ -575,9 +604,20 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         for tab: TerminalTabRecord,
         session: TerminalSession
     ) {
-        guard let codexRuntime, tab.sessionName != nil else { return }
+        guard tab.sessionName != nil else { return }
+        guard let codexRuntime else {
+            var registration = codexEndpointRegistrations[tab.id] ?? .init()
+            registration.failPreparation()
+            codexEndpointRegistrations[tab.id] = registration
+            refreshCodexTerminalContext()
+            return
+        }
         let token = UUID()
         codexEndpointTokens[tab.id] = token
+        var registration = codexEndpointRegistrations[tab.id] ?? .init()
+        registration.begin(generationID: token)
+        codexEndpointRegistrations[tab.id] = registration
+        refreshCodexTerminalContext()
         codexEndpointTasks[tab.id]?.cancel()
         codexEndpointTasks[tab.id] = Task { [weak self, weak session] in
             guard let self else { return }
@@ -586,9 +626,15 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
                     self.codexEndpointTasks.removeValue(forKey: tab.id)
                 }
             }
-            guard let session,
-                let identity = await self.resolveTmuxIdentity(for: tab)
-            else { return }
+            guard let session else { return }
+            guard let identity = await self.resolveTmuxIdentity(for: tab) else {
+                self.failCodexEndpointRegistration(
+                    tabID: tab.id,
+                    token: token,
+                    session: session
+                )
+                return
+            }
             await self.finishCodexEndpointRegistration(
                 tabID: tab.id,
                 token: token,
@@ -633,6 +679,11 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         do {
             try await coordinator.registerEndpoint(endpoint)
         } catch {
+            failCodexEndpointRegistration(
+                tabID: tabID,
+                token: token,
+                session: session
+            )
             return
         }
         guard codexEndpointTokens[tabID] == token,
@@ -642,6 +693,14 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
             return
         }
         codexEndpointIDs[tabID] = endpointID
+        var registration = codexEndpointRegistrations[tabID] ?? .init()
+        guard registration.succeed(generationID: token) else {
+            await coordinator.unregisterEndpoint(endpointID)
+            return
+        }
+        codexEndpointRegistrations[tabID] = registration
+        codexReconnectingTabIDs.remove(tabID)
+        refreshCodexTerminalContext()
         if selectedTabID == tabID {
             publishCodexFocus(endpointID)
         }
@@ -650,10 +709,29 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     private func detachCodexEndpoint(for tabID: String) {
         codexEndpointTokens.removeValue(forKey: tabID)
         codexEndpointTasks.removeValue(forKey: tabID)?.cancel()
+        var registration = codexEndpointRegistrations[tabID] ?? .init()
+        registration.detach()
+        codexEndpointRegistrations[tabID] = registration
+        refreshCodexTerminalContext()
         guard let endpointID = codexEndpointIDs.removeValue(forKey: tabID),
             let coordinator = codexRuntime?.coordinator
         else { return }
         Task { await coordinator.unregisterEndpoint(endpointID) }
+    }
+
+    private func failCodexEndpointRegistration(
+        tabID: String,
+        token: UUID,
+        session: TerminalSession
+    ) {
+        guard codexEndpointTokens[tabID] == token,
+            sessions[tabID] === session
+        else { return }
+        var registration = codexEndpointRegistrations[tabID] ?? .init()
+        guard registration.fail(generationID: token) else { return }
+        codexEndpointRegistrations[tabID] = registration
+        codexReconnectingTabIDs.remove(tabID)
+        refreshCodexTerminalContext()
     }
 
     private func focusSelectedCodexEndpoint() {

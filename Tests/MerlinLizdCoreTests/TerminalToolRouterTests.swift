@@ -277,6 +277,64 @@ struct TerminalToolRouterTests {
         #expect(await port.counts().send == 0)
     }
 
+    @Test("input approval binds the verified pane and bounded visible screen")
+    func inputApprovalBindsVerifiedContext() async throws {
+        let screen = TerminalToolFixtures.screen(
+            revision: 501,
+            text: "dangerous command\nProceed? [y/N]",
+            columns: 91,
+            cursorColumn: 14
+        )
+        let original = TerminalToolFixtures.surface(
+            paneID: "%41",
+            command: "zsh"
+        )
+        let switched = TerminalToolFixtures.surface(
+            paneID: "%42",
+            command: "vim"
+        )
+        let port = FakeTerminalToolPort(snapshot: screen)
+        let surfaces = FakeTerminalSurfaceController(surface: original)
+        let journal = MemoryTerminalToolJournal()
+        let (router, threadID, turnID) = try await makeRouter(
+            port: port,
+            surfaces: surfaces,
+            journal: journal
+        )
+        let batch = TerminalInputBatch(
+            expectedRevision: screen.revision,
+            events: [.key(.enter, modifiers: [])],
+            purpose: "confirm dangerous command",
+            declaredRisk: .high
+        )
+
+        let action = Task {
+            try await router.execute(
+                handle: threadID,
+                turnID: turnID,
+                conversationKey: TerminalToolFixtures.key,
+                call: .sendInput(batch)
+            )
+        }
+        let request = try await pendingRequest(router: router)
+        #expect(request.scope.endpointID != terminalTestEndpoint())
+        #expect(request.scope.screenRevision == screen.revision)
+        #expect(request.scope.context?.surface == original)
+        #expect(request.scope.context?.screen.revision == screen.revision)
+        #expect(request.scope.context?.screen.columns == 91)
+        #expect(request.scope.context?.screen.rows == 24)
+        #expect(request.scope.context?.screen.cursor == screen.cursor)
+        #expect(request.scope.context?.screen.mode == screen.mode)
+        #expect(request.scope.context?.screen.text == screen.text)
+
+        await surfaces.setSurface(switched)
+        #expect(await router.approveOnce(request.id))
+        await #expect(throws: TerminalToolRouterError.approvalExpired) {
+            try await action.value
+        }
+        #expect(await port.counts().send == 0)
+    }
+
     @Test("same conversation serializes acknowledged input while different keys overlap")
     func serializesPerConversation() async throws {
         let gate = TerminalToolTestGate()

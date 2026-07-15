@@ -4,14 +4,105 @@ public enum CodexDrawerTerminalContext: Equatable, Hashable, Sendable {
     case noSelection
     case plainLocalShell
     case unresolvedTmux
+    case notStarted(TerminalConversationKey)
+    case endpointRegistering(TerminalConversationKey)
+    case registrationFailed(TerminalConversationKey)
+    case detached(TerminalConversationKey)
+    case exited(TerminalConversationKey)
+    case closed(TerminalConversationKey)
+    case reconnecting(TerminalConversationKey)
     case disconnected(TerminalConversationKey)
     case connected(TerminalConversationKey)
 
     public var conversationKey: TerminalConversationKey? {
         switch self {
-        case let .connected(key), let .disconnected(key): key
+        case let .notStarted(key), let .endpointRegistering(key),
+            let .registrationFailed(key), let .detached(key),
+            let .exited(key), let .closed(key), let .reconnecting(key),
+            let .connected(key), let .disconnected(key):
+            key
         case .noSelection, .plainLocalShell, .unresolvedTmux: nil
         }
+    }
+
+    public static func project(
+        key: TerminalConversationKey,
+        session: CodexDrawerTerminalSessionReadiness,
+        endpoint: CodexDrawerEndpointReadiness,
+        isReconnecting: Bool
+    ) -> Self {
+        if isReconnecting { return .reconnecting(key) }
+        switch session {
+        case .exited: return .exited(key)
+        case .closed: return .closed(key)
+        case .missing, .idle, .running: break
+        }
+        switch endpoint {
+        case .registered:
+            guard session != .missing else { return .notStarted(key) }
+            return .connected(key)
+        case .registering: return .endpointRegistering(key)
+        case .registrationFailed: return .registrationFailed(key)
+        case .detached: return .detached(key)
+        case .notStarted: return .notStarted(key)
+        }
+    }
+}
+
+public enum CodexDrawerTerminalSessionReadiness: Equatable, Sendable {
+    case missing
+    case idle
+    case running
+    case exited
+    case closed
+}
+
+public enum CodexDrawerEndpointReadiness: Equatable, Sendable {
+    case notStarted
+    case registering
+    case registered
+    case registrationFailed
+    case detached
+}
+
+public struct CodexDrawerEndpointRegistration: Equatable, Sendable {
+    public private(set) var readiness: CodexDrawerEndpointReadiness
+    public private(set) var generationID: UUID?
+
+    public init(
+        readiness: CodexDrawerEndpointReadiness = .notStarted
+    ) {
+        self.readiness = readiness
+        generationID = nil
+    }
+
+    public mutating func begin(generationID: UUID) {
+        self.generationID = generationID
+        readiness = .registering
+    }
+
+    @discardableResult
+    public mutating func succeed(generationID: UUID) -> Bool {
+        guard self.generationID == generationID else { return false }
+        readiness = .registered
+        return true
+    }
+
+    @discardableResult
+    public mutating func fail(generationID: UUID) -> Bool {
+        guard self.generationID == generationID else { return false }
+        readiness = .registrationFailed
+        return true
+    }
+
+    public mutating func failPreparation() {
+        generationID = nil
+        readiness = .registrationFailed
+    }
+
+    public mutating func detach() {
+        generationID = nil
+        readiness = .detached
     }
 }
 
@@ -100,6 +191,16 @@ public enum CodexDrawerCommand: Equatable, Sendable {
     case retryAvailability
 }
 
+public enum CodexDrawerCommandSequencer {
+    public static func stopAndTakeOver(
+        _ key: TerminalConversationKey,
+        stop: @escaping @Sendable () async -> Void
+    ) async -> CodexDrawerAction {
+        await stop()
+        return .takeoverCompleted(key)
+    }
+}
+
 public struct CodexDrawerState: Equatable, Sendable {
     public static let collapsedHeight = 42.0
     public static let compactHeight = 92.0
@@ -161,6 +262,12 @@ public struct CodexDrawerState: Equatable, Sendable {
     public var keyboardOwnership: CodexDrawerKeyboardOwnership {
         guard let selectedConversationKey else { return .user }
         return ownership[selectedConversationKey] ?? .user
+    }
+
+    public var canTakeOver: Bool {
+        selectedConversationKey != nil
+            && isActive
+            && keyboardOwnership != .takeoverPending
     }
 
     public var canSend: Bool {
@@ -236,6 +343,20 @@ public struct CodexDrawerState: Equatable, Sendable {
         case .plainLocalShell: "Codex is available only for tmux-backed tabs."
         case .unresolvedTmux:
             "Waiting for a stable tmux session identity."
+        case .notStarted:
+            "Preparing this tmux terminal for Codex."
+        case .endpointRegistering:
+            "Registering the visible tmux terminal with Codex."
+        case .registrationFailed:
+            "Codex could not attach to this tmux terminal. Reconnect to retry."
+        case .detached:
+            "The Codex terminal route is detached. Reconnect this tab."
+        case .exited:
+            "This terminal exited. Reconnect it before starting new Codex work."
+        case .closed:
+            "This terminal is closed."
+        case .reconnecting:
+            "Reconnecting this tmux terminal to Codex…"
         case .disconnected:
             "Reconnect this terminal before asking Codex to operate it."
         case .connected: nil
@@ -346,10 +467,7 @@ public struct CodexDrawerState: Equatable, Sendable {
             isExpanded = true
             expandedFraction = Self.clamp(fraction)
         case .requestTakeover:
-            guard case .connected = terminalContext,
-                let key = selectedConversationKey,
-                isActive,
-                ownership[key] != .takeoverPending
+            guard let key = selectedConversationKey, canTakeOver
             else { break }
             ownership[key] = .takeoverPending
             return [.stopAndTakeOver(key)]
@@ -357,9 +475,11 @@ public struct CodexDrawerState: Equatable, Sendable {
             ownership[key] = .user
         case let .allowOnce(requestID):
             guard case .connected = terminalContext,
-                selectedSession?.pendingApprovals.contains(where: {
-                $0.id == requestID
-            }) == true else { break }
+                let request = selectedSession?.pendingApprovals.first(where: {
+                    $0.id == requestID
+                }),
+                request.scope.context != nil
+            else { break }
             return [.allowOnce(requestID)]
         case let .deny(requestID):
             guard selectedSession?.pendingApprovals.contains(where: {

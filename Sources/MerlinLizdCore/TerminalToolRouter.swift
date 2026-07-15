@@ -1109,13 +1109,18 @@ public actor TerminalToolRouter {
         turn: TurnKey,
         binding: TerminalEndpointBinding
     ) async throws -> TerminalToolResult {
+        let initialSurface = try await currentSurface(binding)
         let screen = try await observedScreen(binding.endpoint.terminal)
+        let verifiedSurface = try await currentSurface(binding)
+        guard verifiedSurface == initialSurface else {
+            throw TerminalToolRouterError.surfaceFailure
+        }
         try verifyRevision(batch.expectedRevision, screen: screen)
         let preparation = try await prepareMutation(
             operation: "sendInput",
             batch: batch,
             initialScreen: screen,
-            initialSurface: nil,
+            initialSurface: initialSurface,
             turn: turn,
             binding: binding
         )
@@ -1987,7 +1992,8 @@ public actor TerminalToolRouter {
         let evaluation = try policy.evaluate(
             batch: batch,
             endpointID: binding.endpoint.id,
-            screen: initialScreen
+            screen: initialScreen,
+            surface: initialSurface
         )
         try await append(
             event(

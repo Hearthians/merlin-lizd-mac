@@ -398,6 +398,7 @@ struct TerminalPermissionPolicyTests {
     func combinesDeclaredAndStructuralRisk() throws {
         let endpoint = terminalTestEndpoint()
         let screen = terminalTestScreen()
+        let surface = terminalTestApprovalSurface()
         let declaredBatch = terminalTestBatch(
             events: [.text("plain UTF-8")],
             risk: .high
@@ -405,7 +406,8 @@ struct TerminalPermissionPolicyTests {
         let declared = try TerminalPermissionPolicy().evaluate(
             batch: declaredBatch,
             endpointID: endpoint,
-            screen: screen
+            screen: screen,
+            surface: surface
         )
         #expect(declared.deterministicRisk == .routine)
         #expect(declared.effectiveRisk == .high)
@@ -417,8 +419,17 @@ struct TerminalPermissionPolicyTests {
         #expect(request.scope == (try TerminalApprovalScope(
             batch: declaredBatch,
             endpointID: endpoint,
-            screenRevision: screen.revision
+            screen: screen,
+            surface: surface
         )))
+        #expect(request.scope.context?.surface == surface)
+        #expect(request.scope.context?.screen.revision == screen.revision)
+        #expect(request.scope.context?.screen.columns == screen.columns)
+        #expect(request.scope.context?.screen.rows == screen.rows)
+        #expect(request.scope.context?.screen.cursor == screen.cursor)
+        #expect(request.scope.context?.screen.mode == screen.mode)
+        #expect(request.scope.context?.screen.text == screen.text)
+        #expect(request.scope.context?.screen.isTextTruncated == false)
 
         let structural = try evaluate(
             events: [.key(.enter, modifiers: [])],
@@ -459,7 +470,8 @@ struct TerminalPermissionPolicyTests {
             let evaluation = try TerminalPermissionPolicy().evaluate(
                 batch: batch,
                 endpointID: terminalTestEndpoint(),
-                screen: terminalTestScreen()
+                screen: terminalTestScreen(),
+                surface: terminalTestApprovalSurface()
             )
             assertDenied(evaluation, context: batch.purpose)
         }
@@ -580,7 +592,20 @@ struct TerminalPermissionPolicyTests {
                 risk: declaredRisk
             ),
             endpointID: terminalTestEndpoint(),
-            screen: screen
+            screen: screen,
+            surface: terminalTestApprovalSurface()
+        )
+    }
+
+    private func terminalTestApprovalSurface() -> TmuxSurface {
+        TmuxSurface(
+            sessionIdentity: TmuxSessionIdentity(
+                serverSessionID: "$17",
+                createdAtEpoch: 1_721_000_017
+            ),
+            windowID: "@4",
+            paneID: "%9",
+            currentCommand: "vim"
         )
     }
 

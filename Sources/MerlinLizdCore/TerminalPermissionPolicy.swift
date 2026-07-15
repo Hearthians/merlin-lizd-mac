@@ -11,15 +11,20 @@ public struct TerminalApprovalScope: Codable, Hashable, Sendable {
     public let payloadDigest: String
     public let endpointID: TerminalEndpointID
     public let screenRevision: UInt64
+    /// Immutable approval-time context. It is optional only so historical
+    /// journal records written before context capture remain decodable.
+    public let context: TerminalApprovalContext?
 
     public init(
         payloadDigest: String,
         endpointID: TerminalEndpointID,
-        screenRevision: UInt64
+        screenRevision: UInt64,
+        context: TerminalApprovalContext? = nil
     ) {
         self.payloadDigest = payloadDigest
         self.endpointID = endpointID
         self.screenRevision = screenRevision
+        self.context = context
     }
 
     public init(
@@ -32,6 +37,24 @@ public struct TerminalApprovalScope: Codable, Hashable, Sendable {
             payloadDigest: Self.sha256Hex(bytes),
             endpointID: endpointID,
             screenRevision: screenRevision
+        )
+    }
+
+    public init(
+        batch: TerminalInputBatch,
+        endpointID: TerminalEndpointID,
+        screen: TerminalScreenSnapshot,
+        surface: TmuxSurface
+    ) throws {
+        let bytes = try Self.canonicalPayloadBytes(for: batch)
+        self.init(
+            payloadDigest: Self.sha256Hex(bytes),
+            endpointID: endpointID,
+            screenRevision: screen.revision,
+            context: TerminalApprovalContext(
+                surface: surface,
+                screen: TerminalApprovalScreenContext(snapshot: screen)
+            )
         )
     }
 
@@ -49,6 +72,63 @@ public struct TerminalApprovalScope: Codable, Hashable, Sendable {
 
     private static func sha256Hex(_ data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+public struct TerminalApprovalContext: Codable, Equatable, Hashable, Sendable {
+    public let surface: TmuxSurface
+    public let screen: TerminalApprovalScreenContext
+
+    public init(
+        surface: TmuxSurface,
+        screen: TerminalApprovalScreenContext
+    ) {
+        self.surface = surface
+        self.screen = screen
+    }
+}
+
+public struct TerminalApprovalScreenContext:
+    Codable, Equatable, Hashable, Sendable
+{
+    public static let maximumTextByteCount = 8 * 1024
+
+    public let revision: UInt64
+    public let columns: Int
+    public let rows: Int
+    public let cursor: TerminalCursor
+    public let mode: TerminalScreenMode
+    public let text: String
+    public let isTextTruncated: Bool
+
+    public init(snapshot: TerminalScreenSnapshot) {
+        revision = snapshot.revision
+        columns = snapshot.columns
+        rows = snapshot.rows
+        cursor = snapshot.cursor
+        mode = snapshot.mode
+        let bounded = Self.boundedUTF8(
+            snapshot.text,
+            maximumByteCount: Self.maximumTextByteCount
+        )
+        text = bounded.text
+        isTextTruncated = bounded.truncated
+    }
+
+    private static func boundedUTF8(
+        _ value: String,
+        maximumByteCount: Int
+    ) -> (text: String, truncated: Bool) {
+        let data = Data(value.utf8)
+        guard data.count > maximumByteCount else { return (value, false) }
+        var end = maximumByteCount
+        while end > 0 {
+            if let text = String(data: data.prefix(end), encoding: .utf8) {
+                return (text, true)
+            }
+            end -= 1
+        }
+        return ("", true)
     }
 }
 
@@ -101,7 +181,8 @@ public struct TerminalPermissionPolicy: Sendable {
     public func evaluate(
         batch: TerminalInputBatch,
         endpointID: TerminalEndpointID,
-        screen: TerminalScreenSnapshot
+        screen: TerminalScreenSnapshot,
+        surface: TmuxSurface? = nil
     ) throws -> TerminalPermissionEvaluation {
         if let denialReason = validate(batch: batch, screen: screen) {
             return TerminalPermissionEvaluation(
@@ -115,19 +196,24 @@ public struct TerminalPermissionPolicy: Sendable {
         let effectiveRisk = max(batch.declaredRisk, classification.risk)
         let decision: TerminalPermissionDecision
         if effectiveRisk == .high {
-            let scope = try TerminalApprovalScope(
-                batch: batch,
-                endpointID: endpointID,
-                screenRevision: screen.revision
-            )
-            decision = .requireApproval(
-                TerminalApprovalRequest(
-                    scope: scope,
+            if let surface {
+                let scope = try TerminalApprovalScope(
                     batch: batch,
-                    reason: classification.reason
-                        ?? "The agent declared this terminal mutation high risk"
+                    endpointID: endpointID,
+                    screen: screen,
+                    surface: surface
                 )
-            )
+                decision = .requireApproval(
+                    TerminalApprovalRequest(
+                        scope: scope,
+                        batch: batch,
+                        reason: classification.reason
+                            ?? "The agent declared this terminal mutation high risk"
+                    )
+                )
+            } else {
+                decision = .deny(reason: "Verified tmux surface unavailable")
+            }
         } else {
             decision = .allow
         }

@@ -449,6 +449,16 @@ actor MemoryTerminalToolJournal: TerminalOperationJournaling {
         events.filter { $0.key == key }
     }
 
+    func recentEntries(
+        for key: TerminalConversationKey,
+        request: TerminalJournalReadPageRequest
+    ) async throws -> TerminalJournalReadPage {
+        terminalInMemoryRecentPage(
+            events.filter { $0.key == key },
+            request: request
+        )
+    }
+
     func deleteJournal(for key: TerminalConversationKey) async throws {
         events.removeAll { $0.key == key }
     }

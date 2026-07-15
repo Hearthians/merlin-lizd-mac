@@ -14,25 +14,31 @@ struct TerminalOperationJournalTests {
             events: [.text("git push origin main")],
             risk: .high
         )
+        let screen = terminalTestScreen(
+            revision: 7,
+            text: "git push origin main\\nProceed? [y/N]",
+            changedRows: [2, 3],
+            cursorRow: 1,
+            cursorColumn: 14
+        )
+        let surface = TmuxSurface(
+            sessionIdentity: terminalTestConversationKey().tmux,
+            windowID: "@9",
+            paneID: "%9",
+            currentCommand: "zsh"
+        )
         let scope = try TerminalApprovalScope(
             batch: batch,
             endpointID: terminalTestEndpoint(),
-            screenRevision: 7
+            screen: screen,
+            surface: surface
         )
         let events: [TerminalJournalEvent] = [
             terminalTestJournalEvent(
                 kind: .request(operation: "sendInput", purpose: batch.purpose)
             ),
             terminalTestJournalEvent(
-                kind: .screen(
-                    terminalTestScreen(
-                        revision: 7,
-                        text: "git push origin main\\nProceed? [y/N]",
-                        changedRows: [2, 3],
-                        cursorRow: 1,
-                        cursorColumn: 14
-                    )
-                )
+                kind: .screen(screen)
             ),
             terminalTestJournalEvent(
                 kind: .risk(
@@ -92,6 +98,157 @@ struct TerminalOperationJournalTests {
             try await reopened.entries(for: terminalTestConversationKey())
                 == events
         )
+        #expect(scope.context?.surface == surface)
+        #expect(scope.context?.screen == TerminalApprovalScreenContext(
+            snapshot: screen
+        ))
+    }
+
+    @Test("recent pages enforce event and byte limits while preserving order")
+    func readsBoundedRecentPages() async throws {
+        let fixture = try TerminalPersistenceFixture()
+        defer { fixture.remove() }
+        let journal = try FileTerminalOperationJournal(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        let key = terminalTestConversationKey()
+        var events: [TerminalJournalEvent] = []
+        for index in 0..<30 {
+            let event = terminalTestJournalEvent(
+                key: key,
+                operationID: terminalUUID(),
+                kind: .request(
+                    operation: "operation-\(index)",
+                    purpose: String(repeating: "p", count: 180)
+                )
+            )
+            events.append(event)
+            try await journal.append(event)
+        }
+        let fileByteCount = try terminalRawData(
+            at: journal.journalURL(for: key)
+        ).count
+        let request = TerminalJournalReadPageRequest(
+            maximumEventCount: 5,
+            maximumByteCount: 4_096
+        )
+
+        let newest = try await journal.recentEntries(for: key, request: request)
+        #expect(newest.entries == Array(events.suffix(5)))
+        #expect(newest.encodedBytesRead <= request.maximumByteCount)
+        #expect(newest.encodedBytesRead < fileByteCount)
+        #expect(newest.olderCursor != nil)
+        #expect(newest.hasOlderEntries)
+        #expect(newest.hasTruncatedHistory)
+
+        let cursor = try #require(newest.olderCursor)
+        let previous = try await journal.recentEntries(
+            for: key,
+            request: TerminalJournalReadPageRequest(
+                maximumEventCount: 5,
+                maximumByteCount: 4_096,
+                before: cursor
+            )
+        )
+        #expect(previous.entries == Array(events.dropLast(5).suffix(5)))
+        #expect(previous.encodedBytesRead <= 4_096)
+        #expect(Set(previous.entries.map(\.operationID)).isDisjoint(
+            with: Set(newest.entries.map(\.operationID))
+        ))
+    }
+
+    @Test("oversized recent records yield a deterministic truncation cursor")
+    func skipsOversizedRecentRecordDeterministically() async throws {
+        let fixture = try TerminalPersistenceFixture()
+        defer { fixture.remove() }
+        let journal = try FileTerminalOperationJournal(
+            applicationSupportDirectory: fixture.applicationSupportDirectory
+        )
+        let key = terminalTestConversationKey()
+        let older = terminalTestJournalEvent(
+            key: key,
+            operationID: terminalUUID(),
+            kind: .request(operation: "older", purpose: "visible")
+        )
+        let oversized = terminalTestJournalEvent(
+            key: key,
+            operationID: terminalUUID(),
+            kind: .screen(terminalTestScreen(
+                text: String(repeating: "large-screen-", count: 2_000)
+            ))
+        )
+        try await journal.append(older)
+        try await journal.append(oversized)
+
+        let page = try await journal.recentEntries(
+            for: key,
+            request: TerminalJournalReadPageRequest(
+                maximumEventCount: 10,
+                maximumByteCount: 1_024
+            )
+        )
+        #expect(page.entries.isEmpty)
+        #expect(page.didOmitOversizedEntry)
+        #expect(page.encodedBytesRead == 1_024)
+        #expect(page.olderCursor != nil)
+        #expect(page.hasOlderEntries)
+        #expect(page.hasTruncatedHistory)
+
+        var cursor = page.olderCursor
+        var recovered: [TerminalJournalEvent] = []
+        for _ in 0..<64 {
+            guard let current = cursor else { break }
+            let olderPage = try await journal.recentEntries(
+                for: key,
+                request: TerminalJournalReadPageRequest(
+                    maximumEventCount: 10,
+                    maximumByteCount: 1_024,
+                    before: current
+                )
+            )
+            recovered.append(contentsOf: olderPage.entries)
+            cursor = olderPage.olderCursor
+        }
+        #expect(recovered.contains(older))
+    }
+
+    @Test("recent traversal observes cancellation between bounded reads")
+    func recentReadIsCancellable() async throws {
+        let fixture = try TerminalPersistenceFixture()
+        defer { fixture.remove() }
+        let gate = AsyncStartGate()
+        let journal = try FileTerminalOperationJournal(
+            applicationSupportDirectory: fixture.applicationSupportDirectory,
+            hooks: TerminalOperationJournalHooks(
+                recentReadChunk: {
+                    await gate.wait()
+                    try Task.checkCancellation()
+                }
+            )
+        )
+        let key = terminalTestConversationKey()
+        try await journal.append(terminalTestJournalEvent(
+            key: key,
+            kind: .screen(terminalTestScreen(
+                text: String(repeating: "screen", count: 2_000)
+            ))
+        ))
+
+        let read = Task {
+            try await journal.recentEntries(
+                for: key,
+                request: TerminalJournalReadPageRequest(
+                    maximumEventCount: 20,
+                    maximumByteCount: 8_192
+                )
+            )
+        }
+        await gate.waitUntilEntered()
+        read.cancel()
+        await gate.open()
+        await #expect(throws: CancellationError.self) {
+            try await read.value
+        }
     }
 
     @Test("pane provenance codec preserves full new IDs and accepts legacy pane-only events")
