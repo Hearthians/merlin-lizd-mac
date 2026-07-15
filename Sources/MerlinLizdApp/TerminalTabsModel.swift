@@ -27,6 +27,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     private var codexEndpointTokens: [String: UUID] = [:]
     private var codexEndpointTasks: [String: Task<Void, Never>] = [:]
     private var codexEndpointIDs: [String: TerminalEndpointID] = [:]
+    private var codexFocusRevision: UInt64 = 0
 
     init(
         runtime: MerlinRemoteRuntime,
@@ -575,7 +576,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         }
         codexEndpointIDs[tabID] = endpointID
         if selectedTabID == tabID {
-            await codexFocusArbiter?.requestFocus(endpointID)
+            publishCodexFocus(endpointID)
         }
     }
 
@@ -590,10 +591,21 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
 
     private func focusSelectedCodexEndpoint() {
         guard let selectedTabID,
-            let endpointID = codexEndpointIDs[selectedTabID],
-            let codexFocusArbiter
+            let endpointID = codexEndpointIDs[selectedTabID]
         else { return }
-        Task { await codexFocusArbiter.requestFocus(endpointID) }
+        publishCodexFocus(endpointID)
+    }
+
+    private func publishCodexFocus(_ endpointID: TerminalEndpointID) {
+        guard let codexFocusArbiter else { return }
+        codexFocusRevision += 1
+        let revision = codexFocusRevision
+        Task {
+            await codexFocusArbiter.requestFocus(
+                endpointID,
+                revision: revision
+            )
+        }
     }
 
     private func selectConversation(_ key: TerminalConversationKey) {

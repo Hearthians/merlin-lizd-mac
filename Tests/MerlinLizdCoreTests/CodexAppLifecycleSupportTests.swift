@@ -12,14 +12,38 @@ struct CodexAppLifecycleSupportTests {
         let firstID = TerminalEndpointID(rawValue: TerminalToolFixtures.newID())
         let secondID = TerminalEndpointID(rawValue: TerminalToolFixtures.newID())
 
-        let first = Task { await arbiter.requestFocus(firstID) }
+        let first = Task {
+            await arbiter.requestFocus(firstID, revision: 1)
+        }
         await recorder.waitForCallCount(1)
-        let second = Task { await arbiter.requestFocus(secondID) }
+        let second = Task {
+            await arbiter.requestFocus(secondID, revision: 2)
+        }
         await second.value
         await recorder.releaseFirst()
         await first.value
 
         #expect(await recorder.calls == [firstID, secondID])
+    }
+
+    @Test("older focus publication is ignored when it arrives last")
+    func focusRevisionWinsWhenTaskArrivalIsReversed() async {
+        let recorder = GatedEndpointFocusRecorder()
+        let arbiter = TerminalEndpointFocusArbiter { endpointID in
+            await recorder.focus(endpointID)
+        }
+        let firstID = TerminalEndpointID(rawValue: TerminalToolFixtures.newID())
+        let secondID = TerminalEndpointID(rawValue: TerminalToolFixtures.newID())
+
+        let second = Task {
+            await arbiter.requestFocus(secondID, revision: 2)
+        }
+        await recorder.waitForCallCount(1)
+        await recorder.releaseFirst()
+        await second.value
+        await arbiter.requestFocus(firstID, revision: 1)
+
+        #expect(await recorder.calls == [secondID])
     }
 
     @Test("authoritative reconciliation retires absent notification ids")

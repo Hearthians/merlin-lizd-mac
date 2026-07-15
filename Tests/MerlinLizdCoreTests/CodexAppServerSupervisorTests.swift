@@ -375,9 +375,145 @@ struct CodexAppServerSupervisorTests {
         #expect(
             await failed.recordedCalls.contains(
                 .ensureThreadDeleted(.init(rawValue: "thread-late"))
+            ) == false
+        )
+        #expect(
+            await recovered.recordedCalls.contains(
+                .ensureThreadDeleted(.init(rawValue: "thread-late"))
             )
         )
         await supervisor.shutdown()
+    }
+
+    @Test("failed detached cleanup never becomes a recovery mapping")
+    func lateThreadCleanupFailureNeverBecomesRecoveryMapping() async throws {
+        let lateThreadID = AgentThreadID(rawValue: "thread-late")
+        let syncThreadID = AgentThreadID(rawValue: "thread-sync")
+        let failed = ScriptedSupervisorGeneration(
+            startedThreads: [lateThreadID.rawValue],
+            gatedCalls: [.startThread],
+            ensureThreadDeletionFailures: 1
+        )
+        let replacement = ScriptedSupervisorGeneration()
+        let final = ScriptedSupervisorGeneration()
+        let factory = ScriptedSupervisorGenerationFactory(outcomes: [
+            .generation(failed),
+            .generation(replacement),
+            .generation(final),
+        ])
+        let supervisor = CodexAppServerSupervisor(
+            generationFactory: { try await factory.makeGeneration() },
+            sleeper: { _ in }
+        )
+
+        let starting = Task { try await supervisor.startThread() }
+        await failed.waitForCallStart(.startThread)
+        await failed.crash()
+        await factory.waitForCreationCount(2)
+        await failed.release(.startThread)
+
+        await #expect(throws: CodexAppServerSupervisorError.unavailable) {
+            try await starting.value
+        }
+        #expect(
+            await replacement.recordedCalls.contains(
+                .ensureThreadDeleted(lateThreadID)
+            )
+        )
+
+        await replacement.crash()
+        await factory.waitForCreationCount(3)
+        try await supervisor.resumeThread(syncThreadID)
+
+        #expect(
+            await final.recordedCalls.contains(.resumeThread(lateThreadID))
+                == false
+        )
+        await supervisor.shutdown()
+    }
+
+    @Test("failed replacement cleanup transfers the exact thread id")
+    func failedReplacementCleanupTransfersExactThreadOwnership() async throws {
+        let lateThreadID = AgentThreadID(rawValue: "thread-transfer")
+        let syncThreadID = AgentThreadID(rawValue: "thread-sync")
+        let failed = ScriptedSupervisorGeneration(
+            startedThreads: [lateThreadID.rawValue],
+            gatedCalls: [.startThread]
+        )
+        let replacement = ScriptedSupervisorGeneration(
+            ensureThreadDeletionFailures: 1
+        )
+        let final = ScriptedSupervisorGeneration()
+        let factory = ScriptedSupervisorGenerationFactory(outcomes: [
+            .generation(failed),
+            .generation(replacement),
+            .generation(final),
+        ])
+        let supervisor = CodexAppServerSupervisor(
+            generationFactory: { try await factory.makeGeneration() },
+            sleeper: { _ in }
+        )
+
+        let starting = Task { try await supervisor.startThread() }
+        await failed.waitForCallStart(.startThread)
+        await failed.crash()
+        await factory.waitForCreationCount(2)
+        await failed.release(.startThread)
+
+        #expect(try await starting.value == lateThreadID)
+        #expect(
+            await replacement.recordedCalls.contains(
+                .ensureThreadDeleted(lateThreadID)
+            )
+        )
+
+        await replacement.crash()
+        await factory.waitForCreationCount(3)
+        try await supervisor.resumeThread(syncThreadID)
+
+        #expect(
+            await final.recordedCalls.contains(.resumeThread(lateThreadID))
+                == false
+        )
+        await supervisor.shutdown()
+    }
+
+    @Test("cancelled late start transfers ownership without waiting recovery")
+    func cancelledLateStartDoesNotBlockCoordinatorShutdown() async throws {
+        let lateThreadID = AgentThreadID(rawValue: "thread-cancelled")
+        let failed = ScriptedSupervisorGeneration(
+            startedThreads: [lateThreadID.rawValue],
+            gatedCalls: [.startThread]
+        )
+        let sleeper = SuspendedSupervisorSleeper()
+        let factory = ScriptedSupervisorGenerationFactory(outcomes: [
+            .generation(failed),
+            .generation(ScriptedSupervisorGeneration()),
+        ])
+        let supervisor = CodexAppServerSupervisor(
+            generationFactory: { try await factory.makeGeneration() },
+            sleeper: { try await sleeper.sleep(for: $0) }
+        )
+        let completion = SupervisorCompletionProbe()
+
+        let starting = Task {
+            let threadID = try await supervisor.startThread()
+            await completion.recordCompletion()
+            return threadID
+        }
+        await failed.waitForCallStart(.startThread)
+        await failed.crash()
+        await sleeper.waitUntilSleeping()
+        starting.cancel()
+        await failed.release(.startThread)
+
+        let transferredBeforeSupervisorShutdown = await supervisorEventually {
+            await completion.completions == 1
+        }
+        #expect(transferredBeforeSupervisorShutdown)
+
+        await supervisor.shutdown()
+        #expect(try await starting.value == lateThreadID)
     }
 
     @Test("late old-generation turn creation is interrupted and rejected")

@@ -63,6 +63,11 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
         let task: Task<Void, Never>
     }
 
+    private enum LateThreadCompensation {
+        case deleted
+        case transferred
+    }
+
     private struct EventSubscriber {
         var cursor: UInt64?
         var waiters: [UUID: CheckedContinuation<Void, Never>]
@@ -85,6 +90,7 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
     private var recoveryOperation: RecoveryOperation?
     private var shutdownTask: Task<Void, Never>?
     private var mappedThreadIDs: Set<AgentThreadID> = []
+    private var pendingCompensationThreadIDs: Set<AgentThreadID> = []
     private var activeTurns: [AgentThreadID: AgentTurnID] = [:]
     private var eventForwarders: [AgentThreadID: EventForwarder] = [:]
     private var eventSequences: [AgentThreadID: UInt64] = [:]
@@ -160,8 +166,12 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
         do {
             let threadID = try await handle.client.startThread()
             guard owns(handle) else {
-                await compensateLateThread(threadID, owner: handle)
-                throw CodexAppServerSupervisorError.unavailable
+                switch await compensateLateThread(threadID) {
+                case .deleted:
+                    throw CodexAppServerSupervisorError.unavailable
+                case .transferred:
+                    return threadID
+                }
             }
             mappedThreadIDs.insert(threadID)
             generationThreadIDs.insert(threadID)
@@ -579,20 +589,35 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
     }
 
     private func compensateLateThread(
-        _ threadID: AgentThreadID,
-        owner: Generation
-    ) async {
+        _ threadID: AgentThreadID
+    ) async -> LateThreadCompensation {
+        pendingCompensationThreadIDs.insert(threadID)
         await mappingStore?.insert(threadID)
-        do {
-            try await owner.client.ensureThreadDeleted(threadID)
-            await mappingStore?.remove(threadID)
-        } catch {
-            mappedThreadIDs.insert(threadID)
+        while !stopped, !Task.isCancelled {
+            let replacement: Generation
+            do {
+                replacement = try await readyGeneration()
+            } catch {
+                break
+            }
+            do {
+                try await replacement.client.ensureThreadDeleted(threadID)
+                guard owns(replacement) else { continue }
+                await mappingStore?.remove(threadID)
+                pendingCompensationThreadIDs.remove(threadID)
+                return .deleted
+            } catch {
+                guard !owns(replacement) else { break }
+            }
         }
+        pendingCompensationThreadIDs.remove(threadID)
+        return .transferred
     }
 
     private func installEventForwarder(threadID: AgentThreadID) {
-        guard let generation else { return }
+        guard let generation,
+            !pendingCompensationThreadIDs.contains(threadID)
+        else { return }
         if eventForwarders[threadID]?.generationID == generation.id { return }
         eventForwarders[threadID]?.task.cancel()
         let after = eventSequences[threadID]
@@ -763,7 +788,10 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
                 }
                 do {
                     var resumedThreadIDs: [AgentThreadID] = []
-                    for threadID in mappedThreadIDs.subtracting(excluded) {
+                    let resumableThreadIDs = mappedThreadIDs
+                        .subtracting(excluded)
+                        .subtracting(pendingCompensationThreadIDs)
+                    for threadID in resumableThreadIDs {
                         await mappingStore?.insert(threadID)
                         try Task.checkCancellation()
                         try await client.resumeThread(threadID)
@@ -949,6 +977,7 @@ public actor CodexAppServerSupervisor: CodexAgentClient {
 
     private func forgetThread(_ threadID: AgentThreadID) {
         mappedThreadIDs.remove(threadID)
+        pendingCompensationThreadIDs.remove(threadID)
         generationThreadIDs.remove(threadID)
         activeTurns.removeValue(forKey: threadID)
         eventForwarders.removeValue(forKey: threadID)?.task.cancel()

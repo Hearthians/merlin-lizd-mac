@@ -4,20 +4,29 @@ public actor TerminalEndpointFocusArbiter {
     public typealias FocusEffect = @Sendable (TerminalEndpointID) async -> Void
 
     private let apply: FocusEffect
-    private var requestedEndpointID: TerminalEndpointID?
+    private var requestedFocus: (
+        endpointID: TerminalEndpointID,
+        revision: UInt64
+    )?
+    private var highestRevision: UInt64?
     private var isApplying = false
 
     public init(apply: @escaping FocusEffect) {
         self.apply = apply
     }
 
-    public func requestFocus(_ endpointID: TerminalEndpointID) async {
-        requestedEndpointID = endpointID
+    public func requestFocus(
+        _ endpointID: TerminalEndpointID,
+        revision: UInt64
+    ) async {
+        if let highestRevision, revision < highestRevision { return }
+        highestRevision = revision
+        requestedFocus = (endpointID, revision)
         guard !isApplying else { return }
         isApplying = true
-        while let requested = requestedEndpointID {
-            requestedEndpointID = nil
-            await apply(requested)
+        while let requested = requestedFocus {
+            requestedFocus = nil
+            await apply(requested.endpointID)
         }
         isApplying = false
     }

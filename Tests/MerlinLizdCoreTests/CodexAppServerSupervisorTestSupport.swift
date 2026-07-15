@@ -102,6 +102,7 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
         (Int, CheckedContinuation<Void, Never>)
     ] = []
     private let gatedCalls: Set<Gate>
+    private var ensureThreadDeletionFailures: Int
     private var callStartCounts: [Gate: Int] = [:]
     private var callGates: [Gate: [CheckedContinuation<Void, Never>]] = [:]
     private var callStartWaiters: [
@@ -115,12 +116,14 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
         turnIDs: [String] = [],
         gateShutdown: Bool = false,
         gatedCalls: Set<Gate> = [],
+        ensureThreadDeletionFailures: Int = 0,
         availability: AgentAvailability = .ready
     ) {
         self.startedThreads = startedThreads
         self.turnIDs = turnIDs
         self.gateShutdown = gateShutdown
         self.gatedCalls = gatedCalls
+        self.ensureThreadDeletionFailures = ensureThreadDeletionFailures
         availabilityValue = availability
     }
 
@@ -203,8 +206,12 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
         await suspendIfGated(.deleteThread)
     }
 
-    func ensureThreadDeleted(_ threadID: AgentThreadID) {
+    func ensureThreadDeleted(_ threadID: AgentThreadID) throws {
         recordedCalls.append(.ensureThreadDeleted(threadID))
+        if ensureThreadDeletionFailures > 0 {
+            ensureThreadDeletionFailures -= 1
+            throw CodexAppServerSupervisorError.unavailable
+        }
     }
 
     func shutdown() async {
