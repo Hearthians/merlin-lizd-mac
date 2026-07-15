@@ -1,5 +1,95 @@
 import Foundation
 
+public struct TerminalToolActivity: Equatable, Sendable {
+    public let id: UUID
+    public let conversationKey: TerminalConversationKey
+    public let handle: AgentTurnHandle
+    public let turnID: AgentTurnID
+
+    public var threadID: AgentThreadID { handle.threadID }
+
+    public init(
+        id: UUID,
+        conversationKey: TerminalConversationKey,
+        handle: AgentTurnHandle,
+        turnID: AgentTurnID
+    ) {
+        self.id = id
+        self.conversationKey = conversationKey
+        self.handle = handle
+        self.turnID = turnID
+    }
+}
+
+public struct TerminalToolApprovalActivity: Equatable, Sendable {
+    public let conversationKey: TerminalConversationKey
+    public let handle: AgentTurnHandle
+    public let turnID: AgentTurnID
+    public let request: TerminalApprovalRequest
+
+    public var threadID: AgentThreadID { handle.threadID }
+
+    public init(
+        conversationKey: TerminalConversationKey,
+        handle: AgentTurnHandle,
+        turnID: AgentTurnID,
+        request: TerminalApprovalRequest
+    ) {
+        self.conversationKey = conversationKey
+        self.handle = handle
+        self.turnID = turnID
+        self.request = request
+    }
+}
+
+public struct TerminalToolActivitySnapshot: Equatable, Sendable {
+    public let revision: UInt64
+    public let operations: [UUID: TerminalToolActivity]
+    public let approvals: [UUID: TerminalToolApprovalActivity]
+
+    public init(
+        revision: UInt64,
+        operations: [UUID: TerminalToolActivity],
+        approvals: [UUID: TerminalToolApprovalActivity]
+    ) {
+        self.revision = revision
+        self.operations = operations
+        self.approvals = approvals
+    }
+}
+
+public enum TerminalToolActivityEvent: Equatable, Sendable {
+    case operationUpserted(TerminalToolActivity, revision: UInt64)
+    case operationRemoved(UUID, revision: UInt64)
+    case approvalUpserted(TerminalToolApprovalActivity, revision: UInt64)
+    case approvalRemoved(UUID, revision: UInt64)
+    case reconciliationRequired(revision: UInt64)
+
+    public var revision: UInt64 {
+        switch self {
+        case let .operationUpserted(_, revision),
+            let .operationRemoved(_, revision),
+            let .approvalUpserted(_, revision),
+            let .approvalRemoved(_, revision),
+            let .reconciliationRequired(revision):
+            revision
+        }
+    }
+}
+
+public struct TerminalToolActivitySubscription: Sendable {
+    public let snapshot: TerminalToolActivitySnapshot
+    public let events: AsyncStream<TerminalToolActivityEvent>
+
+    public init(
+        snapshot: TerminalToolActivitySnapshot,
+        events: AsyncStream<TerminalToolActivityEvent>
+    ) {
+        self.snapshot = snapshot
+        self.events = events
+    }
+}
+
 private actor TerminalToolOperationGate {
     private struct Waiter {
         let id: UUID
@@ -71,10 +161,15 @@ struct TerminalToolRouterStateSnapshot: Equatable, Sendable {
     let terminationTaskCount: Int
     let terminationReasonCount: Int
     let observedTurnIdentityCount: Int
+    let toolActivityCount: Int
+    let approvalActivityCount: Int
+    let activitySubscriberCount: Int
+    let activityEventBufferCapacity: Int
 }
 
 public actor TerminalToolRouter {
     private static let productionObservedTurnIdentityLimitPerThread = 4_096
+    private static let activityEventBufferCapacity = 32
 
     private struct ThreadTurnIdentity: Hashable, Sendable {
         let threadID: AgentThreadID
@@ -179,6 +274,15 @@ public actor TerminalToolRouter {
         ThreadTurnIdentity: AgentTurnHandle
     ] = [:]
     private var observedTurnIdentityCounts: [AgentThreadID: Int] = [:]
+    private var toolActivities: [UUID: TerminalToolActivity] = [:]
+    private var approvalActivities: [UUID: TerminalToolApprovalActivity] = [:]
+    private var activityRevision: UInt64 = 0
+    private var activitySubscribers: [
+        UUID: AsyncStream<TerminalToolActivityEvent>.Continuation
+    ] = [:]
+    private var activitySubscriberWaiters: [
+        Int: [CheckedContinuation<Void, Never>]
+    ] = [:]
 
     public init(
         registry: TerminalEndpointRegistry,
@@ -360,7 +464,18 @@ public actor TerminalToolRouter {
             )
         }
         activeOperations[operationID] = ActiveOperation(turn: turn, task: task)
-        defer { activeOperations.removeValue(forKey: operationID) }
+        upsertToolActivity(
+            TerminalToolActivity(
+                id: operationID,
+                conversationKey: conversationKey,
+                handle: handle,
+                turnID: turnID
+            )
+        )
+        defer {
+            activeOperations.removeValue(forKey: operationID)
+            removeToolActivity(operationID)
+        }
 
         return try await withTaskCancellationHandler {
             do {
@@ -421,6 +536,32 @@ public actor TerminalToolRouter {
         await approvalBroker.pendingRequests()
     }
 
+    public func subscribeActivity() -> TerminalToolActivitySubscription {
+        let subscriberID = UUID()
+        let pair = AsyncStream<TerminalToolActivityEvent>.makeStream(
+            bufferingPolicy: .bufferingNewest(
+                Self.activityEventBufferCapacity
+            )
+        )
+        pair.continuation.onTermination = { [weak self] _ in
+            Task { await self?.removeActivitySubscriber(subscriberID) }
+        }
+        activitySubscribers[subscriberID] = pair.continuation
+        resolveActivitySubscriberWaiters()
+        return TerminalToolActivitySubscription(
+            snapshot: activitySnapshot(),
+            events: pair.stream
+        )
+    }
+
+    public func activitySnapshot() -> TerminalToolActivitySnapshot {
+        TerminalToolActivitySnapshot(
+            revision: activityRevision,
+            operations: toolActivities,
+            approvals: approvalActivities
+        )
+    }
+
     func testingStateSnapshot() -> TerminalToolRouterStateSnapshot {
         TerminalToolRouterStateSnapshot(
             activeOperationCount: activeOperations.count,
@@ -430,8 +571,19 @@ public actor TerminalToolRouter {
             turnLifecycleCount: turnLifecycles.count,
             terminationTaskCount: terminationTasks.count,
             terminationReasonCount: terminationReasons.count,
-            observedTurnIdentityCount: turnIdentityOwners.count
+            observedTurnIdentityCount: turnIdentityOwners.count,
+            toolActivityCount: toolActivities.count,
+            approvalActivityCount: approvalActivities.count,
+            activitySubscriberCount: activitySubscribers.count,
+            activityEventBufferCapacity: Self.activityEventBufferCapacity
         )
+    }
+
+    func waitUntilActivitySubscriberCount(_ count: Int) async {
+        if activitySubscribers.count == count { return }
+        await withCheckedContinuation {
+            activitySubscriberWaiters[count, default: []].append($0)
+        }
     }
 
     /// Releases stale-turn protection only after the owning coordinator has
@@ -495,6 +647,85 @@ public actor TerminalToolRouter {
             TurnKey(handle: handle, turnID: turnID),
             reason: .crashed
         )
+    }
+
+    private func upsertToolActivity(_ activity: TerminalToolActivity) {
+        toolActivities[activity.id] = activity
+        publishActivityMutation { revision in
+            .operationUpserted(activity, revision: revision)
+        }
+    }
+
+    private func removeToolActivity(_ id: UUID) {
+        guard toolActivities.removeValue(forKey: id) != nil else { return }
+        publishActivityMutation { revision in
+            .operationRemoved(id, revision: revision)
+        }
+    }
+
+    private func upsertApprovalActivity(
+        turn: TurnKey,
+        binding: TerminalEndpointBinding,
+        request: TerminalApprovalRequest
+    ) {
+        let activity = TerminalToolApprovalActivity(
+            conversationKey: binding.conversationKey,
+            handle: turn.handle,
+            turnID: turn.turnID,
+            request: request
+        )
+        approvalActivities[request.id] = activity
+        publishActivityMutation { revision in
+            .approvalUpserted(activity, revision: revision)
+        }
+    }
+
+    private func removeApprovalActivity(_ requestID: UUID) {
+        guard approvalActivities.removeValue(forKey: requestID) != nil else {
+            return
+        }
+        publishActivityMutation { revision in
+            .approvalRemoved(requestID, revision: revision)
+        }
+    }
+
+    private func publishActivityMutation(
+        _ makeEvent: (UInt64) -> TerminalToolActivityEvent
+    ) {
+        activityRevision &+= 1
+        publishActivity(makeEvent(activityRevision))
+    }
+
+    private func publishActivity(_ event: TerminalToolActivityEvent) {
+        var ended: [UUID] = []
+        for (id, subscriber) in activitySubscribers {
+            switch subscriber.yield(event) {
+            case .enqueued:
+                break
+            case .dropped:
+                _ = subscriber.yield(
+                    .reconciliationRequired(revision: activityRevision)
+                )
+            case .terminated:
+                ended.append(id)
+            @unknown default:
+                ended.append(id)
+            }
+        }
+        for id in ended { removeActivitySubscriber(id) }
+    }
+
+    private func removeActivitySubscriber(_ id: UUID) {
+        activitySubscribers.removeValue(forKey: id)
+        resolveActivitySubscriberWaiters()
+    }
+
+    private func resolveActivitySubscriberWaiters() {
+        let count = activitySubscribers.count
+        guard let waiters = activitySubscriberWaiters.removeValue(
+            forKey: count
+        ) else { return }
+        waiters.forEach { $0.resume() }
     }
 
     private func runSerialized(
@@ -1670,12 +1901,19 @@ public actor TerminalToolRouter {
             break
         case let .requireApproval(request):
             let grant: TerminalApprovalGrant
+            upsertApprovalActivity(
+                turn: turn,
+                binding: binding,
+                request: request
+            )
             do {
                 grant = try await approvalBroker.awaitApproval(
                     for: request,
                     turnID: brokerTurnID(turn)
                 )
+                removeApprovalActivity(request.id)
             } catch TerminalApprovalError.denied {
+                removeApprovalActivity(request.id)
                 try await appendApproval(
                     request: request,
                     outcome: .denied,
@@ -1691,6 +1929,7 @@ public actor TerminalToolRouter {
                 )
                 throw TerminalToolRouterError.approvalDenied
             } catch TerminalApprovalError.expired {
+                removeApprovalActivity(request.id)
                 try await appendApproval(
                     request: request,
                     outcome: .expired,
@@ -1706,6 +1945,7 @@ public actor TerminalToolRouter {
                 )
                 throw TerminalToolRouterError.approvalExpired
             } catch TerminalApprovalError.cancelled {
+                removeApprovalActivity(request.id)
                 try await appendApproval(
                     request: request,
                     outcome: .cancelled,
@@ -1720,6 +1960,9 @@ public actor TerminalToolRouter {
                     binding: binding
                 )
                 throw TerminalToolRouterError.interrupted
+            } catch {
+                removeApprovalActivity(request.id)
+                throw error
             }
 
             do {

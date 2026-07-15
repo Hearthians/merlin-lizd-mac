@@ -1,0 +1,485 @@
+import Foundation
+@testable import MerlinLizdCore
+
+actor CodexSessionTestGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        let current = waiters
+        waiters.removeAll()
+        current.forEach { $0.resume() }
+    }
+}
+
+actor CodexSessionCallProbe {
+    private var counts: [String: Int] = [:]
+    private var waiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+
+    func record(_ name: String) {
+        counts[name, default: 0] += 1
+        let ready = waiters.removeValue(forKey: name) ?? []
+        ready.forEach { $0.resume() }
+    }
+
+    func wait(for name: String) async {
+        if counts[name, default: 0] > 0 { return }
+        await withCheckedContinuation { waiters[name, default: []].append($0) }
+    }
+
+    func count(_ name: String) -> Int {
+        counts[name, default: 0]
+    }
+}
+
+enum CodexSessionTestDeadlineError: Error {
+    case timedOut
+}
+
+private actor CodexSessionTestRace<Value: Sendable> {
+    private var result: Result<Value, any Error>?
+    private var waiters: [CheckedContinuation<Result<Value, any Error>, Never>]
+        = []
+
+    func resolve(_ result: Result<Value, any Error>) {
+        guard self.result == nil else { return }
+        self.result = result
+        let current = waiters
+        waiters.removeAll()
+        current.forEach { $0.resume(returning: result) }
+    }
+
+    func wait() async -> Result<Value, any Error> {
+        if let result { return result }
+        return await withCheckedContinuation { waiters.append($0) }
+    }
+}
+
+func codexSessionWithDeadline<Value: Sendable>(
+    timeout: Duration = .seconds(3),
+    operation: @escaping @Sendable () async throws -> Value
+) async throws -> Value {
+    let race = CodexSessionTestRace<Value>()
+    let operationTask = Task {
+        do {
+            await race.resolve(.success(try await operation()))
+        } catch {
+            await race.resolve(.failure(error))
+        }
+    }
+    let deadlineTask = Task {
+        do {
+            try await Task.sleep(for: timeout)
+            await race.resolve(.failure(CodexSessionTestDeadlineError.timedOut))
+        } catch {}
+    }
+    let result = await race.wait()
+    operationTask.cancel()
+    deadlineTask.cancel()
+    await deadlineTask.value
+    return try result.get()
+}
+
+actor FakeCodexSessionAgent: CodexAgentClient {
+    enum Failure: Error, Equatable {
+        case archive
+        case delete
+        case resume
+        case start
+    }
+
+    struct SteerCall: Equatable, Sendable {
+        let threadID: AgentThreadID
+        let turnID: AgentTurnID
+        let prompt: String
+    }
+
+    struct InterruptCall: Equatable, Sendable {
+        let threadID: AgentThreadID
+        let turnID: AgentTurnID
+    }
+
+    private let probe = CodexSessionCallProbe()
+    private var nextThreadIDs: [AgentThreadID]
+    private var nextTurnIDs: [AgentThreadID: [AgentTurnID]] = [:]
+    private var startTurnGates: [AgentThreadID: CodexSessionTestGate] = [:]
+    private var resumeGates: [AgentThreadID: CodexSessionTestGate] = [:]
+    private var resumeEvents: [AgentThreadID: [AgentEvent]] = [:]
+    private var streams: [
+        AgentThreadID: AsyncStream<AgentEvent>.Continuation
+    ] = [:]
+    private var streamValues: [AgentThreadID: AsyncStream<AgentEvent>] = [:]
+    private var resumeCalls: [AgentThreadID] = []
+    private var startCalls: [(AgentThreadID, String)] = []
+    private var steerCalls: [SteerCall] = []
+    private var interruptCalls: [InterruptCall] = []
+    private var archiveCalls: [AgentThreadID] = []
+    private var unarchiveCalls: [AgentThreadID] = []
+    private var deleteCalls: [AgentThreadID] = []
+    private var failure: Failure?
+
+    init(threadIDs: [AgentThreadID]) {
+        nextThreadIDs = threadIDs
+    }
+
+    func startThread() async throws -> AgentThreadID {
+        await probe.record("startThread")
+        if failure == .start { throw Failure.start }
+        return nextThreadIDs.removeFirst()
+    }
+
+    func resumeThread(_ threadID: AgentThreadID) async throws {
+        await probe.record("resume:\(threadID.rawValue)")
+        if failure == .resume { throw Failure.resume }
+        resumeCalls.append(threadID)
+        for event in resumeEvents[threadID, default: []] {
+            _ = streams[threadID]?.yield(event)
+        }
+        if let gate = resumeGates[threadID] {
+            await gate.wait()
+        }
+    }
+
+    func startTurn(
+        threadID: AgentThreadID,
+        prompt: String
+    ) async throws -> AgentTurnID {
+        startCalls.append((threadID, prompt))
+        await probe.record("startTurn:\(threadID.rawValue)")
+        if let gate = startTurnGates[threadID] {
+            await gate.wait()
+        }
+        if failure == .start { throw Failure.start }
+        return nextTurnIDs[threadID, default: []].removeFirst()
+    }
+
+    func steerTurn(
+        threadID: AgentThreadID,
+        turnID: AgentTurnID,
+        prompt: String
+    ) async throws {
+        steerCalls.append(
+            SteerCall(threadID: threadID, turnID: turnID, prompt: prompt)
+        )
+        await probe.record("steer:\(threadID.rawValue)")
+    }
+
+    func interruptTurn(
+        threadID: AgentThreadID,
+        turnID: AgentTurnID
+    ) async {
+        interruptCalls.append(
+            InterruptCall(threadID: threadID, turnID: turnID)
+        )
+        await probe.record("interrupt:\(threadID.rawValue)")
+    }
+
+    func events(for threadID: AgentThreadID) async -> AsyncStream<AgentEvent> {
+        if let stream = streamValues[threadID] { return stream }
+        let pair = AsyncStream<AgentEvent>.makeStream(
+            bufferingPolicy: .bufferingNewest(64)
+        )
+        streams[threadID] = pair.continuation
+        streamValues[threadID] = pair.stream
+        await probe.record("events:\(threadID.rawValue)")
+        return pair.stream
+    }
+
+    func availability() async -> AsyncStream<AgentAvailability> {
+        AsyncStream { $0.finish() }
+    }
+
+    func archiveThread(_ threadID: AgentThreadID) async throws {
+        archiveCalls.append(threadID)
+        if failure == .archive { throw Failure.archive }
+    }
+
+    func unarchiveThread(_ threadID: AgentThreadID) async throws {
+        unarchiveCalls.append(threadID)
+        if failure == .archive { throw Failure.archive }
+    }
+
+    func deleteThread(_ threadID: AgentThreadID) async throws {
+        deleteCalls.append(threadID)
+        if failure == .delete { throw Failure.delete }
+    }
+
+    func shutdown() async {}
+
+    func enqueueTurn(_ turnID: AgentTurnID, for threadID: AgentThreadID) {
+        nextTurnIDs[threadID, default: []].append(turnID)
+    }
+
+    func blockStartTurn(
+        for threadID: AgentThreadID,
+        on gate: CodexSessionTestGate?
+    ) {
+        startTurnGates[threadID] = gate
+    }
+
+    func emitWhileResuming(
+        _ events: [AgentEvent],
+        threadID: AgentThreadID,
+        gate: CodexSessionTestGate
+    ) {
+        resumeEvents[threadID] = events
+        resumeGates[threadID] = gate
+    }
+
+    func emit(_ event: AgentEvent, for threadID: AgentThreadID) {
+        _ = streams[threadID]?.yield(event)
+    }
+
+    func waitForCall(_ name: String) async {
+        await probe.wait(for: name)
+    }
+
+    func recordedStartCalls() -> [(AgentThreadID, String)] {
+        startCalls
+    }
+
+    func recordedSteerCalls() -> [SteerCall] {
+        steerCalls
+    }
+
+    func recordedInterruptCalls() -> [InterruptCall] {
+        interruptCalls
+    }
+
+    func recordedResumeCalls() -> [AgentThreadID] { resumeCalls }
+    func recordedArchiveCalls() -> [AgentThreadID] { archiveCalls }
+    func recordedUnarchiveCalls() -> [AgentThreadID] { unarchiveCalls }
+    func recordedDeleteCalls() -> [AgentThreadID] { deleteCalls }
+
+    func setFailure(_ failure: Failure?) {
+        self.failure = failure
+    }
+}
+
+actor CodexSessionJournalSpy: TerminalOperationJournaling {
+    enum Failure: Error { case delete }
+
+    private var events: [TerminalJournalEvent] = []
+    private var deletedKeys: [TerminalConversationKey] = []
+    private var failDelete = false
+
+    func append(_ event: TerminalJournalEvent) async throws {
+        events.append(event)
+    }
+
+    func entries(
+        for key: TerminalConversationKey
+    ) async throws -> [TerminalJournalEvent] {
+        events.filter { $0.key == key }
+    }
+
+    func deleteJournal(for key: TerminalConversationKey) async throws {
+        if failDelete { throw Failure.delete }
+        deletedKeys.append(key)
+        events.removeAll { $0.key == key }
+    }
+
+    func setFailDelete(_ value: Bool) { failDelete = value }
+    func deletions() -> [TerminalConversationKey] { deletedKeys }
+}
+
+actor CodexSessionStateProbe {
+    private struct Waiter {
+        let id: UUID
+        let key: TerminalConversationKey
+        let phase: CodexSessionPhase
+        let messageText: String?
+        let continuation: CheckedContinuation<CodexSessionState, Never>
+    }
+
+    private var latest: [TerminalConversationKey: CodexSessionState] = [:]
+    private var waiters: [UUID: Waiter] = [:]
+    private var consumer: Task<Void, Never>?
+
+    func start(
+        _ stream: AsyncStream<[
+            TerminalConversationKey: CodexSessionState
+        ]>
+    ) {
+        consumer = Task { [weak self] in
+            for await snapshot in stream {
+                guard !Task.isCancelled else { return }
+                await self?.receive(snapshot)
+            }
+        }
+    }
+
+    func wait(
+        for key: TerminalConversationKey,
+        phase: CodexSessionPhase,
+        containingMessage messageText: String? = nil
+    ) async -> CodexSessionState {
+        if let state = latest[key],
+            matches(state, phase: phase, messageText: messageText)
+        {
+            return state
+        }
+        let id = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if let state = latest[key],
+                    matches(state, phase: phase, messageText: messageText)
+                {
+                    continuation.resume(returning: state)
+                    return
+                }
+                waiters[id] = Waiter(
+                    id: id,
+                    key: key,
+                    phase: phase,
+                    messageText: messageText,
+                    continuation: continuation
+                )
+            }
+        } onCancel: {
+            Task { await self.cancel(id) }
+        }
+    }
+
+    func stop() {
+        consumer?.cancel()
+        consumer = nil
+    }
+
+    private func receive(
+        _ snapshot: [TerminalConversationKey: CodexSessionState]
+    ) {
+        latest = snapshot
+        let ready = waiters.values.filter {
+            guard let state = snapshot[$0.key] else { return false }
+            return matches(
+                state,
+                phase: $0.phase,
+                messageText: $0.messageText
+            )
+        }
+        for waiter in ready {
+            waiters.removeValue(forKey: waiter.id)
+            waiter.continuation.resume(returning: snapshot[waiter.key]!)
+        }
+    }
+
+    private func cancel(_ id: UUID) {
+        guard let waiter = waiters.removeValue(forKey: id) else { return }
+        waiter.continuation.resume(
+            returning: latest[waiter.key]
+                ?? CodexSessionState(key: waiter.key)
+        )
+    }
+
+    private func matches(
+        _ state: CodexSessionState,
+        phase: CodexSessionPhase,
+        messageText: String?
+    ) -> Bool {
+        guard state.phase == phase else { return false }
+        guard let messageText else { return true }
+        return state.messages.contains { $0.text == messageText }
+    }
+}
+
+struct CodexSessionPersistenceFixture: Sendable {
+    let applicationSupportDirectory: URL
+
+    init() throws {
+        applicationSupportDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "merlin-lizd-codex-sessions-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: applicationSupportDirectory,
+            withIntermediateDirectories: false
+        )
+    }
+
+    func remove() {
+        try? FileManager.default.removeItem(at: applicationSupportDirectory)
+    }
+}
+
+func codexTestKey(
+    serverSessionID: String = "$31",
+    createdAtEpoch: Int64 = 1_721_000_000
+) -> TerminalConversationKey {
+    TerminalConversationKey(
+        target: .devbox(sid: "devbox-31"),
+        tmux: TmuxSessionIdentity(
+            serverSessionID: serverSessionID,
+            createdAtEpoch: createdAtEpoch
+        )
+    )
+}
+
+func codexTestRecord(
+    key: TerminalConversationKey = codexTestKey(),
+    threadID: String = "thread-31",
+    archived: Bool = false,
+    updatedAt: Date = Date(timeIntervalSince1970: 1_721_000_100)
+) -> CodexConversationRecord {
+    CodexConversationRecord(
+        key: key,
+        threadID: AgentThreadID(rawValue: threadID),
+        protocolGeneration: CodexConversationRecord.currentProtocolGeneration,
+        archived: archived,
+        updatedAt: updatedAt
+    )
+}
+
+func codexTestEndpoint(
+    key: TerminalConversationKey,
+    id: UUID = UUID(),
+    port: FakeTerminalToolPort
+) -> TerminalEndpoint {
+    let target: TerminalTarget
+    switch key.target {
+    case .local:
+        target = .local
+    case let .devbox(sid):
+        target = .devbox(sid: sid, name: "test", alias: "test")
+    case let .worker(devboxSID, workerID):
+        target = .worker(
+            devboxSID: devboxSID,
+            devboxName: "test",
+            alias: "test",
+            workerID: workerID
+        )
+    }
+    let surface = TmuxSurface(
+        sessionIdentity: key.tmux,
+        windowID: "@1",
+        paneID: "%1",
+        currentCommand: "zsh"
+    )
+    return TerminalEndpoint(
+        id: TerminalEndpointID(rawValue: id),
+        conversationKey: key,
+        terminal: port,
+        surfaces: FakeTerminalSurfaceController(surface: surface),
+        route: TmuxRoute(
+            target: target,
+            sessionName: "test",
+            expectedIdentity: key.tmux
+        )
+    )
+}
+
+func codexPOSIXMode(at url: URL) throws -> Int {
+    let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+    return attributes[.posixPermissions] as? Int ?? -1
+}
+
+func codexWrite(_ contents: String, to url: URL) throws {
+    try Data(contents.utf8).write(to: url)
+}
