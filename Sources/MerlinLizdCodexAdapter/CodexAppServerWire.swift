@@ -100,8 +100,50 @@ public enum CodexServerMessage: Equatable, Sendable {
     case request(id: JSONRPCID, method: String, params: JSONValue?)
 }
 
-struct JSONRPCHeader: Decodable {
+struct JSONRPCInboundEnvelope: Decodable {
+    struct ErrorBody: Decodable {
+        let code: Int
+    }
+
+    let jsonrpc: String
     let id: JSONRPCID?
+    let hasID: Bool
+    let method: String?
+    let params: JSONValue?
+    let result: JSONValue?
+    let hasResult: Bool
+    let error: ErrorBody?
+    let hasError: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case jsonrpc
+        case id
+        case method
+        case params
+        case result
+        case error
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        jsonrpc = try container.decode(String.self, forKey: .jsonrpc)
+        hasID = container.contains(.id)
+        id = hasID ? try container.decode(JSONRPCID.self, forKey: .id) : nil
+        method = container.contains(.method)
+            ? try container.decode(String.self, forKey: .method)
+            : nil
+        params = container.contains(.params)
+            ? try container.decode(JSONValue.self, forKey: .params)
+            : nil
+        hasResult = container.contains(.result)
+        result = hasResult
+            ? try container.decode(JSONValue.self, forKey: .result)
+            : nil
+        hasError = container.contains(.error)
+        error = hasError
+            ? try container.decode(ErrorBody.self, forKey: .error)
+            : nil
+    }
 }
 
 struct JSONRPCRequestEnvelope: Encodable {

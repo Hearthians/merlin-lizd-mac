@@ -244,26 +244,51 @@ actor ScriptedCodexVersionProbe: CodexVersionProbing {
     private let output: String
     private let suspendUntilCancelled: Bool
     private let ignoreCancellationFor: Duration?
+    private let gateStarts: Bool
     private var paths: [String] = []
     private var remainingDurations: [Duration] = []
     private var cancelled = false
+    private var starts = 0
+    private var completions = 0
+    private var cancellationSignals = 0
+    private var startGates: [CheckedContinuation<Void, Never>] = []
+    private var startCountWaiters: [
+        (Int, CheckedContinuation<Void, Never>)
+    ] = []
+    private var completionCountWaiters: [
+        (Int, CheckedContinuation<Void, Never>)
+    ] = []
 
     init(
         output: String = "codex-cli 0.144.2\n",
         suspendUntilCancelled: Bool = false,
-        ignoreCancellationFor: Duration? = nil
+        ignoreCancellationFor: Duration? = nil,
+        gateStarts: Bool = false
     ) {
         self.output = output
         self.suspendUntilCancelled = suspendUntilCancelled
         self.ignoreCancellationFor = ignoreCancellationFor
+        self.gateStarts = gateStarts
     }
 
     func versionOutput(
         executable: URL,
         deadline: ContinuousClock.Instant
     ) async throws -> String {
+        starts += 1
+        resumeStartCountWaiters()
         paths.append(executable.path)
         remainingDurations.append(ContinuousClock.now.duration(to: deadline))
+        if gateStarts {
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { startGates.append($0) }
+            } onCancel: {
+                Task { await self.recordCancellationSignal() }
+            }
+            completions += 1
+            resumeCompletionCountWaiters()
+            return output
+        }
         if let ignoreCancellationFor {
             let end = ContinuousClock.now.advanced(by: ignoreCancellationFor)
             while ContinuousClock.now < end {
@@ -285,6 +310,46 @@ actor ScriptedCodexVersionProbe: CodexVersionProbing {
     func probedPaths() -> [String] { paths }
     func recordedRemainingDurations() -> [Duration] { remainingDurations }
     func wasCancelled() -> Bool { cancelled }
+    func startCount() -> Int { starts }
+    func cancellationSignalCount() -> Int { cancellationSignals }
+
+    func waitForStartCount(_ count: Int) async {
+        if starts >= count { return }
+        await withCheckedContinuation { startCountWaiters.append((count, $0)) }
+    }
+
+    func waitForCompletionCount(_ count: Int) async {
+        if completions >= count { return }
+        await withCheckedContinuation {
+            completionCountWaiters.append((count, $0))
+        }
+    }
+
+    func releaseNextStart() {
+        guard !startGates.isEmpty else { return }
+        startGates.removeFirst().resume()
+    }
+
+    private func recordCancellationSignal() { cancellationSignals += 1 }
+
+    private func resumeStartCountWaiters() {
+        resumeCountWaiters(&startCountWaiters, current: starts)
+    }
+
+    private func resumeCompletionCountWaiters() {
+        resumeCountWaiters(&completionCountWaiters, current: completions)
+    }
+
+    private func resumeCountWaiters(
+        _ waiters: inout [(Int, CheckedContinuation<Void, Never>)],
+        current: Int
+    ) {
+        var retained: [(Int, CheckedContinuation<Void, Never>)] = []
+        for waiter in waiters {
+            if current >= waiter.0 { waiter.1.resume() } else { retained.append(waiter) }
+        }
+        waiters = retained
+    }
 }
 
 func jsonObject(from data: Data) throws -> [String: Any] {
@@ -349,26 +414,29 @@ func exerciseConcreteAppServerProcess() async throws -> (
         ],
         environment: [:]
     )
-    try await process.start()
-    try await process.write(Data("hello\n".utf8))
-    var output = Data()
-    var error = Data()
-    while let event = await process.nextEvent() {
-        switch event {
-        case let .standardOutput(data): output.append(data)
-        case let .standardError(data): error.append(data)
-        case .outputOverflow: break
-        case .terminated: break
+    return try await withProcessTestDeadline(process) {
+        try await process.start()
+        try await process.write(Data("hello\n".utf8))
+        var output = Data()
+        var error = Data()
+        while let event = await process.nextEvent() {
+            switch event {
+            case let .standardOutput(data): output.append(data)
+            case let .standardError(data): error.append(data)
+            case .outputOverflow: break
+            case .outputDrainLimitExceeded: break
+            case .terminated: break
+            }
         }
+        let first = await process.waitForTermination()
+        let second = await process.waitForTermination()
+        return (
+            String(decoding: output, as: UTF8.self),
+            String(decoding: error, as: UTF8.self),
+            first.exitCode,
+            second.exitCode
+        )
     }
-    let first = await process.waitForTermination()
-    let second = await process.waitForTermination()
-    return (
-        String(decoding: output, as: UTF8.self),
-        String(decoding: error, as: UTF8.self),
-        first.exitCode,
-        second.exitCode
-    )
 }
 
 func exerciseTermResistantAppServerProcess() async throws -> (
@@ -380,14 +448,16 @@ func exerciseTermResistantAppServerProcess() async throws -> (
         arguments: ["-c", "trap '' TERM; while :; do :; done"],
         environment: [:]
     )
-    try await process.start()
-    let clock = ContinuousClock()
-    let started = clock.now
-    async let first: Void = process.terminate()
-    async let second: Void = process.terminate()
-    _ = await (first, second)
-    let termination = await process.waitForTermination()
-    return (termination.exitCode, started.duration(to: clock.now))
+    return try await withProcessTestDeadline(process) {
+        try await process.start()
+        let clock = ContinuousClock()
+        let started = clock.now
+        async let first: Void = process.terminate()
+        async let second: Void = process.terminate()
+        _ = await (first, second)
+        let termination = await process.waitForTermination()
+        return (termination.exitCode, started.duration(to: clock.now))
+    }
 }
 
 private actor CompletionProbe {
@@ -409,22 +479,24 @@ func exerciseUnconsumedOutputProcess() async throws -> (
         ],
         environment: [:]
     )
-    try await process.start()
-    let completion = CompletionProbe()
-    let waiter = Task {
-        let result = await process.waitForTermination()
-        await completion.markCompleted()
-        return result
-    }
-    try await Task.sleep(for: .milliseconds(200))
-    let completedBeforeConsumption = await completion.isCompleted()
+    return try await withProcessTestDeadline(process) {
+        try await process.start()
+        let completion = CompletionProbe()
+        let waiter = Task {
+            let result = await process.waitForTermination()
+            await completion.markCompleted()
+            return result
+        }
+        try await Task.sleep(for: .milliseconds(200))
+        let completedBeforeConsumption = await completion.isCompleted()
 
-    var sawOverflow = false
-    while let event = await process.nextEvent() {
-        if case .outputOverflow = event { sawOverflow = true }
+        var sawOverflow = false
+        while let event = await process.nextEvent() {
+            if case .outputOverflow = event { sawOverflow = true }
+        }
+        _ = await waiter.value
+        return (completedBeforeConsumption, sawOverflow)
     }
-    _ = await waiter.value
-    return (completedBeforeConsumption, sawOverflow)
 }
 
 func exerciseBlockedStdinTermination() async throws -> (
@@ -436,28 +508,33 @@ func exerciseBlockedStdinTermination() async throws -> (
         arguments: ["-c", "sleep 1"],
         environment: [:]
     )
-    try await process.start()
-    let write = Task {
-        try await process.write(Data(repeating: 0x61, count: 4 * 1_024 * 1_024))
+    return try await withProcessTestDeadline(process) {
+        try await process.start()
+        let write = Task {
+            try await process.write(Data(
+                repeating: 0x61,
+                count: 4 * 1_024 * 1_024
+            ))
+        }
+        try await Task.sleep(for: .milliseconds(30))
+        let completion = CompletionProbe()
+        let termination = Task {
+            await process.terminate()
+            await completion.markCompleted()
+        }
+        try await Task.sleep(for: .milliseconds(200))
+        let terminationWasPrompt = await completion.isCompleted()
+        await termination.value
+        _ = await process.waitForTermination()
+        let writeFailed: Bool
+        do {
+            try await write.value
+            writeFailed = false
+        } catch {
+            writeFailed = true
+        }
+        return (terminationWasPrompt, writeFailed)
     }
-    try await Task.sleep(for: .milliseconds(30))
-    let completion = CompletionProbe()
-    let termination = Task {
-        await process.terminate()
-        await completion.markCompleted()
-    }
-    try await Task.sleep(for: .milliseconds(200))
-    let terminationWasPrompt = await completion.isCompleted()
-    await termination.value
-    _ = await process.waitForTermination()
-    let writeFailed: Bool
-    do {
-        try await write.value
-        writeFailed = false
-    } catch {
-        writeFailed = true
-    }
-    return (terminationWasPrompt, writeFailed)
 }
 
 func exerciseDescendantPipeLifetimeIsBounded() async throws -> Bool {
@@ -466,20 +543,96 @@ func exerciseDescendantPipeLifetimeIsBounded() async throws -> Bool {
         arguments: ["-c", "(sleep 1) & exit 0"],
         environment: [:]
     )
-    try await process.start()
-    let completion = CompletionProbe()
-    let waiter = Task {
-        let result = await process.waitForTermination()
-        await completion.markCompleted()
-        return result
+    return try await withProcessTestDeadline(process) {
+        try await process.start()
+        let completion = CompletionProbe()
+        let waiter = Task {
+            let result = await process.waitForTermination()
+            await completion.markCompleted()
+            return result
+        }
+        try await Task.sleep(for: .milliseconds(200))
+        let bounded = await completion.isCompleted()
+        if !bounded {
+            while await process.nextEvent() != nil {}
+        }
+        _ = await waiter.value
+        return bounded
     }
-    try await Task.sleep(for: .milliseconds(200))
-    let bounded = await completion.isCompleted()
-    if !bounded {
-        while await process.nextEvent() != nil {}
+}
+
+func exerciseContinuousDescendantDrainDeadline() async throws -> (
+    sawTypedDrainLimit: Bool,
+    elapsed: Duration,
+    descendantExited: Bool,
+    descriptorDelta: Int
+) {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+        UUID().uuidString,
+        isDirectory: true
+    )
+    try FileManager.default.createDirectory(
+        at: root,
+        withIntermediateDirectories: false
+    )
+    defer { try? FileManager.default.removeItem(at: root) }
+    let pidFile = root.appendingPathComponent("descendant.pid")
+    let baseline = try openDescriptorCount()
+    let process = AppServerProcess(
+        executable: URL(fileURLWithPath: "/bin/sh"),
+        arguments: [
+            "-c",
+            "trap '' HUP; /usr/bin/yes x & echo $! > '\(pidFile.path)'; exit 0",
+        ],
+        environment: [:],
+        maximumPostLeaderDrainBytes: 1_024 * 1_024 * 1_024,
+        maximumPostLeaderDrainDuration: .milliseconds(50)
+    )
+    let clock = ContinuousClock()
+    let started = clock.now
+    let processResult = try await withProcessTestDeadline(process) {
+        try await process.start()
+        var sawTypedDrainLimit = false
+        while let event = await process.nextEvent() {
+            if case .outputDrainLimitExceeded = event {
+                sawTypedDrainLimit = true
+            }
+        }
+        _ = await process.waitForTermination()
+        return (
+            sawTypedDrainLimit,
+            started.duration(to: clock.now)
+        )
     }
-    _ = await waiter.value
-    return bounded
+    let pidText = try String(contentsOf: pidFile, encoding: .utf8)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    let descendantPID = Int32(pidText) ?? -1
+    let descendantExited = await waitForProcessExit(
+        descendantPID,
+        timeout: .milliseconds(300)
+    )
+    if !descendantExited, descendantPID > 1 {
+        _ = Darwin.kill(descendantPID, SIGKILL)
+    }
+    return (
+        processResult.0,
+        processResult.1,
+        descendantExited,
+        try openDescriptorCount() - baseline
+    )
+}
+
+private func waitForProcessExit(
+    _ processID: Int32,
+    timeout: Duration
+) async -> Bool {
+    guard processID > 1 else { return false }
+    let deadline = ContinuousClock.now.advanced(by: timeout)
+    while ContinuousClock.now < deadline {
+        if Darwin.kill(processID, 0) != 0, errno == ESRCH { return true }
+        try? await Task.sleep(for: .milliseconds(5))
+    }
+    return Darwin.kill(processID, 0) != 0 && errno == ESRCH
 }
 
 func exerciseFIFOProcessWrites() async throws -> (
@@ -496,20 +649,22 @@ func exerciseFIFOProcessWrites() async throws -> (
         ],
         environment: [:]
     )
-    try await process.start()
-    let firstWrite = Task { try await process.write(first) }
-    try await Task.sleep(for: .milliseconds(20))
-    let secondWrite = Task { try await process.write(second) }
+    return try await withProcessTestDeadline(process) {
+        try await process.start()
+        let firstWrite = Task { try await process.write(first) }
+        try await Task.sleep(for: .milliseconds(20))
+        let secondWrite = Task { try await process.write(second) }
 
-    var output = Data()
-    while let event = await process.nextEvent() {
-        if case let .standardOutput(data) = event { output.append(data) }
+        var output = Data()
+        while let event = await process.nextEvent() {
+            if case let .standardOutput(data) = event { output.append(data) }
+        }
+        try await firstWrite.value
+        try await secondWrite.value
+        _ = await process.waitForTermination()
+        let expected = first + second
+        return (output == expected, output.count, expected.count)
     }
-    try await firstWrite.value
-    try await secondWrite.value
-    _ = await process.waitForTermination()
-    let expected = first + second
-    return (output == expected, output.count, expected.count)
 }
 
 func exerciseProcessDescriptorCleanup() async throws -> (
@@ -537,9 +692,11 @@ func exerciseProcessDescriptorCleanup() async throws -> (
         arguments: ["-c", "sleep 1"],
         environment: [:]
     )
-    try await process.start()
-    await process.terminate()
-    _ = await process.waitForTermination()
+    _ = try await withProcessTestDeadline(process) {
+        try await process.start()
+        await process.terminate()
+        return await process.waitForTermination()
+    }
     let afterTermination = try openDescriptorCount() - baseline
     _ = failed
     return (afterLaunchFailures, afterTermination)
@@ -547,4 +704,62 @@ func exerciseProcessDescriptorCleanup() async throws -> (
 
 private func openDescriptorCount() throws -> Int {
     try FileManager.default.contentsOfDirectory(atPath: "/dev/fd").count
+}
+
+private enum ProcessTestDeadlineError: Error {
+    case timedOut
+}
+
+private actor ProcessTestRace<Value: Sendable> {
+    typealias Outcome = Result<Value, any Error>
+
+    private var outcome: Outcome?
+    private var waiter: CheckedContinuation<Outcome, Never>?
+
+    func wait() async -> Outcome {
+        if let outcome { return outcome }
+        return await withCheckedContinuation { waiter = $0 }
+    }
+
+    func resolve(_ outcome: Outcome) {
+        guard self.outcome == nil else { return }
+        self.outcome = outcome
+        waiter?.resume(returning: outcome)
+        waiter = nil
+    }
+}
+
+private func withProcessTestDeadline<Value: Sendable>(
+    _ process: AppServerProcess,
+    timeout: Duration = .seconds(3),
+    operation: @escaping @Sendable () async throws -> Value
+) async throws -> Value {
+    let race = ProcessTestRace<Value>()
+    let operationTask = Task {
+        do {
+            await race.resolve(.success(try await operation()))
+        } catch {
+            await race.resolve(.failure(error))
+        }
+    }
+    let deadlineTask = Task {
+        do {
+            try await Task.sleep(for: timeout)
+            await race.resolve(.failure(ProcessTestDeadlineError.timedOut))
+        } catch {
+            // Normal completion cancels the deadline task.
+        }
+    }
+    let outcome = await withTaskCancellationHandler {
+        await race.wait()
+    } onCancel: {
+        Task { await race.resolve(.failure(CancellationError())) }
+    }
+    operationTask.cancel()
+    deadlineTask.cancel()
+    await deadlineTask.value
+    await process.terminate()
+    _ = await process.waitForTermination()
+    _ = await operationTask.value
+    return try outcome.get()
 }

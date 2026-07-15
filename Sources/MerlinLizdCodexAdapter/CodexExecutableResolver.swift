@@ -33,6 +33,7 @@ public enum CodexExecutableResolverError: Error, Equatable, Sendable {
     case notFound
     case probeTimedOut
     case versionProbeFailed
+    case probeBusy
     case malformedVersion
     case unsupportedVersion(String)
 }
@@ -67,6 +68,7 @@ public struct CodexExecutableResolver: Sendable {
     private let fileChecker: any CodexExecutableFileChecking
     private let versionProbe: any CodexVersionProbing
     private let probeTimeout: Duration
+    private let probeCoordinator: CodexVersionProbeCoordinator
 
     public init(
         override: URL? = nil,
@@ -83,10 +85,19 @@ public struct CodexExecutableResolver: Sendable {
         self.fileChecker = fileChecker
         self.versionProbe = versionProbe
         self.probeTimeout = probeTimeout
+        probeCoordinator = CodexVersionProbeCoordinator()
     }
 
     var candidatePathsForTesting: [String] {
         candidateURLs.map(\.path)
+    }
+
+    var hasManagedProbeForTesting: Bool {
+        get async { await probeCoordinator.hasManagedProbe }
+    }
+
+    var managedProbeWaiterCountForTesting: Int {
+        get async { await probeCoordinator.waiterCount }
     }
 
     public func resolve() async throws -> ResolvedCodexExecutable {
@@ -136,17 +147,12 @@ public struct CodexExecutableResolver: Sendable {
         deadline: ContinuousClock.Instant
     ) async throws -> String {
         let race = CodexVersionProbeRace()
-        let probe = Task { [versionProbe] in
-            do {
-                let output = try await versionProbe.versionOutput(
-                    executable: executable,
-                    deadline: deadline
-                )
-                await race.resolve(.success(output))
-            } catch {
-                await race.resolve(.failure(error))
-            }
-        }
+        let lease = try await probeCoordinator.acquire(
+            executable: executable,
+            deadline: deadline,
+            probe: versionProbe,
+            waiter: race
+        )
         let timeout = Task {
             do {
                 try await ContinuousClock().sleep(until: deadline)
@@ -162,8 +168,10 @@ public struct CodexExecutableResolver: Sendable {
         } onCancel: {
             Task { await race.resolve(.failure(CancellationError())) }
         }
-        probe.cancel()
         timeout.cancel()
+        await timeout.value
+        await probeCoordinator.release(lease: lease)
+        if Task.isCancelled { throw CancellationError() }
         return try outcome.get()
     }
 
@@ -197,6 +205,92 @@ public struct CodexExecutableResolver: Sendable {
         return candidates.filter {
             seen.insert($0.standardizedFileURL.path).inserted
         }
+    }
+}
+
+private actor CodexVersionProbeCoordinator {
+    typealias Outcome = Result<String, any Error>
+
+    struct Lease: Sendable {
+        let token: UUID
+        let waiterID: UUID?
+    }
+
+    private struct Operation {
+        let token: UUID
+        let executablePath: String
+        let task: Task<Outcome, Never>
+        var waiters: [UUID: CodexVersionProbeRace]
+        var abandoned: Bool
+    }
+
+    private var operation: Operation?
+
+    var hasManagedProbe: Bool { operation != nil }
+    var waiterCount: Int { operation?.waiters.count ?? 0 }
+
+    func acquire(
+        executable: URL,
+        deadline: ContinuousClock.Instant,
+        probe: any CodexVersionProbing,
+        waiter: CodexVersionProbeRace
+    ) throws -> Lease {
+        if var operation {
+            guard operation.executablePath == executable.path else {
+                throw CodexExecutableResolverError.probeBusy
+            }
+            guard !operation.abandoned else {
+                return Lease(token: operation.token, waiterID: nil)
+            }
+            let waiterID = UUID()
+            operation.waiters[waiterID] = waiter
+            self.operation = operation
+            return Lease(token: operation.token, waiterID: waiterID)
+        }
+
+        let token = UUID()
+        let waiterID = UUID()
+        let task = Task<Outcome, Never> { [probe] in
+            do {
+                return Outcome.success(try await probe.versionOutput(
+                    executable: executable,
+                    deadline: deadline
+                ))
+            } catch {
+                return Outcome.failure(error)
+            }
+        }
+        operation = Operation(
+            token: token,
+            executablePath: executable.path,
+            task: task,
+            waiters: [waiterID: waiter],
+            abandoned: false
+        )
+        Task { [weak self] in
+            let outcome = await task.value
+            await self?.complete(token: token, outcome: outcome)
+        }
+        return Lease(token: token, waiterID: waiterID)
+    }
+
+    func release(lease: Lease) {
+        guard var operation, operation.token == lease.token else { return }
+        if let waiterID = lease.waiterID {
+            operation.waiters.removeValue(forKey: waiterID)
+        }
+        if operation.waiters.isEmpty, !operation.abandoned {
+            operation.abandoned = true
+            operation.task.cancel()
+        }
+        self.operation = operation
+    }
+
+    private func complete(token: UUID, outcome: Outcome) async {
+        guard let current = operation, current.token == token else { return }
+        let waiters = Array(current.waiters.values)
+        operation = nil
+        for waiter in waiters { await waiter.resolve(outcome) }
     }
 }
 
@@ -247,6 +341,10 @@ public struct FoundationCodexVersionProbe: CodexVersionProbing, Sendable {
             case .standardError:
                 break
             case .outputOverflow:
+                await process.terminate()
+                _ = await process.waitForTermination()
+                throw CodexExecutableResolverError.versionProbeFailed
+            case .outputDrainLimitExceeded:
                 await process.terminate()
                 _ = await process.waitForTermination()
                 throw CodexExecutableResolverError.versionProbeFailed

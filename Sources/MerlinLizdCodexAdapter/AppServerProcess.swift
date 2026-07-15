@@ -5,6 +5,7 @@ public enum AppServerProcessEvent: Sendable {
     case standardOutput(Data)
     case standardError(Data)
     case outputOverflow(maximumBufferedEvents: Int)
+    case outputDrainLimitExceeded(maximumBytes: Int)
     case terminated(exitCode: Int32)
 }
 
@@ -59,8 +60,12 @@ public actor AppServerProcess: AppServerProcessRunning {
         executable: URL,
         arguments: [String],
         environment: [String: String],
-        currentDirectory: URL? = nil
+        currentDirectory: URL? = nil,
+        maximumPostLeaderDrainBytes: Int = 4 * 1_024 * 1_024,
+        maximumPostLeaderDrainDuration: Duration = .milliseconds(100)
     ) {
+        precondition(maximumPostLeaderDrainBytes > 0)
+        precondition(maximumPostLeaderDrainDuration > .zero)
         let inputPipe = Pipe()
         let outputPipe = Pipe()
         let errorPipe = Pipe()
@@ -82,12 +87,16 @@ public actor AppServerProcess: AppServerProcessRunning {
         standardOutput = NonblockingPipeReader(
             fileDescriptor: Darwin.dup(
                 outputPipe.fileHandleForReading.fileDescriptor
-            )
+            ),
+            maximumPostLeaderDrainBytes: maximumPostLeaderDrainBytes,
+            maximumPostLeaderDrainDuration: maximumPostLeaderDrainDuration
         )
         standardError = NonblockingPipeReader(
             fileDescriptor: Darwin.dup(
                 errorPipe.fileHandleForReading.fileDescriptor
-            )
+            ),
+            maximumPostLeaderDrainBytes: maximumPostLeaderDrainBytes,
+            maximumPostLeaderDrainDuration: maximumPostLeaderDrainDuration
         )
         inputReadHandle = inputPipe.fileHandleForReading
         outputWriteHandle = outputPipe.fileHandleForWriting
@@ -140,9 +149,9 @@ public actor AppServerProcess: AppServerProcessRunning {
         }
         lifecycleTask = Task.detached {
             let exitCode = process.waitUntilExit()
-            await input.processExited()
             output.markLeaderExited()
             error.markLeaderExited()
+            await input.processExited()
             await outputReader.value
             await errorReader.value
             _ = await events.offer(.terminated(exitCode: exitCode))
@@ -197,6 +206,12 @@ public actor AppServerProcess: AppServerProcessRunning {
     ) async {
         drainLoop: while true {
             if handle.shouldStop { break }
+            if handle.reachedPostLeaderLimit(afterReading: 0) {
+                _ = await channel.offer(.outputDrainLimitExceeded(
+                    maximumBytes: handle.maximumPostLeaderDrainBytes
+                ))
+                break
+            }
             switch handle.read(upToCount: ioChunkBytes) {
             case let .data(data):
                 guard await channel.offer(event(data)) else {
@@ -204,11 +219,18 @@ public actor AppServerProcess: AppServerProcessRunning {
                     handle.requestStop()
                     break drainLoop
                 }
-                if handle.exhaustedPostExitDrain(data.count) {
+                if handle.reachedPostLeaderLimit(afterReading: data.count) {
+                    _ = await channel.offer(.outputDrainLimitExceeded(
+                        maximumBytes: handle.maximumPostLeaderDrainBytes
+                    ))
                     break drainLoop
                 }
             case .wouldBlock:
-                if handle.shouldStop || handle.postExitIdleExpired {
+                if handle.shouldStop { break drainLoop }
+                if handle.reachedPostLeaderLimit(afterReading: 0) {
+                    _ = await channel.offer(.outputDrainLimitExceeded(
+                        maximumBytes: handle.maximumPostLeaderDrainBytes
+                    ))
                     break drainLoop
                 }
                 handle.waitUntilReadable(milliseconds: 25)
@@ -281,8 +303,6 @@ private final class FoundationProcessTerminationSignal: @unchecked Sendable {
 }
 
 private final class NonblockingPipeReader: @unchecked Sendable {
-    private static let maximumPostExitDrainBytes = 4 * 1_024 * 1_024
-    private static let maximumPostExitIdle = Duration.milliseconds(100)
     enum ReadResult {
         case data(Data)
         case wouldBlock
@@ -290,13 +310,21 @@ private final class NonblockingPipeReader: @unchecked Sendable {
     }
 
     private let lock = NSLock()
+    let maximumPostLeaderDrainBytes: Int
+    private let maximumPostLeaderDrainDuration: Duration
     private var fileDescriptor: Int32
     private var stopRequested = false
     private var leaderExitInstant: ContinuousClock.Instant?
     private var postExitDrainBytes = 0
 
-    init(fileDescriptor: Int32) {
+    init(
+        fileDescriptor: Int32,
+        maximumPostLeaderDrainBytes: Int,
+        maximumPostLeaderDrainDuration: Duration
+    ) {
         self.fileDescriptor = fileDescriptor
+        self.maximumPostLeaderDrainBytes = maximumPostLeaderDrainBytes
+        self.maximumPostLeaderDrainDuration = maximumPostLeaderDrainDuration
         guard fileDescriptor >= 0 else { return }
         let flags = Darwin.fcntl(fileDescriptor, F_GETFL)
         if flags >= 0 {
@@ -306,14 +334,6 @@ private final class NonblockingPipeReader: @unchecked Sendable {
 
     var shouldStop: Bool {
         lock.withLock { stopRequested || fileDescriptor < 0 }
-    }
-
-    var postExitIdleExpired: Bool {
-        lock.withLock {
-            guard let leaderExitInstant else { return false }
-            return ContinuousClock.now
-                >= leaderExitInstant.advanced(by: Self.maximumPostExitIdle)
-        }
     }
 
     func read(upToCount count: Int) -> ReadResult {
@@ -355,11 +375,14 @@ private final class NonblockingPipeReader: @unchecked Sendable {
         }
     }
 
-    func exhaustedPostExitDrain(_ byteCount: Int) -> Bool {
+    func reachedPostLeaderLimit(afterReading byteCount: Int) -> Bool {
         lock.withLock {
-            guard leaderExitInstant != nil else { return false }
+            guard let leaderExitInstant else { return false }
             postExitDrainBytes += byteCount
-            return postExitDrainBytes >= Self.maximumPostExitDrainBytes
+            return postExitDrainBytes >= maximumPostLeaderDrainBytes
+                || ContinuousClock.now >= leaderExitInstant.advanced(
+                    by: maximumPostLeaderDrainDuration
+                )
         }
     }
 

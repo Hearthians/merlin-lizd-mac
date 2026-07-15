@@ -134,6 +134,15 @@ struct JSONLAppServerTransportTests {
         #expect(try await exerciseDescendantPipeLifetimeIsBounded())
     }
 
+    @Test("continuous descendant output obeys an absolute post-leader deadline")
+    func continuousDescendantOutputHasAbsoluteDeadline() async throws {
+        let result = try await exerciseContinuousDescendantDrainDeadline()
+        #expect(result.sawTypedDrainLimit)
+        #expect(result.elapsed < .milliseconds(500))
+        #expect(result.descendantExited)
+        #expect(result.descriptorDelta <= 2)
+    }
+
     @Test("concurrent stdin writes are acknowledged in FIFO order")
     func concreteProcessWritesAreFIFO() async throws {
         let result = try await exerciseFIFOProcessWrites()
@@ -243,9 +252,13 @@ struct JSONLAppServerTransportTests {
         await process.emit(.standardOutput(jsonLine(
             "{\"jsonrpc\":\"2.0\",\"id\":\"server-1\",\"method\":\"item/tool/call\",\"params\":{\"callId\":\"c\"},\"future\":7}"
         )))
+        await process.emit(.standardOutput(jsonLine(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"turn/null\",\"params\":null,\"future\":7}"
+        )))
 
         let first = try await transport.nextServerMessage()
         let second = try await transport.nextServerMessage()
+        let third = try await transport.nextServerMessage()
         #expect(first == .notification(
             method: "turn/completed",
             params: .object(["turn": .string("t")])
@@ -255,6 +268,7 @@ struct JSONLAppServerTransportTests {
             method: "item/tool/call",
             params: .object(["callId": .string("c")])
         ))
+        #expect(third == .notification(method: "turn/null", params: .null))
         await transport.shutdown()
     }
 
@@ -570,6 +584,27 @@ struct JSONLAppServerTransportTests {
             throws: JSONLAppServerTransportError.processOutputOverflow(
                 maximumBufferedEvents: 32
             )
+        ) {
+            try await request.value
+        }
+    }
+
+    @Test("post-leader output drain limit fails pending requests explicitly")
+    func processOutputDrainLimitFailsPending() async throws {
+        let process = ScriptedAppServerProcess()
+        let transport = JSONLAppServerTransport(process: process)
+        try await transport.start()
+        let request = Task { try await transport.request(method: "pending") }
+        await process.waitForWriteCount(1)
+        await process.emit(.outputDrainLimitExceeded(
+            maximumBytes: 4 * 1_024 * 1_024
+        ))
+
+        await #expect(
+            throws: JSONLAppServerTransportError
+                .processOutputDrainLimitExceeded(
+                    maximumBytes: 4 * 1_024 * 1_024
+                )
         ) {
             try await request.value
         }

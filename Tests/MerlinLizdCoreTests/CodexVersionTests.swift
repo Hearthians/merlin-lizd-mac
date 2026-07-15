@@ -220,4 +220,90 @@ struct CodexVersionTests {
         }
         #expect(started.duration(to: clock.now) < .milliseconds(200))
     }
+
+    @Test("timed out resolves retain one managed noncooperative probe")
+    func repeatedTimeoutsShareOnePhysicalProbe() async throws {
+        let probe = ScriptedCodexVersionProbe(gateStarts: true)
+        let resolver = CodexExecutableResolver(
+            override: testURL("/codex"),
+            environment: [:],
+            homeDirectory: testURL("/Users/test"),
+            fileChecker: ScriptedCodexFileChecker(executablePaths: ["/codex"]),
+            versionProbe: probe,
+            probeTimeout: .milliseconds(10)
+        )
+
+        await #expect(throws: CodexExecutableResolverError.probeTimedOut) {
+            try await resolver.resolve()
+        }
+        let clock = ContinuousClock()
+        let started = clock.now
+        let bounded = await withTaskGroup(of: Bool.self) { group in
+            for _ in 0..<16 {
+                group.addTask {
+                    do {
+                        _ = try await resolver.resolve()
+                        return false
+                    } catch CodexExecutableResolverError.probeTimedOut {
+                        return true
+                    } catch {
+                        return false
+                    }
+                }
+            }
+            return await group.reduce(into: true) { $0 = $0 && $1 }
+        }
+
+        #expect(bounded)
+        #expect(started.duration(to: clock.now) < .milliseconds(250))
+        #expect(await probe.startCount() == 1)
+        #expect(await resolver.hasManagedProbeForTesting)
+        #expect(await resolver.managedProbeWaiterCountForTesting == 0)
+
+        await probe.releaseNextStart()
+        await probe.waitForCompletionCount(1)
+        while await resolver.hasManagedProbeForTesting { await Task.yield() }
+
+        let successor = Task { try await resolver.resolve() }
+        await probe.waitForStartCount(2)
+        #expect(await probe.startCount() == 2)
+        await probe.releaseNextStart()
+        #expect(
+            try await successor.value
+                == ResolvedCodexExecutable(
+                    executable: testURL("/codex"),
+                    version: CodexVersion(major: 0, minor: 144, patch: 2)
+                )
+        )
+    }
+
+    @Test("one cancelled resolver waiter cannot cancel its joined peer")
+    func probeWaiterCancellationIsIsolated() async throws {
+        let probe = ScriptedCodexVersionProbe(gateStarts: true)
+        let resolver = CodexExecutableResolver(
+            override: testURL("/codex"),
+            environment: [:],
+            homeDirectory: testURL("/Users/test"),
+            fileChecker: ScriptedCodexFileChecker(executablePaths: ["/codex"]),
+            versionProbe: probe,
+            probeTimeout: .seconds(1)
+        )
+        let cancelled = Task { try await resolver.resolve() }
+        await probe.waitForStartCount(1)
+        let joined = Task { try await resolver.resolve() }
+        while await resolver.managedProbeWaiterCountForTesting < 2 {
+            await Task.yield()
+        }
+
+        cancelled.cancel()
+        await #expect(throws: CancellationError.self) {
+            try await cancelled.value
+        }
+        #expect(await probe.startCount() == 1)
+        #expect(await probe.cancellationSignalCount() == 0)
+
+        await probe.releaseNextStart()
+        _ = try await joined.value
+        #expect(await probe.cancellationSignalCount() == 0)
+    }
 }

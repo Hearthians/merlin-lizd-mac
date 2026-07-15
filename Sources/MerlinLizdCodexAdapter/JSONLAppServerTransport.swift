@@ -9,6 +9,7 @@ public enum JSONLAppServerTransportError: Error, Equatable, Sendable {
     case lineTooLarge(maximumBytes: Int)
     case outboundLineTooLarge(maximumBytes: Int)
     case processOutputOverflow(maximumBufferedEvents: Int)
+    case processOutputDrainLimitExceeded(maximumBytes: Int)
     case processTerminated(exitCode: Int32)
     case writeFailed
     case remoteError(code: Int)
@@ -372,6 +373,10 @@ public actor JSONLAppServerTransport {
             fail(.processOutputOverflow(
                 maximumBufferedEvents: maximumBufferedEvents
             ))
+        case let .outputDrainLimitExceeded(maximumBytes):
+            fail(.processOutputDrainLimitExceeded(
+                maximumBytes: maximumBytes
+            ))
         case let .terminated(exitCode):
             if !standardOutputBuffer.isEmpty {
                 if standardOutputBuffer.count > lineByteLimit {
@@ -431,25 +436,28 @@ public actor JSONLAppServerTransport {
     private func processLine(_ line: Data) async {
         processedLineCount += 1
         guard !line.isEmpty,
-            String(data: line, encoding: .utf8) != nil,
-            let value = try? decoder.decode(JSONValue.self, from: line),
-            let header = try? decoder.decode(JSONRPCHeader.self, from: line),
-            case let .object(object) = value,
-            object["jsonrpc"] == .string("2.0")
+            let envelope = try? decoder.decode(
+                JSONRPCInboundEnvelope.self,
+                from: line
+            ),
+            envelope.jsonrpc == "2.0"
         else {
             fail(.invalidMessage)
             return
         }
 
-        if case let .string(method)? = object["method"] {
-            let parameters = object["params"]
-            if object["id"] != nil {
-                guard let id = header.id else {
+        if let method = envelope.method {
+            if envelope.hasID {
+                guard let id = envelope.id else {
                     fail(.invalidMessage)
                     return
                 }
                 if knownServerRequestMethods.contains(method) {
-                    enqueue(.request(id: id, method: method, params: parameters))
+                    enqueue(.request(
+                        id: id,
+                        method: method,
+                        params: envelope.params
+                    ))
                 } else {
                     do {
                         try await writeLine(JSONRPCErrorResponseEnvelope(
@@ -464,28 +472,30 @@ public actor JSONLAppServerTransport {
                     }
                 }
             } else {
-                enqueue(.notification(method: method, params: parameters))
+                enqueue(.notification(
+                    method: method,
+                    params: envelope.params
+                ))
             }
             return
         }
 
-        guard object["id"] != nil, let id = header.id else {
+        guard envelope.hasID, let id = envelope.id else {
             fail(.invalidMessage)
             return
         }
         guard let continuation = pending.removeValue(forKey: id) else {
             return
         }
-        if let result = object["result"], object["error"] == nil {
-            continuation.resume(returning: result)
-        } else if case let .object(error)? = object["error"],
-            case let .number(code)? = error["code"],
-            let integerCode = Int(exactly: code),
-            object["result"] == nil
+        if envelope.hasResult,
+            let result = envelope.result,
+            !envelope.hasError
         {
+            continuation.resume(returning: result)
+        } else if let error = envelope.error, !envelope.hasResult {
             continuation.resume(
                 throwing: JSONLAppServerTransportError.remoteError(
-                    code: integerCode
+                    code: error.code
                 )
             )
         } else {
