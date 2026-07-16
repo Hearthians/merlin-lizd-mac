@@ -58,7 +58,7 @@ final class AppModel: ObservableObject {
             )
         }
         if let cached = Self.loadCachedInventory() {
-            snapshot = cached.snapshot
+            snapshot = Self.snapshotAwaitingReadinessProbe(cached.snapshot)
             seedCaches(from: cached)
         }
     }
@@ -502,6 +502,24 @@ final class AppModel: ObservableObject {
                 )
             }
         }
+    }
+
+    private static func snapshotAwaitingReadinessProbe(
+        _ snapshot: InventorySnapshot
+    ) -> InventorySnapshot {
+        InventorySnapshot(
+            devboxes: snapshot.devboxes.map { machine in
+                DevboxInventory(
+                    devbox: machine.devbox,
+                    sshAlias: machine.sshAlias,
+                    workers: machine.workers.map {
+                        $0.withReadiness(.listed)
+                    },
+                    workerStatus: machine.workerStatus
+                )
+            },
+            refreshedAt: snapshot.refreshedAt
+        )
     }
 
     private static func loadCachedInventory() -> PersistedInventoryCache? {
