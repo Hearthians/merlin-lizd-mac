@@ -465,7 +465,10 @@ public actor TmuxSessionDiscovery {
                 separator: "\n",
                 omittingEmptySubsequences: false
             )
-            let markerIndex = lines.firstIndex(of: "__MLZ_READY__")
+            let markerIndex = lines.firstIndex {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                    == "__MLZ_READY__"
+            }
             workerWasReady = markerIndex != nil
             sessionOutput = markerIndex.map {
                 lines[lines.index(after: $0)...].joined(separator: "\n")
