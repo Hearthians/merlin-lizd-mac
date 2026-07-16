@@ -74,7 +74,7 @@ struct TargetWarmupCoordinatorTests {
         await coordinator.shutdown()
     }
 
-    @Test("warmup runs no more than sixteen Worker refreshes concurrently")
+    @Test("warmup runs no more than sixteen Worker refreshes across Devboxes")
     func boundsWorkerConcurrency() async {
         let runner = WarmupDiscoveryRunner(gated: true)
         let pool = SSHMasterPool(
@@ -86,7 +86,10 @@ struct TargetWarmupCoordinatorTests {
             discovery: TmuxSessionDiscovery(processRunner: runner)
         )
         let workers = (1 ... 17).map {
-            warmupWorker(String(2_000_000 + $0))
+            warmupWorker(
+                String(2_000_000 + $0),
+                alias: "warmup_\($0)"
+            )
         }
         await coordinator.reconcile(
             .init(
@@ -117,13 +120,66 @@ struct TargetWarmupCoordinatorTests {
         await coordinator.shutdown()
     }
 
+    @Test("serializes Worker warmups per Devbox while other Devboxes proceed")
+    func serializesWarmupsForSharedAlias() async {
+        let runner = WarmupDiscoveryRunner(gated: true)
+        let coordinator = makeWarmupCoordinator(
+            runner: runner,
+            maxConcurrentWorkerWarmups: 2
+        )
+        let targets = [
+            TerminalTarget.worker(
+                devboxSID: "dbx_135679",
+                devboxName: "wt_hl",
+                alias: "hl_gpu_2",
+                workerID: "2100001"
+            ),
+            TerminalTarget.worker(
+                devboxSID: "dbx_135679",
+                devboxName: "wt_hl",
+                alias: "hl_gpu_2",
+                workerID: "2100002"
+            ),
+            TerminalTarget.worker(
+                devboxSID: "dbx_135680",
+                devboxName: "wt_other",
+                alias: "hl_gpu_3",
+                workerID: "2100003"
+            ),
+        ]
+
+        await coordinator.reconcile(
+            .init(runningDevboxAliases: [], workerTargets: targets),
+            reason: .inventoryChange,
+            onUpdate: { _ in }
+        )
+        await runner.waitForStarts(2)
+        for _ in 0 ..< 1_000 { await Task.yield() }
+
+        #expect(Set(await runner.startedWorkerIDs()) == ["2100001", "2100003"])
+        #expect(await runner.maximumConcurrency() == 2)
+
+        await runner.releaseNext()
+        await runner.waitForStarts(3)
+        #expect(Set(await runner.startedWorkerIDs()) == [
+            "2100001", "2100002", "2100003"
+        ])
+        #expect(await runner.maximumConcurrency() == 2)
+
+        await runner.releaseAll()
+        await coordinator.shutdown()
+    }
+
     @Test("repeated reconciliation keeps each target single-flight")
     func repeatedReconciliationIsSingleFlight() async {
         let runner = WarmupDiscoveryRunner(gated: true)
         let coordinator = makeWarmupCoordinator(runner: runner)
         let inventory = TargetWarmupInventory(
             runningDevboxAliases: [],
-            workerTargets: [warmupWorker("3000001"), warmupWorker("3000002")]
+            workerTargets: [
+                warmupWorker("3000001"),
+                warmupWorker("3000002", alias: "hl_gpu_3"),
+            ]
         )
         await coordinator.reconcile(
             inventory, reason: .inventoryChange, onUpdate: { _ in }
@@ -136,6 +192,62 @@ struct TargetWarmupCoordinatorTests {
 
         #expect(await runner.startedWorkerIDs().count == 2)
         await runner.releaseAll()
+        await coordinator.shutdown()
+    }
+
+    @Test("inventory reconciliation reuses fresh Worker evidence")
+    func inventoryReconciliationReusesFreshWorkerEvidence() async {
+        let runner = WarmupDiscoveryRunner()
+        let coordinator = makeWarmupCoordinator(runner: runner)
+        let updates = WarmupUpdateRecorder()
+        let inventory = TargetWarmupInventory(
+            runningDevboxAliases: [],
+            workerTargets: [warmupWorker("3000003")]
+        )
+
+        await coordinator.reconcile(
+            inventory,
+            reason: .appLaunch,
+            onUpdate: { _ in Task { await updates.record("launch") } }
+        )
+        await updates.waitForCount(1)
+
+        await coordinator.reconcile(
+            inventory,
+            reason: .inventoryChange,
+            onUpdate: { _ in Task { await updates.record("inventory") } }
+        )
+        for _ in 0 ..< 1_000 { await Task.yield() }
+
+        #expect(await runner.startedWorkerIDs() == ["3000003"])
+        await coordinator.shutdown()
+    }
+
+    @Test("manual refresh ignores fresh Worker evidence")
+    func manualRefreshForcesFreshWorkerEvidence() async {
+        let runner = WarmupDiscoveryRunner()
+        let coordinator = makeWarmupCoordinator(runner: runner)
+        let updates = WarmupUpdateRecorder()
+        let inventory = TargetWarmupInventory(
+            runningDevboxAliases: [],
+            workerTargets: [warmupWorker("3000004")]
+        )
+
+        await coordinator.reconcile(
+            inventory,
+            reason: .appLaunch,
+            onUpdate: { _ in Task { await updates.record("launch") } }
+        )
+        await updates.waitForCount(1)
+
+        await coordinator.reconcile(
+            inventory,
+            reason: .manualRefresh,
+            onUpdate: { _ in Task { await updates.record("manual") } }
+        )
+        await updates.waitForCount(2)
+
+        #expect(await runner.startedWorkerIDs() == ["3000004", "3000004"])
         await coordinator.shutdown()
     }
 
@@ -185,7 +297,10 @@ struct TargetWarmupCoordinatorTests {
         await coordinator.reconcile(
             .init(
                 runningDevboxAliases: [],
-                workerTargets: [warmupWorker("4100001"), warmupWorker("4100002")]
+                workerTargets: [
+                    warmupWorker("4100001"),
+                    warmupWorker("4100002", alias: "hl_gpu_3"),
+                ]
             ),
             reason: .inventoryChange,
             onUpdate: { _ in }
@@ -195,7 +310,10 @@ struct TargetWarmupCoordinatorTests {
         await coordinator.reconcile(
             .init(
                 runningDevboxAliases: [],
-                workerTargets: [warmupWorker("4100003"), warmupWorker("4100004")]
+                workerTargets: [
+                    warmupWorker("4100003"),
+                    warmupWorker("4100004", alias: "hl_gpu_3"),
+                ]
             ),
             reason: .inventoryChange,
             onUpdate: { _ in }
@@ -405,11 +523,14 @@ private func makeWarmupCoordinator(
     )
 }
 
-private func warmupWorker(_ workerID: String) -> TerminalTarget {
+private func warmupWorker(
+    _ workerID: String,
+    alias: String = "hl_gpu_2"
+) -> TerminalTarget {
     .worker(
         devboxSID: "dbx_135679",
         devboxName: "wt_hl",
-        alias: "hl_gpu_2",
+        alias: alias,
         workerID: workerID
     )
 }

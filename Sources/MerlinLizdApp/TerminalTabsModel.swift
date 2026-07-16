@@ -156,6 +156,11 @@ final class TerminalTabsModel: ObservableObject {
         select(id)
     }
 
+    func closeSelectedTab() {
+        guard let selectedTabID else { return }
+        close(selectedTabID)
+    }
+
     func reconnect(_ id: String) {
         guard tabs.contains(where: { $0.id == id }) else { return }
         sessions.removeValue(forKey: id)?.close()
@@ -179,7 +184,8 @@ final class TerminalTabsModel: ObservableObject {
                 command: command,
                 currentDirectory: tab.target == .local
                     ? FileManager.default.homeDirectoryForCurrentUser.path
-                    : nil
+                    : nil,
+                terminalType: TerminalTerminfo.term(for: tab.target)
             )
             sessions[id] = session
             return session

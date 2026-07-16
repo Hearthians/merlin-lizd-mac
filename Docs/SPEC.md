@@ -1,8 +1,8 @@
-# Merlin Lizd for macOS — v1 specification
+# MerlinHub for macOS — v1 specification
 
 ## Product intent
 
-Merlin Lizd is a personal, native macOS workspace for seeing Lizd's Merlin CPU Devboxes and their Workers, entering any ready target quickly, and keeping remote shells durable through tmux.
+MerlinHub is a personal, native macOS workspace for seeing Lizd's Merlin CPU Devboxes and their Workers, entering any ready target quickly, and keeping remote shells durable through tmux.
 
 The primary mental model is **machines**. A future **tasks** workspace may add fan-out execution without mixing task orchestration into the v1 machine browser.
 

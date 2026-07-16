@@ -9,6 +9,13 @@ func temporarySSHDirectory() -> URL {
     )
 }
 
+func excessivelyLongSSHDirectory() -> URL {
+    URL(
+        fileURLWithPath: "/tmp/" + String(repeating: "a", count: 55),
+        isDirectory: true
+    )
+}
+
 func createEmptyFile(atPath path: String) throws {
     try Data().write(to: URL(fileURLWithPath: path), options: .withoutOverwriting)
 }

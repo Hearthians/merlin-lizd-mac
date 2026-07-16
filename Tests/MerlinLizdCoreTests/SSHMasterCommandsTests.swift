@@ -12,7 +12,26 @@ struct SSHMasterCommandsTests {
         #expect(first == (try commands.socketPath(alias: "hl_gpu_2")))
         #expect(first.hasPrefix("/tmp/mlz-tests/m-"))
         #expect(!first.contains("hl_gpu_2"))
-        #expect(first.utf8.count < 104)
+        #expect(first.utf8.count < 72)
+    }
+
+    @Test("reserves room for OpenSSH's temporary listener suffix")
+    func reservesListenerSuffixHeadroom() {
+        let commands = SSHMasterCommands(directory: excessivelyLongSSHDirectory())
+
+        #expect(throws: SSHMasterCommandError.socketPathTooLong) {
+            try commands.socketPath(alias: "hl_gpu_2")
+        }
+    }
+
+    @Test("uses a short default directory for SSH control sockets")
+    func usesShortDefaultSocketDirectory() throws {
+        let directory = SSHMasterPool.defaultSocketDirectory()
+        let path = try SSHMasterCommands(directory: directory)
+            .socketPath(alias: "hl_gpu_2")
+
+        #expect(directory.path.hasPrefix("/tmp/mlz-ssh-"))
+        #expect(path.utf8.count < 72)
     }
 
     @Test("builds prepare check and graceful stop commands")

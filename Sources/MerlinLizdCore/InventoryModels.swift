@@ -83,6 +83,24 @@ public struct WorkerInventoryRecord: Identifiable, Codable, Equatable, Sendable 
         )
     }
 
+    /// Keeps direct connectivity evidence when newer platform inventory
+    /// refreshes the same Worker records.
+    public static func preservingReadiness(
+        of incoming: [WorkerInventoryRecord],
+        from previous: [WorkerInventoryRecord]
+    ) -> [WorkerInventoryRecord] {
+        var readinessByWorkerID: [String: WorkerReadiness] = [:]
+        for worker in previous {
+            readinessByWorkerID[worker.id] = worker.readiness
+        }
+        return incoming.map { worker in
+            guard let readiness = readinessByWorkerID[worker.id] else {
+                return worker
+            }
+            return worker.withReadiness(readiness)
+        }
+    }
+
     private init(
         id: String,
         cpuCores: Int,

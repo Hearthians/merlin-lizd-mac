@@ -3,13 +3,13 @@
 import PackageDescription
 
 let package = Package(
-    name: "MerlinLizd",
+    name: "MerlinHub",
     platforms: [
         .macOS(.v14)
     ],
     products: [
         .library(name: "MerlinLizdCore", targets: ["MerlinLizdCore"]),
-        .executable(name: "MerlinLizd", targets: ["MerlinLizdApp"]),
+        .executable(name: "MerlinHub", targets: ["MerlinLizdApp"]),
         .executable(name: "MerlinLizdCoreTests", targets: ["MerlinLizdCoreTests"])
     ],
     dependencies: [

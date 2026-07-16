@@ -21,6 +21,7 @@ final class TerminalSession: ObservableObject, Identifiable, LocalProcessTermina
 
     private let command: CommandSpec
     private let currentDirectory: String?
+    private let terminalType: String
 
     @Published private(set) var state: State = .idle
     private(set) var title: String?
@@ -34,12 +35,14 @@ final class TerminalSession: ObservableObject, Identifiable, LocalProcessTermina
         id: UUID = UUID(),
         command: CommandSpec,
         currentDirectory: String? = nil,
+        terminalType: String = "xterm-256color",
         onTitleChange: TitleHandler? = nil,
         onProcessExit: ProcessExitHandler? = nil
     ) {
         self.id = id
         self.command = command
         self.currentDirectory = currentDirectory
+        self.terminalType = terminalType
         self.onTitleChange = onTitleChange
         self.onProcessExit = onProcessExit
 
@@ -57,7 +60,7 @@ final class TerminalSession: ObservableObject, Identifiable, LocalProcessTermina
         terminalView.startProcess(
             executable: command.executable,
             args: command.arguments,
-            environment: TerminalProcessEnvironment.inherited(),
+            environment: TerminalProcessEnvironment.inherited(terminalType: terminalType),
             currentDirectory: currentDirectory
         )
         state = .running
@@ -180,9 +183,9 @@ private enum TerminalProcessReaper {
 }
 
 private enum TerminalProcessEnvironment {
-    static func inherited() -> [String] {
+    static func inherited(terminalType: String) -> [String] {
         var environment = ProcessInfo.processInfo.environment
-        environment["TERM"] = "xterm-256color"
+        environment["TERM"] = terminalType
         environment["COLORTERM"] = "truecolor"
         environment["LANG"] = "en_US.UTF-8"
 

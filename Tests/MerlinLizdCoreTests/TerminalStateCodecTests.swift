@@ -23,6 +23,35 @@ struct TerminalStateCodecTests {
         #expect(TerminalTabSelection.previous(in: [], from: nil) == nil)
     }
 
+    @Test("only Option-closing a tmux tab requests termination confirmation")
+    func resolvesCloseDisposition() {
+        let localTab = TerminalTabRecord(
+            id: "local",
+            title: "Local",
+            target: .local,
+            sessionName: nil
+        )
+        let tmuxTab = TerminalTabRecord(
+            id: "remote",
+            title: "Remote",
+            target: .devbox(sid: "dbx_123", name: "devbox", alias: "devbox"),
+            sessionName: "mlz-work"
+        )
+
+        #expect(
+            TerminalTabCloseDisposition.resolve(for: localTab, optionPressed: false) == .closeTab
+        )
+        #expect(
+            TerminalTabCloseDisposition.resolve(for: tmuxTab, optionPressed: false) == .closeTab
+        )
+        #expect(
+            TerminalTabCloseDisposition.resolve(for: localTab, optionPressed: true) == .closeTab
+        )
+        #expect(
+            TerminalTabCloseDisposition.resolve(for: tmuxTab, optionPressed: true) == .confirmTmuxTermination
+        )
+    }
+
     @Test("persists a renamed tmux session for later reconnection")
     func persistsRenamedSession() throws {
         var tab = TerminalTabRecord(

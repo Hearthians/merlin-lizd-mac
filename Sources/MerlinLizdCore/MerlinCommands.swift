@@ -197,19 +197,6 @@ public enum MerlinCommands {
         }
     }
 
-    public static func warmWorker(target: TerminalTarget) throws -> CommandSpec {
-        let (alias, workerID) = try validatedWorkerRoute(target)
-        return workerCommand(
-            alias: alias,
-            workerID: workerID,
-            // The Devbox shell removes the outer double quotes, leaving the
-            // literal single quotes in mlx's argv. When mlx rejoins argv for
-            // the Worker shell, those quotes still bind the entire fixed body
-            // as sh -lc's one command-string argument.
-            remoteCommands: #"sh -lc "'printf \"__MLZ_READY__\n\"; tmux list-sessions -F#{session_name}'""#
-        )
-    }
-
     public static func startDevbox(
         merlinCLIPath: String,
         sid: String
@@ -289,7 +276,7 @@ public enum MerlinCommands {
             executable: "/usr/bin/ssh",
             arguments: interactiveSSHArguments(
                 alias: alias,
-                remoteCommand: "exec tmux new-session -A -s \(sessionName)"
+                remoteCommand: "TERM=xterm exec tmux new-session -A -s \(sessionName)"
             )
         )
     }
@@ -307,7 +294,7 @@ public enum MerlinCommands {
             executable: "/usr/bin/ssh",
             arguments: interactiveSSHArguments(
                 alias: alias,
-                remoteCommand: "exec mlx worker login \(workerID) -- tmux new-session -A -s \(sessionName)"
+                remoteCommand: "exec mlx worker login \(workerID) -- env TERM=xterm tmux new-session -A -s \(sessionName)"
             )
         )
     }

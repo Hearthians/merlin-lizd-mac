@@ -37,6 +37,7 @@ public actor TargetWarmupCoordinator {
     private struct QueuedWarmup: Sendable {
         let target: TerminalTarget
         let generation: UInt64
+        let forceRefresh: Bool
     }
 
     private struct InFlightWarmup: Sendable {
@@ -48,6 +49,7 @@ public actor TargetWarmupCoordinator {
     private let sshMasterPool: SSHMasterPool
     private let discovery: TmuxSessionDiscovery
     private let maxConcurrentWorkerWarmups: Int
+    private let maxConcurrentWorkerWarmupsPerAlias: Int
     private let sleeper: Sleeper
     private var generation: UInt64 = 0
     private var latestInventory: TargetWarmupInventory?
@@ -65,12 +67,15 @@ public actor TargetWarmupCoordinator {
     public init(
         sshMasterPool: SSHMasterPool,
         discovery: TmuxSessionDiscovery,
-        maxConcurrentWorkerWarmups: Int = 16
+        maxConcurrentWorkerWarmups: Int = 16,
+        maxConcurrentWorkerWarmupsPerAlias: Int = 1
     ) {
         precondition(maxConcurrentWorkerWarmups > 0)
+        precondition(maxConcurrentWorkerWarmupsPerAlias > 0)
         self.sshMasterPool = sshMasterPool
         self.discovery = discovery
         self.maxConcurrentWorkerWarmups = maxConcurrentWorkerWarmups
+        self.maxConcurrentWorkerWarmupsPerAlias = maxConcurrentWorkerWarmupsPerAlias
         sleeper = { duration in try await Task.sleep(for: duration) }
     }
 
@@ -78,12 +83,15 @@ public actor TargetWarmupCoordinator {
         sshMasterPool: SSHMasterPool,
         discovery: TmuxSessionDiscovery,
         maxConcurrentWorkerWarmups: Int = 16,
+        maxConcurrentWorkerWarmupsPerAlias: Int = 1,
         sleeper: @escaping Sleeper
     ) {
         precondition(maxConcurrentWorkerWarmups > 0)
+        precondition(maxConcurrentWorkerWarmupsPerAlias > 0)
         self.sshMasterPool = sshMasterPool
         self.discovery = discovery
         self.maxConcurrentWorkerWarmups = maxConcurrentWorkerWarmups
+        self.maxConcurrentWorkerWarmupsPerAlias = maxConcurrentWorkerWarmupsPerAlias
         self.sleeper = sleeper
     }
 
@@ -93,6 +101,7 @@ public actor TargetWarmupCoordinator {
         onUpdate: @escaping @Sendable (TargetWarmupUpdate) -> Void
     ) async {
         guard !isShuttingDown else { return }
+        let forceRefresh = requiresForcedRefresh(for: reason)
         generation &+= 1
         latestInventory = inventory
         latestUpdate = onUpdate
@@ -124,7 +133,11 @@ public actor TargetWarmupCoordinator {
             // queued work is adopted by this expiry generation.
             queue = queue.map {
                 currentTargets.contains($0.target)
-                    ? .init(target: $0.target, generation: generation)
+                    ? .init(
+                        target: $0.target,
+                        generation: generation,
+                        forceRefresh: forceRefresh
+                    )
                     : $0
             }
         } else {
@@ -141,7 +154,11 @@ public actor TargetWarmupCoordinator {
             }
             queue = queue.map {
                 currentTargets.contains($0.target)
-                    ? .init(target: $0.target, generation: generation)
+                    ? .init(
+                        target: $0.target,
+                        generation: generation,
+                        forceRefresh: forceRefresh
+                    )
                     : $0
             }
         }
@@ -162,7 +179,13 @@ public actor TargetWarmupCoordinator {
         where !alreadyQueued.contains(target)
             && (inFlightTargets[target] == nil || queuesInFlightTargets)
         {
-            queue.append(.init(target: target, generation: generation))
+            queue.append(
+                .init(
+                    target: target,
+                    generation: generation,
+                    forceRefresh: forceRefresh
+                )
+            )
             alreadyQueued.insert(target)
         }
         reorderQueue()
@@ -235,16 +258,25 @@ public actor TargetWarmupCoordinator {
         {
             guard let index = queue.firstIndex(where: {
                 inFlightTargets[$0.target] == nil
+                    && hasAliasCapacity(for: $0.target)
             }) else { return }
             let entry = queue.remove(at: index)
             let discovery = discovery
             nextWarmupToken &+= 1
             let token = nextWarmupToken
             let task = Task { [weak self] in
-                let snapshot = await discovery.refresh(
-                    target: entry.target,
-                    lane: .background
-                )
+                let snapshot: TmuxSessionSnapshot
+                if entry.forceRefresh {
+                    snapshot = await discovery.refresh(
+                        target: entry.target,
+                        lane: .background
+                    )
+                } else {
+                    snapshot = await discovery.refreshIfStale(
+                        target: entry.target,
+                        lane: .background
+                    )
+                }
                 await self?.completeWarmup(
                     target: entry.target,
                     token: token,
@@ -256,6 +288,28 @@ public actor TargetWarmupCoordinator {
                 generation: entry.generation,
                 task: task
             )
+        }
+    }
+
+    private func hasAliasCapacity(for target: TerminalTarget) -> Bool {
+        guard let alias = MerlinCommands.sshAlias(for: target) else {
+            return true
+        }
+        let activeForAlias = inFlightTargets.keys.count {
+            MerlinCommands.sshAlias(for: $0) == alias
+        }
+        return activeForAlias < maxConcurrentWorkerWarmupsPerAlias
+    }
+
+    private func requiresForcedRefresh(for reason: WarmupReason) -> Bool {
+        switch reason {
+        case .inventoryChange:
+            // The visible inventory refreshes every 15 seconds while the app
+            // is active. Keep its Worker checks cache-backed so it does not
+            // repeatedly run `mlx worker login` on an occupied Devbox.
+            false
+        case .appLaunch, .manualRefresh, .cacheExpiry, .foregroundSelection:
+            true
         }
     }
 

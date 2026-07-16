@@ -30,6 +30,20 @@ public struct TerminalTabRecord: Codable, Equatable, Hashable, Identifiable, Sen
     }
 }
 
+public enum TerminalTabCloseDisposition: Equatable, Sendable {
+    case closeTab
+    case confirmTmuxTermination
+
+    public static func resolve(
+        for tab: TerminalTabRecord,
+        optionPressed: Bool
+    ) -> TerminalTabCloseDisposition {
+        optionPressed && tab.sessionName != nil
+            ? .confirmTmuxTermination
+            : .closeTab
+    }
+}
+
 public struct TerminalState: Codable, Equatable, Sendable {
     public static let empty = TerminalState(selectedTabID: nil, tabs: [])
 

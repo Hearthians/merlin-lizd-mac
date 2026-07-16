@@ -22,7 +22,8 @@ final class MerlinRemoteRuntime {
         warmupCoordinator = TargetWarmupCoordinator(
             sshMasterPool: pool,
             discovery: tmuxDiscovery,
-            maxConcurrentWorkerWarmups: 16
+            maxConcurrentWorkerWarmups: 16,
+            maxConcurrentWorkerWarmupsPerAlias: 1
         )
     }
 

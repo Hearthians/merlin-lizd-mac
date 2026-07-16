@@ -21,12 +21,12 @@ struct MerlinLizdApplication: App {
         _terminals = StateObject(
             wrappedValue: terminals
         )
-        appDelegate.configure(runtime: runtime)
+        appDelegate.configure(runtime: runtime, terminals: terminals)
         model.start()
     }
 
     var body: some Scene {
-        WindowGroup("Merlin Lizd") {
+        WindowGroup("MerlinHub") {
             MerlinRootView(
                 model: model,
                 terminals: terminals,
@@ -64,11 +64,47 @@ struct MerlinLizdApplication: App {
 @MainActor
 private final class MerlinLizdApplicationDelegate: NSObject, NSApplicationDelegate {
     private var runtime: MerlinRemoteRuntime?
+    private var terminals: TerminalTabsModel?
     private var terminationTask: Task<Void, Never>?
+    private var closeTabKeyMonitor: Any?
 
-    func configure(runtime: MerlinRemoteRuntime) {
+    func configure(runtime: MerlinRemoteRuntime, terminals: TerminalTabsModel) {
         precondition(self.runtime == nil || self.runtime === runtime)
         self.runtime = runtime
+        self.terminals = terminals
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        installCloseTabMenuCommand()
+        DispatchQueue.main.async { [weak self] in
+            self?.installCloseTabMenuCommand()
+        }
+        closeTabKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard event.charactersIgnoringModifiers == "w" else { return event }
+            let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            guard modifiers == [.command] else { return event }
+
+            self?.terminals?.closeSelectedTab()
+            return nil
+        }
+    }
+
+    private func installCloseTabMenuCommand() {
+        guard let closeItem = NSApp.mainMenu?
+            .items
+            .compactMap(\.submenu)
+            .flatMap(\.items)
+            .first(where: { $0.action == #selector(NSWindow.performClose(_:)) })
+        else {
+            return
+        }
+        closeItem.title = "关闭当前标签页"
+        closeItem.target = self
+        closeItem.action = #selector(closeSelectedTab(_:))
+    }
+
+    @objc private func closeSelectedTab(_ sender: Any?) {
+        terminals?.closeSelectedTab()
     }
 
     func applicationShouldTerminate(

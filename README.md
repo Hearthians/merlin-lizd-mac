@@ -1,6 +1,6 @@
-# Merlin Lizd for macOS
+# MerlinHub for macOS
 
-Merlin Lizd is a personal native macOS dashboard and terminal for Merlin
+MerlinHub is a personal native macOS dashboard and terminal for Merlin
 development machines and their workers. It uses the existing Merlin CLI login,
 system SSH configuration, and remote `mlx`/`tmux` tools; it does not store SSH
 passwords or Merlin tokens itself.
@@ -62,7 +62,7 @@ From this directory:
 
 ```sh
 ./scripts/test.sh
-/usr/bin/swift run MerlinLizd
+/usr/bin/swift run MerlinHub
 ```
 
 `test.sh` runs the repository's custom `MerlinLizdCoreTests` executable.
@@ -71,12 +71,12 @@ From this directory:
 
 ```sh
 ./scripts/package-app.sh
-open "dist/Merlin Lizd.app"
+open "dist/MerlinHub.app"
 ```
 
-The packaging script builds the `MerlinLizd` release product, assembles a
+The packaging script builds the `MerlinHub` release product, assembles a
 Finder-launchable app bundle, and applies a local ad-hoc signature.
-The result is written to `dist/Merlin Lizd.app`. No Xcode project, Developer ID,
+The result is written to `dist/MerlinHub.app`. No Xcode project, Developer ID,
 or signing certificate is required for local use.
 
 SwiftTerm 1.14.0 is vendored with a small packaging patch so its Metal shader
