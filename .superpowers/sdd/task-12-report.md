@@ -2,13 +2,14 @@
 
 ## Status and scope
 
-Status: implemented, manually smoked, packaged, and verified.
+Status: implemented, manually smoked, packaged, repaired after review, and
+verified with the isolated transport-flake caveat documented below.
 
 Starting commit: `6dd2afc`.
 
-The commit containing this report has the required subject
-`test: verify tmux codex workflow`; its object ID is reported in the final
-handoff because a Git commit cannot contain its own final object ID.
+The original Task 12 commit is `931389b` (`test: verify tmux codex workflow`).
+The follow-up repair commit is reported in the final handoff because a Git
+commit cannot contain its own final object ID.
 
 The planned acceptance tests, concurrency regression, README, and specification
 were completed. During real-app smoke, four production defects blocked the
@@ -40,11 +41,28 @@ and
 
 ## RED and GREEN evidence
 
-- The acceptance file began RED as a missing cross-layer composition harness:
-  the fake terminal/session port, coordinator/router/registry wiring, and
-  persistence composition did not compile until implemented. The resulting ten
-  acceptance behaviors all pass without launching Merlin, SSH, tmux, Codex,
-  OpenAI, or network processes.
+- Review found that the first acceptance harness bypassed the coordinator with
+  `router.beginTurn`, used an in-memory journal for behaviors 1-7, and manually
+  forged the duplicate-tab transcript and approval. The repaired harness is
+  GREEN only after `CodexSessionCoordinator.submit` establishes each real turn
+  and pin, and router calls use the coordinator-owned thread/turn identity. All
+  ten behaviors now share the production coordinator, endpoint registry,
+  router, default permission policy, `FileCodexConversationStore`, and
+  `FileTerminalOperationJournal`, with only the agent, PTY, and surface ports
+  faked. Duplicate-tab messages and approval come through real agent/coordinator
+  streams. The crash behavior drives an actual scripted supervisor generation
+  crash plus endpoint disconnect, and asserts no replay, terminal bytes, or
+  surface mutation. The ten behaviors pass without launching Merlin, SSH,
+  tmux, Codex, OpenAI, or network processes.
+- The first late-resume test hung because it started and resumed the same
+  current-generation thread, correctly taking the production idempotent fast
+  path before the scripted resume gate. GREEN uses three generations: the
+  bootstrap generation creates an active durable mapping, its crash leaves the
+  thread unloaded in generation two, generation two gates a real resume and
+  crashes, and generation three resumes the exact durable thread. The old
+  completion is rejected. The two relevant scripted gate waits have
+  cancellation-aware one-second bounds so an impossible scenario fails instead
+  of hanging CI; production resume logic is unchanged.
 - The lifecycle stress regression began RED before its deterministic
   publication/wait/interrupt harness existed. GREEN drives 24 exact keys:
   8 stable waits complete, 16 are interrupted, no waiter continuation remains,
@@ -197,11 +215,19 @@ performed.
 
 ## Final verification
 
-- Focused command:
-  `/usr/bin/swift run MerlinLizdCoreTests --filter 'MerlinLizdCoreTests\.(CodexTerminalAcceptanceTests|ConcurrencyRegressionTests|CodexAppServerSupervisorTests)'`
-  — passed 49 tests across the three affected suites.
-- `./scripts/test.sh` — exited 0; the executable lists 726 tests in the final
-  tree and the full run passed.
+- Focused suites were run individually with the equivalent filters because
+  concurrent SwiftPM invocations serialize on `.build`: acceptance 10/10,
+  concurrency 11/11, and supervisor 28/28, for 49/49 affected tests.
+- `./scripts/test.sh` listed 726 tests in 47 suites. Full run #1 and full run #2
+  each passed the 725 tests outside the known unrelated
+  `continuousDescendantOutputHasAbsoluteDeadline` transport fixture. The first
+  run failed only its descriptor-delta assertion (`7`, expected `<= 2`); the
+  second reported `timedOut` and three issues within that fixture and its
+  cleanup assertions. The exact test was then isolated with
+  `/usr/bin/swift run MerlinLizdCoreTests --filter 'MerlinLizdCoreTests.JSONLAppServerTransportTests/continuousDescendantOutputHasAbsoluteDeadline'`
+  and passed 1/1 in 0.078 seconds. Per the review constraint, the unrelated
+  timing test was not edited. A third fresh `./scripts/test.sh` run then passed
+  all 726 tests in 47 suites in 2.891 seconds.
 - `/usr/bin/swift build` — passed under Swift 6.
 - `./scripts/package-app.sh` — passed and produced the real app bundle.
 - `/usr/bin/codesign --verify --deep --strict 'dist/Merlin Lizd.app'` — passed.
@@ -209,14 +235,18 @@ performed.
   `git diff --check 6dd2afc..HEAD` is run immediately after the final commit and
   reported in the handoff.
 
-No known unrelated app-server transport timing failure occurred in the final
-focused or full runs.
+The known unrelated transport timing fixture fluctuated in full runs #1 and
+#2 as reported above; the isolated rerun and final full run were green.
 
 ## Protected-path review
 
-The final commit contains only the Task 12 acceptance/concurrency/docs/report
-paths plus the four explicitly authorized production closures and the two-file
-documented SwiftTerm patch:
+The cumulative Task 12 range contains only the planned
+acceptance/concurrency/docs/report paths plus the four explicitly authorized
+production closures and the two-file documented SwiftTerm patch. The repair
+commit itself changes only this report, the acceptance test, the supervisor
+test, and its test-support file.
+
+The cumulative authorized closure paths are:
 
 - `Sources/MerlinLizdApp/CodexDrawerModel.swift`
 - `Sources/MerlinLizdApp/CodexNotificationController.swift`

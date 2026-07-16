@@ -758,12 +758,17 @@ struct CodexAppServerSupervisorTests {
     @Test("late old-generation resume completion cannot commit")
     func lateResumeDoesNotMutateReplacementGeneration() async throws {
         let threadID = AgentThreadID(rawValue: "thread-1")
-        let failed = ScriptedSupervisorGeneration(
+        let turnID = AgentTurnID(rawValue: "turn-1")
+        let bootstrap = ScriptedSupervisorGeneration(
             startedThreads: [threadID.rawValue],
+            turnIDs: [turnID.rawValue]
+        )
+        let failed = ScriptedSupervisorGeneration(
             gatedCalls: [.resumeThread]
         )
         let recovered = ScriptedSupervisorGeneration()
         let factory = ScriptedSupervisorGenerationFactory(outcomes: [
+            .generation(bootstrap),
             .generation(failed),
             .generation(recovered),
         ])
@@ -773,15 +778,26 @@ struct CodexAppServerSupervisorTests {
         )
 
         _ = try await supervisor.startThread()
+        _ = try await supervisor.startTurn(threadID: threadID, prompt: "first")
+        await bootstrap.crash()
+
         let resuming = Task { try await supervisor.resumeThread(threadID) }
-        await failed.waitForCallStart(.resumeThread)
+        try await failed.waitForCallStart(
+            .resumeThread,
+            timeout: .seconds(1)
+        )
         await failed.crash()
-        await recovered.waitForResumeCount(1)
+        try await recovered.waitForResumeCount(1, timeout: .seconds(1))
         await failed.release(.resumeThread)
 
         await #expect(throws: CodexAppServerSupervisorError.unavailable) {
             try await resuming.value
         }
+        #expect(
+            await recovered.recordedCalls.filter {
+                $0 == .resumeThread(threadID)
+            }.count == 1
+        )
         await supervisor.shutdown()
     }
 

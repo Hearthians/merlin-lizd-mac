@@ -151,6 +151,9 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
     private var resumeWaiters: [
         (Int, CheckedContinuation<Void, Never>)
     ] = []
+    private var boundedResumeWaiters: [
+        UUID: (Int, CheckedContinuation<Void, any Error>)
+    ] = [:]
     private let gateShutdown: Bool
     private var shutdownGates: [CheckedContinuation<Void, Never>] = []
     private var shutdownWaiters: [
@@ -163,6 +166,9 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
     private var callStartWaiters: [
         (Gate, Int, CheckedContinuation<Void, Never>)
     ] = []
+    private var boundedCallStartWaiters: [
+        UUID: (Gate, Int, CheckedContinuation<Void, any Error>)
+    ] = [:]
     private var callCancellationCounts: [Gate: Int] = [:]
     private var callCancellationWaiters: [
         (Gate, Int, CheckedContinuation<Void, Never>)
@@ -337,6 +343,16 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
         }
     }
 
+    func waitForCallStart(
+        _ gate: Gate,
+        count: Int = 1,
+        timeout: Duration
+    ) async throws {
+        try await codexSessionWithDeadline(timeout: timeout) {
+            try await self.waitForCallStartUntilCancelled(gate, count: count)
+        }
+    }
+
     func waitForCallCancellation(_ gate: Gate, count: Int = 1) async {
         if callCancellationCounts[gate, default: 0] >= count { return }
         await withCheckedContinuation {
@@ -352,6 +368,15 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
     func waitForResumeCount(_ count: Int) async {
         if resumeCount >= count { return }
         await withCheckedContinuation { resumeWaiters.append((count, $0)) }
+    }
+
+    func waitForResumeCount(
+        _ count: Int,
+        timeout: Duration
+    ) async throws {
+        try await codexSessionWithDeadline(timeout: timeout) {
+            try await self.waitForResumeCountUntilCancelled(count)
+        }
     }
 
     private var resumeCount: Int {
@@ -370,6 +395,13 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
             }
         }
         resumeWaiters = retained
+
+        let completed = boundedResumeWaiters.compactMap { id, waiter in
+            resumeCount >= waiter.0 ? id : nil
+        }
+        for id in completed {
+            boundedResumeWaiters.removeValue(forKey: id)?.1.resume()
+        }
     }
 
     private func resumeShutdownWaiters() {
@@ -438,6 +470,73 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
             }
         }
         callStartWaiters = retained
+        let completed = boundedCallStartWaiters.compactMap { id, waiter in
+            callStartCounts[waiter.0, default: 0] >= waiter.1 ? id : nil
+        }
+        for id in completed {
+            boundedCallStartWaiters.removeValue(forKey: id)?.2.resume()
+        }
+    }
+
+    private func waitForCallStartUntilCancelled(
+        _ gate: Gate,
+        count: Int
+    ) async throws {
+        if callStartCounts[gate, default: 0] >= count { return }
+        let waiterID = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation(isolation: self) {
+                (continuation: CheckedContinuation<Void, any Error>) in
+                guard !Task.isCancelled else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                if callStartCounts[gate, default: 0] >= count {
+                    continuation.resume()
+                } else {
+                    boundedCallStartWaiters[waiterID] = (
+                        gate,
+                        count,
+                        continuation
+                    )
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelCallStartWaiter(waiterID) }
+        }
+    }
+
+    private func waitForResumeCountUntilCancelled(_ count: Int) async throws {
+        if resumeCount >= count { return }
+        let waiterID = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation(isolation: self) {
+                (continuation: CheckedContinuation<Void, any Error>) in
+                guard !Task.isCancelled else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                if resumeCount >= count {
+                    continuation.resume()
+                } else {
+                    boundedResumeWaiters[waiterID] = (count, continuation)
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelResumeWaiter(waiterID) }
+        }
+    }
+
+    private func cancelCallStartWaiter(_ waiterID: UUID) {
+        boundedCallStartWaiters.removeValue(forKey: waiterID)?.2.resume(
+            throwing: CancellationError()
+        )
+    }
+
+    private func cancelResumeWaiter(_ waiterID: UUID) {
+        boundedResumeWaiters.removeValue(forKey: waiterID)?.1.resume(
+            throwing: CancellationError()
+        )
     }
 
     private func removeEventContinuation(
