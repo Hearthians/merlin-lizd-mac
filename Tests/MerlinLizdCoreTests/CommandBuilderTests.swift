@@ -235,7 +235,7 @@ struct CommandBuilderTests {
         let remote = try #require(command.arguments.last)
 
         #expect(remote.contains("mlx worker login 3966762 --"))
-        #expect(remote.contains("printf \\\"__MLZ_READY__\\n\\\""))
+        #expect(remote.contains("/bin/echo __MLZ_READY__ \\;"))
         #expect(remote.contains(
             "tmux list-sessions -F#{session_name},#{session_id},#{session_created}"
         ))
@@ -273,7 +273,7 @@ struct CommandBuilderTests {
         )
 
         #expect(reconstructed ==
-            #"sh -lc 'printf "__MLZ_READY__\n"; tmux list-sessions -F#{session_name},#{session_id},#{session_created}'"#)
+            #"/bin/echo __MLZ_READY__ ; tmux list-sessions -F#{session_name},#{session_id},#{session_created}"#)
 
         let directory = temporarySSHDirectory()
         _ = try await runner.run(.init(

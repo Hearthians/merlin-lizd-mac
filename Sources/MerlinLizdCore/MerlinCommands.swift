@@ -380,11 +380,10 @@ public enum MerlinCommands {
         return workerCommand(
             alias: alias,
             workerID: workerID,
-            // The Devbox shell removes the outer double quotes, leaving the
-            // literal single quotes in mlx's argv. When mlx rejoins argv for
-            // the Worker shell, those quotes still bind the entire fixed body
-            // as sh -lc's one command-string argument.
-            remoteCommands: #"sh -lc "'printf \"__MLZ_READY__\n\"; tmux list-sessions -F#{session_name},#{session_id},#{session_created}'""#
+            // The Devbox shell consumes the backslash and passes a literal
+            // semicolon to mlx. mlx then rejoins argv for the Worker shell,
+            // where it separates the marker from the tmux query.
+            remoteCommands: #"/bin/echo __MLZ_READY__ \; tmux list-sessions -F#{session_name},#{session_id},#{session_created}"#
         )
     }
 
