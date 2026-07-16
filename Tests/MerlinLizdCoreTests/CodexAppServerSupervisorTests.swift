@@ -780,6 +780,7 @@ struct CodexAppServerSupervisorTests {
         _ = try await supervisor.startThread()
         _ = try await supervisor.startTurn(threadID: threadID, prompt: "first")
         await bootstrap.crash()
+        try await bootstrap.waitForShutdownCount(1, timeout: .seconds(1))
 
         let resuming = Task { try await supervisor.resumeThread(threadID) }
         try await failed.waitForCallStart(

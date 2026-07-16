@@ -60,9 +60,13 @@ and
   bootstrap generation creates an active durable mapping, its crash leaves the
   thread unloaded in generation two, generation two gates a real resume and
   crashes, and generation three resumes the exact durable thread. The old
-  completion is rejected. The two relevant scripted gate waits have
-  cancellation-aware one-second bounds so an impossible scenario fails instead
-  of hanging CI; production resume logic is unchanged.
+  completion is rejected. A bounded bootstrap-shutdown signal proves the
+  supervisor has detached generation one before the public resume begins, so
+  the scenario cannot race into the current-generation idempotent fast path.
+  The three relevant scripted waits have cancellation-aware one-second bounds
+  so an impossible scenario fails instead of hanging CI; production resume
+  logic is unchanged. The exact regression passed 25 consecutive runs after
+  this synchronization was added.
 - The lifecycle stress regression began RED before its deterministic
   publication/wait/interrupt harness existed. GREEN drives 24 exact keys:
   8 stable waits complete, 16 are interrupted, no waiter continuation remains,

@@ -159,6 +159,9 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
     private var shutdownWaiters: [
         (Int, CheckedContinuation<Void, Never>)
     ] = []
+    private var boundedShutdownWaiters: [
+        UUID: (Int, CheckedContinuation<Void, any Error>)
+    ] = [:]
     private let gatedCalls: Set<Gate>
     private var ensureThreadDeletionFailures: Int
     private var callStartCounts: [Gate: Int] = [:]
@@ -330,6 +333,15 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
         await withCheckedContinuation { shutdownWaiters.append((count, $0)) }
     }
 
+    func waitForShutdownCount(
+        _ count: Int,
+        timeout: Duration
+    ) async throws {
+        try await codexSessionWithDeadline(timeout: timeout) {
+            try await self.waitForShutdownCountUntilCancelled(count)
+        }
+    }
+
     func releaseShutdown() {
         let gates = shutdownGates
         shutdownGates.removeAll()
@@ -414,6 +426,13 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
             }
         }
         shutdownWaiters = retained
+
+        let completed = boundedShutdownWaiters.compactMap { id, waiter in
+            shutdownCount >= waiter.0 ? id : nil
+        }
+        for id in completed {
+            boundedShutdownWaiters.removeValue(forKey: id)?.1.resume()
+        }
     }
 
     private func resumeEventSubscriberWaiters() {
@@ -527,6 +546,29 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
         }
     }
 
+    private func waitForShutdownCountUntilCancelled(
+        _ count: Int
+    ) async throws {
+        if shutdownCount >= count { return }
+        let waiterID = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation(isolation: self) {
+                (continuation: CheckedContinuation<Void, any Error>) in
+                guard !Task.isCancelled else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                if shutdownCount >= count {
+                    continuation.resume()
+                } else {
+                    boundedShutdownWaiters[waiterID] = (count, continuation)
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelShutdownWaiter(waiterID) }
+        }
+    }
+
     private func cancelCallStartWaiter(_ waiterID: UUID) {
         boundedCallStartWaiters.removeValue(forKey: waiterID)?.2.resume(
             throwing: CancellationError()
@@ -535,6 +577,12 @@ actor ScriptedSupervisorGeneration: CodexAgentClient {
 
     private func cancelResumeWaiter(_ waiterID: UUID) {
         boundedResumeWaiters.removeValue(forKey: waiterID)?.1.resume(
+            throwing: CancellationError()
+        )
+    }
+
+    private func cancelShutdownWaiter(_ waiterID: UUID) {
+        boundedShutdownWaiters.removeValue(forKey: waiterID)?.1.resume(
             throwing: CancellationError()
         )
     }
