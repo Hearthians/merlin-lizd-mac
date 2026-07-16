@@ -67,6 +67,9 @@ and
   so an impossible scenario fails instead of hanging CI; production resume
   logic is unchanged. The exact regression passed 25 consecutive runs after
   this synchronization was added.
+- The crash-recovery regression now waits for the supervisor's bounded
+  `.ready` publication instead of treating entry into the replacement
+  generation's `resumeThread` as recovery completion.
 - The lifecycle stress regression began RED before its deterministic
   publication/wait/interrupt harness existed. GREEN drives 24 exact keys:
   8 stable waits complete, 16 are interrupted, no waiter continuation remains,

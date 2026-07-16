@@ -215,7 +215,9 @@ struct CodexAppServerSupervisorTests {
         #expect(
             await failed.value == .turnFailed(turn, .crashed)
         )
-        #expect(await supervisor.currentAvailability == .ready)
+        #expect(await supervisorEventually {
+            await supervisor.currentAvailability == .ready
+        })
         await supervisor.shutdown()
     }
 
