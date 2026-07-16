@@ -1,3 +1,3 @@
-{"id":1,"method":"initialize","params":{"clientInfo":{"name":"Merlin Lizd","title":"Merlin Lizd","version":"1"},"capabilities":{"experimentalApi":true}}}
+{"id":1,"method":"initialize","params":{"clientInfo":{"name":"MerlinHubX","title":"MerlinHubX","version":"1"},"capabilities":{"experimentalApi":true}}}
 {"id":1,"result":{"codexHome":"/Users/test/.codex","platformFamily":"unix","platformOs":"macos","userAgent":"codex-cli/0.144.2"}}
 {"method":"initialized"}

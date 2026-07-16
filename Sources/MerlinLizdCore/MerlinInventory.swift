@@ -277,10 +277,29 @@ private struct InventoryLoader: Sendable {
             let workers = try await loadWorkersFromMerlinCLI(
                 instanceSID: devbox.sid
             )
+            let authoritativeWorkers = workers.map(WorkerInventoryRecord.init(worker:))
+            let enrichedWorkers: [WorkerInventoryRecord]
+            if
+                authoritativeWorkers.contains(where: {
+                    $0.gpuCount > 0 && $0.gpuType == nil
+                }),
+                let alias
+            {
+                let supplemental = await loadWorkersThroughSSH(
+                    for: devbox,
+                    alias: alias
+                )
+                enrichedWorkers = Self.enrichingMissingGPUTypes(
+                    in: authoritativeWorkers,
+                    from: supplemental
+                )
+            } else {
+                enrichedWorkers = authoritativeWorkers
+            }
             return DevboxInventory(
                 devbox: devbox,
                 sshAlias: alias,
-                workers: workers.map(WorkerInventoryRecord.init(worker:)),
+                workers: enrichedWorkers,
                 workerStatus: .loaded
             )
         } catch let error as WorkerInventoryLoadError {
@@ -299,6 +318,30 @@ private struct InventoryLoader: Sendable {
                 )
             }
             return await loadWorkersThroughSSH(for: devbox, alias: alias)
+        }
+    }
+
+    private static func enrichingMissingGPUTypes(
+        in authoritative: [WorkerInventoryRecord],
+        from supplemental: DevboxInventory
+    ) -> [WorkerInventoryRecord] {
+        guard supplemental.workerStatus == .loaded else {
+            return authoritative
+        }
+        var gpuTypesByWorkerID: [String: String] = [:]
+        for worker in supplemental.workers {
+            guard let gpuType = worker.gpuType else { continue }
+            gpuTypesByWorkerID[worker.id] = gpuType
+        }
+        return authoritative.map { worker in
+            guard
+                worker.gpuCount > 0,
+                worker.gpuType == nil,
+                let gpuType = gpuTypesByWorkerID[worker.id]
+            else {
+                return worker
+            }
+            return worker.withGPUType(gpuType)
         }
     }
 

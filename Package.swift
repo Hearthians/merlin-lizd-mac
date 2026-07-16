@@ -3,7 +3,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "MerlinLizd",
+    name: "MerlinHubX",
     platforms: [
         .macOS(.v14)
     ],
@@ -13,7 +13,7 @@ let package = Package(
             name: "MerlinLizdCodexAdapter",
             targets: ["MerlinLizdCodexAdapter"]
         ),
-        .executable(name: "MerlinLizd", targets: ["MerlinLizdApp"]),
+        .executable(name: "MerlinHubX", targets: ["MerlinLizdApp"]),
         .executable(name: "MerlinLizdCoreTests", targets: ["MerlinLizdCoreTests"])
     ],
     dependencies: [

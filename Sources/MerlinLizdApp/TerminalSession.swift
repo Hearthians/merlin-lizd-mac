@@ -137,7 +137,7 @@ final class TerminalSession: ObservableObject, Identifiable, LocalProcessTermina
 
 private enum TerminalProcessReaper {
     private static let queue = DispatchQueue(
-        label: "com.merlin-lizd.terminal-process-reaper",
+        label: "com.merlinhubx.terminal-process-reaper",
         qos: .utility,
         attributes: .concurrent
     )

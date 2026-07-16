@@ -378,7 +378,7 @@ public struct CodexDrawerState: Equatable, Sendable {
             )
         case .unsupportedVersion:
             CodexDrawerAvailabilityNotice(
-                message: "This Codex version is not supported by Merlin Lizd.",
+                message: "This Codex version is not supported by MerlinHubX.",
                 isRetryable: false
             )
         case .authenticationRequired:

@@ -244,6 +244,53 @@ struct MerlinInventoryTests {
         #expect(commands.allSatisfy { $0.executable != "/usr/bin/ssh" })
     }
 
+    @Test("enriches a missing platform GPU type from safe SSH inventory")
+    func enrichesMissingGPUTypeFromSSH() async throws {
+        let runner = ScriptedInventoryProcessRunner(stdout: [
+            devboxPage(sid: "dbx_135679", role: "OWNER", status: "running"),
+            emptyDevboxPage(),
+            "user 135679.some-account.cn",
+            workerPage(
+                sid: "wkr_4031877",
+                status: "running",
+                cpuCores: 22,
+                memoryBytes: 123_480_309_760,
+                gpuCount: 1
+            ),
+        ])
+        let directory = temporarySSHDirectory()
+        let poolRunner = InventorySSHMasterRunner(workerList: """
+            id        cpu    mem    gpu    gpuType     podIP                                   port   createdAt            webshell
+            4031877   99     999    9      NVIDIA-L40  fdbd:secret::1                          9000   2026-07-15T07:44:24  https://secret.invalid/worker
+            """)
+        let pool = SSHMasterPool(testDirectory: directory, runner: poolRunner)
+        let inventory = try MerlinInventory(
+            sshMasterPool: pool,
+            merlinCLIPath: "/Users/test/.merlin-cli/bin/merlin-cli",
+            processRunner: runner
+        )
+
+        let snapshot = try await inventory.refresh(sshAliases: ["hl_gpu_2"])
+        let discoveredMachine = try #require(snapshot.devboxes.first)
+        let loaded = await inventory.loadWorkers(
+            for: discoveredMachine.devbox,
+            sshAlias: discoveredMachine.sshAlias
+        )
+
+        let worker = try #require(loaded.workers.first)
+        #expect(loaded.workerStatus == .loaded)
+        #expect(worker.id == "4031877")
+        #expect(worker.gpuType == "NVIDIA-L40")
+        #expect(worker.cpuCores == 22)
+        #expect(worker.memoryGiB == 115)
+        #expect(worker.gpuCount == 1)
+        #expect(worker.platformStatus == "running")
+        #expect(worker.createdAt == "2026-07-09T04:50:08Z")
+        let safeDescription = String(reflecting: loaded)
+        #expect(!safeDescription.contains("fdbd:secret::1"))
+        #expect(!safeDescription.contains("secret.invalid"))
+    }
+
     @Test("continues platform Worker inventory with cursor pagination")
     func paginatesWorkersByCursor() async throws {
         let runner = ScriptedInventoryProcessRunner(stdout: [
@@ -493,6 +540,7 @@ struct MerlinInventoryTests {
             "sid": "\(sid)",
             "status": "\(status)",
             "gpu_count": \(gpuCount),
+            "gpu_type": null,
             "cpu_cores": \(cpuCores),
             "memory_bytes": \(memoryBytes),
             "created_at": "2026-07-09T04:50:08Z",

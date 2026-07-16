@@ -31,8 +31,7 @@ public final class SSHMasterPool: @unchecked Sendable {
     private let retryInvalidationHook: (@Sendable () async -> Void)?
 
     public convenience init(maxConcurrentPreparations: Int = 4) {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("mlz-ssh-\(getuid())", isDirectory: true)
+        let directory = Self.defaultSocketDirectory()
         self.init(
             directory: directory,
             runner: FoundationInventoryProcessRunner(),
@@ -40,6 +39,13 @@ public final class SSHMasterPool: @unchecked Sendable {
             retryBoundaryHook: nil,
             retryInvalidationHook: nil
         )
+    }
+
+    /// Keeps SSH control sockets below the Unix-domain path limit even on
+    /// systems whose per-user temporary directory has a long sandboxed path.
+    static func defaultSocketDirectory() -> URL {
+        URL(fileURLWithPath: "/tmp", isDirectory: true)
+            .appendingPathComponent("merlinhubx-ssh-\(getuid())", isDirectory: true)
     }
 
     convenience init(

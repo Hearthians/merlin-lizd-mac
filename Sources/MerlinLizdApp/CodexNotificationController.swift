@@ -88,7 +88,7 @@ final class CodexNotificationController {
             delivery?.deliver(
                 identifier: candidate.identifier,
                 title: "Codex needs approval",
-                body: "Open Merlin Lizd to review this request."
+                body: "Open MerlinHubX to review this request."
             )
         }
     }

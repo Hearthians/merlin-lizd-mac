@@ -136,7 +136,7 @@ struct SidebarView: View {
         .scrollContentBackground(.hidden)
         .background(sidebarBackground)
         .tint(.cyan)
-        .navigationTitle("Merlin Lizd")
+        .navigationTitle("MerlinHubX")
         .searchable(text: $searchText, placement: .sidebar, prompt: "搜索机器或 GPU")
         .onKeyPress(.return) {
             openSelectedTerminal() ? .handled : .ignored

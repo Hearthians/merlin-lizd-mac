@@ -277,8 +277,9 @@ final class AppModel: ObservableObject {
         let attemptedAt = Date()
         switch result.workerStatus {
         case .loaded:
+            let knownWorkers = previous?.workers ?? currentMachine.workers
             var knownGPUTypes: [String: String] = [:]
-            for worker in previous?.workers ?? currentMachine.workers {
+            for worker in knownWorkers {
                 if let gpuType = worker.gpuType {
                     knownGPUTypes[worker.id] = gpuType
                 }
@@ -286,10 +287,14 @@ final class AppModel: ObservableObject {
             // The Merlin Worker API intentionally supplies status/resources
             // but not every GPU marketing name. Preserve a previously learned
             // name without making the slow SSH list the primary inventory.
-            effectiveWorkers = result.workers.map { worker in
+            let refreshedWorkers = result.workers.map { worker in
                 guard worker.gpuType == nil else { return worker }
                 return worker.withGPUType(knownGPUTypes[worker.id])
             }
+            effectiveWorkers = WorkerInventoryRecord.preservingReadiness(
+                of: refreshedWorkers,
+                from: knownWorkers
+            )
             fetchedAt = attemptedAt
         case .failed:
             // A transient SSH/mlx failure must never erase the last useful
@@ -426,6 +431,24 @@ final class AppModel: ObservableObject {
             }
         }
 
+        let updatedWorkers = currentMachine.workers.map { worker in
+            worker.id == workerID
+                ? worker.withReadiness(readiness)
+                : worker
+        }
+        if let cached = workerInventoryCache[devboxSID], cached.sshAlias == alias {
+            workerInventoryCache[devboxSID] = CachedWorkerInventory(
+                sshAlias: cached.sshAlias,
+                workers: WorkerInventoryRecord.preservingReadiness(
+                    of: cached.workers,
+                    from: updatedWorkers
+                ),
+                status: cached.status,
+                fetchedAt: cached.fetchedAt,
+                attemptedAt: cached.attemptedAt
+            )
+        }
+
         let devboxes = current.devboxes.map { machine in
             guard
                 machine.devbox.sid == devboxSID,
@@ -436,11 +459,7 @@ final class AppModel: ObservableObject {
             return DevboxInventory(
                 devbox: machine.devbox,
                 sshAlias: machine.sshAlias,
-                workers: machine.workers.map { worker in
-                    worker.id == workerID
-                        ? worker.withReadiness(readiness)
-                        : worker
-                },
+                workers: updatedWorkers,
                 workerStatus: machine.workerStatus
             )
         }

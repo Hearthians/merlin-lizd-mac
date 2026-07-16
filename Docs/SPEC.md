@@ -1,8 +1,8 @@
-# Merlin Lizd for macOS — v1 specification
+# MerlinHubX for macOS — v1 specification
 
 ## Product intent
 
-Merlin Lizd is a personal, native macOS workspace for seeing Lizd's Merlin CPU Devboxes and their Workers, entering any ready target quickly, and keeping remote shells durable through tmux.
+MerlinHubX is a personal, native macOS workspace for seeing Lizd's Merlin CPU Devboxes and their Workers, entering any ready target quickly, and keeping remote shells durable through tmux.
 
 The primary mental model is **machines**. Codex work is scoped to a real tmux
 session inside that workspace; it is not a cross-machine fan-out facility.
@@ -146,5 +146,5 @@ Devbox start/session termination, and the tmux Codex drawer described above.
 Automated acceptance uses fakes plus real local persistence and launches no
 Merlin, SSH, tmux, Codex, OpenAI, or network process. Release verification runs
 `./scripts/test.sh`, `/usr/bin/swift build`, and `./scripts/package-app.sh`; the
-authoritative product is `MerlinLizd` and the signed local bundle is
-`dist/Merlin Lizd.app`.
+authoritative product is `MerlinHubX` and the signed local bundle is
+`dist/MerlinHubX.app`.

@@ -78,8 +78,8 @@ public struct CodexLaunchConfiguration: Sendable {
     public var initializeParams: JSONValue {
         .object([
             "clientInfo": .object([
-                "name": .string("Merlin Lizd"),
-                "title": .string("Merlin Lizd"),
+                "name": .string("MerlinHubX"),
+                "title": .string("MerlinHubX"),
                 "version": .string("1"),
             ]),
             "capabilities": .object(["experimentalApi": .bool(true)]),

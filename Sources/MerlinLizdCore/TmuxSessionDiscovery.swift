@@ -462,8 +462,8 @@ public actor TmuxSessionDiscovery {
         if case .worker = target {
             isWorker = true
             let lines = output.stdout.split(
-                separator: "\n",
-                omittingEmptySubsequences: false
+                omittingEmptySubsequences: false,
+                whereSeparator: { $0.isNewline }
             )
             let markerIndex = lines.firstIndex {
                 $0.trimmingCharacters(in: .whitespacesAndNewlines)

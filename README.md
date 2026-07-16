@@ -1,6 +1,6 @@
-# Merlin Lizd for macOS
+# MerlinHubX for macOS
 
-Merlin Lizd is a personal native macOS dashboard and terminal for Merlin
+MerlinHubX is a personal native macOS dashboard and terminal for Merlin
 development machines and their workers. It uses the existing Merlin CLI login,
 system SSH configuration, and remote `mlx`/`tmux` tools; it does not store SSH
 passwords or Merlin tokens itself.
@@ -63,7 +63,7 @@ From this directory:
 
 ```sh
 ./scripts/test.sh
-/usr/bin/swift run MerlinLizd
+/usr/bin/swift run MerlinHubX
 ```
 
 `test.sh` runs the repository's custom `MerlinLizdCoreTests` executable.
@@ -72,12 +72,12 @@ From this directory:
 
 ```sh
 ./scripts/package-app.sh
-open "dist/Merlin Lizd.app"
+open "dist/MerlinHubX.app"
 ```
 
-The packaging script builds the `MerlinLizd` release product, assembles a
+The packaging script builds the `MerlinHubX` release product, assembles a
 Finder-launchable app bundle, and applies a local ad-hoc signature.
-The result is written to `dist/Merlin Lizd.app`. No Xcode project, Developer ID,
+The result is written to `dist/MerlinHubX.app`. No Xcode project, Developer ID,
 or signing certificate is required for local use.
 
 SwiftTerm 1.14.0 is vendored with a small packaging patch so its Metal shader
@@ -92,14 +92,14 @@ as a separate release step; the local packaging path deliberately does neither.
 Implementation status: shipped in this repository. The native drawer, local
 app-server adapter, terminal permission router, persistent conversations,
 operation journal, notifications, and failure containment are wired into the
-`MerlinLizd` app target and covered by cross-layer acceptance tests.
+`MerlinHubX` executable product and covered by cross-layer acceptance tests.
 
 ### Goal and scope
 
-Merlin Lizd provides a native Codex conversation drawer for every terminal
+MerlinHubX provides a native Codex conversation drawer for every terminal
 tab backed by tmux. Codex runs on the local Mac, reuses the user's existing
 Codex login and model configuration, and operates the same tmux session shown
-by Merlin Lizd. The remote machine does not need Codex, and Merlin Lizd has no
+by MerlinHubX. The remote machine does not need Codex, and MerlinHubX has no
 API-key field or separate model configuration.
 
 The first version supports local, Devbox, and Worker tmux sessions. It supports
@@ -215,7 +215,7 @@ The tmux identity includes the server-provided session ID and creation time;
 the editable session name is routing and display metadata, not identity.
 Renaming a session therefore preserves its conversation. Terminating a session
 and later creating another with the same name produces a new conversation;
-the old thread remains available as history. Merlin Lizd resolves the real tmux
+the old thread remains available as history. MerlinHubX resolves the real tmux
 identity before enabling Codex for a tab. Failure to resolve it disables Codex
 for that tab without affecting the terminal.
 
@@ -266,7 +266,7 @@ sends a macOS notification without switching the selected tab.
 
 ### Codex app-server adapter
 
-Merlin Lizd launches a local `codex app-server` child using the user's existing
+MerlinHubX launches a local `codex app-server` child using the user's existing
 Codex home and authentication. Per-process overrides disable built-in shell,
 file-editing, web, app, and unrelated tools and provide only the namespaced
 `merlin_tmux` Dynamic Tools. The Codex process receives no remote filesystem
@@ -318,13 +318,14 @@ exact proposed input, reason, target surface, and relevant screen context.
 
 ### Operations, storage, and troubleshooting
 
-The supported Codex CLI range is exactly `>= 0.144.2 && < 0.145.0`. Merlin
-Lizd resolves the installed local executable, inherits the user's Codex home,
+The supported Codex CLI range is exactly `>= 0.144.2 && < 0.145.0`. MerlinHubX
+resolves the installed local executable, inherits the user's Codex home,
 login, model, and auth environment, and never asks for an API key. Use the
 normal Codex CLI or ChatGPT login flow if the drawer reports authentication is
-required; do not add credentials to Merlin Lizd.
+required; do not add credentials to MerlinHubX.
 
-Codex state is stored below `~/Library/Application Support/MerlinLizd/`:
+For compatibility with existing installs, Codex state remains below
+`~/Library/Application Support/MerlinLizd/`:
 
 - `CodexConversations/conversations.json` stores the stable tmux-to-thread
   mapping, archive state, and staged deletion recovery.

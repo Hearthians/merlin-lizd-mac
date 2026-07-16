@@ -36,7 +36,7 @@ struct MerlinLizdApplication: App {
     }
 
     var body: some Scene {
-        WindowGroup("Merlin Lizd") {
+        WindowGroup("MerlinHubX") {
             MerlinRootView(
                 model: model,
                 terminals: terminals,

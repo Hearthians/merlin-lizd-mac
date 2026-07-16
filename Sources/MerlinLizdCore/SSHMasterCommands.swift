@@ -8,6 +8,11 @@ enum SSHMasterCommandError: Error, Equatable, Sendable {
 }
 
 struct SSHMasterCommands: Sendable {
+    // macOS reserves 104 bytes for a Unix-domain socket pathname including its
+    // NUL terminator. OpenSSH temporarily adds a randomized listener suffix
+    // while establishing the master, so retain a generous 32-byte headroom.
+    private static let maximumControlPathBytes = 71
+
     private let directory: URL
 
     init(directory: URL) {
@@ -27,7 +32,7 @@ struct SSHMasterCommands: Sendable {
             .appendingPathComponent("m-\(hash)", isDirectory: false)
             .path
 
-        guard path.utf8.count < 104 else {
+        guard path.utf8.count <= Self.maximumControlPathBytes else {
             throw SSHMasterCommandError.socketPathTooLong
         }
         return path
