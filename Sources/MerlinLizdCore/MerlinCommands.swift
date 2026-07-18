@@ -316,17 +316,12 @@ public enum MerlinCommands {
         try validateWorkerID(workerID)
         try validateSessionName(sessionName)
         let directoryArgument = try tmuxWorkingDirectoryArgument(workingDirectory)
-        let workerCommand =
-            #"exec env TERM=xterm TMUX_TMPDIR="$HOME" tmux new-session -A -s "#
-            + sessionName
-            + directoryArgument
 
         return CommandSpec(
             executable: "/usr/bin/ssh",
             arguments: interactiveSSHArguments(
                 alias: alias,
-                remoteCommand:
-                    "exec mlx worker login \(workerID) -- sh -c \(shellQuote(workerCommand))"
+                remoteCommand: "exec mlx worker login \(workerID) -- env -u TMUX TERM=xterm TMUX_TMPDIR=/dev/shm tmux new-session -A -s \(sessionName)\(directoryArgument)"
             )
         )
     }
