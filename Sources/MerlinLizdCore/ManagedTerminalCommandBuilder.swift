@@ -15,21 +15,32 @@ public struct ManagedTerminalCommandBuilder: Sendable {
 
     public func swiftTermCommand(
         target: TerminalTarget,
-        sessionName: String
+        sessionName: String,
+        workingDirectory: String? = nil
     ) throws -> CommandSpec {
-        try managedRemoteCommand(target: target, sessionName: sessionName)
+        try managedRemoteCommand(
+            target: target,
+            sessionName: sessionName,
+            workingDirectory: workingDirectory
+        )
     }
 
     public func externalTerminalCommand(
         target: TerminalTarget,
-        sessionName: String
+        sessionName: String,
+        workingDirectory: String? = nil
     ) throws -> CommandSpec {
-        try managedRemoteCommand(target: target, sessionName: sessionName)
+        try managedRemoteCommand(
+            target: target,
+            sessionName: sessionName,
+            workingDirectory: workingDirectory
+        )
     }
 
     private func managedRemoteCommand(
         target: TerminalTarget,
-        sessionName: String
+        sessionName: String,
+        workingDirectory: String?
     ) throws -> CommandSpec {
         let command: CommandSpec
         let alias: String
@@ -40,14 +51,16 @@ public struct ManagedTerminalCommandBuilder: Sendable {
             alias = targetAlias
             command = try MerlinCommands.devboxTerminal(
                 alias: targetAlias,
-                sessionName: sessionName
+                sessionName: sessionName,
+                workingDirectory: workingDirectory
             )
         case let .worker(_, _, targetAlias, workerID):
             alias = targetAlias
             command = try MerlinCommands.workerTerminal(
                 alias: targetAlias,
                 workerID: workerID,
-                sessionName: sessionName
+                sessionName: sessionName,
+                workingDirectory: workingDirectory
             )
         }
         return try sshMasterPool.managedCommand(command, alias: alias)

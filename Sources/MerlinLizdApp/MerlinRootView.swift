@@ -107,6 +107,25 @@ struct MerlinRootView: View {
                 )
             }
         }
+        .sheet(
+            isPresented: Binding(
+                get: { terminals.pendingTmuxCreation != nil },
+                set: { if !$0 { terminals.cancelPendingTmuxCreation() } }
+            )
+        ) {
+            if let draft = terminals.pendingTmuxCreation {
+                TmuxCreationSheetView(
+                    draft: draft,
+                    onCreate: { sessionName, workingDirectory in
+                        try terminals.createPendingTmux(
+                            sessionName: sessionName,
+                            workingDirectory: workingDirectory
+                        )
+                    },
+                    onCancel: terminals.cancelPendingTmuxCreation
+                )
+            }
+        }
     }
 
     @ViewBuilder

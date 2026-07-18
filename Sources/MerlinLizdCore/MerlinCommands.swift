@@ -14,6 +14,7 @@ public enum CommandValidationError: Error, Equatable, Sendable {
     case invalidAlias
     case invalidWorkerID
     case invalidSessionName
+    case invalidWorkingDirectory
     case invalidExecutablePath
     case invalidSID
     case workerTargetRequired
@@ -29,6 +30,28 @@ public enum MerlinCommands {
         case let .devbox(_, _, alias), let .worker(_, _, alias, _):
             alias
         }
+    }
+
+    public static func localTerminal(
+        tmuxPath: String,
+        sessionName: String,
+        workingDirectory: String? = nil
+    ) throws -> CommandSpec {
+        guard tmuxPath.hasPrefix("/") else {
+            throw CommandValidationError.invalidExecutablePath
+        }
+        try validateSessionName(sessionName)
+        if
+            let workingDirectory,
+            !MerlinIdentifierValidator.isTmuxWorkingDirectory(workingDirectory)
+        {
+            throw CommandValidationError.invalidWorkingDirectory
+        }
+        return CommandSpec(
+            executable: tmuxPath,
+            arguments: ["new-session", "-A", "-s", sessionName]
+                + (workingDirectory.map { ["-c", $0] } ?? [])
+        )
     }
 
     /// Captures one machine-readable, read-only metrics snapshot inside a
@@ -267,16 +290,18 @@ public enum MerlinCommands {
 
     public static func devboxTerminal(
         alias: String,
-        sessionName: String
+        sessionName: String,
+        workingDirectory: String? = nil
     ) throws -> CommandSpec {
         try validateAlias(alias)
         try validateSessionName(sessionName)
+        let directoryArgument = try tmuxWorkingDirectoryArgument(workingDirectory)
 
         return CommandSpec(
             executable: "/usr/bin/ssh",
             arguments: interactiveSSHArguments(
                 alias: alias,
-                remoteCommand: "TERM=xterm exec tmux new-session -A -s \(sessionName)"
+                remoteCommand: "TERM=xterm exec tmux new-session -A -s \(sessionName)\(directoryArgument)"
             )
         )
     }
@@ -284,17 +309,19 @@ public enum MerlinCommands {
     public static func workerTerminal(
         alias: String,
         workerID: String,
-        sessionName: String
+        sessionName: String,
+        workingDirectory: String? = nil
     ) throws -> CommandSpec {
         try validateAlias(alias)
         try validateWorkerID(workerID)
         try validateSessionName(sessionName)
+        let directoryArgument = try tmuxWorkingDirectoryArgument(workingDirectory)
 
         return CommandSpec(
             executable: "/usr/bin/ssh",
             arguments: interactiveSSHArguments(
                 alias: alias,
-                remoteCommand: "exec mlx worker login \(workerID) -- env TERM=xterm tmux new-session -A -s \(sessionName)"
+                remoteCommand: "exec mlx worker login \(workerID) -- env TERM=xterm tmux new-session -A -s \(sessionName)\(directoryArgument)"
             )
         )
     }
@@ -433,6 +460,20 @@ public enum MerlinCommands {
         guard MerlinIdentifierValidator.isTmuxSessionName(value) else {
             throw CommandValidationError.invalidSessionName
         }
+    }
+
+    private static func tmuxWorkingDirectoryArgument(
+        _ workingDirectory: String?
+    ) throws -> String {
+        guard let workingDirectory else { return "" }
+        guard MerlinIdentifierValidator.isTmuxWorkingDirectory(workingDirectory) else {
+            throw CommandValidationError.invalidWorkingDirectory
+        }
+        return " -c \(shellQuote(workingDirectory))"
+    }
+
+    private static func shellQuote(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: #"'\''"#))'"
     }
 
     private struct StartPayload: Encodable {

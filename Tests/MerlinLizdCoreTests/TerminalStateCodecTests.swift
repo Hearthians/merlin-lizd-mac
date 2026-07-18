@@ -96,7 +96,8 @@ struct TerminalStateCodecTests {
                         alias: "hl_gpu_2",
                         workerID: "3959909"
                     ),
-                    sessionName: "merlin-lizd-train"
+                    sessionName: "merlin-lizd-train",
+                    workingDirectory: "/mnt/training"
                 ),
             ]
         )
@@ -107,5 +108,15 @@ struct TerminalStateCodecTests {
         #expect(decoded == state)
         #expect(!encoded.contains("ProxyCommand"))
         #expect(!encoded.contains("ssh_proxy_cmd"))
+    }
+
+    @Test("restores older tabs without a working directory")
+    func decodesLegacyTerminalTab() throws {
+        let encoded =
+            #"{"selectedTabID":"tab-local","tabs":[{"id":"tab-local","sessionName":null,"target":{"local":{}},"title":"Local"}]}"#
+
+        let decoded = try TerminalStateCodec.decode(encoded)
+
+        #expect(decoded.tabs.first?.workingDirectory == nil)
     }
 }

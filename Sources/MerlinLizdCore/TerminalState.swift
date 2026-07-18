@@ -16,17 +16,20 @@ public struct TerminalTabRecord: Codable, Equatable, Hashable, Identifiable, Sen
     public var title: String
     public let target: TerminalTarget
     public var sessionName: String?
+    public let workingDirectory: String?
 
     public init(
         id: String,
         title: String,
         target: TerminalTarget,
-        sessionName: String?
+        sessionName: String?,
+        workingDirectory: String? = nil
     ) {
         self.id = id
         self.title = title
         self.target = target
         self.sessionName = sessionName
+        self.workingDirectory = workingDirectory
     }
 }
 

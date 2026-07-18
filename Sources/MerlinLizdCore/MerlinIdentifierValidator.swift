@@ -20,6 +20,14 @@ public enum MerlinIdentifierValidator {
         matches(value, pattern: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"#)
     }
 
+    public static func isTmuxWorkingDirectory(_ value: String) -> Bool {
+        value.hasPrefix("/")
+            && value.unicodeScalars.count <= 1_024
+            && !value.unicodeScalars.contains(where: {
+                CharacterSet.newlines.contains($0) || $0.value == 0
+            })
+    }
+
     private static func matches(_ value: String, pattern: String) -> Bool {
         guard let range = value.range(of: pattern, options: .regularExpression) else {
             return false

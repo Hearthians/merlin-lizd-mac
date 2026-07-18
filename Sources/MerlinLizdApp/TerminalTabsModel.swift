@@ -5,6 +5,7 @@ import SwiftUI
 @MainActor
 final class TerminalTabsModel: ObservableObject {
     @Published private(set) var tabs: [TerminalTabRecord]
+    @Published private var tmuxCreation = TmuxCreationCoordinator()
     @Published var selectedTabID: String? {
         didSet {
             persist()
@@ -53,6 +54,10 @@ final class TerminalTabsModel: ObservableObject {
         return tabs.first { $0.id == selectedTabID }
     }
 
+    var pendingTmuxCreation: TmuxCreationDraft? {
+        tmuxCreation.pending
+    }
+
     func openLocal() {
         open(
             title: "本机",
@@ -63,7 +68,7 @@ final class TerminalTabsModel: ObservableObject {
 
     func openDevbox(_ machine: DevboxInventory) {
         guard let alias = machine.sshAlias else { return }
-        open(
+        requestTmuxCreation(
             title: alias,
             target: .devbox(
                 sid: machine.devbox.sid,
@@ -76,7 +81,7 @@ final class TerminalTabsModel: ObservableObject {
 
     func openWorker(_ worker: WorkerInventoryRecord, on machine: DevboxInventory) {
         guard let alias = machine.sshAlias else { return }
-        open(
+        requestTmuxCreation(
             title: "\(worker.gpuType ?? "Worker") · \(worker.id)",
             target: .worker(
                 devboxSID: machine.devbox.sid,
@@ -86,6 +91,39 @@ final class TerminalTabsModel: ObservableObject {
             ),
             sessionName: makeSessionName(label: "\(alias)-\(worker.id)")
         )
+    }
+
+    func createPendingTmux(
+        sessionName proposedName: String,
+        workingDirectory proposedDirectory: String
+    ) throws {
+        let result: TmuxCreationResult
+        do {
+            result = try tmuxCreation.create(
+                sessionName: proposedName,
+                workingDirectory: proposedDirectory
+            )
+        } catch let error as TmuxCreationError {
+            switch error {
+            case .unavailable:
+                throw TerminalTabOperationError.sessionUnavailable
+            case .invalidSessionName:
+                throw TerminalTabOperationError.invalidSessionName
+            case .invalidWorkingDirectory:
+                throw TerminalTabOperationError.invalidWorkingDirectory
+            }
+        }
+
+        open(
+            title: result.draft.title,
+            target: result.draft.target,
+            sessionName: result.configuration.sessionName,
+            workingDirectory: result.configuration.workingDirectory
+        )
+    }
+
+    func cancelPendingTmuxCreation() {
+        tmuxCreation.cancel()
     }
 
     func attachExistingSession(_ sessionName: String, target: TerminalTarget) {
@@ -339,13 +377,31 @@ final class TerminalTabsModel: ObservableObject {
         )
     }
 
-    private func open(title: String, target: TerminalTarget, sessionName: String?) {
+    private func requestTmuxCreation(
+        title: String,
+        target: TerminalTarget,
+        sessionName: String
+    ) {
+        tmuxCreation.request(TmuxCreationDraft(
+            title: title,
+            target: target,
+            suggestedSessionName: sessionName
+        ))
+    }
+
+    private func open(
+        title: String,
+        target: TerminalTarget,
+        sessionName: String?,
+        workingDirectory: String? = nil
+    ) {
         let id = UUID().uuidString
         let record = TerminalTabRecord(
             id: id,
             title: title,
             target: target,
-            sessionName: sessionName
+            sessionName: sessionName,
+            workingDirectory: workingDirectory
         )
         tabs.append(record)
         selectedTabID = id
@@ -368,40 +424,31 @@ final class TerminalTabsModel: ObservableObject {
                 guard let tmux = resolvedLocalTmuxPath() else {
                     throw CommandValidationError.invalidExecutablePath
                 }
-                return CommandSpec(
-                    executable: tmux,
-                    arguments: ["new-session", "-A", "-s", sessionName]
+                return try MerlinCommands.localTerminal(
+                    tmuxPath: tmux,
+                    sessionName: sessionName,
+                    workingDirectory: tab.workingDirectory
                 )
             }
             let configuredShell = ProcessInfo.processInfo.environment["SHELL"]
             let shell = configuredShell.flatMap { $0.hasPrefix("/") ? $0 : nil } ?? "/bin/zsh"
             return CommandSpec(executable: shell, arguments: ["-l"])
-        case .devbox:
+        case .devbox, .worker:
             guard let sessionName = tab.sessionName else {
                 throw CommandValidationError.invalidSessionName
             }
             switch destination {
             case .swiftTerm:
                 return try managedTerminalCommands.swiftTermCommand(
-                    target: tab.target, sessionName: sessionName
+                    target: tab.target,
+                    sessionName: sessionName,
+                    workingDirectory: tab.workingDirectory
                 )
             case .externalTerminal:
                 return try managedTerminalCommands.externalTerminalCommand(
-                    target: tab.target, sessionName: sessionName
-                )
-            }
-        case .worker:
-            guard let sessionName = tab.sessionName else {
-                throw CommandValidationError.invalidSessionName
-            }
-            switch destination {
-            case .swiftTerm:
-                return try managedTerminalCommands.swiftTermCommand(
-                    target: tab.target, sessionName: sessionName
-                )
-            case .externalTerminal:
-                return try managedTerminalCommands.externalTerminalCommand(
-                    target: tab.target, sessionName: sessionName
+                    target: tab.target,
+                    sessionName: sessionName,
+                    workingDirectory: tab.workingDirectory
                 )
             }
         }
@@ -486,6 +533,7 @@ struct TmuxBatchTerminationResult: Sendable {
 
 enum TerminalTabOperationError: LocalizedError {
     case invalidSessionName
+    case invalidWorkingDirectory
     case sessionUnavailable
     case localTmuxNotFound
     case workerNotReady
@@ -495,6 +543,8 @@ enum TerminalTabOperationError: LocalizedError {
         switch self {
         case .invalidSessionName:
             "tmux 会话名只能包含字母、数字、点、短横线和下划线，且最长 64 个字符。"
+        case .invalidWorkingDirectory:
+            "工作目录必须是绝对路径，不能包含换行或空字符，且最长 1024 个字符。"
         case .sessionUnavailable:
             "这个标签没有可操作的 tmux 会话。"
         case .localTmuxNotFound:

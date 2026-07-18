@@ -117,6 +117,51 @@ struct CommandBuilderTests {
         ])
     }
 
+    @Test("a Worker terminal starts tmux in the requested working directory")
+    func buildsWorkerTerminalCommandWithWorkingDirectory() throws {
+        let command = try MerlinCommands.workerTerminal(
+            alias: "hl_gpu_2",
+            workerID: "3960209",
+            sessionName: "merlin-lizd-train",
+            workingDirectory: "/mnt/training runs/it's-ready"
+        )
+
+        #expect(command.arguments.last ==
+            #"exec mlx worker login 3960209 -- env TERM=xterm tmux new-session -A -s merlin-lizd-train -c '/mnt/training runs/it'\''s-ready'"#
+        )
+    }
+
+    @Test("a tmux working directory preserves significant outer whitespace")
+    func preservesWorkingDirectoryWhitespace() throws {
+        let command = try MerlinCommands.devboxTerminal(
+            alias: "hl_gpu_2",
+            sessionName: "merlin-lizd-train",
+            workingDirectory: "/mnt/training "
+        )
+
+        #expect(command.arguments.last ==
+            "TERM=xterm exec tmux new-session -A -s merlin-lizd-train -c '/mnt/training '"
+        )
+    }
+
+    @Test("rejects relative paths and control characters in a tmux working directory")
+    func rejectsUnsafeWorkingDirectory() {
+        #expect(throws: CommandValidationError.invalidWorkingDirectory) {
+            try MerlinCommands.devboxTerminal(
+                alias: "hl_gpu_2",
+                sessionName: "merlin-lizd-train",
+                workingDirectory: "source"
+            )
+        }
+        #expect(throws: CommandValidationError.invalidWorkingDirectory) {
+            try MerlinCommands.devboxTerminal(
+                alias: "hl_gpu_2",
+                sessionName: "merlin-lizd-train",
+                workingDirectory: "/mnt/training\nwhoami"
+            )
+        }
+    }
+
     @Test("a Devbox terminal forces compatible terminfo before attaching tmux")
     func forcesCompatibleTerminfoForDevboxTerminal() throws {
         let command = try MerlinCommands.devboxTerminal(
