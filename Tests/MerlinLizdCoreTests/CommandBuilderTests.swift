@@ -113,8 +113,21 @@ struct CommandBuilderTests {
             "-o", "ServerAliveInterval=10",
             "-o", "ServerAliveCountMax=3",
             "hl_gpu_2",
-            "exec mlx worker login 3960209 -- env TERM=xterm tmux new-session -A -s merlin-lizd-train"
+            #"exec mlx worker login 3960209 -- sh -c 'exec env TERM=xterm TMUX_TMPDIR="$HOME" tmux new-session -A -s merlin-lizd-train'"#
         ])
+    }
+
+    @Test("a Worker terminal avoids relying on a container tmp directory")
+    func buildsWorkerTerminalWithUserScopedTmuxSocket() throws {
+        let command = try MerlinCommands.workerTerminal(
+            alias: "hl_gpu_2",
+            workerID: "3960209",
+            sessionName: "merlin-lizd-train"
+        )
+
+        #expect(command.arguments.last?.contains(
+            #"sh -c 'exec env TERM=xterm TMUX_TMPDIR="$HOME" tmux"#
+        ) == true)
     }
 
     @Test("a Worker terminal starts tmux in the requested working directory")
@@ -127,7 +140,7 @@ struct CommandBuilderTests {
         )
 
         #expect(command.arguments.last ==
-            #"exec mlx worker login 3960209 -- env TERM=xterm tmux new-session -A -s merlin-lizd-train -c '/mnt/training runs/it'\''s-ready'"#
+            #"exec mlx worker login 3960209 -- sh -c 'exec env TERM=xterm TMUX_TMPDIR="$HOME" tmux new-session -A -s merlin-lizd-train -c '\''/mnt/training runs/it'\''\'\'''\''s-ready'\'''"#
         )
     }
 
@@ -183,7 +196,7 @@ struct CommandBuilderTests {
         )
 
         #expect(command.arguments.last ==
-            "exec mlx worker login 3960209 -- env TERM=xterm tmux new-session -A -s merlin-lizd-train"
+            #"exec mlx worker login 3960209 -- sh -c 'exec env TERM=xterm TMUX_TMPDIR="$HOME" tmux new-session -A -s merlin-lizd-train'"#
         )
     }
 
