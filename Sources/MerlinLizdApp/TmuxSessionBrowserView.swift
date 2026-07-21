@@ -145,6 +145,8 @@ struct TmuxSessionBrowserView: View {
                     Text(targetLabel)
                         .font(.caption.monospaced())
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .help(targetLabel)
                     verificationStatus
                 }
                 Spacer()
@@ -217,6 +219,8 @@ struct TmuxSessionBrowserView: View {
                                 .foregroundStyle(.tint)
                             Text(session.name)
                                 .font(.body.monospaced())
+                                .lineLimit(1)
+                                .help("tmux: \(session.name)")
                             Spacer()
                             Button("接入") {
                                 terminals.attachExistingSession(

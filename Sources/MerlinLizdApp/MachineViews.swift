@@ -334,7 +334,7 @@ struct WorkerDetailView: View {
             VStack(alignment: .leading, spacing: 18) {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(workerDisplayName(worker))
+                        Text(worker.displayName)
                             .font(.largeTitle.bold())
                         Text("\(machine.sshAlias ?? machine.devbox.name) · \(worker.id)")
                             .font(.callout.monospaced())
@@ -460,12 +460,13 @@ struct WorkerRow: View {
                 .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(workerDisplayName(worker))
+                Text(worker.displayName)
                     .font(.headline)
-                Text([parentLabel, worker.id].compactMap { $0 }.joined(separator: " · "))
+                Text(workerIdentityText)
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
             }
+            .help(workerHelpText)
 
             Spacer()
 
@@ -487,6 +488,16 @@ struct WorkerRow: View {
             RoundedRectangle(cornerRadius: 10)
                 .stroke(.separator.opacity(0.6), lineWidth: 0.5)
         }
+    }
+
+    private var workerIdentityText: String {
+        [parentLabel, worker.id]
+            .compactMap { $0 }
+            .joined(separator: " · ")
+    }
+
+    private var workerHelpText: String {
+        "\(worker.displayName)\n\(workerIdentityText)"
     }
 }
 
@@ -548,10 +559,6 @@ struct WorkerPlatformStatusPill: View {
             }
         }
     }
-}
-
-private func workerDisplayName(_ worker: WorkerInventoryRecord) -> String {
-    worker.gpuType ?? (worker.gpuCount > 0 ? "GPU Worker" : "CPU Worker")
 }
 
 private func formatGiB(_ bytes: Int64) -> String {

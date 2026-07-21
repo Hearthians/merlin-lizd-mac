@@ -339,6 +339,17 @@ private struct SidebarDevboxLabel: View {
         .padding(.vertical, 5)
         .background(selectionBackground)
         .contentShape(RoundedRectangle(cornerRadius: 9))
+        .help(helpText)
+    }
+
+    private var helpText: String {
+        var lines = [title]
+        if machine.devbox.name != title {
+            lines.append(machine.devbox.name)
+        }
+        lines.append("SID：\(machine.devbox.sid)")
+        lines.append("状态：\(lifecycleLabel)")
+        return lines.joined(separator: "\n")
     }
 
     private var workerCount: String {
@@ -377,13 +388,14 @@ private struct SidebarWorkerLabel: View {
                 .frame(width: 25, height: 25)
                 .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
             VStack(alignment: .leading, spacing: 2) {
-                Text(worker.gpuType ?? (worker.gpuCount > 0 ? "GPU Worker" : "CPU Worker"))
+                Text(worker.displayName)
                     .font(.callout.weight(selected ? .semibold : .regular))
                     .lineLimit(1)
                 Text(worker.id)
                     .font(.caption2.monospaced())
                     .foregroundStyle(.secondary)
             }
+            .help("\(worker.displayName)\nWorker \(worker.id)")
             Spacer(minLength: 3)
             Circle()
                 .fill(readinessColor)

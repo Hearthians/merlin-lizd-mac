@@ -441,6 +441,7 @@ private struct MonitoringKPICard: View {
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+                .help(detail)
         }
     }
 }

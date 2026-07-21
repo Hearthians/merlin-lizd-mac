@@ -198,6 +198,7 @@ struct TerminalTabBar: View {
                 .padding(.vertical, 5)
             }
             .buttonStyle(.plain)
+            .help(tabHelp(for: tab))
 
             if terminatingSessionID == tab.id {
                 ProgressView()
@@ -216,6 +217,7 @@ struct TerminalTabBar: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
                 .padding(.trailing, 4)
+                .help(closeHelp(for: tab))
             }
         }
         .background(
@@ -256,9 +258,24 @@ struct TerminalTabBar: View {
                 requestClose(tab)
             }
         }
-        .help(tab.sessionName.map {
-            "\(tab.title)\ntmux: \($0)（按住 ⌥ 点击关闭可终止会话）"
-        } ?? "本机终端")
+    }
+
+    private func tabHelp(for tab: TerminalTabRecord) -> String {
+        guard let sessionName = tab.sessionName else { return tab.title }
+        var lines = ["tmux: \(sessionName)"]
+        if let contextTitle = tab.sessionContextTitle {
+            lines.append("标签：\(contextTitle)")
+        }
+        if let workingDirectory = tab.workingDirectory, !workingDirectory.isEmpty {
+            lines.append("创建目录：\(workingDirectory)")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func closeHelp(for tab: TerminalTabRecord) -> String {
+        tab.sessionName == nil
+            ? "关闭标签"
+            : "关闭标签；按住 ⌥ 点击可终止 tmux 会话"
     }
 
     private var addTerminalMenu: some View {
