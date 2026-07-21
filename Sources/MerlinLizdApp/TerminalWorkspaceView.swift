@@ -175,9 +175,22 @@ struct TerminalTabBar: View {
             } label: {
                 HStack(spacing: 6) {
                     Image(systemName: tabSymbol(tab.target))
-                    Text(tab.title)
-                        .lineLimit(1)
-                        .frame(maxWidth: 180)
+                    HStack(spacing: 4) {
+                        if let sessionName = tab.sessionName {
+                            Text(sessionName)
+                                .layoutPriority(1)
+                            if let secondaryTitle = tab.sessionContextTitle {
+                                Text("·")
+                                    .foregroundStyle(.tertiary)
+                                Text(secondaryTitle)
+                                    .foregroundStyle(.tertiary)
+                            }
+                        } else {
+                            Text(tab.title)
+                        }
+                    }
+                    .lineLimit(1)
+                    .frame(maxWidth: 320, alignment: .leading)
                 }
                 .font(.caption)
                 .foregroundStyle(selected ? .primary : .secondary)
@@ -243,7 +256,9 @@ struct TerminalTabBar: View {
                 requestClose(tab)
             }
         }
-        .help(tab.sessionName.map { "tmux: \($0)（按住 ⌥ 点击关闭可终止会话）" } ?? "本机终端")
+        .help(tab.sessionName.map {
+            "\(tab.title)\ntmux: \($0)（按住 ⌥ 点击关闭可终止会话）"
+        } ?? "本机终端")
     }
 
     private var addTerminalMenu: some View {

@@ -9,6 +9,17 @@ public enum TerminalTarget: Codable, Equatable, Hashable, Sendable {
         alias: String,
         workerID: String
     )
+
+    public var sessionAttachmentTitle: String {
+        switch self {
+        case .local:
+            "本机"
+        case let .devbox(_, _, alias):
+            alias
+        case let .worker(_, _, _, workerID):
+            "Worker \(workerID)"
+        }
+    }
 }
 
 public struct TerminalTabRecord: Codable, Equatable, Hashable, Identifiable, Sendable {
@@ -30,6 +41,28 @@ public struct TerminalTabRecord: Codable, Equatable, Hashable, Identifiable, Sen
         self.target = target
         self.sessionName = sessionName
         self.workingDirectory = workingDirectory
+    }
+
+    public var sessionContextTitle: String? {
+        guard let sessionName else { return title.isEmpty ? nil : title }
+        let contextTitle = titleExcludingSessionName(sessionName)
+        return contextTitle.isEmpty ? nil : contextTitle
+    }
+
+    @discardableResult
+    public mutating func recordSessionRename(
+        from currentName: String,
+        to newName: String
+    ) -> Bool {
+        guard sessionName == currentName else { return false }
+        title = titleExcludingSessionName(currentName)
+        sessionName = newName
+        return true
+    }
+
+    private func titleExcludingSessionName(_ sessionName: String) -> String {
+        let legacyTitle = "\(target.sessionAttachmentTitle) · \(sessionName)"
+        return title == legacyTitle ? target.sessionAttachmentTitle : title
     }
 }
 

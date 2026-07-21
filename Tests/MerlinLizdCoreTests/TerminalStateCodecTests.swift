@@ -76,6 +76,117 @@ struct TerminalStateCodecTests {
         #expect(!encoded.contains("mlz-old"))
     }
 
+    @Test("removes a legacy embedded session name from the context title")
+    func normalizesLegacySessionTitle() {
+        let tab = TerminalTabRecord(
+            id: "tab-worker",
+            title: "Worker 3959909 · training-main",
+            target: .worker(
+                devboxSID: "dbx_135679",
+                devboxName: "wt_hl",
+                alias: "hl_gpu_2",
+                workerID: "3959909"
+            ),
+            sessionName: "training-main"
+        )
+
+        #expect(tab.sessionContextTitle == "Worker 3959909")
+    }
+
+    @Test("keeps context titles that only resemble the session name")
+    func keepsDistinctContextTitle() {
+        let tab = TerminalTabRecord(
+            id: "tab-worker",
+            title: "Training training-main-old",
+            target: .local,
+            sessionName: "training-main"
+        )
+
+        #expect(tab.sessionContextTitle == "Training training-main-old")
+    }
+
+    @Test("omits an empty context title without hiding a user title")
+    func handlesEmptyAndSessionOnlyContextTitles() {
+        let empty = TerminalTabRecord(
+            id: "empty",
+            title: "",
+            target: .local,
+            sessionName: "training-main"
+        )
+        let sessionOnly = TerminalTabRecord(
+            id: "session-only",
+            title: "training-main",
+            target: .local,
+            sessionName: "training-main"
+        )
+
+        #expect(empty.sessionContextTitle == nil)
+        #expect(sessionOnly.sessionContextTitle == "training-main")
+    }
+
+    @Test("renaming a session canonicalizes its legacy title")
+    func renamesSessionAndNormalizesTitle() {
+        var tab = TerminalTabRecord(
+            id: "tab-worker",
+            title: "Worker 3959909 · mlz-old",
+            target: .worker(
+                devboxSID: "dbx_135679",
+                devboxName: "wt_hl",
+                alias: "hl_gpu_2",
+                workerID: "3959909"
+            ),
+            sessionName: "mlz-old"
+        )
+
+        let renamed = tab.recordSessionRename(
+            from: "mlz-old",
+            to: "training-main"
+        )
+
+        #expect(renamed)
+        #expect(tab.title == "Worker 3959909")
+        #expect(tab.sessionName == "training-main")
+    }
+
+    @Test("renaming a session preserves a user-authored suffix")
+    func preservesCustomTitleDuringSessionRename() {
+        var tab = TerminalTabRecord(
+            id: "tab-worker",
+            title: "Production · mlz-old",
+            target: .worker(
+                devboxSID: "dbx_135679",
+                devboxName: "wt_hl",
+                alias: "hl_gpu_2",
+                workerID: "3959909"
+            ),
+            sessionName: "mlz-old"
+        )
+
+        tab.recordSessionRename(from: "mlz-old", to: "training-main")
+
+        #expect(tab.title == "Production · mlz-old")
+        #expect(tab.sessionContextTitle == "Production · mlz-old")
+    }
+
+    @Test("a stale session rename leaves the tab unchanged")
+    func rejectsStaleSessionRename() {
+        var tab = TerminalTabRecord(
+            id: "tab-worker",
+            title: "Worker 3959909",
+            target: .local,
+            sessionName: "current-session"
+        )
+
+        let renamed = tab.recordSessionRename(
+            from: "stale-session",
+            to: "new-session"
+        )
+
+        #expect(!renamed)
+        #expect(tab.title == "Worker 3959909")
+        #expect(tab.sessionName == "current-session")
+    }
+
     @Test("restores target and tmux metadata without persisting connection secrets")
     func roundTripsTerminalTabs() throws {
         let state = TerminalState(

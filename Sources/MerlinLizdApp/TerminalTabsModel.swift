@@ -128,17 +128,8 @@ final class TerminalTabsModel: ObservableObject {
 
     func attachExistingSession(_ sessionName: String, target: TerminalTarget) {
         guard TmuxSessionParser.isAttachable(sessionName) else { return }
-        let targetLabel: String
-        switch target {
-        case .local:
-            targetLabel = "本机"
-        case let .devbox(_, _, alias):
-            targetLabel = alias
-        case let .worker(_, _, _, workerID):
-            targetLabel = "Worker \(workerID)"
-        }
         open(
-            title: "\(targetLabel) · \(sessionName)",
+            title: target.sessionAttachmentTitle,
             target: target,
             sessionName: sessionName
         )
@@ -287,13 +278,13 @@ final class TerminalTabsModel: ObservableObject {
 
         // The remote operation is authoritative. Persist its new identity only
         // if this tab still describes the session that was renamed.
-        guard
-            let currentIndex = tabs.firstIndex(where: { $0.id == id }),
-            tabs[currentIndex].sessionName == currentName
-        else {
+        guard let currentIndex = tabs.firstIndex(where: { $0.id == id }) else {
             return
         }
-        tabs[currentIndex].sessionName = newName
+        guard tabs[currentIndex].recordSessionRename(
+            from: currentName,
+            to: newName
+        ) else { return }
         persist()
     }
 
