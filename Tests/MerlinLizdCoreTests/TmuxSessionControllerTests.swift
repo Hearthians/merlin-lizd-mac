@@ -21,7 +21,7 @@ struct TmuxSessionControllerTests {
         )
 
         #expect(await runner.lastCommand()?.arguments.last ==
-            "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- tmux rename-session -t mlz-old training-main")
+            "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux rename-session -t mlz-old training-main")
     }
 
     @Test("routes a mutation through the shared path without replay")
@@ -125,7 +125,7 @@ struct TmuxSessionControllerTests {
         )
 
         #expect(await runner.lastCommand()?.arguments.last ==
-            "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- tmux kill-session -t mlz-finished-run")
+            "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux kill-session -t mlz-finished-run")
     }
 }
 

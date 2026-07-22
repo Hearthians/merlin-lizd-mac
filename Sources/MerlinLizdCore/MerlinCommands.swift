@@ -135,7 +135,10 @@ public enum MerlinCommands {
                 executable: "/usr/bin/ssh",
                 arguments: nonInteractiveSSHArguments(
                     alias: alias,
-                    remoteCommand: "NO_COLOR=1 TERM=dumb mlx worker login \(workerID) -- tmux kill-session -t \(sessionName)"
+                    remoteCommand: workerTmuxRemoteCommand(
+                        workerID: workerID,
+                        tmuxCommand: "kill-session -t \(sessionName)"
+                    )
                 )
             )
         }
@@ -178,7 +181,10 @@ public enum MerlinCommands {
                 executable: "/usr/bin/ssh",
                 arguments: nonInteractiveSSHArguments(
                     alias: alias,
-                    remoteCommand: "NO_COLOR=1 TERM=dumb mlx worker login \(workerID) -- tmux rename-session -t \(currentName) \(newName)"
+                    remoteCommand: workerTmuxRemoteCommand(
+                        workerID: workerID,
+                        tmuxCommand: "rename-session -t \(currentName) \(newName)"
+                    )
                 )
             )
         }
@@ -214,7 +220,10 @@ public enum MerlinCommands {
                     // mlx reconstructs its remote command without preserving
                     // quoting. Keeping the format attached to -F prevents the
                     // leading # from becoming a shell comment.
-                    remoteCommand: "NO_COLOR=1 TERM=dumb mlx worker login \(workerID) -- tmux list-sessions -F#{session_name}"
+                    remoteCommand: workerTmuxRemoteCommand(
+                        workerID: workerID,
+                        tmuxCommand: "list-sessions -F#{session_name}"
+                    )
                 )
             )
         }
@@ -316,14 +325,38 @@ public enum MerlinCommands {
         try validateWorkerID(workerID)
         try validateSessionName(sessionName)
         let directoryArgument = try tmuxWorkingDirectoryArgument(workingDirectory)
+        let tmuxInvocation = workerTmuxInvocation(
+            term: "xterm",
+            tmuxCommand: "new-session -A -s \(sessionName)\(directoryArgument)"
+        )
 
         return CommandSpec(
             executable: "/usr/bin/ssh",
             arguments: interactiveSSHArguments(
                 alias: alias,
-                remoteCommand: "exec mlx worker login \(workerID) -- env -u TMUX TERM=xterm TMUX_TMPDIR=/dev/shm tmux new-session -A -s \(sessionName)\(directoryArgument)"
+                remoteCommand: "exec mlx worker login \(workerID) -- \(tmuxInvocation)"
             )
         )
+    }
+
+    /// Every Worker tmux operation must address the same server. `mlx` can
+    /// inherit the Devbox's TMUX value, which points at an unrelated socket.
+    private static func workerTmuxInvocation(
+        term: String,
+        tmuxCommand: String
+    ) -> String {
+        "env -u TMUX TERM=\(term) TMUX_TMPDIR=/dev/shm tmux \(tmuxCommand)"
+    }
+
+    private static func workerTmuxRemoteCommand(
+        workerID: String,
+        tmuxCommand: String
+    ) -> String {
+        let tmuxInvocation = workerTmuxInvocation(
+            term: "dumb",
+            tmuxCommand: tmuxCommand
+        )
+        return "NO_COLOR=1 TERM=dumb mlx worker login \(workerID) -- \(tmuxInvocation)"
     }
 
     private static func interactiveSSHArguments(

@@ -284,7 +284,7 @@ struct CommandBuilderTests {
         }
     }
 
-    @Test("lists tmux sessions inside a Worker without allocating an interactive terminal")
+    @Test("lists Worker tmux sessions through the same safe socket directory used at creation")
     func buildsWorkerTmuxListCommand() throws {
         let command = try MerlinCommands.listTmuxSessions(
             target: .worker(
@@ -301,7 +301,7 @@ struct CommandBuilderTests {
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=10",
             "hl_gpu_2",
-            "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- tmux list-sessions -F#{session_name}"
+            "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux list-sessions -F#{session_name}"
         ])
     }
 
@@ -319,7 +319,7 @@ struct CommandBuilderTests {
         )
 
         #expect(command.arguments.last ==
-            "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- tmux rename-session -t mlz-old training-main")
+            "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux rename-session -t mlz-old training-main")
     }
 
     @Test("terminates one Worker tmux session through its parent Devbox")
@@ -335,7 +335,7 @@ struct CommandBuilderTests {
         )
 
         #expect(command.arguments.last ==
-            "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- tmux kill-session -t mlz-finished-run")
+            "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux kill-session -t mlz-finished-run")
     }
 
     @Test("rejects shell syntax in a tmux termination target")

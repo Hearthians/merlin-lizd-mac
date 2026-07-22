@@ -438,7 +438,7 @@ struct TmuxSessionDiscoveryTests {
         #expect(command?.executable == "/usr/bin/ssh")
     }
 
-    @Test("Worker discovery uses direct tmux listing without a shell-hop marker")
+    @Test("Worker discovery clears inherited tmux state and uses the safe socket directory")
     func workerDiscoveryUsesDirectTmuxListing() async throws {
         let runner = TmuxScriptedRunner(output: InventoryProcessOutput(
             stdout: "connecting to Worker\none\ntwo\n",
@@ -458,7 +458,25 @@ struct TmuxSessionDiscoveryTests {
         #expect(sessions.map(\.name) == ["one", "two"])
         let remote = await runner.recordedCommand()?.arguments.last
         #expect(remote ==
-            "NO_COLOR=1 TERM=dumb mlx worker login 3966762 -- tmux list-sessions -F#{session_name}")
+            "NO_COLOR=1 TERM=dumb mlx worker login 3966762 -- env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux list-sessions -F#{session_name}")
+    }
+
+    @Test("Worker discovery finds sessions in the socket directory used by terminals")
+    func workerDiscoveryUsesTerminalSocketDirectory() async {
+        let discovery = TmuxSessionDiscovery(
+            processRunner: WorkerSocketAwareDiscoveryRunner()
+        )
+        let target = TerminalTarget.worker(
+            devboxSID: "dbx_135679",
+            devboxName: "wt_hl",
+            alias: "hl_gpu_2",
+            workerID: "4065910"
+        )
+
+        let snapshot = await discovery.refresh(target: target)
+
+        #expect(snapshot.sessions.map(\.name) == ["dora_metric_ana", "metric"])
+        #expect(snapshot.lastError == nil)
     }
 
     @Test("successful Worker login discovers sessions without a synthetic readiness marker")
@@ -949,5 +967,28 @@ private actor TmuxScriptedRunner: InventoryProcessRunning {
 
     func recordedCommand() -> CommandSpec? {
         command
+    }
+}
+
+private actor WorkerSocketAwareDiscoveryRunner: InventoryProcessRunning {
+    func run(_ command: CommandSpec) async throws -> InventoryProcessOutput {
+        let remoteCommand = command.arguments.last ?? ""
+        let usesTerminalSocket = [
+            "env -u TMUX",
+            "TMUX_TMPDIR=/dev/shm",
+            "tmux list-sessions",
+        ].allSatisfy(remoteCommand.contains)
+        guard usesTerminalSocket else {
+            return InventoryProcessOutput(
+                stdout: "",
+                stderr: "no server running on /tmp/tmux-1000/default",
+                exitCode: 1
+            )
+        }
+        return InventoryProcessOutput(
+            stdout: "dora_metric_ana\nmetric\n",
+            stderr: "",
+            exitCode: 0
+        )
     }
 }
