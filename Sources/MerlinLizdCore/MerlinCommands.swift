@@ -17,6 +17,7 @@ public enum CommandValidationError: Error, Equatable, Sendable {
     case invalidWorkingDirectory
     case invalidExecutablePath
     case invalidSID
+    case remoteTargetRequired
     case workerTargetRequired
     case invalidMetricsInterval
     case invalidWorkerPageSize
@@ -30,6 +31,50 @@ public enum MerlinCommands {
         case let .devbox(_, _, alias), let .worker(_, _, alias, _):
             alias
         }
+    }
+
+    /// Renders a standalone command for recovering access outside MerlinHub.
+    /// It intentionally omits App-owned SSH control sockets.
+    public static func manualSSHCommand(
+        for target: TerminalTarget
+    ) throws -> String {
+        let command: CommandSpec
+        switch target {
+        case .local:
+            throw CommandValidationError.remoteTargetRequired
+        case let .devbox(sid, _, alias):
+            try validateDevboxRoute(alias: alias, devboxSID: sid)
+            command = standaloneInteractiveSSHCommand(alias: alias)
+        case let .worker(devboxSID, _, alias, workerID):
+            let connectsDirectly = try validatesDirectWorkerRoute(
+                alias: alias,
+                devboxSID: devboxSID,
+                workerID: workerID
+            )
+            command = standaloneInteractiveSSHCommand(
+                alias: alias,
+                remoteCommand: connectsDirectly
+                    ? nil
+                    : "exec env NO_COLOR=1 TERM=dumb "
+                        + "mlx worker login \(workerID)"
+            )
+        }
+        return try ShellCommandRenderer.render(command)
+    }
+
+    private static func standaloneInteractiveSSHCommand(
+        alias: String,
+        remoteCommand: String? = nil
+    ) -> CommandSpec {
+        CommandSpec(
+            executable: "/usr/bin/ssh",
+            arguments: [
+                "-tt",
+                "-o", "ServerAliveInterval=10",
+                "-o", "ServerAliveCountMax=3",
+            ] + sshPortArguments(forConnectionTarget: alias) + [alias]
+                + (remoteCommand.map { [$0] } ?? [])
+        )
     }
 
     public static func localTerminal(

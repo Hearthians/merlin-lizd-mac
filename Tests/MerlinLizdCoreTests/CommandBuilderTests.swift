@@ -156,6 +156,56 @@ struct CommandBuilderTests {
             #"'/usr/bin/printf' '%s' 'it'\''s $(not-a-command); $HOME'"#)
     }
 
+    @Test("renders a standalone SSH command for a platform Devbox route")
+    func rendersManualDevboxSSHCommand() throws {
+        let rendered = try MerlinCommands.manualSSHCommand(for: .devbox(
+            sid: "dbx_135679",
+            name: "wt_hl",
+            alias: "135679.lizhuodong.ws@merlin-ssh-proxy-cn.byted.org"
+        ))
+
+        #expect(rendered ==
+            "'/usr/bin/ssh' '-tt' '-o' 'ServerAliveInterval=10' "
+                + "'-o' 'ServerAliveCountMax=3' '-p' '22222' "
+                + "'135679.lizhuodong.ws@merlin-ssh-proxy-cn.byted.org'")
+        #expect(!rendered.contains("ControlPath"))
+    }
+
+    @Test("renders a direct Worker SSH command without a Devbox relay")
+    func rendersManualDirectWorkerSSHCommand() throws {
+        let destination =
+            "4099222.lizhuodong.worker@merlin-ssh-proxy-cn.byted.org"
+        let rendered = try MerlinCommands.manualSSHCommand(for: .worker(
+            devboxSID: "dbx_135679",
+            devboxName: "wt_hl",
+            alias: destination,
+            workerID: "4099222"
+        ))
+
+        #expect(rendered ==
+            "'/usr/bin/ssh' '-tt' '-o' 'ServerAliveInterval=10' "
+                + "'-o' 'ServerAliveCountMax=3' '-p' '22222' "
+                + "'\(destination)'")
+        #expect(!rendered.contains("mlx worker login"))
+        #expect(!rendered.contains("ControlPath"))
+    }
+
+    @Test("renders a relay Worker SSH command that enters through the Devbox")
+    func rendersManualRelayWorkerSSHCommand() throws {
+        let rendered = try MerlinCommands.manualSSHCommand(for: .worker(
+            devboxSID: "dbx_135679",
+            devboxName: "wt_hl",
+            alias: "hl_gpu_2",
+            workerID: "3960209"
+        ))
+
+        #expect(rendered ==
+            "'/usr/bin/ssh' '-tt' '-o' 'ServerAliveInterval=10' "
+                + "'-o' 'ServerAliveCountMax=3' 'hl_gpu_2' "
+                + "'exec env NO_COLOR=1 TERM=dumb mlx worker login 3960209'")
+        #expect(!rendered.contains("ControlPath"))
+    }
+
     @Test("passes the rendered command to osascript as argv")
     func buildsExternalTerminalLaunchCommand() throws {
         let launch = try ExternalTerminalLauncher.command(

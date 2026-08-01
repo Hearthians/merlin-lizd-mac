@@ -106,6 +106,12 @@ struct SidebarView: View {
                             }
                             .disabled(machine.sshConnectionTarget == nil)
                         }
+                        if let target = devboxTarget(machine) {
+                            Divider()
+                            Button("复制 SSH 命令", systemImage: "doc.on.doc") {
+                                SSHCommandClipboard.copy(target)
+                            }
+                        }
                     }
                 }
             } header: {
@@ -237,6 +243,11 @@ struct SidebarView: View {
                 leading: 2,
                 trailing: 6
             )
+            .contextMenu {
+                Button("复制 SSH 命令", systemImage: "doc.on.doc") {
+                    SSHCommandClipboard.copy(target)
+                }
+            }
         } else {
             workerLabel(worker, on: machine)
                 .tag(selection)
@@ -280,6 +291,15 @@ struct SidebarView: View {
         on machine: DevboxInventory
     ) -> TerminalTarget? {
         machine.workerTerminalTarget(for: worker)
+    }
+
+    private func devboxTarget(_ machine: DevboxInventory) -> TerminalTarget? {
+        guard let alias = machine.sshConnectionTarget else { return nil }
+        return .devbox(
+            sid: machine.devbox.sid,
+            name: machine.devbox.name,
+            alias: alias
+        )
     }
 
     private func tmuxExpandedBinding(

@@ -203,6 +203,8 @@ struct DevboxDetailView: View {
                     }
                 }
 
+                SSHCommandCard(target: sshTarget)
+
                 SurfaceCard("资源") {
                     HStack(spacing: 8) {
                         if let cpu = machine.devbox.cpuCores {
@@ -252,6 +254,15 @@ struct DevboxDetailView: View {
             }
             .padding(24)
         }
+    }
+
+    private var sshTarget: TerminalTarget? {
+        guard let alias = machine.sshConnectionTarget else { return nil }
+        return .devbox(
+            sid: machine.devbox.sid,
+            name: machine.devbox.name,
+            alias: alias
+        )
     }
 }
 
@@ -360,6 +371,10 @@ struct WorkerDetailView: View {
                 }
                 .disabled(
                     machine.workerTerminalTarget(for: worker) == nil
+                )
+
+                SSHCommandCard(
+                    target: machine.workerTerminalTarget(for: worker)
                 )
 
                 if machine.workerTerminalTarget(for: worker) == nil {
