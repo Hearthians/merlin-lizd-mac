@@ -17,12 +17,14 @@ struct SidebarView: View {
                 machine.sshConnectionTarget,
                 machine.displayName,
                 machine.devbox.sid,
+                machine.clusterName,
             ]
                 .compactMap { $0 }
                 .contains { $0.localizedCaseInsensitiveContains(searchText) }
             let workers = machine.workers.filter {
                 $0.id.localizedCaseInsensitiveContains(searchText)
                     || ($0.gpuType?.localizedCaseInsensitiveContains(searchText) == true)
+                    || ($0.clusterName?.localizedCaseInsensitiveContains(searchText) == true)
             }
             if machineMatches {
                 return machine
@@ -265,6 +267,7 @@ struct SidebarView: View {
         let selection = workerSelection(worker, on: machine)
         return SidebarWorkerLabel(
             worker: worker,
+            clusterLocation: machine.workerClusterLocation(for: worker),
             selected: model.selection == selection
         )
             .contentShape(Rectangle())
@@ -381,7 +384,9 @@ private struct SidebarDevboxLabel: View {
     }
 
     private var subtitle: String {
-        lifecycleLabel
+        [lifecycleLabel, machine.clusterName.map { "集群 \($0)" }]
+            .compactMap { $0 }
+            .joined(separator: " · ")
     }
 
     private var lifecycleLabel: String {
@@ -437,6 +442,9 @@ private struct SidebarDevboxLabel: View {
         }
         lines.append("SID：\(machine.devbox.sid)")
         lines.append("状态：\(lifecycleLabel)")
+        if let clusterName = machine.clusterName {
+            lines.append("集群：\(clusterName)")
+        }
         return lines.joined(separator: "\n")
     }
 
@@ -462,6 +470,7 @@ private struct SidebarDevboxLabel: View {
 
 private struct SidebarWorkerLabel: View {
     let worker: WorkerInventoryRecord
+    let clusterLocation: WorkerClusterLocation?
     let selected: Bool
 
     private var tint: Color {
@@ -479,11 +488,11 @@ private struct SidebarWorkerLabel: View {
                 Text(worker.displayName)
                     .font(.callout.weight(selected ? .semibold : .regular))
                     .lineLimit(1)
-                Text(worker.id)
+                Text(workerSubtitle)
                     .font(.caption2.monospaced())
                     .foregroundStyle(.secondary)
             }
-            .help("\(worker.displayName)\nWorker \(worker.id)")
+            .help(workerHelpText)
             Spacer(minLength: 3)
             Circle()
                 .fill(readinessColor)
@@ -494,6 +503,18 @@ private struct SidebarWorkerLabel: View {
         .padding(.vertical, 4)
         .background(selectionBackground)
         .contentShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var workerSubtitle: String {
+        [worker.id, clusterLocation?.displayLabel]
+            .compactMap { $0 }
+            .joined(separator: " · ")
+    }
+
+    private var workerHelpText: String {
+        [worker.displayName, "Worker \(worker.id)", clusterLocation?.displayLabel]
+            .compactMap { $0 }
+            .joined(separator: "\n")
     }
 
     private var readinessColor: Color {

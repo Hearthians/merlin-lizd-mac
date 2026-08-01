@@ -126,6 +126,11 @@ struct DevboxCard: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(machine.displayName)
                         .font(.headline)
+                    if let clusterName = machine.clusterName {
+                        Text("集群 \(clusterName)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                     if let alias = machine.sshAlias, alias != machine.displayName {
                         Text("SSH: \(alias)")
                             .font(.caption)
@@ -181,6 +186,11 @@ struct DevboxDetailView: View {
                         Text(machine.devbox.sid)
                             .font(.callout.monospaced())
                             .foregroundStyle(.secondary)
+                        if let clusterName = machine.clusterName {
+                            Label("集群 \(clusterName)", systemImage: "server.rack")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                     Spacer()
                     LifecyclePill(status: machine.devbox.status)
@@ -242,6 +252,9 @@ struct DevboxDetailView: View {
                         ForEach(machine.workers) { worker in
                             WorkerRow(
                                 worker: worker,
+                                clusterLocation: machine.workerClusterLocation(
+                                    for: worker
+                                ),
                                 isConnectable: machine.workerTerminalTarget(
                                     for: worker
                                 ) != nil
@@ -324,6 +337,9 @@ struct AllWorkersView: View {
                         WorkerRow(
                             worker: worker,
                             parentLabel: devbox.displayName,
+                            clusterLocation: devbox.workerClusterLocation(
+                                for: worker
+                            ),
                             isConnectable: devbox.workerTerminalTarget(
                                 for: worker
                             ) != nil
@@ -355,6 +371,16 @@ struct WorkerDetailView: View {
                         Text("\(machine.displayName) · \(worker.id)")
                             .font(.callout.monospaced())
                             .foregroundStyle(.secondary)
+                        if let clusterLocation = machine.workerClusterLocation(
+                            for: worker
+                        ) {
+                            Label(
+                                clusterLocation.displayLabel,
+                                systemImage: "server.rack"
+                            )
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                        }
                     }
                     Spacer()
                     HStack(spacing: 7) {
@@ -463,6 +489,7 @@ struct WorkerDetailView: View {
 struct WorkerRow: View {
     let worker: WorkerInventoryRecord
     var parentLabel: String?
+    var clusterLocation: WorkerClusterLocation?
     var isConnectable = true
     let onConnect: () -> Void
 
@@ -506,7 +533,7 @@ struct WorkerRow: View {
     }
 
     private var workerIdentityText: String {
-        [parentLabel, worker.id]
+        [parentLabel, worker.id, clusterLocation?.displayLabel]
             .compactMap { $0 }
             .joined(separator: " · ")
     }

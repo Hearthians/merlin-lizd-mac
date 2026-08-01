@@ -18,7 +18,8 @@ struct DevboxPageParserTests {
               "disk_bytes": 137438953472,
               "worker_num": 4,
               "rootfs_type": "nfs",
-              "region": "hl",
+              "region": "cn",
+              "cluster": {"name": "candy-yg", "dc": "yg", "id": 8},
               "access_role": "OWNER",
               "created_at": "2026-07-08T04:08:15Z",
               "updated_at": "2026-07-11T08:00:00Z",
@@ -40,6 +41,11 @@ struct DevboxPageParserTests {
         #expect(page.devboxes[0].memoryBytes == 34_359_738_368)
         #expect(page.devboxes[0].diskBytes == 137_438_953_472)
         #expect(page.devboxes[0].workerCount == 4)
+        #expect(page.devboxes[0].cluster == DevboxCluster(
+            id: 8,
+            name: "candy-yg",
+            dataCenter: "yg"
+        ))
         #expect(page.devboxes[0].accessRole == "OWNER")
         #expect(page.devboxes[0].sshProxyDestination ==
             "135679.lizhuodong.ws@merlin-ssh-proxy-cn.byted.org")
@@ -80,5 +86,27 @@ struct DevboxPageParserTests {
 
         #expect(devbox.status == .running)
         #expect(devbox.status.isRunning)
+    }
+
+    @Test("keeps the Devbox usable when cluster metadata is partial")
+    func acceptsPartialClusterMetadata() throws {
+        let json = """
+        {
+          "ResponseBase": {"code": 0, "message": "success"},
+          "data": [{
+            "sid": "dbx_140542",
+            "name": "hl_gpu",
+            "status": "running",
+            "cluster": {"dc": "hl", "id": 6}
+          }],
+          "pagination": {"page_size": 100}
+        }
+        """
+
+        let devbox = try #require(DevboxPageParser.parse(json).devboxes.first)
+
+        #expect(devbox.cluster?.name == nil)
+        #expect(devbox.cluster?.dataCenter == "hl")
+        #expect(devbox.cluster?.id == 6)
     }
 }

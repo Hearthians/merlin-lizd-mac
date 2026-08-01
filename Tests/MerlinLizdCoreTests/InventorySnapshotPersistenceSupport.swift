@@ -14,6 +14,7 @@ struct InventorySnapshotPersistenceFixture {
                 "sid":"dbx_1",
                 "name":"one",
                 "status":"running",
+                "cluster":{"id":8,"name":"candy-yg","dc":"yg"},
                 "ssh_proxy_cmd":"1.lizhuodong.ws@merlin-ssh-proxy-cn.byted.org"
               }],
               "pagination": {"page_size": 100}
@@ -25,6 +26,7 @@ struct InventorySnapshotPersistenceFixture {
             memoryGiB: 32,
             gpuCount: 1,
             gpuType: "GPU",
+            clusterName: "k8s-worker-yg",
             sshProxyDestination:
                 "123.lizhuodong.worker@merlin-ssh-proxy-cn.byted.org",
             podIP: "secret-network-address",
@@ -63,5 +65,16 @@ struct InventorySnapshotPersistenceFixture {
         }
         """.utf8)
         return try JSONDecoder().decode(WorkerInventoryRecord.self, from: data)
+    }
+
+    static func decodeLegacyDevbox() throws -> Devbox {
+        let data = Data("""
+        {
+          "sid": "dbx_1",
+          "name": "one",
+          "status": "running"
+        }
+        """.utf8)
+        return try JSONDecoder().decode(Devbox.self, from: data)
     }
 }

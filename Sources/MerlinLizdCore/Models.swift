@@ -28,6 +28,24 @@ public struct DevboxLifecycle: RawRepresentable, Codable, Hashable, Sendable {
     }
 }
 
+public struct DevboxCluster: Codable, Hashable, Sendable {
+    public let id: Int?
+    public let name: String?
+    public let dataCenter: String?
+
+    public init(id: Int?, name: String?, dataCenter: String?) {
+        self.id = id
+        self.name = name
+        self.dataCenter = dataCenter
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case dataCenter = "dc"
+    }
+}
+
 public struct Devbox: Identifiable, Codable, Hashable, Sendable {
     public var id: String { sid }
 
@@ -40,6 +58,7 @@ public struct Devbox: Identifiable, Codable, Hashable, Sendable {
     public let workerCount: Int?
     public let rootfsType: String?
     public let region: String?
+    public let cluster: DevboxCluster?
     public let accessRole: String?
     public let sshProxyDestination: String?
     public let createdAt: String?
@@ -55,6 +74,7 @@ public struct Devbox: Identifiable, Codable, Hashable, Sendable {
         workerCount: Int?,
         rootfsType: String?,
         region: String?,
+        cluster: DevboxCluster? = nil,
         accessRole: String?,
         sshProxyDestination: String?,
         createdAt: String?,
@@ -69,6 +89,7 @@ public struct Devbox: Identifiable, Codable, Hashable, Sendable {
         self.workerCount = workerCount
         self.rootfsType = rootfsType
         self.region = region
+        self.cluster = cluster
         self.accessRole = accessRole
         self.sshProxyDestination = sshProxyDestination
         self.createdAt = createdAt
@@ -85,6 +106,7 @@ public struct Devbox: Identifiable, Codable, Hashable, Sendable {
         case workerCount = "worker_num"
         case rootfsType = "rootfs_type"
         case region
+        case cluster
         case accessRole = "access_role"
         case sshProxyDestination = "ssh_proxy_cmd"
         case createdAt = "created_at"
@@ -111,6 +133,9 @@ public struct Worker: Identifiable, Codable, Hashable, Sendable {
     public let memoryGiB: Int
     public let gpuCount: Int
     public let gpuType: String?
+    /// Optional Worker-reported Kubernetes cluster name. Some platform
+    /// responses omit it, so callers may present the parent Devbox cluster.
+    public let clusterName: String?
     /// Merlin's control-plane lifecycle value. This is deliberately separate
     /// from `readiness`: a platform `running` Worker can still be unavailable
     /// to an SSH/`mlx worker login` probe.
@@ -128,6 +153,7 @@ public struct Worker: Identifiable, Codable, Hashable, Sendable {
         memoryGiB: Int,
         gpuCount: Int,
         gpuType: String?,
+        clusterName: String? = nil,
         platformStatus: String? = nil,
         sshProxyDestination: String? = nil,
         podIP: String?,
@@ -141,6 +167,7 @@ public struct Worker: Identifiable, Codable, Hashable, Sendable {
         self.memoryGiB = memoryGiB
         self.gpuCount = gpuCount
         self.gpuType = gpuType
+        self.clusterName = clusterName
         self.platformStatus = platformStatus
         self.sshProxyDestination = sshProxyDestination
         self.podIP = podIP

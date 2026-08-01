@@ -10,6 +10,21 @@ public struct InventorySnapshot: Codable, Equatable, Sendable {
     }
 }
 
+public struct WorkerClusterLocation: Equatable, Sendable {
+    public enum Source: Equatable, Sendable {
+        case worker
+        case devbox
+    }
+
+    public let name: String
+    public let source: Source
+
+    public init(name: String, source: Source) {
+        self.name = name
+        self.source = source
+    }
+}
+
 public struct DevboxInventory: Identifiable, Codable, Equatable, Sendable {
     public var id: String { devbox.sid }
 
@@ -19,6 +34,24 @@ public struct DevboxInventory: Identifiable, Codable, Equatable, Sendable {
     public let workerStatus: WorkerInventoryStatus
 
     public var displayName: String { devbox.name }
+    public var clusterName: String? {
+        Self.normalizedClusterName(devbox.cluster?.name)
+    }
+
+    public func workerClusterLocation(
+        for worker: WorkerInventoryRecord
+    ) -> WorkerClusterLocation? {
+        if let name = Self.normalizedClusterName(worker.clusterName) {
+            return WorkerClusterLocation(name: name, source: .worker)
+        }
+        guard let name = clusterName else { return nil }
+        return WorkerClusterLocation(name: name, source: .devbox)
+    }
+
+    private static func normalizedClusterName(_ value: String?) -> String? {
+        let name = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name?.isEmpty == false ? name : nil
+    }
 
     /// Platform connectivity is authoritative. The local alias is retained
     /// only as a compatibility fallback for older Devboxes.
@@ -129,15 +162,16 @@ public struct DevboxInventory: Identifiable, Codable, Equatable, Sendable {
     }
 }
 
-/// A persistence-safe projection of `Worker`. Only the validated SSH proxy
-/// destination crosses the inventory interface; raw addresses and signed URLs
-/// remain excluded.
+/// A persistence-safe projection of `Worker`. Display-safe resource metadata
+/// and the validated SSH proxy destination cross the inventory interface; raw
+/// addresses and signed URLs remain excluded.
 public struct WorkerInventoryRecord: Identifiable, Codable, Equatable, Sendable {
     public let id: String
     public let cpuCores: Int
     public let memoryGiB: Int
     public let gpuCount: Int
     public let gpuType: String?
+    public let clusterName: String?
     public let platformStatus: String?
     public let sshProxyDestination: String?
     public let createdAt: String
@@ -149,6 +183,7 @@ public struct WorkerInventoryRecord: Identifiable, Codable, Equatable, Sendable 
         self.memoryGiB = worker.memoryGiB
         self.gpuCount = worker.gpuCount
         self.gpuType = worker.gpuType
+        self.clusterName = worker.clusterName
         self.platformStatus = worker.platformStatus
         self.sshProxyDestination = worker.sshProxyDestination
         self.createdAt = worker.createdAt
@@ -162,6 +197,7 @@ public struct WorkerInventoryRecord: Identifiable, Codable, Equatable, Sendable 
             memoryGiB: memoryGiB,
             gpuCount: gpuCount,
             gpuType: gpuType,
+            clusterName: clusterName,
             platformStatus: platformStatus,
             sshProxyDestination: sshProxyDestination,
             createdAt: createdAt,
@@ -179,6 +215,7 @@ public struct WorkerInventoryRecord: Identifiable, Codable, Equatable, Sendable 
             memoryGiB: memoryGiB,
             gpuCount: gpuCount,
             gpuType: gpuType,
+            clusterName: clusterName,
             platformStatus: platformStatus,
             sshProxyDestination: sshProxyDestination,
             createdAt: createdAt,
@@ -211,6 +248,7 @@ public struct WorkerInventoryRecord: Identifiable, Codable, Equatable, Sendable 
         memoryGiB: Int,
         gpuCount: Int,
         gpuType: String?,
+        clusterName: String?,
         platformStatus: String?,
         sshProxyDestination: String?,
         createdAt: String,
@@ -221,6 +259,7 @@ public struct WorkerInventoryRecord: Identifiable, Codable, Equatable, Sendable 
         self.memoryGiB = memoryGiB
         self.gpuCount = gpuCount
         self.gpuType = gpuType
+        self.clusterName = clusterName
         self.platformStatus = platformStatus
         self.sshProxyDestination = sshProxyDestination
         self.createdAt = createdAt

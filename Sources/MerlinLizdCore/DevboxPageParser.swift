@@ -36,6 +36,7 @@ public enum DevboxPageParser {
                     workerCount: payload.workerCount,
                     rootfsType: payload.rootfsType,
                     region: payload.region,
+                    cluster: payload.cluster,
                     accessRole: payload.accessRole,
                     sshProxyDestination: destination,
                     createdAt: payload.createdAt,
@@ -68,6 +69,7 @@ public enum DevboxPageParser {
         let workerCount: Int?
         let rootfsType: String?
         let region: String?
+        let cluster: DevboxCluster?
         let accessRole: String?
         let sshProxyDestination: String?
         let createdAt: String?
@@ -83,6 +85,7 @@ public enum DevboxPageParser {
             case workerCount = "worker_num"
             case rootfsType = "rootfs_type"
             case region
+            case cluster
             case accessRole = "access_role"
             case sshProxyDestination = "ssh_proxy_cmd"
             case createdAt = "created_at"

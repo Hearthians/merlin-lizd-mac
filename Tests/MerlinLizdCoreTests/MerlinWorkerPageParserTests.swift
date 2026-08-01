@@ -15,6 +15,7 @@ struct MerlinWorkerPageParserTests {
             "gpu_type": "NVIDIA-L20",
             "cpu_cores": 22,
             "memory_bytes": 123480309760,
+            "cluster": "k8s-candy-yg",
             "created_at": "2026-07-09T04:50:08Z",
             "pod_ip": "2605:secret::1",
             "host_ip": "2605:secret::2",
@@ -36,6 +37,7 @@ struct MerlinWorkerPageParserTests {
         #expect(worker.memoryGiB == 115)
         #expect(worker.gpuCount == 1)
         #expect(worker.gpuType == "NVIDIA-L20")
+        #expect(worker.clusterName == "k8s-candy-yg")
         #expect(worker.createdAt == "2026-07-09T04:50:08Z")
         #expect(worker.readiness == .listed)
         #expect(worker.sshProxyDestination ==
@@ -49,6 +51,7 @@ struct MerlinWorkerPageParserTests {
         #expect(safeRecord.sshConnectionTarget(fallback: "hl_gpu_2") ==
             "3966773.lizhuodong.worker@merlin-ssh-proxy-cn.byted.org")
         #expect(enrichedRecord.gpuType == "NVIDIA-L20")
+        #expect(enrichedRecord.clusterName == "k8s-candy-yg")
         #expect(enrichedRecord.platformStatus == "running")
         #expect(enrichedRecord.readiness == .listed)
         let description = String(reflecting: safeRecord)

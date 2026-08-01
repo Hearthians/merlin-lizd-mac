@@ -72,6 +72,9 @@ public enum MerlinWorkerPageParser {
         let rawStatus = payload.status.trimmingCharacters(
             in: .whitespacesAndNewlines
         )
+        let rawClusterName = payload.clusterName?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
         let sshProxyDestination = payload.sshProxyCommand.flatMap { value in
             MerlinIdentifierValidator.isWorkerSSHProxyDestination(
                 value,
@@ -84,6 +87,9 @@ public enum MerlinWorkerPageParser {
             memoryGiB: memoryGiB,
             gpuCount: payload.gpuCount,
             gpuType: payload.gpuType,
+            clusterName: rawClusterName?.isEmpty == false
+                ? rawClusterName
+                : nil,
             platformStatus: rawStatus.isEmpty ? nil : rawStatus,
             sshProxyDestination: sshProxyDestination,
             podIP: nil,
@@ -126,6 +132,7 @@ public enum MerlinWorkerPageParser {
         let cpuCores: Int
         let memoryBytes: UInt64
         let gpuType: String?
+        let clusterName: String?
         let createdAt: String
         let sshProxyCommand: String?
 
@@ -136,6 +143,7 @@ public enum MerlinWorkerPageParser {
             case cpuCores = "cpu_cores"
             case memoryBytes = "memory_bytes"
             case gpuType = "gpu_type"
+            case clusterName = "cluster"
             case createdAt = "created_at"
             case sshProxyCommand = "ssh_proxy_cmd"
         }

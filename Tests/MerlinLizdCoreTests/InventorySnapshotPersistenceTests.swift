@@ -16,6 +16,10 @@ struct InventorySnapshotPersistenceTests {
             "123.lizhuodong.worker@merlin-ssh-proxy-cn.byted.org")
         #expect(fixture.decoded.devboxes.first?.sshConnectionTarget ==
             "1.lizhuodong.ws@merlin-ssh-proxy-cn.byted.org")
+        #expect(fixture.decoded.devboxes.first?.devbox.cluster?.name ==
+            "candy-yg")
+        #expect(fixture.decoded.devboxes.first?.workers.first?.clusterName ==
+            "k8s-worker-yg")
     }
 
     @Test("decodes Worker caches written before platform status existed")
@@ -24,8 +28,18 @@ struct InventorySnapshotPersistenceTests {
             .decodeLegacyWorkerRecord()
 
         #expect(worker.id == "123")
+        #expect(worker.clusterName == nil)
         #expect(worker.platformStatus == nil)
         #expect(worker.sshProxyDestination == nil)
         #expect(worker.readiness == .listed)
+    }
+
+    @Test("decodes Devbox caches written before cluster metadata existed")
+    func decodesLegacyDevbox() throws {
+        let devbox = try InventorySnapshotPersistenceFixture
+            .decodeLegacyDevbox()
+
+        #expect(devbox.sid == "dbx_1")
+        #expect(devbox.cluster == nil)
     }
 }
