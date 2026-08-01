@@ -73,6 +73,13 @@ struct MerlinRootView: View {
         .onChange(of: model.snapshot, initial: true) { _, snapshot in
             if let snapshot {
                 terminals.reconcileRemoteRoutes(with: snapshot)
+                if
+                    let current = sessionBrowserTarget,
+                    let migrated = current.retargeted(using: snapshot),
+                    migrated != current
+                {
+                    sessionBrowserTarget = migrated
+                }
             }
         }
         .onChange(of: sessionBrowserTarget) { _, target in
@@ -110,6 +117,7 @@ struct MerlinRootView: View {
                     target: sessionBrowserTarget,
                     terminals: terminals
                 )
+                .id(sessionBrowserTarget)
             }
         }
         .sheet(

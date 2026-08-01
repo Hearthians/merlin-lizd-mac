@@ -58,6 +58,44 @@ struct TmuxCreationTests {
         #expect(coordinator.pending == nil)
     }
 
+    @Test("pending creation follows the current inventory route")
+    func retargetsPendingCreation() throws {
+        let destination = "135679.lizhuodong.ws@merlin-ssh-proxy-cn.byted.org"
+        let devbox = Devbox(
+            sid: "dbx_135679",
+            name: "wt_hl",
+            status: .running,
+            cpuCores: nil,
+            memoryBytes: nil,
+            diskBytes: nil,
+            workerCount: nil,
+            rootfsType: nil,
+            region: nil,
+            accessRole: nil,
+            sshProxyDestination: destination,
+            createdAt: nil,
+            updatedAt: nil
+        )
+        let snapshot = InventorySnapshot(
+            devboxes: [DevboxInventory(devbox: devbox, sshAlias: "hl_gpu_2")],
+            refreshedAt: .distantPast
+        )
+        var coordinator = TmuxCreationCoordinator()
+        coordinator.request(draft)
+
+        let didRetarget = coordinator.retarget(using: snapshot)
+        #expect(didRetarget)
+        let pending = try #require(coordinator.pending)
+
+        #expect(pending.title == draft.title)
+        #expect(pending.suggestedSessionName == draft.suggestedSessionName)
+        #expect(pending.target == .devbox(
+            sid: "dbx_135679",
+            name: "wt_hl",
+            alias: destination
+        ))
+    }
+
     @Test("local tmux uses a separate working-directory argument")
     func buildsLocalCommand() throws {
         let command = try MerlinCommands.localTerminal(

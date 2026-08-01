@@ -98,60 +98,6 @@ struct MerlinWorkerPageParserTests {
         #expect(page.workers.first?.sshProxyDestination == nil)
     }
 
-    @Test("preserves probed readiness when platform Worker data refreshes")
-    func preservesProbedReadinessAcrossWorkerRefresh() {
-        let previous = [
-            WorkerInventoryRecord(worker: Worker(
-                id: "3960209",
-                cpuCores: 100,
-                memoryGiB: 240,
-                gpuCount: 0,
-                gpuType: nil,
-                platformStatus: "running",
-                podIP: nil,
-                port: 0,
-                createdAt: "before",
-                webshellURL: nil,
-                readiness: .ready
-            )),
-        ]
-        let refreshed = [
-            WorkerInventoryRecord(worker: Worker(
-                id: "3960209",
-                cpuCores: 64,
-                memoryGiB: 190,
-                gpuCount: 0,
-                gpuType: nil,
-                platformStatus: "running",
-                podIP: nil,
-                port: 0,
-                createdAt: "after",
-                webshellURL: nil
-            )),
-            WorkerInventoryRecord(worker: Worker(
-                id: "3960210",
-                cpuCores: 20,
-                memoryGiB: 115,
-                gpuCount: 1,
-                gpuType: "NVIDIA-L20",
-                platformStatus: "running",
-                podIP: nil,
-                port: 0,
-                createdAt: "new",
-                webshellURL: nil
-            )),
-        ]
-
-        let reconciled = WorkerInventoryRecord.preservingReadiness(
-            of: refreshed,
-            from: previous
-        )
-
-        #expect(reconciled.map(\.readiness) == [.ready, .listed])
-        #expect(reconciled[0].cpuCores == 64)
-        #expect(reconciled[0].createdAt == "after")
-    }
-
     @Test("rejects malformed platform Worker identifiers")
     func rejectsMalformedWorkerSID() {
         #expect(throws: MerlinWorkerPageParserError.invalidWorkerSID("3960209")) {

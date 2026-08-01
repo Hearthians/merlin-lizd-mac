@@ -69,6 +69,53 @@ public struct DevboxInventory: Identifiable, Codable, Equatable, Sendable {
         )
     }
 
+    /// Carries readiness evidence forward only while the same Worker keeps the
+    /// exact same usable route. A relay disappearing with its parent, or a
+    /// relay/direct endpoint change, must be probed again.
+    public func workersPreservingReadiness(
+        from previous: DevboxInventory
+    ) -> [WorkerInventoryRecord] {
+        var previousByID: [String: WorkerInventoryRecord] = [:]
+        for worker in previous.workers {
+            previousByID[worker.id] = worker
+        }
+        return workers.map { worker in
+            guard let previousWorker = previousByID[worker.id] else {
+                return worker
+            }
+            guard
+                let route = workerTerminalTarget(for: worker),
+                let previousRoute = previous.workerTerminalTarget(
+                    for: previousWorker
+                ),
+                route == previousRoute
+            else {
+                return worker.withReadiness(.listed)
+            }
+            return worker.withReadiness(previousWorker.readiness)
+        }
+    }
+
+    /// Projects last-known Worker rows onto newer Devbox metadata. This keeps
+    /// the machine tree stable while the control-plane Worker refresh runs,
+    /// while route-specific readiness is reconciled against the new route.
+    public func carryingWorkerInventory(
+        from previous: DevboxInventory
+    ) -> DevboxInventory {
+        let candidate = DevboxInventory(
+            devbox: devbox,
+            sshAlias: sshAlias,
+            workers: previous.workers,
+            workerStatus: previous.workerStatus
+        )
+        return DevboxInventory(
+            devbox: candidate.devbox,
+            sshAlias: candidate.sshAlias,
+            workers: candidate.workersPreservingReadiness(from: previous),
+            workerStatus: candidate.workerStatus
+        )
+    }
+
     public init(
         devbox: Devbox,
         sshAlias: String? = nil,
@@ -137,24 +184,6 @@ public struct WorkerInventoryRecord: Identifiable, Codable, Equatable, Sendable 
             createdAt: createdAt,
             readiness: readiness
         )
-    }
-
-    /// Keeps direct connectivity evidence when newer platform inventory
-    /// refreshes the same Worker records.
-    public static func preservingReadiness(
-        of incoming: [WorkerInventoryRecord],
-        from previous: [WorkerInventoryRecord]
-    ) -> [WorkerInventoryRecord] {
-        var readinessByWorkerID: [String: WorkerReadiness] = [:]
-        for worker in previous {
-            readinessByWorkerID[worker.id] = worker.readiness
-        }
-        return incoming.map { worker in
-            guard let readiness = readinessByWorkerID[worker.id] else {
-                return worker
-            }
-            return worker.withReadiness(readiness)
-        }
     }
 
     public func sshConnectionTarget(fallback: String?) -> String? {

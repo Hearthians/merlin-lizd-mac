@@ -323,7 +323,8 @@ struct TmuxSessionDiscoveryTests {
         "empty tmux diagnostics replace inventory with authoritative evidence",
         arguments: [
             "no server running on /tmp/tmux/default",
-            "no sessions"
+            "no sessions",
+            "error connecting to /dev/shm/tmux-1000/default (No such file or directory)",
         ]
     )
     func emptyTmuxIsAuthoritative(_ diagnostic: String) async {
@@ -412,6 +413,50 @@ struct TmuxSessionDiscoveryTests {
         #expect(renamed?.fetchedAt == first.fetchedAt)
         #expect(terminated?.sessions.map(\.name) == ["renamed"])
         #expect(terminated?.fetchedAt == first.fetchedAt)
+    }
+
+    @Test("mutations update cached snapshots across routes for one platform target")
+    func mutationsFollowStableTargetIdentity() async {
+        let runner = TmuxSnapshotRunner(steps: [
+            .output(.init(stdout: "one\ntwo\n", stderr: "", exitCode: 0)),
+            .output(.init(stdout: "one\ntwo\n", stderr: "", exitCode: 0)),
+        ])
+        let discovery = TmuxSessionDiscovery(processRunner: runner)
+        let relay = TerminalTarget.worker(
+            devboxSID: "dbx_135679",
+            devboxName: "wt_hl",
+            alias: "hl_gpu_2",
+            workerID: "3966773"
+        )
+        let direct = TerminalTarget.worker(
+            devboxSID: "dbx_135679",
+            devboxName: "wt_hl",
+            alias: "3966773.lizhuodong.worker@merlin-ssh-proxy-cn.byted.org",
+            workerID: "3966773"
+        )
+        _ = await discovery.refresh(target: relay)
+        _ = await discovery.refresh(target: direct)
+
+        await discovery.recordRename(
+            target: relay,
+            from: "one",
+            to: "renamed"
+        )
+
+        #expect(await discovery.peekSnapshot(target: relay)?
+            .sessions.map(\.name) == ["renamed", "two"])
+        #expect(await discovery.peekSnapshot(target: direct)?
+            .sessions.map(\.name) == ["renamed", "two"])
+
+        await discovery.recordTermination(
+            target: relay,
+            sessionNames: ["renamed"]
+        )
+
+        #expect(await discovery.peekSnapshot(target: relay)?
+            .sessions.map(\.name) == ["two"])
+        #expect(await discovery.peekSnapshot(target: direct)?
+            .sessions.map(\.name) == ["two"])
     }
 
     @Test("discovers sessions through the safe target command")

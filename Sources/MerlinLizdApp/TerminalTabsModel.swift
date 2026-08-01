@@ -92,6 +92,11 @@ final class TerminalTabsModel: ObservableObject {
     }
 
     func reconcileRemoteRoutes(with snapshot: InventorySnapshot) {
+        var migratedCreation = tmuxCreation
+        if migratedCreation.retarget(using: snapshot) {
+            tmuxCreation = migratedCreation
+        }
+
         let current = TerminalState(
             selectedTabID: selectedTabID,
             tabs: tabs
@@ -491,7 +496,7 @@ final class TerminalTabsModel: ObservableObject {
     ) {
         let matchingIDs: [String] = tabs.compactMap { tab -> String? in
             guard
-                tab.target == target,
+                tab.target.identity == target.identity,
                 let sessionName = tab.sessionName,
                 sessionNames.contains(sessionName)
             else {

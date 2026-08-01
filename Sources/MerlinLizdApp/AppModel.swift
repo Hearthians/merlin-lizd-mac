@@ -147,30 +147,26 @@ final class AppModel: ObservableObject {
             currentSIDs.contains($0.key)
         }
 
-        // A route change invalidates freshness without discarding last-known
-        // rows. Parent lifecycle does not: the platform Worker list and direct
-        // Worker destinations remain usable without a running Devbox process.
-        for machine in incoming.devboxes {
-            let sid = machine.devbox.sid
-            guard let cached = workerInventoryCache[sid] else { continue }
-            if machine.sshConnectionTarget != cached.sshAlias {
-                workerInventoryCache[sid] = cached.invalidated()
-            }
-        }
-
         let devboxes = incoming.devboxes.map { machine in
-            guard
-                let cached = workerInventoryCache[machine.devbox.sid],
-                cached.sshAlias == machine.sshConnectionTarget
-            else {
+            let sid = machine.devbox.sid
+            guard let cached = workerInventoryCache[sid] else {
                 return machine
             }
-            return DevboxInventory(
-                devbox: machine.devbox,
-                sshAlias: machine.sshAlias,
-                workers: cached.workers,
-                workerStatus: cached.status
+            // A Devbox route change invalidates Worker-list freshness, but it
+            // must not clear safe last-known rows. Direct Worker readiness can
+            // survive; relay readiness is reset by route-aware reconciliation.
+            let effectiveCache = if machine.sshConnectionTarget == cached.sshAlias {
+                cached
+            } else {
+                cached.invalidated()
+            }
+            let reconciled = machine.carryingWorkerInventory(
+                from: effectiveCache.machine
             )
+            workerInventoryCache[sid] = effectiveCache.replacing(
+                machine: reconciled
+            )
+            return reconciled
         }
         return InventorySnapshot(
             devboxes: devboxes,
@@ -271,7 +267,8 @@ final class AppModel: ObservableObject {
         let attemptedAt = Date()
         switch result.workerStatus {
         case .loaded:
-            let knownWorkers = previous?.workers ?? currentMachine.workers
+            let previousMachine = previous?.machine ?? currentMachine
+            let knownWorkers = previousMachine.workers
             var knownGPUTypes: [String: String] = [:]
             for worker in knownWorkers {
                 if let gpuType = worker.gpuType {
@@ -285,23 +282,41 @@ final class AppModel: ObservableObject {
                 guard worker.gpuType == nil else { return worker }
                 return worker.withGPUType(knownGPUTypes[worker.id])
             }
-            effectiveWorkers = WorkerInventoryRecord.preservingReadiness(
-                of: refreshedWorkers,
-                from: knownWorkers
+            let refreshedMachine = DevboxInventory(
+                devbox: currentMachine.devbox,
+                sshAlias: currentMachine.sshAlias,
+                workers: refreshedWorkers,
+                workerStatus: result.workerStatus
+            )
+            effectiveWorkers = refreshedMachine.workersPreservingReadiness(
+                from: previousMachine
             )
             fetchedAt = attemptedAt
         case .failed:
             // A transient SSH/mlx failure must never erase the last useful
             // Worker inventory. Keep it stale and retry on the next poll.
-            effectiveWorkers = previous?.workers ?? currentMachine.workers
+            let previousMachine = previous?.machine ?? currentMachine
+            let failedMachine = DevboxInventory(
+                devbox: currentMachine.devbox,
+                sshAlias: currentMachine.sshAlias,
+                workers: previousMachine.workers,
+                workerStatus: result.workerStatus
+            )
+            effectiveWorkers = failedMachine.workersPreservingReadiness(
+                from: previousMachine
+            )
             fetchedAt = previous?.fetchedAt ?? .distantPast
         case .notQueried:
             return
         }
-        workerInventoryCache[sid] = CachedWorkerInventory(
-            sshAlias: target.sshAlias,
+        let effectiveMachine = DevboxInventory(
+            devbox: currentMachine.devbox,
+            sshAlias: currentMachine.sshAlias,
             workers: effectiveWorkers,
-            status: result.workerStatus,
+            workerStatus: result.workerStatus
+        )
+        workerInventoryCache[sid] = CachedWorkerInventory(
+            machine: effectiveMachine,
             fetchedAt: fetchedAt,
             attemptedAt: attemptedAt
         )
@@ -380,13 +395,22 @@ final class AppModel: ObservableObject {
             let cached = workerInventoryCache[devboxSID],
             cached.sshAlias == currentMachine.sshConnectionTarget
         {
-            workerInventoryCache[devboxSID] = CachedWorkerInventory(
-                sshAlias: cached.sshAlias,
-                workers: WorkerInventoryRecord.preservingReadiness(
-                    of: cached.workers,
-                    from: updatedMachine.workers
+            let candidate = DevboxInventory(
+                devbox: updatedMachine.devbox,
+                sshAlias: updatedMachine.sshAlias,
+                workers: cached.workers,
+                workerStatus: cached.status
+            )
+            let reconciled = DevboxInventory(
+                devbox: candidate.devbox,
+                sshAlias: candidate.sshAlias,
+                workers: candidate.workersPreservingReadiness(
+                    from: updatedMachine
                 ),
-                status: cached.status,
+                workerStatus: candidate.workerStatus
+            )
+            workerInventoryCache[devboxSID] = CachedWorkerInventory(
+                machine: reconciled,
                 fetchedAt: cached.fetchedAt,
                 attemptedAt: cached.attemptedAt
             )
@@ -433,10 +457,16 @@ final class AppModel: ObservableObject {
     private func seedCaches(from cached: PersistedInventoryCache) {
         for machine in cached.snapshot.devboxes {
             if machine.workerStatus != .notQueried {
+                let seededMachine = DevboxInventory(
+                    devbox: machine.devbox,
+                    sshAlias: machine.sshAlias,
+                    workers: machine.workers.map {
+                        $0.withReadiness(.listed)
+                    },
+                    workerStatus: machine.workerStatus
+                )
                 workerInventoryCache[machine.devbox.sid] = CachedWorkerInventory(
-                    sshAlias: machine.sshConnectionTarget,
-                    workers: machine.workers.map { $0.withReadiness(.listed) },
-                    status: machine.workerStatus,
+                    machine: seededMachine,
                     fetchedAt: cached.workerFetchedAtBySID[
                         machine.devbox.sid
                     ] ?? .distantPast,
@@ -542,19 +572,27 @@ private struct WorkerInventoryTarget: Sendable {
 }
 
 private struct CachedWorkerInventory: Sendable {
-    let sshAlias: String?
-    let workers: [WorkerInventoryRecord]
-    let status: WorkerInventoryStatus
+    let machine: DevboxInventory
     let fetchedAt: Date
     let attemptedAt: Date
 
+    var sshAlias: String? { machine.sshConnectionTarget }
+    var workers: [WorkerInventoryRecord] { machine.workers }
+    var status: WorkerInventoryStatus { machine.workerStatus }
+
     func invalidated() -> CachedWorkerInventory {
         CachedWorkerInventory(
-            sshAlias: sshAlias,
-            workers: workers,
-            status: status,
+            machine: machine,
             fetchedAt: .distantPast,
             attemptedAt: .distantPast
+        )
+    }
+
+    func replacing(machine: DevboxInventory) -> CachedWorkerInventory {
+        CachedWorkerInventory(
+            machine: machine,
+            fetchedAt: fetchedAt,
+            attemptedAt: attemptedAt
         )
     }
 }

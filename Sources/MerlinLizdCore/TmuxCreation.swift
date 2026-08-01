@@ -62,6 +62,27 @@ public struct TmuxCreationCoordinator: Equatable, Sendable {
         pending = nil
     }
 
+    /// Keeps an open creation sheet on the same platform identity while its
+    /// validated SSH route changes underneath it.
+    @discardableResult
+    public mutating func retarget(
+        using snapshot: InventorySnapshot
+    ) -> Bool {
+        guard
+            let pending,
+            let target = pending.target.retargeted(using: snapshot),
+            target != pending.target
+        else {
+            return false
+        }
+        self.pending = TmuxCreationDraft(
+            title: pending.title,
+            target: target,
+            suggestedSessionName: pending.suggestedSessionName
+        )
+        return true
+    }
+
     public mutating func create(
         sessionName: String,
         workingDirectory: String

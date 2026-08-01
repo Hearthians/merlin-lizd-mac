@@ -44,10 +44,10 @@ The primary mental model is **machines**. A future **tasks** workspace may add f
 ### SSH prewarming and tmux snapshot cache
 
 - Start prewarming from the restored safe inventory without delaying the first App frame, then reconcile against authoritative inventory updates.
-- Own at most one OpenSSH control socket per running Devbox. Store sockets in an App-owned owner-only temporary directory under hashed alias names. Pass `ControlMaster=auto`, that `ControlPath`, and `ControlPersist=600` explicitly to App SSH children; never modify the user's SSH configuration.
-- Prewarm all current Workers with selected/open/recent targets first. Prewarming and browser refreshes share a total limit of two concurrent `mlx worker login` operations. Warmup commands are fixed, read-only readiness and `tmux list-sessions` probes.
+- Own at most one OpenSSH control socket per validated active connection target. Direct Workers use their own platform destination; relay-only Workers share the running parent Devbox target. Store sockets in an App-owned owner-only temporary directory under hashed target names. Pass `ControlMaster=auto`, that `ControlPath`, and `ControlPersist=600` explicitly to App SSH children; never modify the user's SSH configuration.
+- Prewarm all current reachable Workers with selected/open/recent targets first. Direct probes bypass the parent Devbox; relay probes use `mlx worker login` only while the parent is running. Prewarming and browser refreshes are bounded globally and serialized per shared connection target. Warmup commands are fixed, read-only readiness and `tmux list-sessions` probes.
 - Treat a tmux snapshot as fresh for 60 seconds and schedule current targets for refresh every five minutes. Fresh sheets make no remote request. Stale rows remain visible during background verification and after transport or Worker-not-ready failures.
-- A warmed Devbox operation avoids the measured SSH handshake, and a warmed Worker session sheet renders cached rows immediately. The first interactive Worker terminal may still incur `mlx worker login` latency. A long-lived Worker `agent --stdio` transport is deferred for a later phase if terminal-first-byte latency remains unacceptable.
+- A warmed target avoids the measured SSH handshake, and a warmed Worker session sheet renders cached rows immediately. A direct Worker terminal also avoids `mlx worker login`; only a relay fallback may still incur that startup latency. A long-lived Worker `agent --stdio` transport is deferred for a later phase if fallback terminal-first-byte latency remains unacceptable.
 
 ## Authentication and safety
 

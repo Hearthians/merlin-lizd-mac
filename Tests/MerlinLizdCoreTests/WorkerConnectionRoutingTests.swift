@@ -84,6 +84,143 @@ struct WorkerConnectionRoutingTests {
         #expect(current.applyingWarmupUpdate(update) == nil)
     }
 
+    @Test("stopping a relay-only parent invalidates Worker readiness")
+    func resetsReadinessWhenRelayStops() {
+        let previous = makeMachine(
+            status: .running,
+            readiness: .ready
+        )
+        let incoming = makeMachine(status: .stopped)
+
+        let reconciled = incoming.workersPreservingReadiness(from: previous)
+
+        #expect(reconciled.map(\.readiness) == [.listed])
+    }
+
+    @Test("switching a Worker from relay to direct invalidates old readiness")
+    func resetsReadinessWhenRouteChanges() {
+        let previous = makeMachine(
+            status: .running,
+            readiness: .ready
+        )
+        let incoming = makeMachine(
+            status: .running,
+            workerDestination: directWorkerDestination
+        )
+
+        let reconciled = incoming.workersPreservingReadiness(from: previous)
+
+        #expect(reconciled.map(\.readiness) == [.listed])
+    }
+
+    @Test("refreshing an unchanged direct route preserves Worker readiness")
+    func preservesReadinessForSameDirectRoute() {
+        let previous = makeMachine(
+            status: .running,
+            workerDestination: directWorkerDestination,
+            readiness: .ready
+        )
+        let incoming = makeMachine(
+            status: .stopped,
+            workerDestination: directWorkerDestination
+        )
+
+        let reconciled = incoming.workersPreservingReadiness(from: previous)
+
+        #expect(reconciled.map(\.readiness) == [.ready])
+    }
+
+    @Test("restarting a relay parent requires a fresh Worker probe")
+    func resetsReadinessWhenRelayRestarts() {
+        let previous = makeMachine(
+            status: .stopped,
+            readiness: .unreachable
+        )
+        let incoming = makeMachine(status: .running)
+
+        let reconciled = incoming.workersPreservingReadiness(from: previous)
+
+        #expect(reconciled.map(\.readiness) == [.listed])
+    }
+
+    @Test("switching a Worker from direct to relay requires a fresh probe")
+    func resetsReadinessWhenDirectFallsBackToRelay() {
+        let previous = makeMachine(
+            status: .running,
+            workerDestination: directWorkerDestination,
+            readiness: .ready
+        )
+        let incoming = makeMachine(status: .running)
+
+        let reconciled = incoming.workersPreservingReadiness(from: previous)
+
+        #expect(reconciled.map(\.readiness) == [.listed])
+    }
+
+    @Test("rotating a direct Worker endpoint requires a fresh probe")
+    func resetsReadinessWhenDirectEndpointRotates() {
+        let previous = makeMachine(
+            status: .running,
+            workerDestination: directWorkerDestination,
+            readiness: .ready
+        )
+        let incoming = makeMachine(
+            status: .running,
+            workerDestination: rotatedWorkerDestination
+        )
+
+        let reconciled = incoming.workersPreservingReadiness(from: previous)
+
+        #expect(reconciled.map(\.readiness) == [.listed])
+    }
+
+    @Test("Devbox endpoint rotation keeps cached Worker rows and resets relay readiness")
+    func projectsCachedWorkersAcrossDevboxEndpointRotation() throws {
+        let previous = makeMachine(
+            status: .running,
+            devboxDestination: originalDevboxDestination,
+            readiness: .ready
+        )
+        let incoming = withoutWorkers(makeMachine(
+            status: .running,
+            devboxDestination: rotatedDevboxDestination
+        ))
+
+        let projected = incoming.carryingWorkerInventory(from: previous)
+        let worker = try #require(projected.workers.first)
+
+        #expect(projected.workers.count == 1)
+        #expect(worker.readiness == .listed)
+        #expect(projected.workerTerminalTarget(for: worker) == .worker(
+            devboxSID: devboxSID,
+            devboxName: devboxName,
+            alias: rotatedDevboxDestination,
+            workerID: workerID
+        ))
+    }
+
+    @Test("Devbox endpoint rotation preserves an unchanged direct Worker route")
+    func preservesDirectWorkerAcrossDevboxEndpointRotation() throws {
+        let previous = makeMachine(
+            status: .running,
+            devboxDestination: originalDevboxDestination,
+            workerDestination: directWorkerDestination,
+            readiness: .ready
+        )
+        let incoming = withoutWorkers(makeMachine(
+            status: .running,
+            devboxDestination: rotatedDevboxDestination
+        ))
+
+        let projected = incoming.carryingWorkerInventory(from: previous)
+        let worker = try #require(projected.workers.first)
+
+        #expect(projected.workers.count == 1)
+        #expect(worker.readiness == .ready)
+        #expect(projected.workerTerminalTarget(for: worker)?.workerAlias ==
+            directWorkerDestination)
+    }
+
     @Test("restored Worker tabs migrate to the current direct route")
     func retargetsRestoredWorkerTab() throws {
         let machine = makeMachine(
@@ -201,6 +338,64 @@ struct WorkerConnectionRoutingTests {
         ))
     }
 
+    @Test("restored direct Worker tabs migrate back to a valid relay route")
+    func retargetsDirectWorkerTabToRelay() throws {
+        let machine = makeMachine(status: .running)
+        let snapshot = InventorySnapshot(
+            devboxes: [machine],
+            refreshedAt: .distantPast
+        )
+        let originalTarget = TerminalTarget.worker(
+            devboxSID: devboxSID,
+            devboxName: devboxName,
+            alias: directWorkerDestination,
+            workerID: workerID
+        )
+
+        let migrated = try #require(originalTarget.retargeted(using: snapshot))
+
+        #expect(migrated == .worker(
+            devboxSID: devboxSID,
+            devboxName: devboxName,
+            alias: devboxAlias,
+            workerID: workerID
+        ))
+    }
+
+    @Test("route changes preserve stable platform identity")
+    func matchesTargetsAcrossRouteChanges() {
+        let relay = TerminalTarget.worker(
+            devboxSID: devboxSID,
+            devboxName: devboxName,
+            alias: devboxAlias,
+            workerID: workerID
+        )
+        let direct = TerminalTarget.worker(
+            devboxSID: devboxSID,
+            devboxName: "renamed",
+            alias: directWorkerDestination,
+            workerID: workerID
+        )
+        let oldDevbox = TerminalTarget.devbox(
+            sid: devboxSID,
+            name: devboxName,
+            alias: devboxAlias
+        )
+        let newDevbox = TerminalTarget.devbox(
+            sid: devboxSID,
+            name: "renamed",
+            alias: rotatedDevboxDestination
+        )
+
+        #expect(relay.identity == direct.identity)
+        #expect(oldDevbox.identity == newDevbox.identity)
+        #expect(relay.identity != oldDevbox.identity)
+        #expect(relay.identity != .worker(
+            devboxSID: devboxSID,
+            workerID: "4103855"
+        ))
+    }
+
     @Test("restored tabs never migrate from untrusted or unrelated inventory")
     func rejectsUnsafeTabMigration() {
         let unsafe = makeMachine(
@@ -276,11 +471,21 @@ struct WorkerConnectionRoutingTests {
     private var directWorkerDestination: String {
         "4099222.lizhuodong.worker@merlin-ssh-proxy-cn.byted.org"
     }
+    private var rotatedWorkerDestination: String {
+        "4099222.rotated.worker@merlin-ssh-proxy-cn.byted.org"
+    }
+    private var originalDevboxDestination: String {
+        "135679.lizhuodong.ws@merlin-ssh-proxy-cn.byted.org"
+    }
+    private var rotatedDevboxDestination: String {
+        "135679.rotated.ws@merlin-ssh-proxy-cn.byted.org"
+    }
 
     private func makeMachine(
         status: DevboxLifecycle,
         devboxDestination: String? = nil,
-        workerDestination: String? = nil
+        workerDestination: String? = nil,
+        readiness: WorkerReadiness = .listed
     ) -> DevboxInventory {
         let devbox = Devbox(
             sid: devboxSID,
@@ -308,7 +513,8 @@ struct WorkerConnectionRoutingTests {
             podIP: nil,
             port: 0,
             createdAt: "now",
-            webshellURL: nil
+            webshellURL: nil,
+            readiness: readiness
         )
         return DevboxInventory(
             devbox: devbox,
@@ -330,6 +536,22 @@ struct WorkerConnectionRoutingTests {
             verification: .idle,
             lastError: nil
         )
+    }
+
+    private func withoutWorkers(
+        _ machine: DevboxInventory
+    ) -> DevboxInventory {
+        DevboxInventory(
+            devbox: machine.devbox,
+            sshAlias: machine.sshAlias
+        )
+    }
+}
+
+private extension TerminalTarget {
+    var workerAlias: String? {
+        guard case let .worker(_, _, alias, _) = self else { return nil }
+        return alias
     }
 }
 

@@ -21,14 +21,15 @@ URLs are never persisted.
 
 ## SSH reuse and session prewarming
 
-At launch, the app prepares one App-owned OpenSSH control socket for each
-running Devbox and prewarms read-only tmux snapshots for current Workers. All
-tmux discovery, including browser refreshes, shares a total limit of two
-Worker logins in flight. Socket names use hashed aliases in a
-private temporary directory. The app does not edit the user's SSH
-configuration. Platform-provided destinations connect directly through the
-Merlin proxy; local aliases remain a fallback. Child SSH commands reuse the
-SSH Agent while explicitly opting into the App-owned socket.
+At launch, the app prepares App-owned OpenSSH control sockets for active
+validated connection targets and prewarms read-only tmux snapshots for current
+Workers. A direct Worker uses its own platform destination; relay-only Workers
+share the running parent Devbox route. Discovery is bounded globally and
+serialized per shared route. Socket names use hashed targets in a private
+temporary directory. The app does not edit the user's SSH configuration.
+Platform-provided destinations connect directly through the Merlin proxy;
+local aliases remain a fallback. Child SSH commands reuse the SSH Agent while
+explicitly opting into the App-owned socket.
 
 Tmux snapshots are fresh for 60 seconds and are refreshed every five minutes.
 A stale snapshot remains visible while verification runs and also remains the
@@ -38,12 +39,12 @@ App-owned SSH masters; it preserves remote tmux sessions and their processes.
 The confirmed **terminate session** action is the only app path that kills a
 tmux session.
 
-Connection reuse removes the Devbox SSH handshake from warmed operations, and
-a warmed Worker session sheet can render its cached rows immediately. Opening
-the first interactive Worker terminal can still pay `mlx worker login` startup
-latency. If that terminal-first-byte boundary remains unacceptable, a future
-phase may evaluate a long-lived Worker `agent --stdio` transport; it is not
-part of v1.
+Connection reuse removes the SSH handshake from warmed operations, and a
+warmed Worker session sheet can render its cached rows immediately. Direct
+Worker terminals also bypass `mlx worker login`; only relay fallbacks can still
+pay that startup latency. If that fallback boundary remains unacceptable, a
+future phase may evaluate a long-lived Worker `agent --stdio` transport; it is
+not part of v1.
 
 ## Requirements
 

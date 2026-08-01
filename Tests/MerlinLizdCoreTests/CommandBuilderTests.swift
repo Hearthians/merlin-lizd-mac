@@ -213,6 +213,21 @@ struct CommandBuilderTests {
         #expect(!command.arguments.contains { $0.contains("mlx worker login") })
     }
 
+    @Test("a direct Worker working directory needs only one shell layer")
+    func buildsDirectWorkerWorkingDirectory() throws {
+        let destination = "3960209.lizhuodong.worker@merlin-ssh-proxy-cn.byted.org"
+        let command = try MerlinCommands.workerTerminal(
+            alias: destination,
+            workerID: "3960209",
+            sessionName: "merlin-lizd-train",
+            workingDirectory: "/mnt/training runs/it's-ready"
+        )
+
+        #expect(command.arguments.last ==
+            #"exec env -u TMUX TERM=xterm TMUX_TMPDIR=/dev/shm tmux new-session -A -s merlin-lizd-train -c '/mnt/training runs/it'\''s-ready'"#
+        )
+    }
+
     @Test("a Worker terminal avoids relying on a container tmp directory")
     func buildsWorkerTerminalWithWritableTmuxSocket() throws {
         let command = try MerlinCommands.workerTerminal(
@@ -236,7 +251,7 @@ struct CommandBuilderTests {
         )
 
         #expect(command.arguments.last ==
-            #"exec mlx worker login 3960209 -- env -u TMUX TERM=xterm TMUX_TMPDIR=/dev/shm tmux new-session -A -s merlin-lizd-train -c '/mnt/training runs/it'\''s-ready'"#
+            #"exec mlx worker login 3960209 -- env -u TMUX TERM=xterm TMUX_TMPDIR=/dev/shm tmux new-session -A -s merlin-lizd-train -c ''\''/mnt/training runs/it'\''\'\'''\''s-ready'\'''"#
         )
     }
 
@@ -310,6 +325,12 @@ struct CommandBuilderTests {
                 alias: "hl_gpu_2",
                 workerID: "3960209",
                 sessionName: "unsafe$(id)"
+            )
+        }
+        #expect(throws: CommandValidationError.invalidAlias) {
+            try MerlinCommands.devboxTerminal(
+                alias: "user@attacker.example",
+                sessionName: "safe-name"
             )
         }
     }

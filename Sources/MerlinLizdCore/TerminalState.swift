@@ -1,5 +1,11 @@
 import Foundation
 
+public enum TerminalTargetIdentity: Equatable, Hashable, Sendable {
+    case local
+    case devbox(sid: String)
+    case worker(devboxSID: String, workerID: String)
+}
+
 public enum TerminalTarget: Codable, Equatable, Hashable, Sendable {
     case local
     case devbox(sid: String, name: String, alias: String)
@@ -18,6 +24,57 @@ public enum TerminalTarget: Codable, Equatable, Hashable, Sendable {
             name
         case let .worker(_, _, _, workerID):
             "Worker \(workerID)"
+        }
+    }
+
+    /// Stable platform identity, intentionally excluding labels and transport
+    /// routes that may change while an asynchronous operation is in flight.
+    public var identity: TerminalTargetIdentity {
+        switch self {
+        case .local:
+            .local
+        case let .devbox(sid, _, _):
+            .devbox(sid: sid)
+        case let .worker(devboxSID, _, _, workerID):
+            .worker(devboxSID: devboxSID, workerID: workerID)
+        }
+    }
+
+    /// Resolves the current validated connection route for the same platform
+    /// identity. Missing inventory returns `nil` so callers can keep their
+    /// last-known route instead of guessing.
+    public func retargeted(
+        using snapshot: InventorySnapshot
+    ) -> TerminalTarget? {
+        switch self {
+        case .local:
+            return .local
+        case let .devbox(sid, _, _):
+            guard
+                let machine = snapshot.devboxes.first(where: {
+                    $0.devbox.sid == sid
+                }),
+                let destination = machine.sshConnectionTarget
+            else {
+                return nil
+            }
+            return .devbox(
+                sid: sid,
+                name: machine.devbox.name,
+                alias: destination
+            )
+        case let .worker(devboxSID, _, _, workerID):
+            guard
+                let machine = snapshot.devboxes.first(where: {
+                    $0.devbox.sid == devboxSID
+                }),
+                let worker = machine.workers.first(where: {
+                    $0.id == workerID
+                })
+            else {
+                return nil
+            }
+            return machine.workerTerminalTarget(for: worker)
         }
     }
 }
@@ -97,38 +154,9 @@ public struct TerminalState: Codable, Equatable, Sendable {
     public func retargetingConnections(
         using snapshot: InventorySnapshot
     ) -> TerminalState {
-        var machinesBySID: [String: DevboxInventory] = [:]
-        for machine in snapshot.devboxes where machinesBySID[machine.devbox.sid] == nil {
-            machinesBySID[machine.devbox.sid] = machine
-        }
         let migratedTabs = tabs.map { tab -> TerminalTabRecord in
-            let target: TerminalTarget
-            switch tab.target {
-            case .local:
+            guard let target = tab.target.retargeted(using: snapshot) else {
                 return tab
-            case let .devbox(sid, _, _):
-                guard
-                    let machine = machinesBySID[sid],
-                    let destination = machine.sshConnectionTarget
-                else {
-                    return tab
-                }
-                target = .devbox(
-                    sid: sid,
-                    name: machine.devbox.name,
-                    alias: destination
-                )
-            case let .worker(devboxSID, _, _, workerID):
-                guard
-                    let machine = machinesBySID[devboxSID],
-                    let worker = machine.workers.first(where: {
-                        $0.id == workerID
-                    }),
-                    let currentTarget = machine.workerTerminalTarget(for: worker)
-                else {
-                    return tab
-                }
-                target = currentTarget
             }
             guard target != tab.target else { return tab }
             return TerminalTabRecord(

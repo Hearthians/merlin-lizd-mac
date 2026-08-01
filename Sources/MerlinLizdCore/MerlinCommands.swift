@@ -308,7 +308,10 @@ public enum MerlinCommands {
         if let devboxSID {
             try validateDevboxRoute(alias: alias, devboxSID: devboxSID)
         } else {
-            try validateConnectionTarget(alias)
+            // A platform proxy destination is trusted only when its Devbox SID
+            // is available for identity binding. Legacy callers without a SID
+            // may use a local SSH config alias, but not arbitrary user@host.
+            try validateAlias(alias)
         }
         try validateSessionName(sessionName)
         let directoryArgument = try tmuxWorkingDirectoryArgument(workingDirectory)
@@ -335,7 +338,10 @@ public enum MerlinCommands {
             workerID: workerID
         )
         try validateSessionName(sessionName)
-        let directoryArgument = try tmuxWorkingDirectoryArgument(workingDirectory)
+        let directoryArgument = try tmuxWorkingDirectoryArgument(
+            workingDirectory,
+            shellLayers: connectsDirectly ? 1 : 2
+        )
         let tmuxInvocation = workerTmuxInvocation(
             term: "xterm",
             tmuxCommand: "new-session -A -s \(sessionName)\(directoryArgument)"
@@ -514,12 +520,6 @@ public enum MerlinCommands {
         }
     }
 
-    private static func validateConnectionTarget(_ value: String) throws {
-        guard MerlinIdentifierValidator.isSSHConnectionTarget(value) else {
-            throw CommandValidationError.invalidAlias
-        }
-    }
-
     private static func validateDevboxRoute(
         alias: String,
         devboxSID: String
@@ -582,13 +582,18 @@ public enum MerlinCommands {
     }
 
     private static func tmuxWorkingDirectoryArgument(
-        _ workingDirectory: String?
+        _ workingDirectory: String?,
+        shellLayers: Int = 1
     ) throws -> String {
         guard let workingDirectory else { return "" }
         guard MerlinIdentifierValidator.isTmuxWorkingDirectory(workingDirectory) else {
             throw CommandValidationError.invalidWorkingDirectory
         }
-        return " -c \(shellQuote(workingDirectory))"
+        var quoted = workingDirectory
+        for _ in 0..<shellLayers {
+            quoted = shellQuote(quoted)
+        }
+        return " -c \(quoted)"
     }
 
     private static func shellQuote(_ value: String) -> String {

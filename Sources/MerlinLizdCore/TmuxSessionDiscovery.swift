@@ -176,20 +176,27 @@ public actor TmuxSessionDiscovery {
         from currentName: String,
         to newName: String
     ) {
-        recordMutation(
-            .rename(from: currentName, to: newName),
-            target: target
-        )
-        guard let snapshot = snapshots[target] else { return }
-        guard snapshot.sessions.contains(where: { $0.name == currentName }) else {
-            return
+        for route in mutationTargets(for: target) {
+            recordMutation(
+                .rename(from: currentName, to: newName),
+                target: route
+            )
+            guard let snapshot = snapshots[route] else { continue }
+            guard snapshot.sessions.contains(where: {
+                $0.name == currentName
+            }) else {
+                continue
+            }
+            let sessions = snapshot.sessions.map { session in
+                session.name == currentName
+                    ? TmuxSessionRecord(name: newName)
+                    : session
+            }
+            snapshots[route] = replacingSessions(
+                in: snapshot,
+                with: sessions
+            )
         }
-        let sessions = snapshot.sessions.map { session in
-            session.name == currentName
-                ? TmuxSessionRecord(name: newName)
-                : session
-        }
-        snapshots[target] = replacingSessions(in: snapshot, with: sessions)
     }
 
     public func recordTermination(
@@ -197,12 +204,39 @@ public actor TmuxSessionDiscovery {
         sessionNames: Set<String>
     ) {
         guard !sessionNames.isEmpty else { return }
-        recordMutation(.terminate(sessionNames), target: target)
-        guard let snapshot = snapshots[target] else { return }
-        let sessions = snapshot.sessions.filter {
-            !sessionNames.contains($0.name)
+        for route in mutationTargets(for: target) {
+            recordMutation(.terminate(sessionNames), target: route)
+            guard let snapshot = snapshots[route] else { continue }
+            let sessions = snapshot.sessions.filter {
+                !sessionNames.contains($0.name)
+            }
+            snapshots[route] = replacingSessions(
+                in: snapshot,
+                with: sessions
+            )
         }
-        snapshots[target] = replacingSessions(in: snapshot, with: sessions)
+    }
+
+    /// A label or SSH route can change while a mutation is in flight. Cached
+    /// snapshots and refresh journals for the same platform machine must see
+    /// the authoritative mutation together.
+    private func mutationTargets(
+        for target: TerminalTarget
+    ) -> Set<TerminalTarget> {
+        var targets: Set<TerminalTarget> = [target]
+        for candidate in snapshots.keys
+        where candidate.identity == target.identity {
+            targets.insert(candidate)
+        }
+        for candidate in refreshes.keys
+        where candidate.identity == target.identity {
+            targets.insert(candidate)
+        }
+        for candidate in mutationRevisions.keys
+        where candidate.identity == target.identity {
+            targets.insert(candidate)
+        }
+        return targets
     }
 
     private func startRefresh(
@@ -420,8 +454,7 @@ public actor TmuxSessionDiscovery {
         }
 
         guard output.exitCode == 0 else {
-            if (diagnostic.contains("no server running")
-                || diagnostic.contains("no sessions")) {
+            if isEmptyTmuxDiagnostic(diagnostic) {
                 return authoritativeSnapshot(
                     target: target,
                     sessions: [],
@@ -441,6 +474,15 @@ public actor TmuxSessionDiscovery {
             sessions: TmuxSessionParser.parse(output.stdout),
             now: now()
         )
+    }
+
+    private static func isEmptyTmuxDiagnostic(_ diagnostic: String) -> Bool {
+        diagnostic.contains("no server running")
+            || diagnostic.contains("no sessions")
+            || (
+                diagnostic.contains("error connecting to /dev/shm/tmux-")
+                    && diagnostic.contains("(no such file or directory)")
+            )
     }
 
     private static func authoritativeSnapshot(
