@@ -113,7 +113,7 @@ public actor TmuxSessionController {
         target: TerminalTarget
     ) async throws -> InventoryProcessOutput {
         guard
-            let alias = MerlinCommands.sshAlias(for: target),
+            let alias = MerlinCommands.sshConnectionTarget(for: target),
             let sshMasterPool
         else {
             return try await processRunner.run(command)

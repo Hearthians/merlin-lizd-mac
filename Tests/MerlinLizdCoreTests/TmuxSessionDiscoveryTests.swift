@@ -557,7 +557,8 @@ struct TmuxSessionDiscoveryTests {
         let coordinator = TargetWarmupCoordinator(
             sshMasterPool: pool,
             discovery: discovery,
-            maxConcurrentWorkerWarmups: 2
+            maxConcurrentWorkerWarmups: 2,
+            maxConcurrentWorkerWarmupsPerAlias: 2
         )
         await coordinator.reconcile(
             .init(

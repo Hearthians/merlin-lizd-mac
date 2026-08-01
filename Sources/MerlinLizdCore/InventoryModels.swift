@@ -18,6 +18,57 @@ public struct DevboxInventory: Identifiable, Codable, Equatable, Sendable {
     public let workers: [WorkerInventoryRecord]
     public let workerStatus: WorkerInventoryStatus
 
+    public var displayName: String { devbox.name }
+
+    /// Platform connectivity is authoritative. The local alias is retained
+    /// only as a compatibility fallback for older Devboxes.
+    public var sshConnectionTarget: String? {
+        if
+            let destination = devbox.sshProxyDestination,
+            MerlinIdentifierValidator.isDevboxSSHProxyDestination(
+                destination,
+                devboxSID: devbox.sid
+            )
+        {
+            return destination
+        }
+        guard
+            let sshAlias,
+            MerlinIdentifierValidator.isSSHAlias(sshAlias)
+        else {
+            return nil
+        }
+        return sshAlias
+    }
+
+    public func sshConnectionTarget(
+        for worker: WorkerInventoryRecord
+    ) -> String? {
+        if let direct = worker.sshConnectionTarget(fallback: nil) {
+            return direct
+        }
+        guard devbox.status.isRunning else { return nil }
+        return worker.sshConnectionTarget(fallback: sshConnectionTarget)
+    }
+
+    public func workerTerminalTarget(
+        for worker: WorkerInventoryRecord
+    ) -> TerminalTarget? {
+        guard
+            MerlinIdentifierValidator.isDevboxSID(devbox.sid),
+            MerlinIdentifierValidator.isWorkerID(worker.id),
+            let destination = sshConnectionTarget(for: worker)
+        else {
+            return nil
+        }
+        return .worker(
+            devboxSID: devbox.sid,
+            devboxName: devbox.name,
+            alias: destination,
+            workerID: worker.id
+        )
+    }
+
     public init(
         devbox: Devbox,
         sshAlias: String? = nil,
@@ -118,7 +169,7 @@ public struct WorkerInventoryRecord: Identifiable, Codable, Equatable, Sendable 
         }
         guard
             let fallback,
-            MerlinIdentifierValidator.isSSHAlias(fallback)
+            MerlinIdentifierValidator.isSSHConnectionTarget(fallback)
         else {
             return nil
         }

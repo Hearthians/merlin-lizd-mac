@@ -124,10 +124,10 @@ struct DevboxCard: View {
         SurfaceCard {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(machine.sshAlias ?? machine.devbox.name)
+                    Text(machine.displayName)
                         .font(.headline)
-                    if machine.sshAlias != nil {
-                        Text(machine.devbox.name)
+                    if let alias = machine.sshAlias, alias != machine.displayName {
+                        Text("SSH: \(alias)")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -153,7 +153,10 @@ struct DevboxCard: View {
                 Spacer()
                 Button("连接", systemImage: "terminal", action: onConnect)
                     .buttonStyle(.bordered)
-                    .disabled(!machine.devbox.status.isRunning || machine.sshAlias == nil)
+                    .disabled(
+                        !machine.devbox.status.isRunning
+                            || machine.sshConnectionTarget == nil
+                    )
             }
         }
     }
@@ -173,9 +176,9 @@ struct DevboxDetailView: View {
             VStack(alignment: .leading, spacing: 18) {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(machine.sshAlias ?? machine.devbox.name)
+                        Text(machine.displayName)
                             .font(.largeTitle.bold())
-                        Text("\(machine.devbox.name) · \(machine.devbox.sid)")
+                        Text(machine.devbox.sid)
                             .font(.callout.monospaced())
                             .foregroundStyle(.secondary)
                     }
@@ -187,16 +190,16 @@ struct DevboxDetailView: View {
                     if machine.devbox.status.isRunning {
                         Button("打开终端", systemImage: "terminal", action: onConnect)
                             .buttonStyle(.borderedProminent)
-                            .disabled(machine.sshAlias == nil)
+                            .disabled(machine.sshConnectionTarget == nil)
                         Button("tmux 会话", systemImage: "rectangle.stack", action: onBrowseSessions)
                             .buttonStyle(.bordered)
-                            .disabled(machine.sshAlias == nil)
+                            .disabled(machine.sshConnectionTarget == nil)
                     } else if machine.devbox.status.isStopped {
                         Button("启动开发机", systemImage: "play.fill", action: onStart)
                             .buttonStyle(.borderedProminent)
                     }
-                    if machine.sshAlias == nil {
-                        StatusPill(label: "未匹配 SSH alias", color: .orange, symbol: "link.badge.plus")
+                    if machine.sshConnectionTarget == nil {
+                        StatusPill(label: "暂无 SSH 连接信息", color: .orange, symbol: "link.badge.plus")
                     }
                 }
 
@@ -237,8 +240,9 @@ struct DevboxDetailView: View {
                         ForEach(machine.workers) { worker in
                             WorkerRow(
                                 worker: worker,
-                                isConnectable: machine.devbox.status.isRunning
-                                    && machine.sshAlias != nil
+                                isConnectable: machine.workerTerminalTarget(
+                                    for: worker
+                                ) != nil
                             ) {
                                 onConnectWorker(worker)
                             }
@@ -308,9 +312,10 @@ struct AllWorkersView: View {
                     ForEach(rows, id: \.1.id) { devbox, worker in
                         WorkerRow(
                             worker: worker,
-                            parentLabel: devbox.sshAlias ?? devbox.devbox.name,
-                            isConnectable: devbox.devbox.status.isRunning
-                                && devbox.sshAlias != nil
+                            parentLabel: devbox.displayName,
+                            isConnectable: devbox.workerTerminalTarget(
+                                for: worker
+                            ) != nil
                         ) {
                             onConnect(devbox, worker)
                         }
@@ -336,7 +341,7 @@ struct WorkerDetailView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(worker.displayName)
                             .font(.largeTitle.bold())
-                        Text("\(machine.sshAlias ?? machine.devbox.name) · \(worker.id)")
+                        Text("\(machine.displayName) · \(worker.id)")
                             .font(.callout.monospaced())
                             .foregroundStyle(.secondary)
                     }
@@ -353,11 +358,13 @@ struct WorkerDetailView: View {
                     Button("现有会话", systemImage: "rectangle.stack", action: onBrowseSessions)
                         .buttonStyle(.bordered)
                 }
-                .disabled(machine.sshAlias == nil || !machine.devbox.status.isRunning)
+                .disabled(
+                    machine.workerTerminalTarget(for: worker) == nil
+                )
 
-                if machine.sshAlias == nil {
+                if machine.workerTerminalTarget(for: worker) == nil {
                     MessageBanner(
-                        text: "Merlin 平台状态与监控仍可使用；未匹配 SSH alias，因此终端与 tmux 暂不可用。",
+                        text: "Merlin 平台状态与监控仍可使用；暂无 SSH 连接信息，因此终端与 tmux 暂不可用。",
                         kind: .info
                     )
                 }
@@ -402,7 +409,6 @@ struct WorkerDetailView: View {
     }
 
     private var platformMonitoringTarget: MerlinPlatformMetricsTarget? {
-        guard machine.devbox.status.isRunning else { return nil }
         return MerlinPlatformMetricsTarget(
             devboxSID: machine.devbox.sid,
             workerID: worker.id
@@ -411,20 +417,14 @@ struct WorkerDetailView: View {
 
     private var directMonitoringTarget: TerminalTarget? {
         guard
-            machine.devbox.status.isRunning,
-            let alias = machine.sshAlias,
+            let target = machine.workerTerminalTarget(for: worker),
             platformAllowsDirectMonitoring,
             worker.readiness != .notReady,
             worker.readiness != .unreachable
         else {
             return nil
         }
-        return .worker(
-            devboxSID: machine.devbox.sid,
-            devboxName: machine.devbox.name,
-            alias: alias,
-            workerID: worker.id
-        )
+        return target
     }
 
     private var platformAllowsDirectMonitoring: Bool {
@@ -435,8 +435,8 @@ struct WorkerDetailView: View {
     }
 
     private var monitoringUnavailableMessage: String {
-        if !machine.devbox.status.isRunning {
-            return "开发机未运行，无法读取 Worker 指标。"
+        if machine.workerTerminalTarget(for: worker) == nil {
+            return "暂无可用 Worker SSH 连接，无法直接读取指标。"
         }
         if platformMonitoringTarget == nil {
             return "Worker 标识无效，无法请求 Merlin 平台指标。"
@@ -480,7 +480,7 @@ struct WorkerRow: View {
             Button("连接", systemImage: "terminal", action: onConnect)
                 .buttonStyle(.bordered)
                 .disabled(!isConnectable)
-                .help(isConnectable ? "打开 Worker 终端" : "开发机未运行或未匹配 SSH alias")
+                .help(isConnectable ? "打开 Worker 终端" : "暂无可用 SSH 连接信息")
         }
         .padding(12)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
@@ -577,13 +577,6 @@ private struct WorkerStatusPresentation {
 private func workerStatusPresentation(
     _ machine: DevboxInventory
 ) -> WorkerStatusPresentation {
-    guard machine.devbox.status.isRunning else {
-        return WorkerStatusPresentation(
-            summary: "开发机未运行",
-            detail: nil,
-            isFailure: false
-        )
-    }
     return switch machine.workerStatus {
     case .notQueried:
         WorkerStatusPresentation(summary: "后台查询中", detail: nil, isFailure: false)
@@ -619,9 +612,6 @@ private func workerCountLabel(_ machine: DevboxInventory) -> String {
 }
 
 private func emptyWorkerMessage(_ machine: DevboxInventory) -> String {
-    guard machine.devbox.status.isRunning else {
-        return "开发机未运行，无法查询工作机。"
-    }
     return switch machine.workerStatus {
     case .notQueried:
         "Worker 列表正在后台查询…"
@@ -633,6 +623,5 @@ private func emptyWorkerMessage(_ machine: DevboxInventory) -> String {
 }
 
 private func workerInventoryIsPending(_ machine: DevboxInventory) -> Bool {
-    machine.devbox.status.isRunning
-        && machine.workerStatus == .notQueried
+    machine.workerStatus == .notQueried
 }

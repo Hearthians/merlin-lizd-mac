@@ -70,6 +70,34 @@ struct MerlinWorkerPageParserTests {
         #expect(worker.memoryGiB == 240)
     }
 
+    @Test("ignores a proxy destination whose identity does not match the Worker")
+    func rejectsMismatchedSSHProxyDestination() throws {
+        let page = try MerlinWorkerPageParser.parse(workerPage(
+            sid: "wkr_3960209",
+            status: "running",
+            memoryBytes: 257698037760,
+            sshProxyCommand:
+                "9999999.lizhuodong.worker@merlin-ssh-proxy-cn.byted.org"
+        ))
+
+        let worker = try #require(page.workers.first)
+        #expect(worker.sshProxyDestination == nil)
+        #expect(WorkerInventoryRecord(worker: worker)
+            .sshConnectionTarget(fallback: "hl_gpu_2") == "hl_gpu_2")
+    }
+
+    @Test("ignores a Worker destination outside the Merlin SSH proxy")
+    func rejectsUntrustedSSHProxyHost() throws {
+        let page = try MerlinWorkerPageParser.parse(workerPage(
+            sid: "wkr_3960209",
+            status: "running",
+            memoryBytes: 257698037760,
+            sshProxyCommand: "3960209.lizhuodong.worker@attacker.example"
+        ))
+
+        #expect(page.workers.first?.sshProxyDestination == nil)
+    }
+
     @Test("preserves probed readiness when platform Worker data refreshes")
     func preservesProbedReadinessAcrossWorkerRefresh() {
         let previous = [
@@ -154,9 +182,13 @@ struct MerlinWorkerPageParserTests {
     private func workerPage(
         sid: String,
         status: String,
-        memoryBytes: UInt64
+        memoryBytes: UInt64,
+        sshProxyCommand: String? = nil
     ) -> String {
-        """
+        let proxyField = sshProxyCommand.map {
+            #", "ssh_proxy_cmd": "\#($0)""#
+        } ?? ""
+        return """
         {
           "ResponseBase": {"code": 0, "message": "success"},
           "data": [{
@@ -165,7 +197,7 @@ struct MerlinWorkerPageParserTests {
             "gpu_count": 0,
             "cpu_cores": 100,
             "memory_bytes": \(memoryBytes),
-            "created_at": "2026-07-08T05:20:59Z"
+            "created_at": "2026-07-08T05:20:59Z"\(proxyField)
           }],
           "pagination": {"page_size": 100}
         }

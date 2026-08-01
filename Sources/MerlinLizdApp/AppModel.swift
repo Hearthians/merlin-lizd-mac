@@ -73,10 +73,12 @@ final class AppModel: ObservableObject {
 
     var devboxes: [DevboxInventory] {
         (snapshot?.devboxes ?? []).sorted { lhs, rhs in
-            if lhs.devbox.status == rhs.devbox.status {
-                return (lhs.sshAlias ?? lhs.devbox.name) < (rhs.sshAlias ?? rhs.devbox.name)
+            if lhs.devbox.status.isRunning != rhs.devbox.status.isRunning {
+                return lhs.devbox.status.isRunning
             }
-            return lhs.devbox.status.isRunning
+            return lhs.displayName.localizedCaseInsensitiveCompare(
+                rhs.displayName
+            ) == .orderedAscending
         }
     }
 
@@ -145,25 +147,21 @@ final class AppModel: ObservableObject {
             currentSIDs.contains($0.key)
         }
 
-        // A lifecycle or route change invalidates freshness without discarding
-        // last-known rows. If the Devbox returns during this run, the UI can
-        // show them immediately while a mandatory revalidation starts.
+        // A route change invalidates freshness without discarding last-known
+        // rows. Parent lifecycle does not: the platform Worker list and direct
+        // Worker destinations remain usable without a running Devbox process.
         for machine in incoming.devboxes {
             let sid = machine.devbox.sid
             guard let cached = workerInventoryCache[sid] else { continue }
-            if
-                !machine.devbox.status.isRunning
-                    || machine.sshAlias != cached.sshAlias
-            {
+            if machine.sshConnectionTarget != cached.sshAlias {
                 workerInventoryCache[sid] = cached.invalidated()
             }
         }
 
         let devboxes = incoming.devboxes.map { machine in
             guard
-                machine.devbox.status.isRunning,
                 let cached = workerInventoryCache[machine.devbox.sid],
-                cached.sshAlias == machine.sshAlias
+                cached.sshAlias == machine.sshConnectionTarget
             else {
                 return machine
             }
@@ -195,12 +193,9 @@ final class AppModel: ObservableObject {
 
         let now = Date()
         let targets = snapshot.devboxes.compactMap { machine -> WorkerInventoryTarget? in
-            guard machine.devbox.status.isRunning else {
-                return nil
-            }
             if !force,
                let cached = workerInventoryCache[machine.devbox.sid],
-               cached.sshAlias == machine.sshAlias
+               cached.sshAlias == machine.sshConnectionTarget
             {
                 switch cached.status {
                 case .loaded
@@ -217,7 +212,7 @@ final class AppModel: ObservableObject {
             }
             return WorkerInventoryTarget(
                 machine: machine,
-                sshAlias: machine.sshAlias
+                sshAlias: machine.sshConnectionTarget
             )
         }
         guard !targets.isEmpty else { return false }
@@ -265,8 +260,7 @@ final class AppModel: ObservableObject {
             let currentMachine = current.devboxes.first(where: {
                 $0.devbox.sid == sid
             }),
-            currentMachine.devbox.status.isRunning,
-            currentMachine.sshAlias == target.sshAlias
+            currentMachine.sshConnectionTarget == target.sshAlias
         else {
             return
         }
@@ -360,102 +354,37 @@ final class AppModel: ObservableObject {
         for snapshot: InventorySnapshot,
         reason: WarmupReason
     ) {
-        let inventory = Self.warmupInventory(from: snapshot)
+        let inventory = TargetWarmupInventory(snapshot: snapshot)
         let relay = warmupUpdateRelay
         runtime.reconcile(inventory, reason: reason) { update in
             relay.submit(update)
         }
     }
 
-    private static func warmupInventory(
-        from snapshot: InventorySnapshot
-    ) -> TargetWarmupInventory {
-        var aliases: [String] = []
-        var seenAliases: Set<String> = []
-        var workerTargets: [TerminalTarget] = []
-        for machine in snapshot.devboxes {
-            guard
-                machine.devbox.status.isRunning,
-                MerlinIdentifierValidator.isDevboxSID(machine.devbox.sid)
-            else {
-                continue
-            }
-            if
-                let alias = machine.sshAlias,
-                MerlinIdentifierValidator.isSSHAlias(alias),
-                seenAliases.insert(alias).inserted
-            {
-                aliases.append(alias)
-            }
-            workerTargets.append(contentsOf: machine.workers.compactMap { worker in
-                guard
-                    MerlinIdentifierValidator.isWorkerID(worker.id),
-                    let connectionTarget = worker.sshConnectionTarget(
-                        fallback: machine.sshAlias
-                    )
-                else {
-                    return nil
-                }
-                return .worker(
-                    devboxSID: machine.devbox.sid,
-                    devboxName: machine.devbox.name,
-                    alias: connectionTarget,
-                    workerID: worker.id
-                )
-            })
-        }
-        return TargetWarmupInventory(
-            runningDevboxAliases: aliases,
-            workerTargets: workerTargets
-        )
-    }
-
     fileprivate func applyWarmupUpdate(_ update: TargetWarmupUpdate) {
         guard
-            case let .worker(devboxSID, _, alias, workerID) = update.target,
+            case let .worker(devboxSID, _, _, _) = update.target,
             let current = snapshot,
+            let updated = current.applyingWarmupUpdate(update),
             let currentMachine = current.devboxes.first(where: {
                 $0.devbox.sid == devboxSID
             }),
-            currentMachine.devbox.status.isRunning,
-            let currentWorker = currentMachine.workers.first(where: {
-                $0.id == workerID
-            }),
-            currentWorker.sshConnectionTarget(
-                fallback: currentMachine.sshAlias
-            ) == alias
+            let updatedMachine = updated.devboxes.first(where: {
+                $0.devbox.sid == devboxSID
+            })
         else {
             return
         }
 
-        let readiness: WorkerReadiness
-        if let error = update.snapshot.lastError {
-            readiness = error == .workerNotReady ? .notReady : .unreachable
-        } else {
-            switch update.snapshot.readiness {
-            case .ready:
-                readiness = .ready
-            case .workerNotReady:
-                readiness = .notReady
-            case .unknown:
-                readiness = .unreachable
-            }
-        }
-
-        let updatedWorkers = currentMachine.workers.map { worker in
-            worker.id == workerID
-                ? worker.withReadiness(readiness)
-                : worker
-        }
         if
             let cached = workerInventoryCache[devboxSID],
-            cached.sshAlias == currentMachine.sshAlias
+            cached.sshAlias == currentMachine.sshConnectionTarget
         {
             workerInventoryCache[devboxSID] = CachedWorkerInventory(
                 sshAlias: cached.sshAlias,
                 workers: WorkerInventoryRecord.preservingReadiness(
                     of: cached.workers,
-                    from: updatedWorkers
+                    from: updatedMachine.workers
                 ),
                 status: cached.status,
                 fetchedAt: cached.fetchedAt,
@@ -463,23 +392,7 @@ final class AppModel: ObservableObject {
             )
         }
 
-        let devboxes = current.devboxes.map { machine in
-            guard
-                machine.devbox.sid == devboxSID
-            else {
-                return machine
-            }
-            return DevboxInventory(
-                devbox: machine.devbox,
-                sshAlias: machine.sshAlias,
-                workers: updatedWorkers,
-                workerStatus: machine.workerStatus
-            )
-        }
-        snapshot = InventorySnapshot(
-            devboxes: devboxes,
-            refreshedAt: current.refreshedAt
-        )
+        snapshot = updated
         persistSnapshot()
     }
 
@@ -493,7 +406,7 @@ final class AppModel: ObservableObject {
         case let .devbox(sid):
             guard
                 let machine = devbox(sid: sid),
-                let alias = machine.sshAlias
+                let alias = machine.sshConnectionTarget
             else {
                 return
             }
@@ -506,17 +419,12 @@ final class AppModel: ObservableObject {
             guard let (machine, worker) = worker(
                 devboxSID: devboxSID,
                 workerID: workerID
-            ), let connectionTarget = worker.sshConnectionTarget(
-                fallback: machine.sshAlias
+            ), let workerTarget = machine.workerTerminalTarget(
+                for: worker
             ) else {
                 return
             }
-            target = .worker(
-                devboxSID: devboxSID,
-                devboxName: machine.devbox.name,
-                alias: connectionTarget,
-                workerID: workerID
-            )
+            target = workerTarget
         }
         guard let target else { return }
         runtime.prioritize(target)
@@ -526,7 +434,7 @@ final class AppModel: ObservableObject {
         for machine in cached.snapshot.devboxes {
             if machine.workerStatus != .notQueried {
                 workerInventoryCache[machine.devbox.sid] = CachedWorkerInventory(
-                    sshAlias: machine.sshAlias,
+                    sshAlias: machine.sshConnectionTarget,
                     workers: machine.workers.map { $0.withReadiness(.listed) },
                     status: machine.workerStatus,
                     fetchedAt: cached.workerFetchedAtBySID[
@@ -602,7 +510,7 @@ final class AppModel: ObservableObject {
                 return
             }
             message = AppMessage(
-                text: "已提交 \(machine.sshAlias ?? machine.devbox.name) 的启动请求。",
+                text: "已提交 \(machine.displayName) 的启动请求。",
                 kind: .info
             )
             await refresh()

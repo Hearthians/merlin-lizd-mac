@@ -14,8 +14,8 @@ public enum TerminalTarget: Codable, Equatable, Hashable, Sendable {
         switch self {
         case .local:
             "本机"
-        case let .devbox(_, _, alias):
-            alias
+        case let .devbox(_, name, _):
+            name
         case let .worker(_, _, _, workerID):
             "Worker \(workerID)"
         }
@@ -89,6 +89,60 @@ public struct TerminalState: Codable, Equatable, Sendable {
     public init(selectedTabID: String?, tabs: [TerminalTabRecord]) {
         self.selectedTabID = selectedTabID
         self.tabs = tabs
+    }
+
+    /// Migrates persisted remote tabs only when current inventory exposes a
+    /// validated route for the same platform identity. Missing inventory never
+    /// guesses or silently rewrites an old route.
+    public func retargetingConnections(
+        using snapshot: InventorySnapshot
+    ) -> TerminalState {
+        var machinesBySID: [String: DevboxInventory] = [:]
+        for machine in snapshot.devboxes where machinesBySID[machine.devbox.sid] == nil {
+            machinesBySID[machine.devbox.sid] = machine
+        }
+        let migratedTabs = tabs.map { tab -> TerminalTabRecord in
+            let target: TerminalTarget
+            switch tab.target {
+            case .local:
+                return tab
+            case let .devbox(sid, _, _):
+                guard
+                    let machine = machinesBySID[sid],
+                    let destination = machine.sshConnectionTarget
+                else {
+                    return tab
+                }
+                target = .devbox(
+                    sid: sid,
+                    name: machine.devbox.name,
+                    alias: destination
+                )
+            case let .worker(devboxSID, _, _, workerID):
+                guard
+                    let machine = machinesBySID[devboxSID],
+                    let worker = machine.workers.first(where: {
+                        $0.id == workerID
+                    }),
+                    let currentTarget = machine.workerTerminalTarget(for: worker)
+                else {
+                    return tab
+                }
+                target = currentTarget
+            }
+            guard target != tab.target else { return tab }
+            return TerminalTabRecord(
+                id: tab.id,
+                title: tab.title,
+                target: target,
+                sessionName: tab.sessionName,
+                workingDirectory: tab.workingDirectory
+            )
+        }
+        return TerminalState(
+            selectedTabID: selectedTabID,
+            tabs: migratedTabs
+        )
     }
 }
 

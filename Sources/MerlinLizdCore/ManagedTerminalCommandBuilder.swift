@@ -47,17 +47,19 @@ public struct ManagedTerminalCommandBuilder: Sendable {
         switch target {
         case .local:
             throw ManagedTerminalCommandError.remoteTargetRequired
-        case let .devbox(_, _, targetAlias):
+        case let .devbox(sid, _, targetAlias):
             alias = targetAlias
             command = try MerlinCommands.devboxTerminal(
                 alias: targetAlias,
+                devboxSID: sid,
                 sessionName: sessionName,
                 workingDirectory: workingDirectory
             )
-        case let .worker(_, _, targetAlias, workerID):
+        case let .worker(devboxSID, _, targetAlias, workerID):
             alias = targetAlias
             command = try MerlinCommands.workerTerminal(
                 alias: targetAlias,
+                devboxSID: devboxSID,
                 workerID: workerID,
                 sessionName: sessionName,
                 workingDirectory: workingDirectory

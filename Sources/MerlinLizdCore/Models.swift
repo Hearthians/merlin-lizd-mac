@@ -41,8 +41,39 @@ public struct Devbox: Identifiable, Codable, Hashable, Sendable {
     public let rootfsType: String?
     public let region: String?
     public let accessRole: String?
+    public let sshProxyDestination: String?
     public let createdAt: String?
     public let updatedAt: String?
+
+    init(
+        sid: String,
+        name: String,
+        status: DevboxLifecycle,
+        cpuCores: Int?,
+        memoryBytes: Int64?,
+        diskBytes: Int64?,
+        workerCount: Int?,
+        rootfsType: String?,
+        region: String?,
+        accessRole: String?,
+        sshProxyDestination: String?,
+        createdAt: String?,
+        updatedAt: String?
+    ) {
+        self.sid = sid
+        self.name = name
+        self.status = status
+        self.cpuCores = cpuCores
+        self.memoryBytes = memoryBytes
+        self.diskBytes = diskBytes
+        self.workerCount = workerCount
+        self.rootfsType = rootfsType
+        self.region = region
+        self.accessRole = accessRole
+        self.sshProxyDestination = sshProxyDestination
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
 
     enum CodingKeys: String, CodingKey {
         case sid
@@ -55,6 +86,7 @@ public struct Devbox: Identifiable, Codable, Hashable, Sendable {
         case rootfsType = "rootfs_type"
         case region
         case accessRole = "access_role"
+        case sshProxyDestination = "ssh_proxy_cmd"
         case createdAt = "created_at"
         case updatedAt = "updated_at"
     }

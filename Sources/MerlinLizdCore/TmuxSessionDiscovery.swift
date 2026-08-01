@@ -365,7 +365,7 @@ public actor TmuxSessionDiscovery {
                 target: target,
                 localTmuxPath: localPath
             )
-            if let alias = MerlinCommands.sshAlias(for: target),
+            if let alias = MerlinCommands.sshConnectionTarget(for: target),
                 let sshMasterPool
             {
                 let executionPolicy = switch lane {

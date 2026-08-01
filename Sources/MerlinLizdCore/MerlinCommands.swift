@@ -23,7 +23,7 @@ public enum CommandValidationError: Error, Equatable, Sendable {
 }
 
 public enum MerlinCommands {
-    public static func sshAlias(for target: TerminalTarget) -> String? {
+    public static func sshConnectionTarget(for target: TerminalTarget) -> String? {
         switch target {
         case .local:
             nil
@@ -61,8 +61,8 @@ public enum MerlinCommands {
     public static func sampleWorkerMetrics(
         target: TerminalTarget
     ) throws -> CommandSpec {
-        let (alias, workerID) = try validatedWorkerRoute(target)
-        let separator = #"\;"#
+        let (alias, workerID, connectsDirectly) = try validatedWorkerRoute(target)
+        let separator = connectsDirectly ? ";" : #"\;"#
         let commands = [
             "export LC_ALL=C",
             workerMetricsSnapshotCommands(separator: separator),
@@ -71,6 +71,7 @@ public enum MerlinCommands {
         return workerCommand(
             alias: alias,
             workerID: workerID,
+            connectsDirectly: connectsDirectly,
             remoteCommands: commands
         )
     }
@@ -85,8 +86,8 @@ public enum MerlinCommands {
         guard (1 ... 3_600).contains(intervalSeconds) else {
             throw CommandValidationError.invalidMetricsInterval
         }
-        let (alias, workerID) = try validatedWorkerRoute(target)
-        let separator = #"\;"#
+        let (alias, workerID, connectsDirectly) = try validatedWorkerRoute(target)
+        let separator = connectsDirectly ? ";" : #"\;"#
         let snapshot = workerMetricsSnapshotCommands(separator: separator)
         let commands = [
             "export LC_ALL=C",
@@ -98,6 +99,7 @@ public enum MerlinCommands {
         return streamingWorkerCommand(
             alias: alias,
             workerID: workerID,
+            connectsDirectly: connectsDirectly,
             remoteCommands: commands
         )
     }
@@ -119,8 +121,8 @@ public enum MerlinCommands {
                 executable: localTmuxPath,
                 arguments: tmuxArguments
             )
-        case let .devbox(_, _, alias):
-            try validateAlias(alias)
+        case let .devbox(sid, _, alias):
+            try validateDevboxRoute(alias: alias, devboxSID: sid)
             return CommandSpec(
                 executable: "/usr/bin/ssh",
                 arguments: nonInteractiveSSHArguments(
@@ -128,14 +130,14 @@ public enum MerlinCommands {
                     remoteCommand: "tmux kill-session -t \(sessionName)"
                 )
             )
-        case let .worker(_, _, alias, workerID):
-            try validateAlias(alias)
-            try validateWorkerID(workerID)
+        case let .worker(devboxSID, _, alias, workerID):
             return CommandSpec(
                 executable: "/usr/bin/ssh",
                 arguments: nonInteractiveSSHArguments(
                     alias: alias,
-                    remoteCommand: workerTmuxRemoteCommand(
+                    remoteCommand: try workerTmuxRemoteCommand(
+                        alias: alias,
+                        devboxSID: devboxSID,
                         workerID: workerID,
                         tmuxCommand: "kill-session -t \(sessionName)"
                     )
@@ -165,8 +167,8 @@ public enum MerlinCommands {
                 executable: localTmuxPath,
                 arguments: tmuxArguments
             )
-        case let .devbox(_, _, alias):
-            try validateAlias(alias)
+        case let .devbox(sid, _, alias):
+            try validateDevboxRoute(alias: alias, devboxSID: sid)
             return CommandSpec(
                 executable: "/usr/bin/ssh",
                 arguments: nonInteractiveSSHArguments(
@@ -174,14 +176,14 @@ public enum MerlinCommands {
                     remoteCommand: "tmux rename-session -t \(currentName) \(newName)"
                 )
             )
-        case let .worker(_, _, alias, workerID):
-            try validateAlias(alias)
-            try validateWorkerID(workerID)
+        case let .worker(devboxSID, _, alias, workerID):
             return CommandSpec(
                 executable: "/usr/bin/ssh",
                 arguments: nonInteractiveSSHArguments(
                     alias: alias,
-                    remoteCommand: workerTmuxRemoteCommand(
+                    remoteCommand: try workerTmuxRemoteCommand(
+                        alias: alias,
+                        devboxSID: devboxSID,
                         workerID: workerID,
                         tmuxCommand: "rename-session -t \(currentName) \(newName)"
                     )
@@ -201,8 +203,8 @@ public enum MerlinCommands {
                 throw CommandValidationError.invalidExecutablePath
             }
             return CommandSpec(executable: localTmuxPath, arguments: tmuxArguments)
-        case let .devbox(_, _, alias):
-            try validateAlias(alias)
+        case let .devbox(sid, _, alias):
+            try validateDevboxRoute(alias: alias, devboxSID: sid)
             return CommandSpec(
                 executable: "/usr/bin/ssh",
                 arguments: nonInteractiveSSHArguments(
@@ -210,11 +212,7 @@ public enum MerlinCommands {
                     remoteCommand: "tmux list-sessions -F#{session_name}"
                 )
             )
-        case let .worker(_, _, alias, workerID):
-            let connectsDirectly = try validatesDirectWorkerRoute(
-                alias: alias,
-                workerID: workerID
-            )
+        case let .worker(devboxSID, _, alias, workerID):
             return CommandSpec(
                 executable: "/usr/bin/ssh",
                 arguments: nonInteractiveSSHArguments(
@@ -222,15 +220,12 @@ public enum MerlinCommands {
                     // mlx reconstructs its remote command without preserving
                     // quoting. Keeping the format attached to -F prevents the
                     // leading # from becoming a shell comment.
-                    remoteCommand: connectsDirectly
-                        ? workerTmuxInvocation(
-                            term: "dumb",
-                            tmuxCommand: "list-sessions -F#{session_name}"
-                        )
-                        : workerTmuxRemoteCommand(
-                            workerID: workerID,
-                            tmuxCommand: "list-sessions -F#{session_name}"
-                        )
+                    remoteCommand: try workerTmuxRemoteCommand(
+                        alias: alias,
+                        devboxSID: devboxSID,
+                        workerID: workerID,
+                        tmuxCommand: "list-sessions -F#{session_name}"
+                    )
                 )
             )
         }
@@ -306,10 +301,15 @@ public enum MerlinCommands {
 
     public static func devboxTerminal(
         alias: String,
+        devboxSID: String? = nil,
         sessionName: String,
         workingDirectory: String? = nil
     ) throws -> CommandSpec {
-        try validateAlias(alias)
+        if let devboxSID {
+            try validateDevboxRoute(alias: alias, devboxSID: devboxSID)
+        } else {
+            try validateConnectionTarget(alias)
+        }
         try validateSessionName(sessionName)
         let directoryArgument = try tmuxWorkingDirectoryArgument(workingDirectory)
 
@@ -324,12 +324,14 @@ public enum MerlinCommands {
 
     public static func workerTerminal(
         alias: String,
+        devboxSID: String? = nil,
         workerID: String,
         sessionName: String,
         workingDirectory: String? = nil
     ) throws -> CommandSpec {
         let connectsDirectly = try validatesDirectWorkerRoute(
             alias: alias,
+            devboxSID: devboxSID,
             workerID: workerID
         )
         try validateSessionName(sessionName)
@@ -360,14 +362,22 @@ public enum MerlinCommands {
     }
 
     private static func workerTmuxRemoteCommand(
+        alias: String,
+        devboxSID: String,
         workerID: String,
         tmuxCommand: String
-    ) -> String {
+    ) throws -> String {
         let tmuxInvocation = workerTmuxInvocation(
             term: "dumb",
             tmuxCommand: tmuxCommand
         )
-        return "NO_COLOR=1 TERM=dumb mlx worker login \(workerID) -- \(tmuxInvocation)"
+        return try validatesDirectWorkerRoute(
+            alias: alias,
+            devboxSID: devboxSID,
+            workerID: workerID
+        )
+            ? tmuxInvocation
+            : "NO_COLOR=1 TERM=dumb mlx worker login \(workerID) -- \(tmuxInvocation)"
     }
 
     private static func interactiveSSHArguments(
@@ -378,8 +388,8 @@ public enum MerlinCommands {
             "-tt",
             "-o", "ServerAliveInterval=10",
             "-o", "ServerAliveCountMax=3",
-            alias,
-            remoteCommand,
+        ] + sshPortArguments(forConnectionTarget: alias) + [
+            alias, remoteCommand,
         ]
     }
 
@@ -391,32 +401,38 @@ public enum MerlinCommands {
             "-nT",
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=10",
-            alias,
-            remoteCommand,
+        ] + sshPortArguments(forConnectionTarget: alias) + [
+            alias, remoteCommand,
         ]
     }
 
     private static func validatedWorkerRoute(
         _ target: TerminalTarget
-    ) throws -> (alias: String, workerID: String) {
-        guard case let .worker(_, _, alias, workerID) = target else {
+    ) throws -> (alias: String, workerID: String, connectsDirectly: Bool) {
+        guard case let .worker(devboxSID, _, alias, workerID) = target else {
             throw CommandValidationError.workerTargetRequired
         }
-        try validateAlias(alias)
-        try validateWorkerID(workerID)
-        return (alias, workerID)
+        let connectsDirectly = try validatesDirectWorkerRoute(
+            alias: alias,
+            devboxSID: devboxSID,
+            workerID: workerID
+        )
+        return (alias, workerID, connectsDirectly)
     }
 
     private static func workerCommand(
         alias: String,
         workerID: String,
+        connectsDirectly: Bool,
         remoteCommands: String
     ) -> CommandSpec {
         CommandSpec(
             executable: "/usr/bin/ssh",
             arguments: nonInteractiveSSHArguments(
                 alias: alias,
-                remoteCommand: "NO_COLOR=1 TERM=dumb mlx worker login \(workerID) -- \(remoteCommands)"
+                remoteCommand: connectsDirectly
+                    ? remoteCommands
+                    : "NO_COLOR=1 TERM=dumb mlx worker login \(workerID) -- \(remoteCommands)"
             )
         )
     }
@@ -424,6 +440,7 @@ public enum MerlinCommands {
     private static func streamingWorkerCommand(
         alias: String,
         workerID: String,
+        connectsDirectly: Bool,
         remoteCommands: String
     ) -> CommandSpec {
         CommandSpec(
@@ -434,8 +451,11 @@ public enum MerlinCommands {
                 "-o", "ConnectTimeout=10",
                 "-o", "ServerAliveInterval=10",
                 "-o", "ServerAliveCountMax=3",
+            ] + sshPortArguments(forConnectionTarget: alias) + [
                 alias,
-                "NO_COLOR=1 TERM=dumb mlx worker login \(workerID) -- \(remoteCommands)",
+                connectsDirectly
+                    ? remoteCommands
+                    : "NO_COLOR=1 TERM=dumb mlx worker login \(workerID) -- \(remoteCommands)",
             ]
         )
     }
@@ -494,6 +514,25 @@ public enum MerlinCommands {
         }
     }
 
+    private static func validateConnectionTarget(_ value: String) throws {
+        guard MerlinIdentifierValidator.isSSHConnectionTarget(value) else {
+            throw CommandValidationError.invalidAlias
+        }
+    }
+
+    private static func validateDevboxRoute(
+        alias: String,
+        devboxSID: String
+    ) throws {
+        if MerlinIdentifierValidator.isDevboxSSHProxyDestination(
+            alias,
+            devboxSID: devboxSID
+        ) {
+            return
+        }
+        try validateAlias(alias)
+    }
+
     private static func validateWorkerID(_ value: String) throws {
         guard MerlinIdentifierValidator.isWorkerID(value) else {
             throw CommandValidationError.invalidWorkerID
@@ -502,6 +541,7 @@ public enum MerlinCommands {
 
     private static func validatesDirectWorkerRoute(
         alias: String,
+        devboxSID: String?,
         workerID: String
     ) throws -> Bool {
         try validateWorkerID(workerID)
@@ -511,8 +551,28 @@ public enum MerlinCommands {
         ) {
             return true
         }
+        if
+            let devboxSID,
+            MerlinIdentifierValidator.isDevboxSSHProxyDestination(
+                alias,
+                devboxSID: devboxSID
+            )
+        {
+            return false
+        }
         try validateAlias(alias)
         return false
+    }
+
+    static func sshPortArguments(
+        forConnectionTarget target: String
+    ) -> [String] {
+        guard let port = MerlinIdentifierValidator.sshPort(
+            forConnectionTarget: target
+        ) else {
+            return []
+        }
+        return ["-p", String(port)]
     }
 
     private static func validateSessionName(_ value: String) throws {

@@ -3,6 +3,33 @@ import Testing
 
 @Suite("Merlin inventory alias and readiness fallbacks")
 struct MerlinInventoryAliasTests {
+    @Test("prefers the platform SSH destination over a local alias")
+    func usesPlatformSSHDestination() async throws {
+        let runner = AliasScriptedRunner(outputs: [
+            .success(devboxPage(
+                sid: "dbx_140542",
+                name: "hl_gpu",
+                status: "running",
+                sshProxyDestination:
+                    "140542.lizhuodong.ws@merlin-ssh-proxy-cn.byted.org"
+            )),
+            .success(emptyDevboxPage),
+            .success("user 140542.lizhuodong.ws"),
+        ])
+        let inventory = try MerlinInventory(
+            merlinCLIPath: "/Users/test/.merlin-cli/bin/merlin-cli",
+            processRunner: runner
+        )
+
+        let snapshot = try await inventory.refresh(sshAliases: ["hl_gpu"])
+        let machine = try #require(snapshot.devboxes.first)
+
+        #expect(machine.sshAlias == "hl_gpu")
+        #expect(machine.sshConnectionTarget ==
+            "140542.lizhuodong.ws@merlin-ssh-proxy-cn.byted.org")
+        #expect(machine.displayName == "hl_gpu")
+    }
+
     @Test("matches a unique Devbox name when SSH User has no SID")
     func matchesUniqueDevboxName() async throws {
         let runner = AliasScriptedRunner(outputs: [
@@ -50,6 +77,27 @@ struct MerlinInventoryAliasTests {
         let snapshot = try await inventory.refresh(sshAliases: ["shared_name"])
 
         #expect(snapshot.devboxes.allSatisfy { $0.sshAlias == nil })
+    }
+
+    @Test("does not match a Devbox name when SSH User contains a stale SID")
+    func rejectsNameMatchWithStaleSID() async throws {
+        let runner = AliasScriptedRunner(outputs: [
+            .success(devboxPage(
+                sid: "dbx_139503",
+                name: "hl_gpu",
+                status: "running"
+            )),
+            .success(emptyDevboxPage),
+            .success("user 133757.account.ws"),
+        ])
+        let inventory = try MerlinInventory(
+            merlinCLIPath: "/Users/test/.merlin-cli/bin/merlin-cli",
+            processRunner: runner
+        )
+
+        let snapshot = try await inventory.refresh(sshAliases: ["hl_gpu"])
+
+        #expect(snapshot.devboxes.first?.sshAlias == nil)
     }
 
     @Test("keeps mlx not-ready evidence as Worker readiness")
@@ -163,9 +211,19 @@ private func workerPage(
 private func devboxPage(
     sid: String,
     name: String,
-    status: String
+    status: String,
+    sshProxyDestination: String? = nil
 ) -> String {
-    devboxPage(entries: [(sid: sid, name: name, status: status)])
+    let proxyField = sshProxyDestination.map {
+        ",\"ssh_proxy_cmd\":\"\($0)\""
+    } ?? ""
+    return """
+    {
+      "ResponseBase": {"code": 0, "message": "success"},
+      "data": [{"sid":"\(sid)","name":"\(name)","status":"\(status)"\(proxyField)}],
+      "pagination": {"page_size": 100}
+    }
+    """
 }
 
 private func devboxPage(

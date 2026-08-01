@@ -370,6 +370,27 @@ struct MerlinInventoryTests {
             .contains("ControlPath=\(expectedPath)") == true)
     }
 
+    @Test("probes Worker readiness through its direct SSH destination")
+    func probesWorkerReadinessDirectly() async throws {
+        let runner = ScriptedInventoryProcessRunner(stdout: [""])
+        let inventory = try MerlinInventory(
+            merlinCLIPath: "/Users/test/.merlin-cli/bin/merlin-cli",
+            processRunner: runner
+        )
+        let destination =
+            "3966762.lizhuodong.worker@merlin-ssh-proxy-cn.byted.org"
+
+        let readiness = await inventory.probeWorker(
+            sshAlias: destination,
+            workerID: "3966762"
+        )
+
+        #expect(readiness == .ready)
+        let command = try #require(await runner.recordedCommands().last)
+        #expect(command.arguments.dropLast().last == destination)
+        #expect(command.arguments.last == "true")
+    }
+
     @Test("loads platform Workers without an SSH alias")
     func loadsPlatformWorkersWithoutAlias() async throws {
         let runner = ScriptedInventoryProcessRunner(stdout: [

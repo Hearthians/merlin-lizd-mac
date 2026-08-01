@@ -4,6 +4,8 @@ import Foundation
 /// deliberately constrained remote command. Callers still pass plain strings,
 /// but every command-producing path shares these exact rules.
 public enum MerlinIdentifierValidator {
+    public static let merlinSSHProxyPort = 22_222
+
     public static func isSSHAlias(_ value: String) -> Bool {
         matches(value, pattern: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"#)
     }
@@ -18,8 +20,36 @@ public enum MerlinIdentifierValidator {
             value,
             pattern: #"^"# + escapedWorkerID
                 + #"\.[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.worker@"#
-                + #"[A-Za-z0-9][A-Za-z0-9.-]{0,252}$"#
+                + #"merlin-ssh-proxy-[A-Za-z0-9-]{1,63}\.byted\.org$"#
         )
+    }
+
+    public static func isDevboxSSHProxyDestination(
+        _ value: String,
+        devboxSID: String
+    ) -> Bool {
+        let prefix = "dbx_"
+        guard devboxSID.hasPrefix(prefix) else { return false }
+        let numericID = String(devboxSID.dropFirst(prefix.count))
+        guard isWorkerID(numericID) else { return false }
+        let escapedID = NSRegularExpression.escapedPattern(for: numericID)
+        return matches(
+            value,
+            pattern: #"^"# + escapedID
+                + #"\.[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.ws@"#
+                + #"merlin-ssh-proxy-[A-Za-z0-9-]{1,63}\.byted\.org$"#
+        )
+    }
+
+    public static func sshPort(forConnectionTarget value: String) -> Int? {
+        guard matches(
+            value,
+            pattern: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}@"#
+                + #"merlin-ssh-proxy-[A-Za-z0-9-]{1,63}\.byted\.org$"#
+        ) else {
+            return nil
+        }
+        return merlinSSHProxyPort
     }
 
     public static func isSSHConnectionTarget(_ value: String) -> Bool {

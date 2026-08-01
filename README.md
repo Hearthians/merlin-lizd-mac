@@ -2,7 +2,7 @@
 
 MerlinHub is a personal native macOS dashboard and terminal for Merlin
 development machines and their workers. It uses the existing Merlin CLI login,
-system SSH configuration, and remote `mlx`/`tmux` tools; it does not store SSH
+system SSH client, SSH Agent, and remote `mlx`/`tmux` tools; it does not store SSH
 passwords or Merlin tokens itself.
 
 Machine data uses stale-while-revalidate behavior: the last safe snapshot is
@@ -11,12 +11,13 @@ in separate background stages. The snapshot deliberately excludes Pod IPs,
 ports, webshell URLs, ProxyCommand text, raw command output, and credentials.
 
 Worker inventory and lifecycle state come from `merlin-cli cpu-devbox workers
-list`; SSH is only the fallback inventory route and the connection path for
-terminals. Selecting a Worker loads its official Merlin/Grafana five-minute
-history and, when an SSH alias is available, supplements the live edge with one
-read-only Worker stream. The UI always identifies the active data source and
-marks direct-only data as degraded. Leaving the page cancels and reaps active
-processes; telemetry and signed monitoring URLs are never persisted.
+list`; SSH is only the fallback inventory route. Worker terminals and live
+metrics use the validated platform Worker destination directly when available,
+falling back to the running parent Devbox and `mlx worker login`. Selecting a
+Worker also loads its official Merlin/Grafana five-minute history. The UI always
+identifies the active data source and marks direct-only data as degraded. Leaving
+the page cancels and reaps active processes; telemetry and signed monitoring
+URLs are never persisted.
 
 ## SSH reuse and session prewarming
 
@@ -25,7 +26,8 @@ running Devbox and prewarms read-only tmux snapshots for current Workers. All
 tmux discovery, including browser refreshes, shares a total limit of two
 Worker logins in flight. Socket names use hashed aliases in a
 private temporary directory. The app does not edit the user's SSH
-configuration; child SSH commands continue to use that configuration and the
+configuration. Platform-provided destinations connect directly through the
+Merlin proxy; local aliases remain a fallback. Child SSH commands reuse the
 SSH Agent while explicitly opting into the App-owned socket.
 
 Tmux snapshots are fresh for 60 seconds and are refreshed every five minutes.
@@ -48,7 +50,7 @@ part of v1.
 - macOS 14 or newer on Apple Silicon
 - Apple Command Line Tools with Swift 6
 - `merlin-cli` installed and logged in
-- working SSH aliases for development machines
+- SSH Agent credentials accepted by the Merlin SSH proxy
 - `mlx` and `tmux` on the corresponding remote machines
 - `nvidia-smi` inside GPU Workers only for the live direct-sampling supplement
   or fallback; Merlin platform history remains available without it

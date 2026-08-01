@@ -288,21 +288,29 @@ struct TerminalTabBar: View {
                 Divider()
                 Menu("开发机", systemImage: "server.rack") {
                     ForEach(devboxes) { machine in
-                        Button(machine.sshAlias ?? machine.devbox.name) {
+                        Button(machine.displayName) {
                             terminals.openDevbox(machine)
                         }
-                        .disabled(!machine.devbox.status.isRunning || machine.sshAlias == nil)
+                        .disabled(
+                            !machine.devbox.status.isRunning
+                                || machine.sshConnectionTarget == nil
+                        )
                     }
                 }
 
                 Menu("工作机", systemImage: "cpu") {
                     ForEach(devboxes) { machine in
                         if !machine.workers.isEmpty {
-                            Menu(machine.sshAlias ?? machine.devbox.name) {
+                            Menu(machine.displayName) {
                                 ForEach(machine.workers) { worker in
                                     Button("\(worker.gpuType ?? "CPU") · \(worker.id)") {
                                         terminals.openWorker(worker, on: machine)
                                     }
+                                    .disabled(
+                                        machine.workerTerminalTarget(
+                                            for: worker
+                                        ) == nil
+                                    )
                                 }
                             }
                         }

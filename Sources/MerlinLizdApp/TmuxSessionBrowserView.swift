@@ -386,10 +386,10 @@ struct TmuxSessionBrowserView: View {
         switch model.target {
         case .local:
             "本机"
-        case let .devbox(_, name, alias):
-            "\(alias) · \(name)"
-        case let .worker(_, _, alias, workerID):
-            "\(alias) · Worker \(workerID)"
+        case let .devbox(_, name, _):
+            name
+        case let .worker(_, devboxName, _, workerID):
+            "\(devboxName) · Worker \(workerID)"
         }
     }
 

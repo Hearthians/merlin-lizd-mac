@@ -11,7 +11,12 @@ struct SidebarView: View {
     private var filteredDevboxes: [DevboxInventory] {
         guard !searchText.isEmpty else { return model.devboxes }
         return model.devboxes.compactMap { machine in
-            let machineMatches = [machine.sshAlias, machine.devbox.name, machine.devbox.sid]
+            let machineMatches = [
+                machine.sshAlias,
+                machine.sshConnectionTarget,
+                machine.displayName,
+                machine.devbox.sid,
+            ]
                 .compactMap { $0 }
                 .contains { $0.localizedCaseInsensitiveContains(searchText) }
             let workers = machine.workers.filter {
@@ -124,7 +129,7 @@ struct SidebarView: View {
                             Button("打开终端") {
                                 terminals.openDevbox(machine)
                             }
-                            .disabled(machine.sshAlias == nil)
+                            .disabled(machine.sshConnectionTarget == nil)
                         }
                     }
                 }
@@ -201,7 +206,10 @@ struct SidebarView: View {
 
     @discardableResult
     private func openDevboxIfConnectable(_ machine: DevboxInventory) -> Bool {
-        guard machine.devbox.status.isRunning, machine.sshAlias != nil else { return false }
+        guard
+            machine.devbox.status.isRunning,
+            machine.sshConnectionTarget != nil
+        else { return false }
         terminals.openDevbox(machine)
         return true
     }
@@ -211,7 +219,9 @@ struct SidebarView: View {
         _ worker: WorkerInventoryRecord,
         on machine: DevboxInventory
     ) -> Bool {
-        guard machine.devbox.status.isRunning, machine.sshAlias != nil else { return false }
+        guard machine.workerTerminalTarget(for: worker) != nil else {
+            return false
+        }
         terminals.openWorker(worker, on: machine)
         return true
     }
@@ -287,13 +297,11 @@ private struct SidebarDevboxLabel: View {
     let selected: Bool
 
     private var title: String {
-        machine.sshAlias ?? machine.devbox.name
+        machine.displayName
     }
 
     private var subtitle: String {
-        title == machine.devbox.name
-            ? lifecycleLabel
-            : machine.devbox.name
+        lifecycleLabel
     }
 
     private var lifecycleLabel: String {

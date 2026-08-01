@@ -130,11 +130,23 @@ public actor MerlinInventory {
     /// the machine tree first and merge this result in the background.
     public func probeWorker(
         sshAlias: String,
+        devboxSID: String? = nil,
         workerID: String
     ) async -> WorkerReadiness {
+        let isDevboxDestination = devboxSID.map {
+            MerlinIdentifierValidator.isDevboxSSHProxyDestination(
+                sshAlias,
+                devboxSID: $0
+            )
+        } ?? false
         guard
-            MerlinIdentifierValidator.isSSHAlias(sshAlias),
-            MerlinIdentifierValidator.isWorkerID(workerID)
+            MerlinIdentifierValidator.isWorkerID(workerID),
+            MerlinIdentifierValidator.isSSHAlias(sshAlias)
+                || MerlinIdentifierValidator.isWorkerSSHProxyDestination(
+                    sshAlias,
+                    workerID: workerID
+                )
+                || isDevboxDestination
         else {
             return .unreachable
         }
@@ -146,18 +158,40 @@ public actor MerlinInventory {
 
     /// Worker listing is isolated from Devbox inventory. Merlin's control plane
     /// is authoritative; SSH/`mlx` is used only when that command is unavailable
-    /// and a validated alias provides a fallback route.
+    /// and a validated SSH target provides a fallback route.
     public func loadWorkers(
         for devbox: Devbox,
         sshAlias: String?
     ) async -> DevboxInventory {
-        let safeAlias = sshAlias.flatMap {
+        let safeAlias = sshAlias.flatMap { target in
+            if
+                MerlinIdentifierValidator.isSSHAlias(target)
+                    || MerlinIdentifierValidator.isDevboxSSHProxyDestination(
+                        target,
+                        devboxSID: devbox.sid
+                    )
+            {
+                return target
+            }
+            return nil
+        }
+        let localAlias = safeAlias.flatMap {
             MerlinIdentifierValidator.isSSHAlias($0) ? $0 : nil
         }
-        guard devbox.status.isRunning else {
-            return DevboxInventory(devbox: devbox, sshAlias: safeAlias)
-        }
-        return await workerLoader.loadWorkers(for: devbox, alias: safeAlias)
+        // The Merlin control-plane list is independent of the Devbox process.
+        // A stopped parent only disables the SSH/`mlx` fallback route.
+        let fallbackAlias = devbox.status.isRunning ? safeAlias : nil
+        let loaded = await workerLoader.loadWorkers(
+            for: devbox,
+            alias: fallbackAlias
+        )
+        guard loaded.sshAlias == nil, localAlias != nil else { return loaded }
+        return DevboxInventory(
+            devbox: loaded.devbox,
+            sshAlias: localAlias,
+            workers: loaded.workers,
+            workerStatus: loaded.workerStatus
+        )
     }
 
     private func clearRefresh(generation: UUID) {
@@ -248,12 +282,10 @@ private struct InventoryLoader: Sendable {
                 continue
             }
 
-            if
-                let sid = Self.devboxSID(fromSSHConfiguration: output.stdout),
-                knownSIDs.contains(sid),
-                result[sid] == nil
-            {
-                result[sid] = alias
+            if let sid = Self.devboxSID(fromSSHConfiguration: output.stdout) {
+                if knownSIDs.contains(sid), result[sid] == nil {
+                    result[sid] = alias
+                }
                 continue
             }
 
@@ -273,13 +305,16 @@ private struct InventoryLoader: Sendable {
     }
 
     func loadWorkers(for devbox: Devbox, alias: String?) async -> DevboxInventory {
+        let localAlias = alias.flatMap {
+            MerlinIdentifierValidator.isSSHAlias($0) ? $0 : nil
+        }
         do {
             let workers = try await loadWorkersFromMerlinCLI(
                 instanceSID: devbox.sid
             )
             return DevboxInventory(
                 devbox: devbox,
-                sshAlias: alias,
+                sshAlias: localAlias,
                 workers: workers.map(WorkerInventoryRecord.init(worker:)),
                 workerStatus: .loaded
             )
@@ -354,6 +389,9 @@ private struct InventoryLoader: Sendable {
         for devbox: Devbox,
         alias: String
     ) async -> DevboxInventory {
+        let localAlias = MerlinIdentifierValidator.isSSHAlias(alias)
+            ? alias
+            : nil
         var offset = 0
         var workers: [Worker] = []
 
@@ -364,6 +402,9 @@ private struct InventoryLoader: Sendable {
                     "-nT",
                     "-o", "BatchMode=yes",
                     "-o", "ConnectTimeout=10",
+                ] + MerlinCommands.sshPortArguments(
+                    forConnectionTarget: alias
+                ) + [
                     alias,
                     "NO_COLOR=1 TERM=dumb mlx worker list --limit \(workerPageSize) --offset \(offset)",
                 ]
@@ -393,7 +434,7 @@ private struct InventoryLoader: Sendable {
             } catch {
                 return DevboxInventory(
                     devbox: devbox,
-                    sshAlias: alias,
+                    sshAlias: localAlias,
                     workers: workers.map(WorkerInventoryRecord.init(worker:)),
                     workerStatus: .failed(.transport)
                 )
@@ -401,7 +442,7 @@ private struct InventoryLoader: Sendable {
             guard output.exitCode == 0 else {
                 return DevboxInventory(
                     devbox: devbox,
-                    sshAlias: alias,
+                    sshAlias: localAlias,
                     workers: workers.map(WorkerInventoryRecord.init(worker:)),
                     workerStatus: .failed(.commandFailed(exitCode: output.exitCode))
                 )
@@ -413,7 +454,7 @@ private struct InventoryLoader: Sendable {
             } catch {
                 return DevboxInventory(
                     devbox: devbox,
-                    sshAlias: alias,
+                    sshAlias: localAlias,
                     workers: workers.map(WorkerInventoryRecord.init(worker:)),
                     workerStatus: .failed(.malformedOutput)
                 )
@@ -425,7 +466,7 @@ private struct InventoryLoader: Sendable {
 
         return DevboxInventory(
             devbox: devbox,
-            sshAlias: alias,
+            sshAlias: localAlias,
             workers: workers.map(WorkerInventoryRecord.init(worker:)),
             workerStatus: .loaded
         )
@@ -435,14 +476,21 @@ private struct InventoryLoader: Sendable {
         workerID: String,
         alias: String
     ) async -> WorkerReadiness {
+        let connectsDirectly = MerlinIdentifierValidator
+            .isWorkerSSHProxyDestination(alias, workerID: workerID)
         let command = CommandSpec(
             executable: "/usr/bin/ssh",
             arguments: [
                 "-nT",
                 "-o", "BatchMode=yes",
                 "-o", "ConnectTimeout=10",
+            ] + MerlinCommands.sshPortArguments(
+                forConnectionTarget: alias
+            ) + [
                 alias,
-                "NO_COLOR=1 TERM=dumb mlx worker login \(workerID) -- true",
+                connectsDirectly
+                    ? "true"
+                    : "NO_COLOR=1 TERM=dumb mlx worker login \(workerID) -- true",
             ]
         )
         do {

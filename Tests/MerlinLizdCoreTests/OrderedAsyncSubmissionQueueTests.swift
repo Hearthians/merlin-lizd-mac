@@ -77,7 +77,8 @@ struct OrderedAsyncSubmissionQueueTests {
         let coordinator = TargetWarmupCoordinator(
             sshMasterPool: pool,
             discovery: TmuxSessionDiscovery(processRunner: discoveryRunner),
-            maxConcurrentWorkerWarmups: 2
+            maxConcurrentWorkerWarmups: 2,
+            maxConcurrentWorkerWarmupsPerAlias: 2
         )
         let queue = OrderedAsyncSubmissionQueue()
         let background = startupWorker("9100001")

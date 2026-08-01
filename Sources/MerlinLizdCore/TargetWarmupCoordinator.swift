@@ -292,11 +292,11 @@ public actor TargetWarmupCoordinator {
     }
 
     private func hasAliasCapacity(for target: TerminalTarget) -> Bool {
-        guard let alias = MerlinCommands.sshAlias(for: target) else {
+        guard let alias = MerlinCommands.sshConnectionTarget(for: target) else {
             return true
         }
         let activeForAlias = inFlightTargets.keys.count {
-            MerlinCommands.sshAlias(for: $0) == alias
+            MerlinCommands.sshConnectionTarget(for: $0) == alias
         }
         return activeForAlias < maxConcurrentWorkerWarmupsPerAlias
     }

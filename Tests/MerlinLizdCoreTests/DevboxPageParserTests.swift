@@ -3,7 +3,7 @@ import Testing
 
 @Suite("Devbox inventory parsing")
 struct DevboxPageParserTests {
-    @Test("decodes only the safe inventory fields and preserves unknown states")
+    @Test("decodes the safe inventory fields and validated SSH destination")
     func decodesSafeFields() throws {
         let json = """
         {
@@ -23,7 +23,7 @@ struct DevboxPageParserTests {
               "created_at": "2026-07-08T04:08:15Z",
               "updated_at": "2026-07-11T08:00:00Z",
               "environment_variables": {"SECRET_TOKEN": "must-not-be-decoded"},
-              "ssh_proxy_cmd": "must-not-be-decoded"
+              "ssh_proxy_cmd": "135679.lizhuodong.ws@merlin-ssh-proxy-cn.byted.org"
             }
           ],
           "pagination": {"total": 1, "page_size": 100, "next_page_token": "opaque-next"}
@@ -41,7 +41,29 @@ struct DevboxPageParserTests {
         #expect(page.devboxes[0].diskBytes == 137_438_953_472)
         #expect(page.devboxes[0].workerCount == 4)
         #expect(page.devboxes[0].accessRole == "OWNER")
+        #expect(page.devboxes[0].sshProxyDestination ==
+            "135679.lizhuodong.ws@merlin-ssh-proxy-cn.byted.org")
         #expect(page.nextPageToken == "opaque-next")
+    }
+
+    @Test("rejects an SSH destination that does not match the Devbox SID")
+    func rejectsMismatchedSSHDestination() throws {
+        let json = """
+        {
+          "ResponseBase": {"code": 0, "message": "success"},
+          "data": [{
+            "sid": "dbx_140542",
+            "name": "hl_gpu",
+            "status": "running",
+            "ssh_proxy_cmd": "999999.lizhuodong.ws@merlin-ssh-proxy-cn.byted.org"
+          }],
+          "pagination": {"page_size": 100}
+        }
+        """
+
+        let devbox = try #require(DevboxPageParser.parse(json).devboxes.first)
+
+        #expect(devbox.sshProxyDestination == nil)
     }
 
     @Test("normalizes lifecycle casing at the decode boundary")

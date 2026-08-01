@@ -25,6 +25,80 @@ struct CommandBuilderTests {
         )
     }
 
+    @Test("Devbox terminal connects through the platform SSH proxy")
+    func buildsDirectDevboxTerminalCommand() throws {
+        let destination =
+            "140542.lizhuodong.ws@merlin-ssh-proxy-cn.byted.org"
+        let pool = SSHMasterPool(
+            testDirectory: .init(fileURLWithPath: "/tmp/mlz-command-tests"),
+            runner: SSHMasterScriptedRunner()
+        )
+        let builder = ManagedTerminalCommandBuilder(sshMasterPool: pool)
+
+        let command = try builder.swiftTermCommand(
+            target: .devbox(
+                sid: "dbx_140542",
+                name: "hl_gpu",
+                alias: destination
+            ),
+            sessionName: "mlz-hl-gpu"
+        )
+
+        let destinationIndex = try #require(command.arguments.firstIndex(of: destination))
+        #expect(command.arguments[..<destinationIndex].contains("-p"))
+        #expect(command.arguments[..<destinationIndex].contains("22222"))
+        #expect(command.arguments.last ==
+            "TERM=xterm exec tmux new-session -A -s mlz-hl-gpu")
+    }
+
+    @Test("Worker terminal can enter through the platform Devbox route")
+    func buildsWorkerTerminalThroughDirectDevbox() throws {
+        let destination =
+            "140542.lizhuodong.ws@merlin-ssh-proxy-cn.byted.org"
+        let pool = SSHMasterPool(
+            testDirectory: .init(fileURLWithPath: "/tmp/mlz-command-tests"),
+            runner: SSHMasterScriptedRunner()
+        )
+        let builder = ManagedTerminalCommandBuilder(sshMasterPool: pool)
+
+        let command = try builder.swiftTermCommand(
+            target: .worker(
+                devboxSID: "dbx_140542",
+                devboxName: "hl_gpu",
+                alias: destination,
+                workerID: "3960209"
+            ),
+            sessionName: "mlz-worker"
+        )
+
+        #expect(command.arguments.contains("-p"))
+        #expect(command.arguments.contains("22222"))
+        #expect(command.arguments.last?.contains(
+            "mlx worker login 3960209"
+        ) == true)
+    }
+
+    @Test("rejects a platform Devbox route for a different SID")
+    func rejectsMismatchedDirectDevboxRoute() {
+        let pool = SSHMasterPool(
+            testDirectory: .init(fileURLWithPath: "/tmp/mlz-command-tests"),
+            runner: SSHMasterScriptedRunner()
+        )
+        let builder = ManagedTerminalCommandBuilder(sshMasterPool: pool)
+
+        #expect(throws: CommandValidationError.invalidAlias) {
+            try builder.swiftTermCommand(
+                target: .devbox(
+                    sid: "dbx_140542",
+                    name: "hl_gpu",
+                    alias:
+                        "999999.lizhuodong.ws@merlin-ssh-proxy-cn.byted.org"
+                ),
+                sessionName: "mlz-hl-gpu"
+            )
+        }
+    }
+
     @Test("external Terminal command uses the same interactive SSH transport")
     func buildsManagedExternalTerminalCommand() throws {
         let directory = temporarySSHDirectory()
@@ -132,6 +206,7 @@ struct CommandBuilderTests {
             "-tt",
             "-o", "ServerAliveInterval=10",
             "-o", "ServerAliveCountMax=3",
+            "-p", "22222",
             destination,
             "exec env -u TMUX TERM=xterm TMUX_TMPDIR=/dev/shm tmux new-session -A -s merlin-lizd-train",
         ])
@@ -343,6 +418,7 @@ struct CommandBuilderTests {
             "-nT",
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=10",
+            "-p", "22222",
             destination,
             "env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux list-sessions -F#{session_name}",
         ])
@@ -366,6 +442,24 @@ struct CommandBuilderTests {
             "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux rename-session -t mlz-old training-main")
     }
 
+    @Test("renames a Worker tmux session through its direct SSH destination")
+    func buildsDirectWorkerTmuxRenameCommand() throws {
+        let destination = "3960209.lizhuodong.worker@merlin-ssh-proxy-cn.byted.org"
+        let command = try MerlinCommands.renameTmuxSession(
+            target: .worker(
+                devboxSID: "dbx_135679",
+                devboxName: "wt_hl",
+                alias: destination,
+                workerID: "3960209"
+            ),
+            from: "mlz-old",
+            to: "training-main"
+        )
+
+        #expect(command.arguments.last ==
+            "env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux rename-session -t mlz-old training-main")
+    }
+
     @Test("terminates one Worker tmux session through its parent Devbox")
     func buildsWorkerTmuxTerminationCommand() throws {
         let command = try MerlinCommands.terminateTmuxSession(
@@ -380,6 +474,23 @@ struct CommandBuilderTests {
 
         #expect(command.arguments.last ==
             "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux kill-session -t mlz-finished-run")
+    }
+
+    @Test("terminates a Worker tmux session through its direct SSH destination")
+    func buildsDirectWorkerTmuxTerminationCommand() throws {
+        let destination = "3960209.lizhuodong.worker@merlin-ssh-proxy-cn.byted.org"
+        let command = try MerlinCommands.terminateTmuxSession(
+            target: .worker(
+                devboxSID: "dbx_135679",
+                devboxName: "wt_hl",
+                alias: destination,
+                workerID: "3960209"
+            ),
+            sessionName: "mlz-finished-run"
+        )
+
+        #expect(command.arguments.last ==
+            "env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux kill-session -t mlz-finished-run")
     }
 
     @Test("rejects shell syntax in a tmux termination target")
@@ -455,6 +566,26 @@ struct CommandBuilderTests {
         #expect(!remoteCommand.contains("9221"))
     }
 
+    @Test("samples Worker metrics through its direct SSH destination")
+    func buildsDirectWorkerMetricsCommand() throws {
+        let destination = "3966762.lizhuodong.worker@merlin-ssh-proxy-cn.byted.org"
+        let command = try MerlinCommands.sampleWorkerMetrics(
+            target: .worker(
+                devboxSID: "dbx_135679",
+                devboxName: "wt_hl",
+                alias: destination,
+                workerID: "3966762"
+            )
+        )
+
+        #expect(command.arguments.dropLast().last == destination)
+        let remoteCommand = try #require(command.arguments.last)
+        #expect(remoteCommand.hasPrefix("export LC_ALL=C ;"))
+        #expect(!remoteCommand.contains("mlx worker login"))
+        #expect(!remoteCommand.contains(#"\;"#))
+        #expect(remoteCommand.contains("nvidia-smi --query-gpu="))
+    }
+
     @Test("metrics sampling rejects non-Worker and unsafe Worker targets")
     func rejectsUnsafeMetricsTargets() {
         #expect(throws: CommandValidationError.workerTargetRequired) {
@@ -511,6 +642,27 @@ struct CommandBuilderTests {
             "__MERLIN_LIZD_METRICS_V1_END__ \\; sleep 15 \\; done"
         ))
         #expect(remoteCommand.contains("__MERLIN_LIZD_METRICS_V1_BEGIN__"))
+    }
+
+    @Test("streams Worker metrics through its direct SSH destination")
+    func buildsDirectWorkerMetricsStreamCommand() throws {
+        let destination = "3966762.lizhuodong.worker@merlin-ssh-proxy-cn.byted.org"
+        let command = try MerlinCommands.streamWorkerMetrics(
+            target: .worker(
+                devboxSID: "dbx_135679",
+                devboxName: "wt_hl",
+                alias: destination,
+                workerID: "3966762"
+            ),
+            intervalSeconds: 15
+        )
+
+        #expect(command.arguments.dropLast().last == destination)
+        let remoteCommand = try #require(command.arguments.last)
+        #expect(remoteCommand.hasPrefix("export LC_ALL=C ; while true ; do "))
+        #expect(remoteCommand.hasSuffix("sleep 15 ; done"))
+        #expect(!remoteCommand.contains("mlx worker login"))
+        #expect(!remoteCommand.contains(#"\;"#))
     }
 
     @Test("rejects unsafe metrics stream intervals before command construction")

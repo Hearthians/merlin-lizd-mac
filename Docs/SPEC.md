@@ -8,8 +8,8 @@ The primary mental model is **machines**. A future **tasks** workspace may add f
 
 ## Vocabulary
 
-- **Devbox**: a Merlin CPU Devbox Master discovered from Lizd's current Merlin account. A known SSH alias is its preferred connection route and display label.
-- **Worker**: a Workspace Worker owned by one Devbox and entered through `mlx worker login <id>` on that Devbox.
+- **Devbox**: a Merlin CPU Devbox Master discovered from Lizd's current Merlin account. Its platform name is the display label; its validated platform SSH destination is the preferred connection route, with a local alias as fallback.
+- **Worker**: a Workspace Worker owned by one Devbox. Its validated platform SSH destination is preferred; `mlx worker login <id>` through the Devbox remains a fallback.
 - **Target**: Local Mac, one Devbox, or one Worker.
 - **Terminal tab**: one interactive terminal bound to exactly one target and, for remote targets, one tmux session.
 - **Managed session**: a tmux session created by this app. Existing external tmux sessions are also discoverable and attachable.
@@ -30,8 +30,8 @@ The primary mental model is **machines**. A future **tasks** workspace may add f
 ## Inventory and refresh
 
 - Discover all CPU Devboxes from the current `merlin-cli` account, not only aliases already present in SSH config.
-- Match a Devbox SID/name to a safe local SSH alias when possible. Never display or persist ProxyCommand contents.
-- For every running Devbox, list Workers through `merlin-cli cpu-devbox workers list` with `filter.instance_sid`. This platform query does not require a local SSH alias. Use `NO_COLOR=1 TERM=dumb mlx worker list` through SSH only when the platform query fails and a safe alias exists.
+- Validate and use the platform `ssh_proxy_cmd` destination when its encoded identity matches the Devbox SID. Match a safe local SSH alias only as fallback. Never display or persist raw ProxyCommand contents.
+- For every Devbox, list Workers through `merlin-cli cpu-devbox workers list` with `filter.instance_sid`. This control-plane query does not require the Devbox process or a local SSH alias. Use `NO_COLOR=1 TERM=dumb mlx worker list` through SSH only when the platform query fails, the Devbox is running, and a validated connection target exists.
 - Keep Merlin's Worker lifecycle status separate from SSH/`mlx worker login` readiness. Platform `running` is not proof that a terminal connection is ready.
 - Render the last safe snapshot immediately, then refresh Devboxes, platform Worker lists, and Worker connection readiness in separate stages. A slow platform query or `mlx worker login` must not block or clear the machine tree.
 - Refresh immediately on launch, manually on request, and every 15 seconds while the app is active. Pause foreground polling when inactive.
@@ -51,7 +51,7 @@ The primary mental model is **machines**. A future **tasks** workspace may add f
 
 ## Authentication and safety
 
-- Reuse the installed `merlin-cli` login, system SSH config, and SSH Agent. The app stores no password, private key, JWT, or raw ProxyCommand.
+- Reuse the installed `merlin-cli` login, system SSH client, and SSH Agent. Platform routes do not require `~/.ssh/config`; local aliases remain a compatibility fallback. The app stores no password, private key, JWT, or raw ProxyCommand.
 - A last-known inventory snapshot may be cached locally, but only from the safe projection: never Pod IPs, ports, webshell URLs, raw command output, or credentials.
 - Read-only discovery may run automatically. Starting a Devbox requires confirmation; terminating one or more tmux sessions requires a separate destructive confirmation. No Devbox/Worker stop, delete, or kill mutation is exposed in v1.
 - Closing a terminal tab or the App preserves every remote tmux session. Graceful App shutdown stops only App-owned OpenSSH masters after local channels drain. The explicitly confirmed terminate-session action is the only tmux-killing path.
@@ -61,8 +61,8 @@ The primary mental model is **machines**. A future **tasks** workspace may add f
 ## Terminal routing
 
 - Local target: start the user's login shell.
-- Devbox target: start system `ssh` to its safe alias and attach/create the selected tmux session.
-- Worker target: start system `ssh` to its parent Devbox, enter the Worker by numeric ID, and attach/create the selected tmux session there.
+- Devbox target: start system `ssh` to its validated platform destination on the Merlin proxy port, or a safe local alias as fallback, and attach/create the selected tmux session.
+- Worker target: start system `ssh` to the Worker's validated platform destination on the Merlin proxy port. If no direct destination exists, connect to the running parent Devbox, enter the Worker by numeric ID, and attach/create the selected tmux session there.
 - The embedded terminal is primary. Opening the same target in Terminal/iTerm remains a fallback.
 
 ## Explicit non-goals

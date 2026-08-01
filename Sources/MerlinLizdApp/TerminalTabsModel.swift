@@ -67,33 +67,61 @@ final class TerminalTabsModel: ObservableObject {
     }
 
     func openDevbox(_ machine: DevboxInventory) {
-        guard let alias = machine.sshAlias else { return }
+        guard let connectionTarget = machine.sshConnectionTarget else { return }
         requestTmuxCreation(
-            title: alias,
+            title: machine.displayName,
             target: .devbox(
                 sid: machine.devbox.sid,
                 name: machine.devbox.name,
-                alias: alias
+                alias: connectionTarget
             ),
-            sessionName: makeSessionName(label: alias)
+            sessionName: makeSessionName(label: machine.displayName)
         )
     }
 
     func openWorker(_ worker: WorkerInventoryRecord, on machine: DevboxInventory) {
-        guard let connectionTarget = worker.sshConnectionTarget(
-            fallback: machine.sshAlias
-        ) else { return }
-        let label = machine.sshAlias ?? machine.devbox.name
+        guard let target = machine.workerTerminalTarget(for: worker) else {
+            return
+        }
+        let label = machine.displayName
         requestTmuxCreation(
             title: "\(worker.gpuType ?? "Worker") · \(worker.id)",
-            target: .worker(
-                devboxSID: machine.devbox.sid,
-                devboxName: machine.devbox.name,
-                alias: connectionTarget,
-                workerID: worker.id
-            ),
+            target: target,
             sessionName: makeSessionName(label: "\(label)-\(worker.id)")
         )
+    }
+
+    func reconcileRemoteRoutes(with snapshot: InventorySnapshot) {
+        let current = TerminalState(
+            selectedTabID: selectedTabID,
+            tabs: tabs
+        )
+        let migrated = current.retargetingConnections(using: snapshot)
+        let changedIDs = Set(zip(current.tabs, migrated.tabs).compactMap {
+            old, new in old.target == new.target ? nil : old.id
+        })
+        guard !changedIDs.isEmpty else { return }
+
+        let selectedSessionNeedsRestart = selectedTabID.map {
+            changedIDs.contains($0) && sessions[$0] != nil
+        } ?? false
+        for id in changedIDs {
+            sessions.removeValue(forKey: id)?.close()
+        }
+        tabs = migrated.tabs
+        persist()
+
+        let targets = Set(
+            migrated.tabs.compactMap { tab in
+                changedIDs.contains(tab.id) ? tab.target : nil
+            }
+        )
+        for target in targets {
+            runtime.prioritize(target)
+        }
+        if selectedSessionNeedsRestart, let selectedTabID {
+            _ = session(for: selectedTabID)
+        }
     }
 
     func createPendingTmux(

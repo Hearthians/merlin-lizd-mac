@@ -70,6 +70,11 @@ struct MerlinRootView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task { await model.refresh() }
         }
+        .onChange(of: model.snapshot, initial: true) { _, snapshot in
+            if let snapshot {
+                terminals.reconcileRemoteRoutes(with: snapshot)
+            }
+        }
         .onChange(of: sessionBrowserTarget) { _, target in
             if let target {
                 terminals.prioritize(target)
@@ -91,7 +96,7 @@ struct MerlinRootView: View {
             }
         } message: {
             if let machine = model.pendingStartDevbox {
-                Text("将启动 \(machine.sshAlias ?? machine.devbox.name)（\(machine.devbox.sid)）。")
+                Text("将启动 \(machine.displayName)（\(machine.devbox.sid)）。")
             }
         }
         .sheet(
@@ -155,7 +160,7 @@ struct MerlinRootView: View {
                     machine: machine,
                     onConnect: { terminals.openDevbox(machine) },
                     onBrowseSessions: {
-                        guard let alias = machine.sshAlias else { return }
+                        guard let alias = machine.sshConnectionTarget else { return }
                         sessionBrowserTarget = .devbox(
                             sid: machine.devbox.sid,
                             name: machine.devbox.name,
@@ -175,12 +180,8 @@ struct MerlinRootView: View {
                     worker: worker,
                     onConnect: { terminals.openWorker(worker, on: machine) },
                     onBrowseSessions: {
-                        guard let alias = machine.sshAlias else { return }
-                        sessionBrowserTarget = .worker(
-                            devboxSID: machine.devbox.sid,
-                            devboxName: machine.devbox.name,
-                            alias: alias,
-                            workerID: worker.id
+                        sessionBrowserTarget = machine.workerTerminalTarget(
+                            for: worker
                         )
                     },
                     metricsStreamer: metricsStreamer

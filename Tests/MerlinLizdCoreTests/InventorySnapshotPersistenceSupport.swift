@@ -10,7 +10,12 @@ struct InventorySnapshotPersistenceFixture {
         let devbox = try DevboxPageParser.parse("""
             {
               "ResponseBase": {"code": 0, "message": "success"},
-              "data": [{"sid":"dbx_1","name":"one","status":"running"}],
+              "data": [{
+                "sid":"dbx_1",
+                "name":"one",
+                "status":"running",
+                "ssh_proxy_cmd":"1.lizhuodong.ws@merlin-ssh-proxy-cn.byted.org"
+              }],
               "pagination": {"page_size": 100}
             }
             """).devboxes[0]
@@ -20,6 +25,8 @@ struct InventorySnapshotPersistenceFixture {
             memoryGiB: 32,
             gpuCount: 1,
             gpuType: "GPU",
+            sshProxyDestination:
+                "123.lizhuodong.worker@merlin-ssh-proxy-cn.byted.org",
             podIP: "secret-network-address",
             port: 9000,
             createdAt: "now",

@@ -71,7 +71,7 @@ public final class WorkerMetricsStreamer: @unchecked Sendable {
                             intervalSeconds: intervalSeconds
                         )
                         if
-                            let alias = MerlinCommands.sshAlias(for: target),
+                            let alias = MerlinCommands.sshConnectionTarget(for: target),
                             let sshMasterPool
                         {
                             guard await sshMasterPool.prepare(

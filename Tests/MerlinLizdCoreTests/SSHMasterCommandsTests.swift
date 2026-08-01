@@ -105,6 +105,27 @@ struct SSHMasterCommandsTests {
         #expect(managed.arguments.contains { $0.hasPrefix("ControlPath=") })
     }
 
+    @Test("uses the Merlin proxy port for a direct destination lifecycle")
+    func directDestinationLifecycleUsesProxyPort() throws {
+        let commands = SSHMasterCommands(
+            directory: .init(fileURLWithPath: "/tmp/mlz-tests")
+        )
+        let destination =
+            "140542.lizhuodong.ws@merlin-ssh-proxy-cn.byted.org"
+
+        for command in [
+            try commands.prepare(alias: destination),
+            try commands.check(alias: destination),
+            try commands.stop(alias: destination),
+        ] {
+            let destinationIndex = try #require(
+                command.arguments.firstIndex(of: destination)
+            )
+            #expect(command.arguments[..<destinationIndex].contains("-p"))
+            #expect(command.arguments[..<destinationIndex].contains("22222"))
+        }
+    }
+
     @Test("finds the destination after options and an option terminator")
     func parsesDestination() throws {
         let commands = SSHMasterCommands(

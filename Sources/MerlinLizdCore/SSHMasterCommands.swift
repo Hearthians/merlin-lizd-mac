@@ -45,7 +45,9 @@ struct SSHMasterCommands: Sendable {
             arguments: [
                 "-MNf", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                 "-o", "ControlMaster=yes", "-o", "ControlPath=\(path)",
-                "-o", "ControlPersist=600", alias,
+                "-o", "ControlPersist=600",
+            ] + MerlinCommands.sshPortArguments(forConnectionTarget: alias) + [
+                alias,
             ]
         )
     }
@@ -123,7 +125,9 @@ struct SSHMasterCommands: Sendable {
             executable: "/usr/bin/ssh",
             arguments: [
                 "-O", operation, "-o", "BatchMode=yes",
-                "-o", "ControlPath=\(path)", alias,
+                "-o", "ControlPath=\(path)",
+            ] + MerlinCommands.sshPortArguments(forConnectionTarget: alias) + [
+                alias,
             ]
         )
     }
