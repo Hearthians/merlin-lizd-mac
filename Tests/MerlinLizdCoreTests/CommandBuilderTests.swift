@@ -117,6 +117,27 @@ struct CommandBuilderTests {
         ])
     }
 
+    @Test("a Worker terminal connects directly when given its SSH proxy destination")
+    func buildsDirectWorkerTerminalCommand() throws {
+        let destination = "3960209.lizhuodong.worker@merlin-ssh-proxy-cn.byted.org"
+
+        let command = try MerlinCommands.workerTerminal(
+            alias: destination,
+            workerID: "3960209",
+            sessionName: "merlin-lizd-train"
+        )
+
+        #expect(command.executable == "/usr/bin/ssh")
+        #expect(command.arguments == [
+            "-tt",
+            "-o", "ServerAliveInterval=10",
+            "-o", "ServerAliveCountMax=3",
+            destination,
+            "exec env -u TMUX TERM=xterm TMUX_TMPDIR=/dev/shm tmux new-session -A -s merlin-lizd-train",
+        ])
+        #expect(!command.arguments.contains { $0.contains("mlx worker login") })
+    }
+
     @Test("a Worker terminal avoids relying on a container tmp directory")
     func buildsWorkerTerminalWithWritableTmuxSocket() throws {
         let command = try MerlinCommands.workerTerminal(
@@ -303,6 +324,29 @@ struct CommandBuilderTests {
             "hl_gpu_2",
             "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux list-sessions -F#{session_name}"
         ])
+    }
+
+    @Test("lists Worker tmux sessions through the direct SSH proxy destination")
+    func buildsDirectWorkerTmuxListCommand() throws {
+        let destination = "3960209.lizhuodong.worker@merlin-ssh-proxy-cn.byted.org"
+
+        let command = try MerlinCommands.listTmuxSessions(
+            target: .worker(
+                devboxSID: "dbx_135679",
+                devboxName: "wt_hl",
+                alias: destination,
+                workerID: "3960209"
+            )
+        )
+
+        #expect(command.arguments == [
+            "-nT",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=10",
+            destination,
+            "env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux list-sessions -F#{session_name}",
+        ])
+        #expect(!command.arguments.contains { $0.contains("mlx worker login") })
     }
 
     @Test("renames the selected Worker tmux session through its parent Devbox")

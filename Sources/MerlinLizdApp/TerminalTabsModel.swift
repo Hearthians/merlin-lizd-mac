@@ -80,16 +80,19 @@ final class TerminalTabsModel: ObservableObject {
     }
 
     func openWorker(_ worker: WorkerInventoryRecord, on machine: DevboxInventory) {
-        guard let alias = machine.sshAlias else { return }
+        guard let connectionTarget = worker.sshConnectionTarget(
+            fallback: machine.sshAlias
+        ) else { return }
+        let label = machine.sshAlias ?? machine.devbox.name
         requestTmuxCreation(
             title: "\(worker.gpuType ?? "Worker") · \(worker.id)",
             target: .worker(
                 devboxSID: machine.devbox.sid,
                 devboxName: machine.devbox.name,
-                alias: alias,
+                alias: connectionTarget,
                 workerID: worker.id
             ),
-            sessionName: makeSessionName(label: "\(alias)-\(worker.id)")
+            sessionName: makeSessionName(label: "\(label)-\(worker.id)")
         )
     }
 

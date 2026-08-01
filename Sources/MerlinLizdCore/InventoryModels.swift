@@ -31,8 +31,9 @@ public struct DevboxInventory: Identifiable, Codable, Equatable, Sendable {
     }
 }
 
-/// A persistence-safe projection of `Worker`. Network addresses and signed URLs
-/// deliberately never cross the inventory interface.
+/// A persistence-safe projection of `Worker`. Only the validated SSH proxy
+/// destination crosses the inventory interface; raw addresses and signed URLs
+/// remain excluded.
 public struct WorkerInventoryRecord: Identifiable, Codable, Equatable, Sendable {
     public let id: String
     public let cpuCores: Int
@@ -40,6 +41,7 @@ public struct WorkerInventoryRecord: Identifiable, Codable, Equatable, Sendable 
     public let gpuCount: Int
     public let gpuType: String?
     public let platformStatus: String?
+    public let sshProxyDestination: String?
     public let createdAt: String
     public let readiness: WorkerReadiness
 
@@ -50,6 +52,7 @@ public struct WorkerInventoryRecord: Identifiable, Codable, Equatable, Sendable 
         self.gpuCount = worker.gpuCount
         self.gpuType = worker.gpuType
         self.platformStatus = worker.platformStatus
+        self.sshProxyDestination = worker.sshProxyDestination
         self.createdAt = worker.createdAt
         self.readiness = worker.readiness
     }
@@ -62,6 +65,7 @@ public struct WorkerInventoryRecord: Identifiable, Codable, Equatable, Sendable 
             gpuCount: gpuCount,
             gpuType: gpuType,
             platformStatus: platformStatus,
+            sshProxyDestination: sshProxyDestination,
             createdAt: createdAt,
             readiness: readiness
         )
@@ -78,6 +82,7 @@ public struct WorkerInventoryRecord: Identifiable, Codable, Equatable, Sendable 
             gpuCount: gpuCount,
             gpuType: gpuType,
             platformStatus: platformStatus,
+            sshProxyDestination: sshProxyDestination,
             createdAt: createdAt,
             readiness: readiness
         )
@@ -101,6 +106,25 @@ public struct WorkerInventoryRecord: Identifiable, Codable, Equatable, Sendable 
         }
     }
 
+    public func sshConnectionTarget(fallback: String?) -> String? {
+        if
+            let sshProxyDestination,
+            MerlinIdentifierValidator.isWorkerSSHProxyDestination(
+                sshProxyDestination,
+                workerID: id
+            )
+        {
+            return sshProxyDestination
+        }
+        guard
+            let fallback,
+            MerlinIdentifierValidator.isSSHAlias(fallback)
+        else {
+            return nil
+        }
+        return fallback
+    }
+
     private init(
         id: String,
         cpuCores: Int,
@@ -108,6 +132,7 @@ public struct WorkerInventoryRecord: Identifiable, Codable, Equatable, Sendable 
         gpuCount: Int,
         gpuType: String?,
         platformStatus: String?,
+        sshProxyDestination: String?,
         createdAt: String,
         readiness: WorkerReadiness
     ) {
@@ -117,6 +142,7 @@ public struct WorkerInventoryRecord: Identifiable, Codable, Equatable, Sendable 
         self.gpuCount = gpuCount
         self.gpuType = gpuType
         self.platformStatus = platformStatus
+        self.sshProxyDestination = sshProxyDestination
         self.createdAt = createdAt
         self.readiness = readiness
     }

@@ -3,7 +3,7 @@ import Testing
 
 @Suite("Merlin CLI Worker page parser")
 struct MerlinWorkerPageParserTests {
-    @Test("projects platform Workers without network or signed URL fields")
+    @Test("projects a validated direct SSH destination without other network fields")
     func parsesSafeWorkerProjection() throws {
         let page = try MerlinWorkerPageParser.parse("""
         {
@@ -18,7 +18,7 @@ struct MerlinWorkerPageParserTests {
             "created_at": "2026-07-09T04:50:08Z",
             "pod_ip": "2605:secret::1",
             "host_ip": "2605:secret::2",
-            "ssh_proxy_cmd": "must-not-escape",
+            "ssh_proxy_cmd": "3966773.lizhuodong.worker@merlin-ssh-proxy-cn.byted.org",
             "webshell_url": "https://secret.invalid/signed",
             "grafana_url": "https://secret.invalid/grafana"
           }],
@@ -38,18 +38,21 @@ struct MerlinWorkerPageParserTests {
         #expect(worker.gpuType == "NVIDIA-L20")
         #expect(worker.createdAt == "2026-07-09T04:50:08Z")
         #expect(worker.readiness == .listed)
+        #expect(worker.sshProxyDestination ==
+            "3966773.lizhuodong.worker@merlin-ssh-proxy-cn.byted.org")
         #expect(worker.podIP == nil)
         #expect(worker.webshellURL == nil)
         #expect(page.nextPageToken == "opaque-cursor")
 
         let safeRecord = WorkerInventoryRecord(worker: worker)
         let enrichedRecord = safeRecord.withGPUType("NVIDIA-L20")
+        #expect(safeRecord.sshConnectionTarget(fallback: "hl_gpu_2") ==
+            "3966773.lizhuodong.worker@merlin-ssh-proxy-cn.byted.org")
         #expect(enrichedRecord.gpuType == "NVIDIA-L20")
         #expect(enrichedRecord.platformStatus == "running")
         #expect(enrichedRecord.readiness == .listed)
         let description = String(reflecting: safeRecord)
         #expect(!description.contains("2605:secret"))
-        #expect(!description.contains("must-not-escape"))
         #expect(!description.contains("secret.invalid"))
     }
 

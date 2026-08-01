@@ -20,7 +20,7 @@ struct SSHMasterCommands: Sendable {
     }
 
     func socketPath(alias: String) throws -> String {
-        guard MerlinIdentifierValidator.isSSHAlias(alias) else {
+        guard MerlinIdentifierValidator.isSSHConnectionTarget(alias) else {
             throw SSHMasterCommandError.invalidAlias
         }
 
@@ -59,7 +59,7 @@ struct SSHMasterCommands: Sendable {
     }
 
     func managed(_ command: CommandSpec, alias: String) throws -> CommandSpec {
-        guard MerlinIdentifierValidator.isSSHAlias(alias) else {
+        guard MerlinIdentifierValidator.isSSHConnectionTarget(alias) else {
             throw SSHMasterCommandError.invalidAlias
         }
         guard

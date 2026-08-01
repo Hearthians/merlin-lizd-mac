@@ -18,9 +18,8 @@ public enum MerlinWorkerPageParserError: Error, Equatable, Sendable {
 }
 
 /// Parses the safe subset of `merlin-cli cpu-devbox workers list` output.
-/// Network coordinates, SSH proxy commands, signed webshell URLs, and Grafana
-/// URLs are intentionally absent from the response model and cannot enter the
-/// returned `Worker` values.
+/// A validated SSH proxy destination is retained for direct Worker access;
+/// Pod/host addresses, signed webshell URLs, and Grafana URLs remain excluded.
 public enum MerlinWorkerPageParser {
     private static let bytesPerGiB: UInt64 = 1_073_741_824
 
@@ -73,6 +72,12 @@ public enum MerlinWorkerPageParser {
         let rawStatus = payload.status.trimmingCharacters(
             in: .whitespacesAndNewlines
         )
+        let sshProxyDestination = payload.sshProxyCommand.flatMap { value in
+            MerlinIdentifierValidator.isWorkerSSHProxyDestination(
+                value,
+                workerID: numericID
+            ) ? value : nil
+        }
         return Worker(
             id: numericID,
             cpuCores: payload.cpuCores,
@@ -80,6 +85,7 @@ public enum MerlinWorkerPageParser {
             gpuCount: payload.gpuCount,
             gpuType: payload.gpuType,
             platformStatus: rawStatus.isEmpty ? nil : rawStatus,
+            sshProxyDestination: sshProxyDestination,
             podIP: nil,
             port: 0,
             createdAt: payload.createdAt,
@@ -121,6 +127,7 @@ public enum MerlinWorkerPageParser {
         let memoryBytes: UInt64
         let gpuType: String?
         let createdAt: String
+        let sshProxyCommand: String?
 
         enum CodingKeys: String, CodingKey {
             case sid
@@ -130,6 +137,7 @@ public enum MerlinWorkerPageParser {
             case memoryBytes = "memory_bytes"
             case gpuType = "gpu_type"
             case createdAt = "created_at"
+            case sshProxyCommand = "ssh_proxy_cmd"
         }
     }
 }

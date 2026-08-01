@@ -83,6 +83,7 @@ public struct Worker: Identifiable, Codable, Hashable, Sendable {
     /// from `readiness`: a platform `running` Worker can still be unavailable
     /// to an SSH/`mlx worker login` probe.
     public let platformStatus: String?
+    public let sshProxyDestination: String?
     public let podIP: String?
     public let port: Int
     public let createdAt: String
@@ -96,6 +97,7 @@ public struct Worker: Identifiable, Codable, Hashable, Sendable {
         gpuCount: Int,
         gpuType: String?,
         platformStatus: String? = nil,
+        sshProxyDestination: String? = nil,
         podIP: String?,
         port: Int,
         createdAt: String,
@@ -108,6 +110,7 @@ public struct Worker: Identifiable, Codable, Hashable, Sendable {
         self.gpuCount = gpuCount
         self.gpuType = gpuType
         self.platformStatus = platformStatus
+        self.sshProxyDestination = sshProxyDestination
         self.podIP = podIP
         self.port = port
         self.createdAt = createdAt

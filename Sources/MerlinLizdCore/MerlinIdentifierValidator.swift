@@ -8,6 +8,29 @@ public enum MerlinIdentifierValidator {
         matches(value, pattern: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"#)
     }
 
+    public static func isWorkerSSHProxyDestination(
+        _ value: String,
+        workerID: String
+    ) -> Bool {
+        guard isWorkerID(workerID) else { return false }
+        let escapedWorkerID = NSRegularExpression.escapedPattern(for: workerID)
+        return matches(
+            value,
+            pattern: #"^"# + escapedWorkerID
+                + #"\.[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.worker@"#
+                + #"[A-Za-z0-9][A-Za-z0-9.-]{0,252}$"#
+        )
+    }
+
+    public static func isSSHConnectionTarget(_ value: String) -> Bool {
+        isSSHAlias(value)
+            || matches(
+                value,
+                pattern: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}@"#
+                    + #"[A-Za-z0-9][A-Za-z0-9.-]{0,252}$"#
+            )
+    }
+
     public static func isDevboxSID(_ value: String) -> Bool {
         matches(value, pattern: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"#)
     }

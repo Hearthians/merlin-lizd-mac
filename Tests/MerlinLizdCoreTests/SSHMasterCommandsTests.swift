@@ -87,6 +87,24 @@ struct SSHMasterCommandsTests {
         ))
     }
 
+    @Test("multiplexes a validated direct Worker destination")
+    func decoratesDirectWorkerChild() throws {
+        let commands = SSHMasterCommands(
+            directory: .init(fileURLWithPath: "/tmp/mlz-tests")
+        )
+        let destination = "3960209.lizhuodong.worker@merlin-ssh-proxy-cn.byted.org"
+        let child = CommandSpec(
+            executable: "/usr/bin/ssh",
+            arguments: ["-nT", destination, "true"]
+        )
+
+        let managed = try commands.managed(child, alias: destination)
+
+        #expect(managed.arguments.contains(destination))
+        #expect(managed.arguments.contains("ControlMaster=auto"))
+        #expect(managed.arguments.contains { $0.hasPrefix("ControlPath=") })
+    }
+
     @Test("finds the destination after options and an option terminator")
     func parsesDestination() throws {
         let commands = SSHMasterCommands(

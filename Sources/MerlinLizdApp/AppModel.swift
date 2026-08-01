@@ -376,23 +376,30 @@ final class AppModel: ObservableObject {
         for machine in snapshot.devboxes {
             guard
                 machine.devbox.status.isRunning,
-                let alias = machine.sshAlias,
-                MerlinIdentifierValidator.isSSHAlias(alias),
                 MerlinIdentifierValidator.isDevboxSID(machine.devbox.sid)
             else {
                 continue
             }
-            if seenAliases.insert(alias).inserted {
+            if
+                let alias = machine.sshAlias,
+                MerlinIdentifierValidator.isSSHAlias(alias),
+                seenAliases.insert(alias).inserted
+            {
                 aliases.append(alias)
             }
             workerTargets.append(contentsOf: machine.workers.compactMap { worker in
-                guard MerlinIdentifierValidator.isWorkerID(worker.id) else {
+                guard
+                    MerlinIdentifierValidator.isWorkerID(worker.id),
+                    let connectionTarget = worker.sshConnectionTarget(
+                        fallback: machine.sshAlias
+                    )
+                else {
                     return nil
                 }
                 return .worker(
                     devboxSID: machine.devbox.sid,
                     devboxName: machine.devbox.name,
-                    alias: alias,
+                    alias: connectionTarget,
                     workerID: worker.id
                 )
             })
@@ -411,8 +418,12 @@ final class AppModel: ObservableObject {
                 $0.devbox.sid == devboxSID
             }),
             currentMachine.devbox.status.isRunning,
-            currentMachine.sshAlias == alias,
-            currentMachine.workers.contains(where: { $0.id == workerID })
+            let currentWorker = currentMachine.workers.first(where: {
+                $0.id == workerID
+            }),
+            currentWorker.sshConnectionTarget(
+                fallback: currentMachine.sshAlias
+            ) == alias
         else {
             return
         }
@@ -436,7 +447,10 @@ final class AppModel: ObservableObject {
                 ? worker.withReadiness(readiness)
                 : worker
         }
-        if let cached = workerInventoryCache[devboxSID], cached.sshAlias == alias {
+        if
+            let cached = workerInventoryCache[devboxSID],
+            cached.sshAlias == currentMachine.sshAlias
+        {
             workerInventoryCache[devboxSID] = CachedWorkerInventory(
                 sshAlias: cached.sshAlias,
                 workers: WorkerInventoryRecord.preservingReadiness(
@@ -451,8 +465,7 @@ final class AppModel: ObservableObject {
 
         let devboxes = current.devboxes.map { machine in
             guard
-                machine.devbox.sid == devboxSID,
-                machine.sshAlias == alias
+                machine.devbox.sid == devboxSID
             else {
                 return machine
             }
@@ -490,16 +503,18 @@ final class AppModel: ObservableObject {
                 alias: alias
             )
         case let .worker(devboxSID, workerID):
-            guard let (machine, _) = worker(
+            guard let (machine, worker) = worker(
                 devboxSID: devboxSID,
                 workerID: workerID
-            ), let alias = machine.sshAlias else {
+            ), let connectionTarget = worker.sshConnectionTarget(
+                fallback: machine.sshAlias
+            ) else {
                 return
             }
             target = .worker(
                 devboxSID: devboxSID,
                 devboxName: machine.devbox.name,
-                alias: alias,
+                alias: connectionTarget,
                 workerID: workerID
             )
         }
