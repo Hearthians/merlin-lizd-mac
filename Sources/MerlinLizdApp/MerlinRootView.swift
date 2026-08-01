@@ -37,6 +37,8 @@ struct MerlinRootView: View {
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 if model.isRefreshing
+                    || model.isRefreshingTasks
+                    || model.isRefreshingTaskMetrics
                     || model.isStartingDevbox
                     || model.isRefreshingWorkers
                 {
@@ -60,7 +62,7 @@ struct MerlinRootView: View {
                 } label: {
                     Label("刷新", systemImage: "arrow.clockwise")
                 }
-                .disabled(model.isRefreshing)
+                .disabled(model.isRefreshing || model.isRefreshingTasks)
                 .keyboardShortcut("r", modifiers: [.command])
             }
         }
@@ -157,6 +159,8 @@ struct MerlinRootView: View {
             AllWorkersView(devboxes: model.devboxes) { machine, worker in
                 terminals.openWorker(worker, on: machine)
             }
+        case .tasks:
+            TaskLifecycleView(state: model.taskPageState)
         case .local:
             LocalTerminalLandingView(
                 onOpen: terminals.openLocal,

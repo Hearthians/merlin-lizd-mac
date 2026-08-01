@@ -6,6 +6,7 @@ import SwiftUI
 enum SidebarSelection: Hashable {
     case overview
     case allWorkers
+    case tasks
     case local
     case devbox(String)
     case worker(devboxSID: String, workerID: String)
@@ -14,18 +15,27 @@ enum SidebarSelection: Hashable {
 @MainActor
 final class AppModel: ObservableObject {
     private static let inventoryCacheKey = "safe-inventory-snapshot-v1"
+    private static let taskCacheKey = "safe-task-snapshot-v2"
 
     @Published var selection: SidebarSelection = .overview {
         didSet { prioritizeSelection() }
     }
     @Published private(set) var snapshot: InventorySnapshot?
+    @Published private(set) var taskSnapshot: MerlinTaskSnapshot?
+    @Published private(set) var taskMetricsByRunID: [String: MerlinTaskMetrics] = [:]
+    @Published private(set) var taskMetricAttemptedRunIDs: Set<String> = []
     @Published private(set) var isRefreshing = false
+    @Published private(set) var isRefreshingTasks = false
+    @Published private(set) var isRefreshingTaskMetrics = false
+    @Published private(set) var taskRefreshFailed = false
     @Published private(set) var isRefreshingWorkers = false
     @Published private(set) var isStartingDevbox = false
     @Published var pendingStartDevbox: DevboxInventory?
     @Published var message: AppMessage?
 
     private let inventory: MerlinInventory?
+    private let taskInventory: MerlinTaskInventory?
+    private let taskMetricsProvider: MerlinTaskMetricsProvider?
     private let devboxLifecycle: MerlinDevboxLifecycle?
     private let runtime: MerlinRemoteRuntime
     private let sshAliases: [String]
@@ -34,6 +44,8 @@ final class AppModel: ObservableObject {
     private var workerInventoryRescanPending = false
     private var pendingWorkerInventoryForce = false
     private var workerInventoryCache: [String: CachedWorkerInventory] = [:]
+    private var taskMetricsRefreshTask: Task<Void, Never>?
+    private var taskMetricsRefreshGeneration: UUID?
     private let workerInventoryCacheLifetime: TimeInterval = 60
     private let failedWorkerRetryDelay: TimeInterval = 15
     private lazy var warmupUpdateRelay = WarmupUpdateRelay(model: self)
@@ -57,10 +69,22 @@ final class AppModel: ObservableObject {
                 kind: .error
             )
         }
+        do {
+            taskInventory = try MerlinTaskInventory()
+        } catch {
+            taskInventory = nil
+            taskRefreshFailed = true
+        }
+        do {
+            taskMetricsProvider = try MerlinTaskMetricsProvider()
+        } catch {
+            taskMetricsProvider = nil
+        }
         if let cached = Self.loadCachedInventory() {
             snapshot = cached.snapshot
             seedCaches(from: cached)
         }
+        taskSnapshot = Self.loadCachedTaskSnapshot()
     }
 
     func start() {
@@ -80,6 +104,16 @@ final class AppModel: ObservableObject {
                 rhs.displayName
             ) == .orderedAscending
         }
+    }
+
+    var taskPageState: TaskPageState {
+        TaskPageState(
+            snapshot: taskSnapshot,
+            metricsByRunID: taskMetricsByRunID,
+            attemptedMetricRunIDs: taskMetricAttemptedRunIDs,
+            isRefreshingMetrics: isRefreshingTaskMetrics,
+            refreshFailed: taskRefreshFailed
+        )
     }
 
     func devbox(sid: String) -> DevboxInventory? {
@@ -111,6 +145,14 @@ final class AppModel: ObservableObject {
     }
 
     func refresh(forceReadinessProbe: Bool = false) async {
+        async let machineRefresh: Void = refreshMachines(
+            forceReadinessProbe: forceReadinessProbe
+        )
+        async let taskRefresh: Void = refreshTasks()
+        _ = await (machineRefresh, taskRefresh)
+    }
+
+    private func refreshMachines(forceReadinessProbe: Bool) async {
         guard !isRefreshing, let inventory else { return }
         isRefreshing = true
         defer { isRefreshing = false }
@@ -137,6 +179,83 @@ final class AppModel: ObservableObject {
                 kind: .error
             )
         }
+    }
+
+    private func refreshTasks() async {
+        guard !isRefreshingTasks, let taskInventory else { return }
+        isRefreshingTasks = true
+        defer { isRefreshingTasks = false }
+
+        do {
+            let loaded = try await taskInventory.refresh()
+            taskSnapshot = loaded
+            taskRefreshFailed = false
+            reconcileTaskMetrics(with: loaded)
+            persistTaskSnapshot()
+            scheduleTaskMetricsRefresh(for: loaded)
+        } catch {
+            taskRefreshFailed = true
+        }
+    }
+
+    private func scheduleTaskMetricsRefresh(for snapshot: MerlinTaskSnapshot) {
+        guard
+            selection == .tasks,
+            taskMetricsRefreshTask == nil,
+            let taskMetricsProvider
+        else { return }
+        let generation = UUID()
+        taskMetricsRefreshGeneration = generation
+        isRefreshingTaskMetrics = true
+        taskMetricsRefreshTask = Task { [weak self] in
+            let refresh = await taskMetricsProvider.refresh(runs: snapshot.runs)
+            guard !Task.isCancelled else { return }
+            self?.applyTaskMetricsRefresh(refresh, generation: generation)
+        }
+    }
+
+    private func applyTaskMetricsRefresh(
+        _ refresh: MerlinTaskMetricsRefresh,
+        generation: UUID
+    ) {
+        guard taskMetricsRefreshGeneration == generation else { return }
+        taskMetricsRefreshTask = nil
+        taskMetricsRefreshGeneration = nil
+        isRefreshingTaskMetrics = false
+        guard let taskSnapshot else { return }
+        let visibleIDs = Set(taskSnapshot.runs.map(\.id))
+        let activeIDs = Set(taskSnapshot.runs(in: .active).map(\.id))
+        let attemptedIDs = refresh.attemptedRunIDs.intersection(visibleIDs)
+        let missingIDs = attemptedIDs.intersection(activeIDs).subtracting(
+            refresh.metricsByRunID.keys
+        )
+        for runID in missingIDs {
+            // A failed refresh must not leave an older reading looking current.
+            taskMetricsByRunID.removeValue(forKey: runID)
+        }
+        for (runID, metrics) in refresh.metricsByRunID
+            where visibleIDs.contains(runID)
+        {
+            taskMetricsByRunID[runID] = metrics
+        }
+        taskMetricAttemptedRunIDs.formUnion(attemptedIDs)
+    }
+
+    private func reconcileTaskMetrics(with snapshot: MerlinTaskSnapshot) {
+        let visibleIDs = Set(snapshot.runs.map(\.id))
+        // Keep the last real sample when a running task reaches a terminal
+        // lifecycle. Historical tasks are never backfilled or re-polled.
+        taskMetricsByRunID = taskMetricsByRunID.filter {
+            visibleIDs.contains($0.key)
+        }
+        taskMetricAttemptedRunIDs.formIntersection(visibleIDs)
+    }
+
+    private func cancelTaskMetricsRefresh() {
+        taskMetricsRefreshTask?.cancel()
+        taskMetricsRefreshTask = nil
+        taskMetricsRefreshGeneration = nil
+        isRefreshingTaskMetrics = false
     }
 
     private func applyingCachedWorkerInventory(
@@ -421,9 +540,16 @@ final class AppModel: ObservableObject {
     }
 
     private func prioritizeSelection() {
+        if selection == .tasks {
+            if let taskSnapshot {
+                scheduleTaskMetricsRefresh(for: taskSnapshot)
+            }
+        } else {
+            cancelTaskMetricsRefresh()
+        }
         let target: TerminalTarget?
         switch selection {
-        case .overview, .allWorkers:
+        case .overview, .allWorkers, .tasks:
             target = nil
         case .local:
             target = .local
@@ -501,6 +627,13 @@ final class AppModel: ObservableObject {
         )
     }
 
+    private static func loadCachedTaskSnapshot() -> MerlinTaskSnapshot? {
+        guard let data = UserDefaults.standard.data(forKey: taskCacheKey) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(MerlinTaskSnapshot.self, from: data)
+    }
+
     private func persistSnapshot() {
         guard let snapshot else { return }
         let persisted = PersistedInventoryCache(
@@ -514,6 +647,19 @@ final class AppModel: ObservableObject {
         // InventorySnapshot contains only the explicit safe projection: never
         // Pod IPs, webshell URLs, ProxyCommand text, credentials, or raw output.
         UserDefaults.standard.set(data, forKey: Self.inventoryCacheKey)
+    }
+
+    private func persistTaskSnapshot() {
+        guard
+            let taskSnapshot,
+            let data = try? JSONEncoder().encode(taskSnapshot)
+        else {
+            return
+        }
+        // MerlinTaskSnapshot contains only the safe task projection: identity,
+        // display/status timestamps, and runtime. Raw CLI metadata,
+        // Grafana routes, queries, and credentials are never cached.
+        UserDefaults.standard.set(data, forKey: Self.taskCacheKey)
     }
 
     func requestStart(_ machine: DevboxInventory) {

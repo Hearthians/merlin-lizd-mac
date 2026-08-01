@@ -61,6 +61,15 @@ struct SidebarView: View {
                     .onTapGesture { show(.allWorkers) }
                     .sidebarListRow()
                 SidebarWorkspaceRow(
+                    title: "任务",
+                    symbol: "list.bullet.rectangle.portrait.fill",
+                    tint: .orange,
+                    selected: model.selection == .tasks
+                )
+                    .tag(SidebarSelection.tasks)
+                    .onTapGesture { show(.tasks) }
+                    .sidebarListRow()
+                SidebarWorkspaceRow(
                     title: "本机终端",
                     symbol: "terminal.fill",
                     tint: .cyan,
@@ -182,7 +191,7 @@ struct SidebarView: View {
                 return false
             }
             return openWorkerIfConnectable(worker, on: machine)
-        case .overview, .allWorkers:
+        case .overview, .allWorkers, .tasks:
             return false
         }
     }

@@ -5,6 +5,7 @@ public enum MerlinInventoryError: Error, Equatable, Sendable {
     case merlinCLINotFound
     case invalidConcurrencyLimit
     case invalidWorkerPageSize
+    case paginationLimitExceeded
     case commandFailed(exitCode: Int32)
     case invalidRequest
 }
