@@ -12,7 +12,7 @@ final class TmuxSessionBrowserModel: ObservableObject {
 
     let target: TerminalTarget
     private let discovery: TmuxSessionDiscovery
-    private let restoredSessions: [TmuxSessionRecord]
+    private var knownSessions: [TmuxSessionRecord]
     private var refreshTask: Task<Void, Never>?
 
     init(
@@ -22,7 +22,7 @@ final class TmuxSessionBrowserModel: ObservableObject {
     ) {
         self.target = target
         self.discovery = discovery
-        restoredSessions = initialSessions
+        knownSessions = initialSessions
         sessions = initialSessions
         hasKnownEvidence = !initialSessions.isEmpty
     }
@@ -34,6 +34,19 @@ final class TmuxSessionBrowserModel: ObservableObject {
             return
         }
         startRefresh(force: force)
+    }
+
+    /// Publishes newer in-memory evidence without starting remote work.
+    func synchronizeCachedSnapshot(
+        knownSessions: [TmuxSessionRecord]
+    ) async {
+        self.knownSessions = knownSessions
+        guard let snapshot = await discovery.peekSnapshot(target: target) else {
+            sessions = knownSessions
+            hasKnownEvidence = !knownSessions.isEmpty
+            return
+        }
+        publish(snapshot)
     }
 
     func removeSessions(named names: Set<String>) {
@@ -62,14 +75,14 @@ final class TmuxSessionBrowserModel: ObservableObject {
 
     private func publish(_ snapshot: TmuxSessionSnapshot?) {
         guard let snapshot else {
-            hasKnownEvidence = !restoredSessions.isEmpty
+            hasKnownEvidence = !knownSessions.isEmpty
             isStale = true
             isVerifying = false
             errorMessage = nil
             return
         }
         hasKnownEvidence = true
-        sessions = merged(snapshot.sessions, restoredSessions)
+        sessions = merged(snapshot.sessions, knownSessions)
         fetchedAt = snapshot.fetchedAt
         isStale = !snapshot.isFresh(at: Date())
         isVerifying = snapshot.verification == .verifying

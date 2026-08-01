@@ -7,6 +7,7 @@ struct SidebarView: View {
 
     @State private var searchText = ""
     @State private var expandedDevboxes: Set<String> = []
+    @State private var expandedTmuxTargets: Set<TerminalTargetIdentity> = []
 
     private var filteredDevboxes: [DevboxInventory] {
         guard !searchText.isEmpty else { return model.devboxes }
@@ -79,33 +80,7 @@ struct SidebarView: View {
                         isExpanded: expandedBinding(for: machine.devbox.sid)
                     ) {
                         ForEach(machine.workers) { worker in
-                            let workerSelection = SidebarSelection.worker(
-                                devboxSID: machine.devbox.sid,
-                                workerID: worker.id
-                            )
-                            SidebarWorkerLabel(
-                                worker: worker,
-                                selected: model.selection == workerSelection
-                            )
-                                .tag(
-                                    workerSelection
-                                )
-                                .contentShape(Rectangle())
-                                .onTapGesture {
-                                    show(
-                                        .worker(
-                                            devboxSID: machine.devbox.sid,
-                                            workerID: worker.id
-                                        )
-                                    )
-                                }
-                                .onTapGesture(count: 2) {
-                                    openWorkerIfConnectable(worker, on: machine)
-                                }
-                                .sidebarListRow(
-                                    leading: 2,
-                                    trailing: 6
-                                )
+                            workerRow(worker, on: machine)
                         }
                     } label: {
                         SidebarDevboxLabel(
@@ -234,6 +209,91 @@ struct SidebarView: View {
                     expandedDevboxes.insert(sid)
                 } else {
                     expandedDevboxes.remove(sid)
+                }
+            }
+        )
+    }
+
+    @ViewBuilder
+    private func workerRow(
+        _ worker: WorkerInventoryRecord,
+        on machine: DevboxInventory
+    ) -> some View {
+        let selection = workerSelection(worker, on: machine)
+        if let target = workerTarget(worker, on: machine) {
+            DisclosureGroup(
+                isExpanded: tmuxExpandedBinding(for: target)
+            ) {
+                SidebarTmuxSessionList(
+                    target: target,
+                    terminals: terminals
+                )
+                .id(target)
+            } label: {
+                workerLabel(worker, on: machine)
+            }
+            .tag(selection)
+            .sidebarListRow(
+                leading: 2,
+                trailing: 6
+            )
+        } else {
+            workerLabel(worker, on: machine)
+                .tag(selection)
+                .sidebarListRow(
+                    leading: 2,
+                    trailing: 6
+                )
+        }
+    }
+
+    private func workerLabel(
+        _ worker: WorkerInventoryRecord,
+        on machine: DevboxInventory
+    ) -> some View {
+        let selection = workerSelection(worker, on: machine)
+        return SidebarWorkerLabel(
+            worker: worker,
+            selected: model.selection == selection
+        )
+            .contentShape(Rectangle())
+            .onTapGesture {
+                show(selection)
+            }
+            .onTapGesture(count: 2) {
+                openWorkerIfConnectable(worker, on: machine)
+            }
+    }
+
+    private func workerSelection(
+        _ worker: WorkerInventoryRecord,
+        on machine: DevboxInventory
+    ) -> SidebarSelection {
+        .worker(
+            devboxSID: machine.devbox.sid,
+            workerID: worker.id
+        )
+    }
+
+    private func workerTarget(
+        _ worker: WorkerInventoryRecord,
+        on machine: DevboxInventory
+    ) -> TerminalTarget? {
+        machine.workerTerminalTarget(for: worker)
+    }
+
+    private func tmuxExpandedBinding(
+        for target: TerminalTarget
+    ) -> Binding<Bool> {
+        let identity = target.identity
+        return Binding(
+            get: { expandedTmuxTargets.contains(identity) },
+            set: { isExpanded in
+                if isExpanded {
+                    expandedTmuxTargets.insert(identity)
+                    terminals.prioritize(target)
+                } else {
+                    expandedTmuxTargets.remove(identity)
                 }
             }
         )
