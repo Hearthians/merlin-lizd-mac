@@ -44,6 +44,55 @@ struct TaskMetricValue: View {
         .help(helpText ?? "")
     }
 
+    static func cpu(
+        _ metrics: MerlinTaskMetrics?,
+        state: TaskMetricAvailability,
+        isFinal: Bool
+    ) -> TaskMetricValue {
+        guard let usedCores = metrics?.cpuUsedCores else {
+            return placeholder(state: state, tint: .indigo)
+        }
+        let currentLabel = isFinal ? "最后采样" : "当前"
+        let averageLabel = isFinal ? "截至采样均值" : "启动均值"
+        let utilization = metrics?.cpuUtilization
+        let value = utilization.map {
+            "\(currentLabel) \(Int($0.rounded()))%"
+        } ?? "\(cores(usedCores)) 核"
+        let detail: String
+        if let quotaCores = metrics?.cpuQuotaCores {
+            let coreUsage = "\(cores(usedCores)) / \(cores(quotaCores)) 核"
+            if let average = metrics?.cpuAverageUtilization {
+                detail = "\(coreUsage) · \(averageLabel) \(Int(average.rounded()))%"
+            } else {
+                detail = coreUsage
+            }
+        } else if let averageCores = metrics?.cpuAverageCores {
+            detail = "\(averageLabel) \(cores(averageCores)) 核"
+        } else {
+            detail = "已用 \(cores(usedCores)) 核"
+        }
+        return TaskMetricValue(
+            value: value,
+            detail: detail,
+            fraction: utilization.map { $0 / 100 },
+            tint: (utilization ?? 0) >= 90 ? .orange : .indigo,
+            isLoading: false,
+            helpText: metrics?.cpu.map {
+                let quota = $0.quotaCores.map {
+                    " / \(cores($0)) 个配额核"
+                } ?? ""
+                let average = if let percent = $0.averageUtilization {
+                    "，\(averageLabel) \(Int(percent.rounded()))%"
+                } else if let cores = $0.averageCores {
+                    "，\(averageLabel) \(Self.cores(cores)) 核"
+                } else {
+                    ""
+                }
+                return "CPU \(currentLabel)占用 \(Self.cores($0.currentCores))\(quota)\(average)，采样于 \($0.sampledAt.formatted(.dateTime.hour().minute().second()))"
+            }
+        )
+    }
+
     static func gpu(
         _ metrics: MerlinTaskMetrics?,
         state: TaskMetricAvailability,
@@ -126,6 +175,13 @@ struct TaskMetricValue: View {
                 ? "平台暂未返回可用指标"
                 : nil
         )
+    }
+
+    private static func cores(_ value: Double) -> String {
+        if value.rounded() == value {
+            return Int(value).formatted()
+        }
+        return value.formatted(.number.precision(.fractionLength(1)))
     }
 }
 

@@ -1,5 +1,38 @@
 import Foundation
 
+public struct MerlinTaskCPUReading: Equatable, Sendable {
+    public let currentCores: Double
+    public let averageCores: Double?
+    public let quotaCores: Double?
+    public let sampledAt: Date
+
+    public init(
+        currentCores: Double,
+        averageCores: Double?,
+        quotaCores: Double?,
+        sampledAt: Date
+    ) {
+        self.currentCores = currentCores
+        self.averageCores = averageCores
+        self.quotaCores = quotaCores
+        self.sampledAt = sampledAt
+    }
+
+    public var utilization: Double? {
+        guard let quotaCores, quotaCores > 0 else { return nil }
+        return currentCores / quotaCores * 100
+    }
+
+    public var averageUtilization: Double? {
+        guard
+            let averageCores,
+            let quotaCores,
+            quotaCores > 0
+        else { return nil }
+        return averageCores / quotaCores * 100
+    }
+}
+
 public struct MerlinTaskGPUReading: Equatable, Sendable {
     public let currentUtilization: Double
     public let averageUtilization: Double?
@@ -40,17 +73,25 @@ public struct MerlinTaskMemoryReading: Equatable, Sendable {
 /// Grafana URLs, queries, routing tags, and credentials never cross this
 /// projection.
 public struct MerlinTaskMetrics: Equatable, Sendable {
+    public let cpu: MerlinTaskCPUReading?
     public let gpu: MerlinTaskGPUReading?
     public let memory: MerlinTaskMemoryReading?
 
     public init(
+        cpu: MerlinTaskCPUReading? = nil,
         gpu: MerlinTaskGPUReading?,
         memory: MerlinTaskMemoryReading?
     ) {
+        self.cpu = cpu
         self.gpu = gpu
         self.memory = memory
     }
 
+    public var cpuUsedCores: Double? { cpu?.currentCores }
+    public var cpuAverageCores: Double? { cpu?.averageCores }
+    public var cpuQuotaCores: Double? { cpu?.quotaCores }
+    public var cpuUtilization: Double? { cpu?.utilization }
+    public var cpuAverageUtilization: Double? { cpu?.averageUtilization }
     public var gpuUtilization: Double? { gpu?.currentUtilization }
     public var gpuAverageUtilization: Double? { gpu?.averageUtilization }
     public var memoryUsedBytes: UInt64? { memory?.usedBytes }
@@ -66,11 +107,39 @@ public enum MerlinTaskMetricsParser {
     private static let aggregateFreshnessTolerance: TimeInterval = 30
 
     public static func parse(
+        cpuOutput: String? = nil,
         gpuOutput: String?,
         memoryOutput: String?,
         memoryTotalOverride: UInt64? = nil,
         trialID: String? = nil
     ) -> MerlinTaskMetrics? {
+        let cpuSeries = series(
+            parseSeries(cpuOutput),
+            matchingTrialID: trialID
+        )
+        let cpuMetricSeries = cpuSeries.filter {
+            metric($0.metric, hasSuffix: "cpu_util")
+        }
+        let currentCPUSeries = cpuMetricSeries.filter {
+            $0.tags["stat"]?.lowercased() != "average"
+        }
+        let cpuReadings = coherentPoints(currentCPUSeries.compactMap {
+            $0.points.last
+        })
+        let explicitCPUAverages = cpuMetricSeries.compactMap {
+            series -> GrafanaMetricPoint? in
+            guard series.tags["stat"]?.lowercased() == "average" else {
+                return nil
+            }
+            return series.points.last
+        }
+        let cpuQuotaReadings = coherentPoints(cpuSeries.compactMap {
+            series -> GrafanaMetricPoint? in
+            guard metric(series.metric, hasSuffix: "cpu_quota") else {
+                return nil
+            }
+            return series.points.last
+        })
         let gpuSeries = series(
             parseSeries(gpuOutput),
             matchingTrialID: trialID
@@ -108,6 +177,43 @@ public enum MerlinTaskMetricsParser {
             metricSuffixes: ["mem_limit", "memory_limit"],
             targetField: "limit"
         )
+        let cpu: MerlinTaskCPUReading?
+        if let cpuSampledAt = cpuReadings.map(\.timestamp).min() {
+            let currentCores = cpuReadings.map(\.value).reduce(0, +)
+            let isLegendProjection = currentCPUSeries.contains {
+                $0.tags["source"] == "grafana-panel-legend"
+            }
+            let averageCores: Double? = if !explicitCPUAverages.isEmpty {
+                explicitCPUAverages.map(\.value).reduce(0, +)
+            } else if isLegendProjection {
+                nil
+            } else {
+                currentCPUSeries.reduce(0) { total, series in
+                    guard !series.points.isEmpty else { return total }
+                    return total + series.points.map(\.value).reduce(0, +)
+                        / Double(series.points.count)
+                }
+            }
+            let quotaCores: Double? = if
+                !cpuQuotaReadings.isEmpty,
+                cpuQuotaReadings.allSatisfy({
+                    abs($0.timestamp.timeIntervalSince(cpuSampledAt))
+                        <= aggregateFreshnessTolerance
+                })
+            {
+                cpuQuotaReadings.map(\.value).reduce(0, +)
+            } else {
+                nil
+            }
+            cpu = MerlinTaskCPUReading(
+                currentCores: currentCores,
+                averageCores: averageCores,
+                quotaCores: quotaCores,
+                sampledAt: cpuSampledAt
+            )
+        } else {
+            cpu = nil
+        }
         let gpu: MerlinTaskGPUReading?
         if let gpuSampledAt = gpuReadings.map(\.timestamp).min() {
             let utilization = min(100, max(
@@ -185,8 +291,8 @@ public enum MerlinTaskMetricsParser {
         } else {
             memory = nil
         }
-        guard gpu != nil || memory != nil else { return nil }
-        return MerlinTaskMetrics(gpu: gpu, memory: memory)
+        guard cpu != nil || gpu != nil || memory != nil else { return nil }
+        return MerlinTaskMetrics(cpu: cpu, gpu: gpu, memory: memory)
     }
 
     private static func parseSeries(_ output: String?) -> [GrafanaMetricSeries] {

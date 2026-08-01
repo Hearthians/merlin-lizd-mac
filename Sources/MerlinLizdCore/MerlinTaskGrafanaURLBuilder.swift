@@ -1,6 +1,7 @@
 import Foundation
 
 enum MerlinTaskMetricPanel: Int, CaseIterable, Hashable, Sendable {
+    case cpu = 2
     case memory = 3
     case gpu = 7
 }

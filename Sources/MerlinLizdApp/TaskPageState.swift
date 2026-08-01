@@ -34,6 +34,13 @@ struct TaskPageState {
         self.isRefreshingMetrics = isRefreshingMetrics
     }
 
+    func cpuMetricAvailability(for run: MerlinTaskRun) -> TaskMetricAvailability {
+        metricAvailability(
+            for: run,
+            hasValue: metricsByRunID[run.id]?.cpu != nil
+        )
+    }
+
     func gpuMetricAvailability(for run: MerlinTaskRun) -> TaskMetricAvailability {
         guard run.allocatedGPUCount != 0 else { return .unavailable }
         return metricAvailability(

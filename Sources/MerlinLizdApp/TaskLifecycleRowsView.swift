@@ -36,6 +36,8 @@ struct TaskColumnHeader: View {
                 .frame(width: 126, alignment: .leading)
             Text("运行时长")
                 .frame(width: 104, alignment: .leading)
+            Text("CPU")
+                .frame(width: 164, alignment: .leading)
             Text("GPU")
                 .frame(width: 126, alignment: .leading)
             Text("内存")
@@ -50,6 +52,7 @@ struct TaskColumnHeader: View {
 struct TaskWideRow: View {
     let run: MerlinTaskRun
     let metrics: MerlinTaskMetrics?
+    let cpuMetricState: TaskMetricAvailability
     let gpuMetricState: TaskMetricAvailability
     let memoryMetricState: TaskMetricAvailability
     let now: Date
@@ -68,6 +71,12 @@ struct TaskWideRow: View {
                     run.startedAtMilliseconds == nil ? .secondary : .primary
                 )
                 .frame(width: 104, alignment: .leading)
+            TaskMetricValue.cpu(
+                metrics,
+                state: cpuMetricState,
+                isFinal: run.lifecycle != .active
+            )
+            .frame(width: 164, alignment: .leading)
             TaskMetricValue.gpu(
                 metrics,
                 state: gpuMetricState,
@@ -89,6 +98,7 @@ struct TaskWideRow: View {
 struct TaskCompactRow: View {
     let run: MerlinTaskRun
     let metrics: MerlinTaskMetrics?
+    let cpuMetricState: TaskMetricAvailability
     let gpuMetricState: TaskMetricAvailability
     let memoryMetricState: TaskMetricAvailability
     let now: Date
@@ -115,6 +125,13 @@ struct TaskCompactRow: View {
                         run: run
                     ))
                     .font(.callout.monospacedDigit())
+                }
+                CompactField("CPU") {
+                    TaskMetricValue.cpu(
+                        metrics,
+                        state: cpuMetricState,
+                        isFinal: run.lifecycle != .active
+                    )
                 }
                 CompactField("GPU") {
                     TaskMetricValue.gpu(

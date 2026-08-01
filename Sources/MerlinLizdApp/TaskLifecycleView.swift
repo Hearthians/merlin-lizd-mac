@@ -52,7 +52,7 @@ struct TaskLifecycleView: View {
                         now: context.date
                     )
                 }
-                .frame(maxWidth: 1_280, alignment: .leading)
+                .frame(maxWidth: 1_440, alignment: .leading)
                 .padding(24)
                 .frame(maxWidth: .infinity, alignment: .top)
             }
@@ -119,7 +119,7 @@ struct TaskLifecycleView: View {
             } else {
                 ViewThatFits(in: .horizontal) {
                     wideSection(runs: runs, now: now)
-                        .frame(minWidth: 900)
+                        .frame(minWidth: 1_080)
                     compactSection(runs: runs, now: now)
                 }
             }
@@ -141,6 +141,7 @@ struct TaskLifecycleView: View {
                 TaskWideRow(
                     run: run,
                     metrics: state.metricsByRunID[run.id],
+                    cpuMetricState: state.cpuMetricAvailability(for: run),
                     gpuMetricState: state.gpuMetricAvailability(for: run),
                     memoryMetricState: state.memoryMetricAvailability(for: run),
                     now: now
@@ -161,6 +162,7 @@ struct TaskLifecycleView: View {
                 TaskCompactRow(
                     run: run,
                     metrics: state.metricsByRunID[run.id],
+                    cpuMetricState: state.cpuMetricAvailability(for: run),
                     gpuMetricState: state.gpuMetricAvailability(for: run),
                     memoryMetricState: state.memoryMetricAvailability(for: run),
                     now: now

@@ -101,7 +101,7 @@ actor MerlinGrafanaOpenAPIClient: MerlinTaskPanelDataLoading {
             height = switch request.panel {
             case .gpu:
                 min(1_600, 600 + max(0, request.seriesCountHint - 2) * 45)
-            case .memory:
+            case .cpu, .memory:
                 min(2_800, 900 + max(0, request.seriesCountHint - 1) * 110)
             }
         }
@@ -409,6 +409,8 @@ actor MerlinGrafanaOpenAPIClient: MerlinTaskPanelDataLoading {
         sampledAt: Date
     ) -> String? {
         let metric = switch panel {
+        case .cpu:
+            "lab.arnold.instance_monitor.cpu_util"
         case .gpu:
             "lab.arnold.instance_monitor.gpu_duty_cycle"
         case .memory:
@@ -431,7 +433,7 @@ actor MerlinGrafanaOpenAPIClient: MerlinTaskPanelDataLoading {
                 dps: [timestamp: reading.current]
             )]
             if
-                panel == .gpu,
+                panel == .gpu || panel == .cpu,
                 let average = reading.average,
                 average.isFinite,
                 average >= 0
@@ -444,6 +446,22 @@ actor MerlinGrafanaOpenAPIClient: MerlinTaskPanelDataLoading {
                         "trial_id": trialID,
                     ],
                     dps: [timestamp: average]
+                ))
+            }
+            if
+                panel == .cpu,
+                let capacity = reading.capacity,
+                capacity.isFinite,
+                capacity > 0
+            {
+                values.append(NormalizedPanelSeries(
+                    metric: "lab.arnold.instance_monitor.cpu_quota",
+                    tags: [
+                        "source": "grafana-panel-legend",
+                        "stat": "capacity",
+                        "trial_id": trialID,
+                    ],
+                    dps: [timestamp: capacity]
                 ))
             }
             return values

@@ -82,11 +82,35 @@ struct MerlinTaskMetricsTests {
         #expect(grafanaQueryValue("viewPanel", in: url) == "7")
     }
 
+    @Test("builds the CPU role panel with a since-start window")
+    func buildsCPURoleMetricURL() throws {
+        let url = try #require(
+            MerlinTaskGrafanaURLBuilder.rolePanelURL(
+                cluster: "federationgpu-hl",
+                dataCenter: "hl",
+                trialIDs: ["389738351", "389738720"],
+                role: "worker",
+                panel: .cpu,
+                startingAtMilliseconds: 250_000,
+                endingAt: taskTestDate(1_000)
+            )
+        )
+
+        #expect(grafanaQueryValue("viewPanel", in: url) == "2")
+        #expect(grafanaQueryValue("from", in: url) == "250000")
+        #expect(grafanaQueryValue("to", in: url) == "1000000")
+    }
+
     @Test("reads official panel screenshots through the JWT OpenAPI client")
     func loadsPanelsThroughOpenAPI() async throws {
         let runner = GrafanaJWTScriptedRunner()
         let http = GrafanaOpenAPIScriptedHTTP()
         let screenshotReader = GrafanaScreenshotScriptedReader(values: [
+            .cpu: MerlinTaskMetricLegendValues(
+                current: 11.1,
+                average: 9.14,
+                capacity: 46
+            ),
             .gpu: MerlinTaskMetricLegendValues(
                 current: 28.9,
                 average: 26.2
@@ -104,6 +128,12 @@ struct MerlinTaskMetricsTests {
             now: { taskTestDate(100) }
         )
         let source = "https://grafana.byted.org/d/rn3WCutvk/?var-cluster=soil&var-dc=hl&var-target_arnold_trial_id=1"
+        let cpuURL = try #require(MerlinTaskGrafanaURLBuilder.rolePanelURL(
+            from: source,
+            role: "worker",
+            panel: .cpu,
+            endingAt: taskTestDate(100)
+        ))
         let gpuURL = try #require(MerlinTaskGrafanaURLBuilder.rolePanelURL(
             from: source,
             role: "worker",
@@ -118,15 +148,20 @@ struct MerlinTaskMetricsTests {
         ))
 
         let output = await client.load([
+            .init(panel: .cpu, url: cpuURL),
             .init(panel: .gpu, url: gpuURL),
             .init(panel: .memory, url: memoryURL),
         ])
 
         let metrics = MerlinTaskMetricsParser.parse(
+            cpuOutput: output[.cpu],
             gpuOutput: output[.gpu],
             memoryOutput: output[.memory],
             memoryTotalOverride: 382_250_795_008
         )
+        #expect(metrics?.cpuUsedCores == 11.1)
+        #expect(metrics?.cpuAverageCores == 9.14)
+        #expect(metrics?.cpuQuotaCores == 46)
         #expect(metrics?.gpuUtilization == 28.9)
         #expect(metrics?.gpuAverageUtilization == 26.2)
         #expect(metrics?.memoryUsedBytes == 267_361_714_176)
@@ -135,7 +170,7 @@ struct MerlinTaskMetricsTests {
         #expect(commands.count == 1)
         #expect(Array(commands[0].arguments.prefix(2)) == ["login", "get-jwt"])
         let requests = await http.requests()
-        #expect(requests.count == 2)
+        #expect(requests.count == 3)
         #expect(requests.allSatisfy {
             $0.endpoint == "https://cloud.bytedance.net/api/v1/grafana_open_api/screenshot"
                 && $0.method == "POST"
@@ -145,7 +180,7 @@ struct MerlinTaskMetricsTests {
                 && $0.bodyContainsViewPanel
                 && $0.bodyContainsScreenshotSize
         })
-        #expect(Set(await screenshotReader.panels()) == [.gpu, .memory])
+        #expect(Set(await screenshotReader.panels()) == [.cpu, .gpu, .memory])
     }
 
     @Test("normalizes every trial row from one grouped screenshot")
@@ -199,6 +234,56 @@ struct MerlinTaskMetricsTests {
         #expect(first?.gpuAverageUtilization == 29.7)
         #expect(second?.gpuUtilization == 22.8)
         #expect(second?.gpuAverageUtilization == 34.1)
+        #expect(await http.requests().count == 1)
+    }
+
+    @Test("normalizes CPU quota with grouped CPU legend rows")
+    func normalizesGroupedCPUScreenshotRows() async throws {
+        let http = GrafanaOpenAPIScriptedHTTP()
+        let client = MerlinGrafanaOpenAPIClient(
+            merlinCLIPath: "/opt/merlin-cli",
+            processRunner: GrafanaJWTScriptedRunner(),
+            httpLoader: http,
+            screenshotReader: GrafanaScreenshotScriptedReader(values: [
+                .cpu: [
+                    "389738351": MerlinTaskMetricLegendValues(
+                        current: 11.1,
+                        average: 9.14,
+                        capacity: 46
+                    ),
+                    "389738720": MerlinTaskMetricLegendValues(
+                        current: 7.29,
+                        average: 6.32,
+                        capacity: 23
+                    ),
+                ],
+            ]),
+            now: { taskTestDate(100) }
+        )
+        let url = try #require(
+            MerlinTaskGrafanaURLBuilder.rolePanelURL(
+                cluster: "federationgpu-hl",
+                dataCenter: "hl",
+                trialIDs: ["389738351", "389738720"],
+                role: "worker",
+                panel: .cpu,
+                endingAt: taskTestDate(100)
+            )
+        )
+
+        let output = await client.load([
+            .init(panel: .cpu, url: url, seriesCountHint: 2),
+        ])
+        let metrics = MerlinTaskMetricsParser.parse(
+            cpuOutput: output[.cpu],
+            gpuOutput: nil,
+            memoryOutput: nil,
+            trialID: "389738351"
+        )
+
+        #expect(metrics?.cpuUsedCores == 11.1)
+        #expect(metrics?.cpuAverageCores == 9.14)
+        #expect(metrics?.cpuQuotaCores == 46)
         #expect(await http.requests().count == 1)
     }
 
@@ -342,7 +427,7 @@ struct MerlinTaskMetricsTests {
         #expect(await runner.commands().count == 1)
     }
 
-    @Test("loads task GPU and memory through role panel view URLs")
+    @Test("loads task CPU, GPU, and memory through role panel view URLs")
     func loadsMetricsThroughRolePanels() async throws {
         let runner = TaskMetricsScriptedRunner()
         let panelLoader = TaskMetricsPanelLoader()
@@ -368,6 +453,10 @@ struct MerlinTaskMetricsTests {
         let refresh = await provider.refresh(runs: [run])
 
         #expect(refresh.attemptedRunIDs == ["job-run"])
+        #expect(refresh.metricsByRunID["job-run"]?.cpuUsedCores == 4)
+        #expect(refresh.metricsByRunID["job-run"]?.cpuAverageCores == 3)
+        #expect(refresh.metricsByRunID["job-run"]?.cpuQuotaCores == 8)
+        #expect(refresh.metricsByRunID["job-run"]?.cpuUtilization == 50)
         #expect(refresh.metricsByRunID["job-run"]?.gpuUtilization == 50)
         #expect(refresh.metricsByRunID["job-run"]?.memoryUsedBytes == 3_000)
         #expect(refresh.metricsByRunID["job-run"]?.memoryTotalBytes == 10_000)
@@ -381,7 +470,7 @@ struct MerlinTaskMetricsTests {
         })
         #expect(try taskMetricJobRunID(from: commands) == "job-run")
         let requests = await panelLoader.requests()
-        #expect(Set(requests.map(\.panel)) == [.gpu, .memory])
+        #expect(Set(requests.map(\.panel)) == [.cpu, .gpu, .memory])
         #expect(requests.allSatisfy {
             $0.url.absoluteString.contains(
                 "viewPanel=" + String($0.panel.rawValue)
@@ -393,8 +482,10 @@ struct MerlinTaskMetricsTests {
         #expect(requests.allSatisfy {
             $0.url.absoluteString.contains("var-target_arnold_role=worker")
         })
+        let cpuRequest = try #require(requests.first { $0.panel == .cpu })
         let gpuRequest = try #require(requests.first { $0.panel == .gpu })
         let memoryRequest = try #require(requests.first { $0.panel == .memory })
+        #expect(grafanaQueryValue("from", in: cpuRequest.url) == "2")
         #expect(grafanaQueryValue("from", in: gpuRequest.url) == "2")
         #expect(grafanaQueryValue("from", in: memoryRequest.url) != "2")
     }
@@ -457,7 +548,81 @@ struct MerlinTaskMetricsTests {
         #expect(readings["389738720"]?.average == 34.1)
     }
 
-    @Test("loads compatible tasks through two grouped panel screenshots")
+    @Test("reads CPU cores, average cores, and quota from one legend")
+    func parsesCPUScreenshotLegend() {
+        let readings = MerlinTaskScreenshotLegendParser.readings(
+            for: .cpu,
+            observations: [
+                screenshotText(
+                    "cpu_util_trial-389884286-trialrun-389884286-worker-0",
+                    0.01,
+                    0.050
+                ),
+                screenshotText("14.0", 0.908, 0.050),
+                screenshotText("9.14", 0.939, 0.050),
+                screenshotText("11.1", 0.969, 0.050),
+                screenshotText(
+                    "cpu_quota_trial-389884286-trialrun-389884286-worker-0",
+                    0.01,
+                    0.020
+                ),
+                screenshotText("46", 0.908, 0.020),
+                screenshotText("46", 0.939, 0.020),
+                screenshotText("46", 0.969, 0.020),
+            ]
+        )
+
+        #expect(readings["389884286"]?.current == 11.1)
+        #expect(readings["389884286"]?.average == 9.14)
+        #expect(readings["389884286"]?.capacity == 46)
+    }
+
+    @Test("aggregates CPU legend rows from every pod in a trial")
+    func aggregatesCPULegendPods() {
+        let readings = MerlinTaskScreenshotLegendParser.readings(
+            for: .cpu,
+            observations: [
+                screenshotText(
+                    "cpu_util_trial-389884286-trialrun-389884286-worker-0",
+                    0.01,
+                    0.110
+                ),
+                screenshotText("14.0", 0.908, 0.110),
+                screenshotText("9.14", 0.939, 0.110),
+                screenshotText("11.1", 0.969, 0.110),
+                screenshotText(
+                    "cpu_util_trial-389884286-trialrun-389884286-worker-1",
+                    0.01,
+                    0.080
+                ),
+                screenshotText("9.0", 0.908, 0.080),
+                screenshotText("6.3", 0.939, 0.080),
+                screenshotText("7.2", 0.969, 0.080),
+                screenshotText(
+                    "cpu_quota_trial-389884286-trialrun-389884286-worker-0",
+                    0.01,
+                    0.050
+                ),
+                screenshotText("46", 0.908, 0.050),
+                screenshotText("46", 0.939, 0.050),
+                screenshotText("46", 0.969, 0.050),
+                screenshotText(
+                    "cpu_quota_trial-389884286-trialrun-389884286-worker-1",
+                    0.01,
+                    0.020
+                ),
+                screenshotText("23", 0.908, 0.020),
+                screenshotText("23", 0.939, 0.020),
+                screenshotText("23", 0.969, 0.020),
+            ]
+        )
+
+        #expect(readings["389884286"]?.current == 18.3)
+        #expect(abs((readings["389884286"]?.average ?? 0) - 15.44) < 0.0001)
+        #expect(readings["389884286"]?.capacity == 69)
+    }
+
+    @Test("loads compatible tasks through three grouped panel screenshots")
     func loadsGroupedTaskMetrics() async throws {
         let runner = TaskMetricsScriptedRunner()
         let panelLoader = GroupedTaskMetricsPanelLoader()
@@ -498,6 +663,8 @@ struct MerlinTaskMetricsTests {
 
         let refresh = await provider.refresh(runs: runs)
 
+        #expect(refresh.metricsByRunID["run-one"]?.cpuUsedCores == 11.1)
+        #expect(refresh.metricsByRunID["run-one"]?.cpuQuotaCores == 46)
         #expect(refresh.metricsByRunID["run-one"]?.gpuUtilization == 21.8)
         #expect(refresh.metricsByRunID["run-one"]?.gpuAverageUtilization == 29.7)
         #expect(refresh.metricsByRunID["run-one"]?.memoryUsedBytes == 3_000)
@@ -506,8 +673,8 @@ struct MerlinTaskMetricsTests {
         #expect(refresh.metricsByRunID["run-two"]?.memoryUsedBytes == 4_000)
         #expect(await runner.commands().isEmpty)
         let requests = await panelLoader.requests()
-        #expect(requests.count == 2)
-        #expect(Set(requests.map(\.panel)) == [.gpu, .memory])
+        #expect(requests.count == 3)
+        #expect(Set(requests.map(\.panel)) == [.cpu, .gpu, .memory])
         #expect(requests.allSatisfy { $0.seriesCountHint == 2 })
         #expect(requests.allSatisfy {
             grafanaQueryValue("var-target_arnold_trial_id", in: $0.url)
@@ -664,7 +831,7 @@ struct MerlinTaskMetricsTests {
         _ = await provider.refresh(runs: [run])
 
         #expect(await runner.commands().count == 1)
-        #expect(await panelLoader.requests().count == 4)
+        #expect(await panelLoader.requests().count == 6)
     }
 
     @Test("exposes the exact batch before slow panel loading starts")
@@ -838,6 +1005,30 @@ struct MerlinTaskMetricsTests {
         #expect(metrics?.memoryUsedBytes == nil)
     }
 
+    @Test("derives CPU utilization from used cores and quota")
+    func derivesCPUUtilization() {
+        let cpuOutput = """
+        {"total":[{"data":[
+          {"metric":"lab.arnold.instance_monitor.cpu_util","tags":{"stat":"current"},"dps":{"20":11.1}},
+          {"metric":"lab.arnold.instance_monitor.cpu_util","tags":{"stat":"average"},"dps":{"20":9.14}},
+          {"metric":"lab.arnold.instance_monitor.cpu_quota","tags":{"stat":"capacity"},"dps":{"20":46}}
+        ]}]}
+        """
+
+        let metrics = MerlinTaskMetricsParser.parse(
+            cpuOutput: cpuOutput,
+            gpuOutput: nil,
+            memoryOutput: nil
+        )
+
+        #expect(metrics?.cpuUsedCores == 11.1)
+        #expect(metrics?.cpuAverageCores == 9.14)
+        #expect(metrics?.cpuQuotaCores == 46)
+        #expect(abs((metrics?.cpuUtilization ?? 0) - 24.1304) < 0.0001)
+        #expect(abs((metrics?.cpuAverageUtilization ?? 0) - 19.8696) < 0.0001)
+        #expect(metrics?.cpu?.sampledAt == taskTestDate(20))
+    }
+
     @Test("sums the latest memory usage and limits across task pods")
     func aggregatesMemory() {
         let memoryOutput = """
@@ -979,6 +1170,15 @@ private actor TaskMetricsPanelLoader: MerlinTaskPanelDataLoading {
     ) -> [MerlinTaskMetricPanel: String] {
         recordedRequests.append(contentsOf: requests)
         var output: [MerlinTaskMetricPanel: String] = [:]
+        if requests.contains(where: { $0.panel == .cpu }) {
+            output[.cpu] = """
+            {"total":[{"data":[
+              {"metric":"lab.arnold.instance_monitor.cpu_util","tags":{"stat":"current"},"dps":{"90":4}},
+              {"metric":"lab.arnold.instance_monitor.cpu_util","tags":{"stat":"average"},"dps":{"90":3}},
+              {"metric":"lab.arnold.instance_monitor.cpu_quota","tags":{"stat":"capacity"},"dps":{"90":8}}
+            ]}]}
+            """
+        }
         if requests.contains(where: { $0.panel == .gpu }) {
             output[.gpu] = """
             {"total":[{"data":[
@@ -1013,6 +1213,16 @@ private actor GroupedTaskMetricsPanelLoader: MerlinTaskPanelDataLoading {
     ) -> [MerlinTaskMetricPanel: String] {
         recordedRequests.append(contentsOf: requests)
         return [
+            .cpu: """
+            {"total":[{"data":[
+              {"metric":"lab.arnold.instance_monitor.cpu_util","tags":{"trial_id":"389738351","stat":"current"},"dps":{"90":11.1}},
+              {"metric":"lab.arnold.instance_monitor.cpu_util","tags":{"trial_id":"389738351","stat":"average"},"dps":{"90":9.14}},
+              {"metric":"lab.arnold.instance_monitor.cpu_quota","tags":{"trial_id":"389738351","stat":"capacity"},"dps":{"90":46}},
+              {"metric":"lab.arnold.instance_monitor.cpu_util","tags":{"trial_id":"389738720","stat":"current"},"dps":{"90":7.29}},
+              {"metric":"lab.arnold.instance_monitor.cpu_util","tags":{"trial_id":"389738720","stat":"average"},"dps":{"90":6.32}},
+              {"metric":"lab.arnold.instance_monitor.cpu_quota","tags":{"trial_id":"389738720","stat":"capacity"},"dps":{"90":23}}
+            ]}]}
+            """,
             .gpu: """
             {"total":[{"data":[
               {"metric":"lab.arnold.instance_monitor.gpu_duty_cycle","tags":{"trial_id":"389738351","stat":"current"},"dps":{"90":21.8}},

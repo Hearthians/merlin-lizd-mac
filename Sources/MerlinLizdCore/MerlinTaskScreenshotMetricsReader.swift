@@ -15,10 +15,21 @@ struct MerlinTaskMetricScreenshotText: Equatable, Sendable {
 struct MerlinTaskMetricLegendValues: Equatable, Sendable {
     let current: Double
     let average: Double?
+    let capacity: Double?
+
+    init(
+        current: Double,
+        average: Double?,
+        capacity: Double? = nil
+    ) {
+        self.current = current
+        self.average = average
+        self.capacity = capacity
+    }
 }
 
 protocol MerlinTaskMetricScreenshotReading: Sendable {
-    /// GPU values are percentages; memory values are bytes.
+    /// CPU values are cores, GPU values are percentages, and memory is bytes.
     func readings(
         for panel: MerlinTaskMetricPanel,
         imageData: Data
@@ -55,13 +66,21 @@ struct VisionMerlinTaskMetricScreenshotReader:
                 ),
                 let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
             else { return [:] }
+            let legendHeight = max(1, Int(Double(image.height) * 0.4))
+            let legendRect = CGRect(
+                x: 0,
+                y: image.height - legendHeight,
+                width: image.width,
+                height: legendHeight
+            )
+            let recognitionImage = image.cropping(to: legendRect) ?? image
 
             let request = VNRecognizeTextRequest()
             request.recognitionLevel = .accurate
             request.recognitionLanguages = ["en-US"]
             request.usesLanguageCorrection = false
             request.minimumTextHeight = 0.003
-            let handler = VNImageRequestHandler(cgImage: image)
+            let handler = VNImageRequestHandler(cgImage: recognitionImage)
             do {
                 try handler.perform([request])
             } catch {
@@ -115,33 +134,28 @@ enum MerlinTaskScreenshotLegendParser {
         observations: [MerlinTaskMetricScreenshotText]
     ) -> [String: MerlinTaskMetricLegendValues] {
         let marker = switch panel {
+        case .cpu: "cpu_util"
         case .gpu: "gpu_util"
         case .memory: "mem_usage"
         }
-        let labels = observations.filter {
-            normalized($0.text).contains(marker)
-        }
-        var readings: [String: MerlinTaskMetricLegendValues] = [:]
-        for label in labels.sorted(by: { $0.width > $1.width }) {
-            let candidates = observations.compactMap {
-                observation -> (Double, Double)? in
-                guard
-                    observation.minX > 0.75,
-                    sameRow(label, observation),
-                    let value = parsedValue(
-                        observation.text,
-                        panel: panel
-                    )
-                else { return nil }
-                return (observation.minX, value)
-            }
-            let ordered = candidates.sorted { $0.0 < $1.0 }
-            if let current = ordered.last {
-                let reading = MerlinTaskMetricLegendValues(
-                    current: current.1,
-                    average: ordered.dropLast().last?.1
+        var readings = legendReadings(
+            marker: marker,
+            panel: panel,
+            observations: observations
+        )
+        if panel == .cpu {
+            let quotas = legendReadings(
+                marker: "cpu_quota",
+                panel: panel,
+                observations: observations
+            )
+            for (trialID, quota) in quotas {
+                guard let reading = readings[trialID] else { continue }
+                readings[trialID] = MerlinTaskMetricLegendValues(
+                    current: reading.current,
+                    average: reading.average,
+                    capacity: quota.current
                 )
-                readings[trialID(in: label.text) ?? label.text] = reading
             }
         }
         if !readings.isEmpty {
@@ -169,6 +183,56 @@ enum MerlinTaskScreenshotLegendParser {
         ]
     }
 
+    private static func legendReadings(
+        marker: String,
+        panel: MerlinTaskMetricPanel,
+        observations: [MerlinTaskMetricScreenshotText]
+    ) -> [String: MerlinTaskMetricLegendValues] {
+        let labels = observations.filter {
+            normalized($0.text).contains(marker)
+        }
+        var readings: [String: MerlinTaskMetricLegendValues] = [:]
+        for label in labels.sorted(by: { $0.width > $1.width }) {
+            let candidates = observations.compactMap {
+                observation -> (Double, Double)? in
+                guard
+                    observation.minX > 0.75,
+                    sameRow(label, observation),
+                    let value = parsedValue(
+                        observation.text,
+                        panel: panel
+                    )
+                else { return nil }
+                return (observation.minX, value)
+            }
+            let ordered = candidates.sorted { $0.0 < $1.0 }
+            if let current = ordered.last {
+                let reading = MerlinTaskMetricLegendValues(
+                    current: current.1,
+                    average: ordered.dropLast().last?.1
+                )
+                let key = trialID(in: label.text) ?? label.text
+                if panel == .cpu, let existing = readings[key] {
+                    let average: Double? = if
+                        let lhs = existing.average,
+                        let rhs = reading.average
+                    {
+                        lhs + rhs
+                    } else {
+                        nil
+                    }
+                    readings[key] = MerlinTaskMetricLegendValues(
+                        current: existing.current + reading.current,
+                        average: average
+                    )
+                } else {
+                    readings[key] = reading
+                }
+            }
+        }
+        return readings
+    }
+
     private static func trialID(in text: String) -> String? {
         let value = text.lowercased()
         for marker in ["trial-", "trialrun-"] {
@@ -194,6 +258,8 @@ enum MerlinTaskScreenshotLegendParser {
         panel: MerlinTaskMetricPanel
     ) -> Double? {
         switch panel {
+        case .cpu:
+            lastNumber(in: text)
         case .gpu:
             percentage(in: text)
         case .memory:

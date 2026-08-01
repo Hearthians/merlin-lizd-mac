@@ -43,7 +43,7 @@ public struct MerlinTaskMetricsBatch: Equatable, Sendable {
 }
 
 /// Incrementally loads task telemetry through Merlin's authenticated Grafana
-/// OpenAPI. Compatible runs share one GPU and one memory screenshot, keeping
+/// OpenAPI. Compatible runs share one CPU, GPU, and memory screenshot, keeping
 /// task status polling independent from slow dashboard rendering.
 public actor MerlinTaskMetricsProvider {
     private let loader: MerlinTaskMetricsLoader
@@ -195,7 +195,11 @@ public actor MerlinTaskMetricsProvider {
         _ metrics: MerlinTaskMetrics?,
         for run: MerlinTaskRun
     ) -> Bool {
-        guard let metrics, metrics.memory != nil else { return false }
+        guard
+            let metrics,
+            metrics.cpu != nil,
+            metrics.memory != nil
+        else { return false }
         return run.allocatedGPUCount == 0 || metrics.gpu != nil
     }
 
@@ -281,6 +285,21 @@ private struct MerlinTaskMetricsLoader: Sendable {
         let trialIDs = group.runs.compactMap(\.trialID).sorted()
         let earliestStart = group.runs.compactMap(\.startedAtMilliseconds).min()
         var requests: [MerlinTaskPanelDataRequest] = []
+        if let cpuURL = MerlinTaskGrafanaURLBuilder.rolePanelURL(
+            cluster: group.key.cluster,
+            dataCenter: group.key.dataCenter,
+            trialIDs: trialIDs,
+            role: group.key.role,
+            panel: .cpu,
+            startingAtMilliseconds: earliestStart,
+            endingAt: endingAt
+        ) {
+            requests.append(.init(
+                panel: .cpu,
+                url: cpuURL,
+                seriesCountHint: group.runs.count
+            ))
+        }
         if
             group.runs.contains(where: { $0.allocatedGPUCount != 0 }),
             let gpuURL = MerlinTaskGrafanaURLBuilder.rolePanelURL(
@@ -318,6 +337,7 @@ private struct MerlinTaskMetricsLoader: Sendable {
             guard
                 let trialID = run.trialID,
                 let sample = MerlinTaskMetricsParser.parse(
+                    cpuOutput: outputs[.cpu],
                     gpuOutput: outputs[.gpu],
                     memoryOutput: outputs[.memory],
                     memoryTotalOverride: run.allocatedMemoryBytes,
@@ -337,6 +357,14 @@ private struct MerlinTaskMetricsLoader: Sendable {
         }
         let role = run.metricRoleName ?? "worker"
         var requests: [MerlinTaskPanelDataRequest] = []
+        if let cpuURL = MerlinTaskGrafanaURLBuilder.rolePanelURL(
+            from: dashboardURL,
+            role: role,
+            panel: .cpu,
+            startingAtMilliseconds: run.startedAtMilliseconds
+        ) {
+            requests.append(.init(panel: .cpu, url: cpuURL))
+        }
         if run.allocatedGPUCount != 0, let gpuURL =
             MerlinTaskGrafanaURLBuilder.rolePanelURL(
                 from: dashboardURL,
@@ -356,6 +384,7 @@ private struct MerlinTaskMetricsLoader: Sendable {
         }
         let outputs = await panelDataLoader.load(requests)
         return MerlinTaskMetricsParser.parse(
+            cpuOutput: outputs[.cpu],
             gpuOutput: outputs[.gpu],
             memoryOutput: outputs[.memory],
             memoryTotalOverride: run.allocatedMemoryBytes
