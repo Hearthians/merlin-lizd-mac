@@ -1,5 +1,26 @@
 import Foundation
 
+private func compactClusterCode(
+    name: String?,
+    dataCenter: String?
+) -> String? {
+    if let code = dataCenter?.trimmingCharacters(
+        in: .whitespacesAndNewlines
+    ), !code.isEmpty {
+        return code.lowercased()
+    }
+    guard let name = name?.trimmingCharacters(
+        in: .whitespacesAndNewlines
+    ), !name.isEmpty else {
+        return nil
+    }
+    return name
+        .split { $0 == "-" || $0 == "_" }
+        .last
+        .map(String.init)?
+        .lowercased() ?? name.lowercased()
+}
+
 public struct InventorySnapshot: Codable, Equatable, Sendable {
     public let devboxes: [DevboxInventory]
     public let refreshedAt: Date
@@ -18,10 +39,20 @@ public struct WorkerClusterLocation: Equatable, Sendable {
 
     public let name: String
     public let source: Source
+    public let dataCenter: String?
 
-    public init(name: String, source: Source) {
+    public var shortCode: String {
+        compactClusterCode(name: name, dataCenter: dataCenter) ?? name
+    }
+
+    public init(
+        name: String,
+        source: Source,
+        dataCenter: String? = nil
+    ) {
         self.name = name
         self.source = source
+        self.dataCenter = dataCenter
     }
 }
 
@@ -37,6 +68,12 @@ public struct DevboxInventory: Identifiable, Codable, Equatable, Sendable {
     public var clusterName: String? {
         Self.normalizedClusterName(devbox.cluster?.name)
     }
+    public var clusterShortCode: String? {
+        compactClusterCode(
+            name: clusterName,
+            dataCenter: devbox.cluster?.dataCenter
+        )
+    }
 
     public func workerClusterLocation(
         for worker: WorkerInventoryRecord
@@ -44,8 +81,12 @@ public struct DevboxInventory: Identifiable, Codable, Equatable, Sendable {
         if let name = Self.normalizedClusterName(worker.clusterName) {
             return WorkerClusterLocation(name: name, source: .worker)
         }
-        guard let name = clusterName else { return nil }
-        return WorkerClusterLocation(name: name, source: .devbox)
+        guard let code = clusterShortCode else { return nil }
+        return WorkerClusterLocation(
+            name: clusterName ?? code,
+            source: .devbox,
+            dataCenter: devbox.cluster?.dataCenter
+        )
     }
 
     private static func normalizedClusterName(_ value: String?) -> String? {

@@ -124,12 +124,12 @@ struct DevboxCard: View {
         SurfaceCard {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(machine.displayName)
-                        .font(.headline)
-                    if let clusterName = machine.clusterName {
-                        Text("集群 \(clusterName)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        Text(machine.displayName)
+                            .font(.headline)
+                        if let cluster = machine.clusterPresentation {
+                            ClusterBadgeView(presentation: cluster)
+                        }
                     }
                     if let alias = machine.sshAlias, alias != machine.displayName {
                         Text("SSH: \(alias)")
@@ -181,16 +181,16 @@ struct DevboxDetailView: View {
             VStack(alignment: .leading, spacing: 18) {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(machine.displayName)
-                            .font(.largeTitle.bold())
+                        HStack(spacing: 8) {
+                            Text(machine.displayName)
+                                .font(.largeTitle.bold())
+                            if let cluster = machine.clusterPresentation {
+                                ClusterBadgeView(presentation: cluster)
+                            }
+                        }
                         Text(machine.devbox.sid)
                             .font(.callout.monospaced())
                             .foregroundStyle(.secondary)
-                        if let clusterName = machine.clusterName {
-                            Label("集群 \(clusterName)", systemImage: "server.rack")
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                        }
                     }
                     Spacer()
                     LifecyclePill(status: machine.devbox.status)
@@ -366,21 +366,20 @@ struct WorkerDetailView: View {
             VStack(alignment: .leading, spacing: 18) {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(worker.displayName)
-                            .font(.largeTitle.bold())
+                        HStack(spacing: 8) {
+                            Text(worker.displayName)
+                                .font(.largeTitle.bold())
+                            if let clusterLocation = machine.workerClusterLocation(
+                                for: worker
+                            ) {
+                                ClusterBadgeView(
+                                    presentation: clusterLocation.clusterPresentation
+                                )
+                            }
+                        }
                         Text("\(machine.displayName) · \(worker.id)")
                             .font(.callout.monospaced())
                             .foregroundStyle(.secondary)
-                        if let clusterLocation = machine.workerClusterLocation(
-                            for: worker
-                        ) {
-                            Label(
-                                clusterLocation.displayLabel,
-                                systemImage: "server.rack"
-                            )
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                        }
                     }
                     Spacer()
                     HStack(spacing: 7) {
@@ -502,8 +501,15 @@ struct WorkerRow: View {
                 .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(worker.displayName)
-                    .font(.headline)
+                HStack(spacing: 6) {
+                    Text(worker.displayName)
+                        .font(.headline)
+                    if let clusterLocation {
+                        ClusterBadgeView(
+                            presentation: clusterLocation.clusterPresentation
+                        )
+                    }
+                }
                 Text(workerIdentityText)
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
@@ -533,13 +539,19 @@ struct WorkerRow: View {
     }
 
     private var workerIdentityText: String {
-        [parentLabel, worker.id, clusterLocation?.displayLabel]
+        [parentLabel, worker.id]
             .compactMap { $0 }
             .joined(separator: " · ")
     }
 
     private var workerHelpText: String {
-        "\(worker.displayName)\n\(workerIdentityText)"
+        [
+            worker.displayName,
+            workerIdentityText,
+            clusterLocation?.clusterPresentation.helpText,
+        ]
+        .compactMap { $0 }
+        .joined(separator: "\n")
     }
 }
 

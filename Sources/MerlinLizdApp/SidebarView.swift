@@ -384,9 +384,7 @@ private struct SidebarDevboxLabel: View {
     }
 
     private var subtitle: String {
-        [lifecycleLabel, machine.clusterName.map { "集群 \($0)" }]
-            .compactMap { $0 }
-            .joined(separator: " · ")
+        lifecycleLabel
     }
 
     private var lifecycleLabel: String {
@@ -414,6 +412,9 @@ private struct SidebarDevboxLabel: View {
                     Text(title)
                         .font(.callout.weight(selected ? .semibold : .medium))
                         .lineLimit(1)
+                    if let cluster = machine.clusterPresentation {
+                        ClusterBadgeView(presentation: cluster)
+                    }
                 }
                 Text(subtitle)
                     .font(.caption2)
@@ -485,9 +486,16 @@ private struct SidebarWorkerLabel: View {
                 .frame(width: 25, height: 25)
                 .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
             VStack(alignment: .leading, spacing: 2) {
-                Text(worker.displayName)
-                    .font(.callout.weight(selected ? .semibold : .regular))
-                    .lineLimit(1)
+                HStack(spacing: 5) {
+                    Text(worker.displayName)
+                        .font(.callout.weight(selected ? .semibold : .regular))
+                        .lineLimit(1)
+                    if let clusterLocation {
+                        ClusterBadgeView(
+                            presentation: clusterLocation.clusterPresentation
+                        )
+                    }
+                }
                 Text(workerSubtitle)
                     .font(.caption2.monospaced())
                     .foregroundStyle(.secondary)
@@ -506,13 +514,15 @@ private struct SidebarWorkerLabel: View {
     }
 
     private var workerSubtitle: String {
-        [worker.id, clusterLocation?.displayLabel]
-            .compactMap { $0 }
-            .joined(separator: " · ")
+        worker.id
     }
 
     private var workerHelpText: String {
-        [worker.displayName, "Worker \(worker.id)", clusterLocation?.displayLabel]
+        [
+            worker.displayName,
+            "Worker \(worker.id)",
+            clusterLocation?.clusterPresentation.helpText,
+        ]
             .compactMap { $0 }
             .joined(separator: "\n")
     }
