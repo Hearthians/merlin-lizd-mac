@@ -1,12 +1,17 @@
 import Foundation
 
-public struct MerlinTaskMetricReading<Value>: Equatable, Sendable
-where Value: Equatable & Sendable {
-    public let value: Value
+public struct MerlinTaskGPUReading: Equatable, Sendable {
+    public let currentUtilization: Double
+    public let averageUtilization: Double?
     public let sampledAt: Date
 
-    public init(value: Value, sampledAt: Date) {
-        self.value = value
+    public init(
+        currentUtilization: Double,
+        averageUtilization: Double?,
+        sampledAt: Date
+    ) {
+        self.currentUtilization = currentUtilization
+        self.averageUtilization = averageUtilization
         self.sampledAt = sampledAt
     }
 }
@@ -35,18 +40,19 @@ public struct MerlinTaskMemoryReading: Equatable, Sendable {
 /// Grafana URLs, queries, routing tags, and credentials never cross this
 /// projection.
 public struct MerlinTaskMetrics: Equatable, Sendable {
-    public let gpu: MerlinTaskMetricReading<Double>?
+    public let gpu: MerlinTaskGPUReading?
     public let memory: MerlinTaskMemoryReading?
 
     public init(
-        gpu: MerlinTaskMetricReading<Double>?,
+        gpu: MerlinTaskGPUReading?,
         memory: MerlinTaskMemoryReading?
     ) {
         self.gpu = gpu
         self.memory = memory
     }
 
-    public var gpuUtilization: Double? { gpu?.value }
+    public var gpuUtilization: Double? { gpu?.currentUtilization }
+    public var gpuAverageUtilization: Double? { gpu?.averageUtilization }
     public var memoryUsedBytes: UInt64? { memory?.usedBytes }
     public var memoryTotalBytes: UInt64? { memory?.totalBytes }
 
@@ -61,18 +67,36 @@ public enum MerlinTaskMetricsParser {
 
     public static func parse(
         gpuOutput: String?,
-        memoryOutput: String?
+        memoryOutput: String?,
+        memoryTotalOverride: UInt64? = nil,
+        trialID: String? = nil
     ) -> MerlinTaskMetrics? {
-        let gpuSeries = parseSeries(gpuOutput)
-        let latestGPUReadings = gpuSeries.compactMap {
+        let gpuSeries = series(
+            parseSeries(gpuOutput),
+            matchingTrialID: trialID
+        )
+        let gpuMetricSeries = gpuSeries.filter {
+            metric($0.metric, hasSuffix: "gpu_duty_cycle")
+        }
+        let currentGPUSeries = gpuMetricSeries.filter {
+            $0.tags["stat"]?.lowercased() != "average"
+        }
+        let latestGPUReadings = currentGPUSeries.compactMap {
             series -> GrafanaMetricPoint? in
-            guard metric(series.metric, hasSuffix: "gpu_duty_cycle") else {
+            return series.points.last
+        }
+        let gpuReadings = coherentPoints(latestGPUReadings)
+        let explicitAverageReadings = gpuMetricSeries.compactMap {
+            series -> GrafanaMetricPoint? in
+            guard series.tags["stat"]?.lowercased() == "average" else {
                 return nil
             }
             return series.points.last
         }
-        let gpuReadings = coherentPoints(latestGPUReadings)
-        let memorySeries = parseSeries(memoryOutput)
+        let memorySeries = series(
+            parseSeries(memoryOutput),
+            matchingTrialID: trialID
+        )
         let allUsedReadings = latestMemoryReadings(
             memorySeries,
             metricSuffixes: ["mem_usage", "memory_usage"],
@@ -84,15 +108,33 @@ public enum MerlinTaskMetricsParser {
             metricSuffixes: ["mem_limit", "memory_limit"],
             targetField: "limit"
         )
-        let gpu: MerlinTaskMetricReading<Double>?
+        let gpu: MerlinTaskGPUReading?
         if let gpuSampledAt = gpuReadings.map(\.timestamp).min() {
             let utilization = min(100, max(
                 0,
                 gpuReadings.map(\.value).reduce(0, +)
                     / Double(gpuReadings.count)
             ))
-            gpu = MerlinTaskMetricReading(
-                value: utilization,
+            let isLegendProjection = currentGPUSeries.contains {
+                $0.tags["source"] == "grafana-panel-legend"
+            }
+            let averagePoints: [GrafanaMetricPoint] = if
+                !explicitAverageReadings.isEmpty
+            {
+                explicitAverageReadings
+            } else if isLegendProjection {
+                []
+            } else {
+                currentGPUSeries.flatMap(\.points)
+            }
+            let average = averagePoints.isEmpty ? nil : min(100, max(
+                0,
+                averagePoints.map(\.value).reduce(0, +)
+                    / Double(averagePoints.count)
+            ))
+            gpu = MerlinTaskGPUReading(
+                currentUtilization: utilization,
+                averageUtilization: average,
                 sampledAt: gpuSampledAt
             )
         } else {
@@ -114,23 +156,23 @@ public enum MerlinTaskMetricsParser {
             else { return }
             matches[reading.key] = limit
         }
-        let memoryTotal: UInt64?
-        if
+        let sampledMemoryTotal: UInt64? = if
             !usedReadings.isEmpty,
             matchingLimits.count == usedReadings.count
         {
-            memoryTotal = sumBytes(usedReadings.keys.compactMap {
+            sumBytes(usedReadings.keys.compactMap {
                 matchingLimits[$0]?.value
             })
         } else {
-            memoryTotal = nil
+            nil
         }
+        let memoryTotal = memoryTotalOverride ?? sampledMemoryTotal
         let memory: MerlinTaskMemoryReading?
         if
             let memoryUsed,
             let memorySampledAt = (
                 usedReadings.values.map(\.timestamp)
-                    + (memoryTotal == nil
+                    + (sampledMemoryTotal == nil
                         ? []
                         : matchingLimits.values.map(\.timestamp))
             ).min()
@@ -150,6 +192,14 @@ public enum MerlinTaskMetricsParser {
     private static func parseSeries(_ output: String?) -> [GrafanaMetricSeries] {
         guard let output else { return [] }
         return (try? GrafanaPanelDataParser.parse(output)) ?? []
+    }
+
+    private static func series(
+        _ values: [GrafanaMetricSeries],
+        matchingTrialID trialID: String?
+    ) -> [GrafanaMetricSeries] {
+        guard let trialID else { return values }
+        return values.filter { $0.tags["trial_id"] == trialID }
     }
 
     private static func coherentPoints(

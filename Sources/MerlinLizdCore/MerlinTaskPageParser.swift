@@ -4,8 +4,9 @@ public enum MerlinTaskPageParserError: Error, Equatable, Sendable {
     case malformedResponse
 }
 
-/// Decodes only the fields required by the task list. In particular, `meta`,
-/// environment variables, storage paths, and tokens are intentionally absent.
+/// Decodes only the approved fields required by the task list and telemetry
+/// routing. Environment variables, storage paths, and tokens are intentionally
+/// absent from the persisted projection.
 public enum MerlinTaskPageParser {
     public static func parse(_ output: String) throws -> MerlinTaskPage {
         guard let data = output.data(using: .utf8) else {
@@ -50,6 +51,7 @@ public enum MerlinTaskPageParser {
             name = definitionName
         }
         guard !id.isEmpty, !name.isEmpty else { return nil }
+        let metricRole = metricRole(from: payload.meta?.jobRunParameters)
         return MerlinTaskRun(
             id: id,
             name: name,
@@ -57,8 +59,27 @@ public enum MerlinTaskPageParser {
             createdAtMilliseconds: payload.creationTime.value,
             startedAtMilliseconds: positive(payload.meta?.startRunningTime),
             completedAtMilliseconds: positive(payload.completedTime),
-            totalRuntimeMilliseconds: positive(payload.meta?.totalRuntime)
+            totalRuntimeMilliseconds: positive(payload.meta?.totalRuntime),
+            clusterName: nonempty(
+                payload.meta?.jobRunParameters?.resource?
+                    .arnoldConfiguration?.clusterName
+            ),
+            trialID: nonempty(payload.latestTrialID),
+            metricRoleName: metricRole?.name,
+            allocatedGPUCount: metricRole?.allocatedGPUCount,
+            allocatedMemoryBytes: metricRole?.allocatedMemoryBytes
         )
+    }
+
+    private static func metricRole(
+        from parameters: JobRunParameters?
+    ) -> ResourceRole? {
+        let roles = parameters?.resource?.arnoldConfiguration?.roles ?? []
+        return roles.first {
+            normalized($0.name) == "worker"
+        } ?? roles.first {
+            ($0.gpu ?? 0) > 0
+        } ?? roles.first
     }
 
     private static func status(for status: String) -> MerlinTaskStatus? {
@@ -83,6 +104,11 @@ public enum MerlinTaskPageParser {
         value.lowercased().filter(\.isLetter)
     }
 
+    private static func nonempty(_ value: String?) -> String? {
+        let value = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value?.isEmpty == false ? value : nil
+    }
+
     private struct Response: Decodable {
         let list: [Payload]
         let total: Int
@@ -96,6 +122,7 @@ public enum MerlinTaskPageParser {
         let triggerMode: String
         let creationTime: FlexibleInt64
         let completedTime: FlexibleInt64?
+        let latestTrialID: String?
         let meta: Metadata?
 
         enum CodingKeys: String, CodingKey {
@@ -106,6 +133,7 @@ public enum MerlinTaskPageParser {
             case triggerMode = "trigger_mode"
             case creationTime = "creation_time"
             case completedTime = "completed_time"
+            case latestTrialID = "latest_trial_id"
             case meta
         }
     }
@@ -114,11 +142,66 @@ public enum MerlinTaskPageParser {
         let caption: String?
         let startRunningTime: FlexibleInt64?
         let totalRuntime: FlexibleInt64?
+        let jobRunParameters: JobRunParameters?
 
         enum CodingKeys: String, CodingKey {
             case caption
             case startRunningTime = "start_running_time"
             case totalRuntime = "total_runtime_ms"
+            case jobRunParameters = "job_run_params"
+        }
+    }
+
+    private struct JobRunParameters: Decodable {
+        let resource: ResourceConfiguration?
+    }
+
+    private struct ResourceConfiguration: Decodable {
+        let arnoldConfiguration: ArnoldConfiguration?
+
+        enum CodingKeys: String, CodingKey {
+            case arnoldConfiguration = "arnold_config"
+        }
+    }
+
+    private struct ArnoldConfiguration: Decodable {
+        let clusterName: String?
+        let roles: [ResourceRole]?
+    }
+
+    private struct ResourceRole: Decodable {
+        let name: String
+        let gpu: Int?
+        let memoryMiB: FlexibleInt64?
+        let count: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case name
+            case gpu
+            case memoryMiB = "memory"
+            case count = "num"
+        }
+
+        var allocatedGPUCount: Int? {
+            guard let gpu, gpu >= 0 else { return nil }
+            let count = max(1, count ?? 1)
+            let result = gpu.multipliedReportingOverflow(by: count)
+            return result.overflow ? nil : result.partialValue
+        }
+
+        var allocatedMemoryBytes: UInt64? {
+            guard let memoryMiB, memoryMiB.value > 0 else { return nil }
+            let count = max(1, count ?? 1)
+            guard
+                let memory = UInt64(exactly: memoryMiB.value),
+                let roleCount = UInt64(exactly: count)
+            else { return nil }
+            let totalMiB = memory.multipliedReportingOverflow(by: roleCount)
+            guard !totalMiB.overflow else { return nil }
+            let bytes = totalMiB.partialValue.multipliedReportingOverflow(
+                by: 1_048_576
+            )
+            return bytes.overflow ? nil : bytes.partialValue
         }
     }
 

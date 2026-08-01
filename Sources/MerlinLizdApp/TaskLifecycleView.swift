@@ -141,7 +141,8 @@ struct TaskLifecycleView: View {
                 TaskWideRow(
                     run: run,
                     metrics: state.metricsByRunID[run.id],
-                    metricState: state.metricAvailability(for: run),
+                    gpuMetricState: state.gpuMetricAvailability(for: run),
+                    memoryMetricState: state.memoryMetricAvailability(for: run),
                     now: now
                 )
             }
@@ -160,7 +161,8 @@ struct TaskLifecycleView: View {
                 TaskCompactRow(
                     run: run,
                     metrics: state.metricsByRunID[run.id],
-                    metricState: state.metricAvailability(for: run),
+                    gpuMetricState: state.gpuMetricAvailability(for: run),
+                    memoryMetricState: state.memoryMetricAvailability(for: run),
                     now: now
                 )
             }

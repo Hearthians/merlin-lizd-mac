@@ -16,6 +16,63 @@ enum SSHCommandClipboard {
     }
 }
 
+@MainActor
+enum TaskSSHCommandClipboard {
+    static func command(runID: String) -> String? {
+        try? MerlinCommands.manualTaskSSHCommand(runID: runID)
+    }
+
+    @discardableResult
+    static func copy(runID: String) -> Bool {
+        guard let command = command(runID: runID) else { return false }
+        NSPasteboard.general.clearContents()
+        return NSPasteboard.general.setString(command, forType: .string)
+    }
+}
+
+struct TaskSSHCopyButton: View {
+    let runID: String
+    @State private var didCopy = false
+    @State private var copyFeedbackTask: Task<Void, Never>?
+
+    var body: some View {
+        Button {
+            guard TaskSSHCommandClipboard.copy(runID: runID) else { return }
+            copyFeedbackTask?.cancel()
+            didCopy = true
+            copyFeedbackTask = Task {
+                try? await Task.sleep(for: .seconds(2))
+                guard !Task.isCancelled else { return }
+                didCopy = false
+            }
+        } label: {
+            Label(
+                didCopy ? "已复制" : "SSH",
+                systemImage: didCopy ? "checkmark" : "terminal"
+            )
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(didCopy ? Color.green : Color.secondary)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .background(.quaternary.opacity(0.8), in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .fixedSize()
+        .help(helpText)
+        .accessibilityLabel(didCopy ? "SSH 命令已复制" : "复制 SSH 命令")
+        .onDisappear {
+            copyFeedbackTask?.cancel()
+        }
+    }
+
+    private var helpText: String {
+        guard let command = TaskSSHCommandClipboard.command(runID: runID) else {
+            return "暂无可用的 SSH 命令"
+        }
+        return "复制由 merlin-cli 建立的 SSH 连接命令：\n\(command)"
+    }
+}
+
 struct SSHCommandCard: View {
     let target: TerminalTarget?
     @State private var didCopy = false

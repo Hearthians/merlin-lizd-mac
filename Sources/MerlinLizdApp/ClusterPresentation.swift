@@ -26,3 +26,15 @@ extension WorkerClusterLocation {
         return ClusterPresentation(shortCode: shortCode, helpText: helpText)
     }
 }
+
+extension MerlinTaskRun {
+    var clusterPresentation: ClusterPresentation? {
+        guard let clusterName, let shortCode = clusterShortCode else {
+            return nil
+        }
+        return ClusterPresentation(
+            shortCode: shortCode,
+            helpText: "任务集群：\(clusterName)"
+        )
+    }
+}

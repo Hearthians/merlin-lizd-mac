@@ -52,14 +52,22 @@ struct TaskMetricValue: View {
         guard let utilization = metrics?.gpuUtilization else {
             return placeholder(state: state, tint: .green)
         }
+        let currentLabel = isFinal ? "最后采样" : "当前"
+        let averageLabel = isFinal ? "截至采样均值" : "启动均值"
+        let averageDetail = metrics?.gpuAverageUtilization.map {
+            "\(averageLabel) \(Int($0.rounded()))%"
+        }
         return TaskMetricValue(
-            value: "\(Int(utilization.rounded()))%",
-            detail: isFinal ? "最终采样" : "任务平均",
+            value: "\(currentLabel) \(Int(utilization.rounded()))%",
+            detail: averageDetail,
             fraction: utilization / 100,
             tint: utilization >= 90 ? .orange : .green,
             isLoading: false,
             helpText: metrics?.gpu.map {
-                "任务 GPU 平均利用率，采样于 \($0.sampledAt.formatted(.dateTime.hour().minute().second()))"
+                let average = $0.averageUtilization.map {
+                    "，\(averageLabel) \(Int($0.rounded()))%"
+                } ?? ""
+                return "GPU \(currentLabel)利用率 \(Int($0.currentUtilization.rounded()))%\(average)，采样于 \($0.sampledAt.formatted(.dateTime.hour().minute().second()))"
             }
         )
     }
@@ -89,7 +97,7 @@ struct TaskMetricValue: View {
             tint: (metrics?.memoryUtilization ?? 0) >= 90 ? .orange : .blue,
             isLoading: false,
             helpText: metrics?.memory.map {
-                let prefix = isFinal ? "任务最终内存占用" : "任务内存占用"
+                let prefix = isFinal ? "任务最后一次内存采样" : "任务内存占用"
                 return "\(prefix)，采样于 \($0.sampledAt.formatted(.dateTime.hour().minute().second()))"
             }
         )

@@ -69,6 +69,10 @@ public enum MerlinIdentifierValidator {
         matches(value, pattern: #"^[0-9]+$"#)
     }
 
+    public static func isJobRunID(_ value: String) -> Bool {
+        matches(value, pattern: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"#)
+    }
+
     public static func isTmuxSessionName(_ value: String) -> Bool {
         matches(value, pattern: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"#)
     }

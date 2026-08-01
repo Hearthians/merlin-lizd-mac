@@ -50,7 +50,8 @@ struct TaskColumnHeader: View {
 struct TaskWideRow: View {
     let run: MerlinTaskRun
     let metrics: MerlinTaskMetrics?
-    let metricState: TaskMetricAvailability
+    let gpuMetricState: TaskMetricAvailability
+    let memoryMetricState: TaskMetricAvailability
     let now: Date
 
     var body: some View {
@@ -69,26 +70,27 @@ struct TaskWideRow: View {
                 .frame(width: 104, alignment: .leading)
             TaskMetricValue.gpu(
                 metrics,
-                state: metricState,
+                state: gpuMetricState,
                 isFinal: run.lifecycle != .active
             )
             .frame(width: 126, alignment: .leading)
             TaskMetricValue.memory(
                 metrics,
-                state: metricState,
+                state: memoryMetricState,
                 isFinal: run.lifecycle != .active
             )
             .frame(width: 164, alignment: .leading)
         }
         .padding(.vertical, 10)
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
     }
 }
 
 struct TaskCompactRow: View {
     let run: MerlinTaskRun
     let metrics: MerlinTaskMetrics?
-    let metricState: TaskMetricAvailability
+    let gpuMetricState: TaskMetricAvailability
+    let memoryMetricState: TaskMetricAvailability
     let now: Date
 
     private let columns = [
@@ -117,21 +119,21 @@ struct TaskCompactRow: View {
                 CompactField("GPU") {
                     TaskMetricValue.gpu(
                         metrics,
-                        state: metricState,
+                        state: gpuMetricState,
                         isFinal: run.lifecycle != .active
                     )
                 }
                 CompactField("内存") {
                     TaskMetricValue.memory(
                         metrics,
-                        state: metricState,
+                        state: memoryMetricState,
                         isFinal: run.lifecycle != .active
                     )
                 }
             }
         }
         .padding(.vertical, 12)
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
     }
 }
 
@@ -139,11 +141,22 @@ private struct TaskIdentity: View {
     let run: MerlinTaskRun
 
     var body: some View {
-        Text(run.name)
-            .font(.headline)
-            .lineLimit(1)
-            .truncationMode(.middle)
-            .help("\(run.name)\n任务 ID：\(run.id)")
+        VStack(alignment: .leading, spacing: 5) {
+            Text(run.name)
+                .font(.headline)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help("\(run.name)\n任务 ID：\(run.id)")
+
+            HStack(spacing: 6) {
+                if let presentation = run.clusterPresentation {
+                    ClusterBadgeView(presentation: presentation)
+                }
+                if run.status == .running {
+                    TaskSSHCopyButton(runID: run.id)
+                }
+            }
+        }
     }
 }
 

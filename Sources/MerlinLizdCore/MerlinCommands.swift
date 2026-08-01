@@ -21,6 +21,7 @@ public enum CommandValidationError: Error, Equatable, Sendable {
     case workerTargetRequired
     case invalidMetricsInterval
     case invalidWorkerPageSize
+    case invalidJobRunID
 }
 
 public enum MerlinCommands {
@@ -60,6 +61,31 @@ public enum MerlinCommands {
             )
         }
         return try ShellCommandRenderer.render(command)
+    }
+
+    /// Renders an interactive task shell command whose SSH target and identity
+    /// are resolved by merlin-cli instead of the user's SSH configuration.
+    public static func manualTaskSSHCommand(runID: String) throws -> String {
+        guard MerlinIdentifierValidator.isJobRunID(runID) else {
+            throw CommandValidationError.invalidJobRunID
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let payloadData = try encoder.encode(TaskSSHPayload(
+            backend: "ssh",
+            jobRunID: runID
+        ))
+        guard let payload = String(data: payloadData, encoding: .utf8) else {
+            throw CommandValidationError.invalidJobRunID
+        }
+        return try ShellCommandRenderer.render(CommandSpec(
+            executable: "merlin-cli",
+            arguments: [
+                "job", "execute-script",
+                "--control-plane", "cn",
+                "--json", payload,
+            ]
+        ))
     }
 
     private static func standaloneInteractiveSSHCommand(
@@ -647,6 +673,16 @@ public enum MerlinCommands {
 
     private struct StartPayload: Encodable {
         let sid: String
+    }
+
+    private struct TaskSSHPayload: Encodable {
+        let backend: String
+        let jobRunID: String
+
+        enum CodingKeys: String, CodingKey {
+            case backend
+            case jobRunID = "job_run_id"
+        }
     }
 
     private struct WorkerListPayload: Encodable {

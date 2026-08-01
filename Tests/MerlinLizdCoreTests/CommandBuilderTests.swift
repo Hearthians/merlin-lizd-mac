@@ -171,6 +171,19 @@ struct CommandBuilderTests {
         #expect(!rendered.contains("ControlPath"))
     }
 
+    @Test("renders a Merlin task SSH shell command without local config")
+    func rendersManualTaskSSHCommand() throws {
+        let rendered = try MerlinCommands.manualTaskSSHCommand(
+            runID: "026d090ddd50fc87"
+        )
+
+        #expect(rendered ==
+            "'merlin-cli' 'job' 'execute-script' '--control-plane' 'cn' "
+                + "'--json' '{\"backend\":\"ssh\","
+                + "\"job_run_id\":\"026d090ddd50fc87\"}'")
+        #expect(!rendered.contains("~/.ssh"))
+    }
+
     @Test("renders a direct Worker SSH command without a Devbox relay")
     func rendersManualDirectWorkerSSHCommand() throws {
         let destination =

@@ -1,6 +1,6 @@
 import Foundation
 
-private func compactClusterCode(
+func compactClusterCode(
     name: String?,
     dataCenter: String?
 ) -> String? {

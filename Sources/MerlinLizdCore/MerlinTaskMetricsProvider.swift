@@ -2,33 +2,61 @@ import Foundation
 
 public struct MerlinTaskMetricsRefresh: Equatable, Sendable {
     public let metricsByRunID: [String: MerlinTaskMetrics]
-    public let attemptedRunIDs: Set<String>
+    public let attemptedRoutesByRunID: [String: MerlinTaskMetricRoute]
     public let refreshedAt: Date
+
+    public var attemptedRunIDs: Set<String> {
+        Set(attemptedRoutesByRunID.keys)
+    }
 
     public init(
         metricsByRunID: [String: MerlinTaskMetrics],
-        attemptedRunIDs: Set<String>,
+        attemptedRoutesByRunID: [String: MerlinTaskMetricRoute],
         refreshedAt: Date
     ) {
         self.metricsByRunID = metricsByRunID
-        self.attemptedRunIDs = attemptedRunIDs
+        self.attemptedRoutesByRunID = attemptedRoutesByRunID
+        self.refreshedAt = refreshedAt
+    }
+
+    public func metrics(for run: MerlinTaskRun) -> MerlinTaskMetrics? {
+        guard attemptedRoutesByRunID[run.id] == run.metricRoute else {
+            return nil
+        }
+        return metricsByRunID[run.id]
+    }
+}
+
+public struct MerlinTaskMetricsBatch: Equatable, Sendable {
+    public let runs: [MerlinTaskRun]
+    public let refreshedAt: Date
+
+    public var runIDs: Set<String> { Set(runs.map(\.id)) }
+    public var routesByRunID: [String: MerlinTaskMetricRoute] {
+        Dictionary(uniqueKeysWithValues: runs.map { ($0.id, $0.metricRoute) })
+    }
+
+    init(runs: [MerlinTaskRun], refreshedAt: Date) {
+        self.runs = runs
         self.refreshedAt = refreshedAt
     }
 }
 
-/// Incrementally loads task telemetry through Merlin's official Grafana
-/// commands. Each refresh touches only a small batch so task status polling is
-/// never held behind slow dashboard rendering.
+/// Incrementally loads task telemetry through Merlin's authenticated Grafana
+/// OpenAPI. Compatible runs share one GPU and one memory screenshot, keeping
+/// task status polling independent from slow dashboard rendering.
 public actor MerlinTaskMetricsProvider {
     private let loader: MerlinTaskMetricsLoader
     private let batchSize: Int
     private let minimumRefreshInterval: TimeInterval
+    private let failedRefreshInterval: TimeInterval
     private let now: @Sendable () -> Date
-    private var attemptedAtByRunID: [String: Date] = [:]
+    private var attemptedAtByRoute: [MerlinTaskMetricRoute: Date] = [:]
 
     public init(
-        batchSize: Int = 2,
-        minimumRefreshInterval: TimeInterval = 90
+        batchSize: Int = 12,
+        minimumRefreshInterval: TimeInterval = 90,
+        failedRefreshInterval: TimeInterval = 30
     ) throws {
         let merlinCLIPath = try MerlinCLIResolver.resolve()
         let runner = BoundedInventoryProcessRunner(
@@ -38,11 +66,17 @@ public actor MerlinTaskMetricsProvider {
                 underlying: FoundationInventoryProcessRunner()
             )
         )
+        let panelDataLoader = MerlinGrafanaOpenAPIClient(
+            merlinCLIPath: merlinCLIPath,
+            processRunner: runner
+        )
         try self.init(
             merlinCLIPath: merlinCLIPath,
             processRunner: runner,
+            panelDataLoader: panelDataLoader,
             batchSize: batchSize,
             minimumRefreshInterval: minimumRefreshInterval,
+            failedRefreshInterval: failedRefreshInterval,
             now: Date.init
         )
     }
@@ -50,38 +84,47 @@ public actor MerlinTaskMetricsProvider {
     init(
         merlinCLIPath: String,
         processRunner: any InventoryProcessRunning,
-        batchSize: Int,
+        panelDataLoader: any MerlinTaskPanelDataLoading,
+        batchSize: Int = 12,
         minimumRefreshInterval: TimeInterval,
+        failedRefreshInterval: TimeInterval = 30,
         now: @escaping @Sendable () -> Date
     ) throws {
         guard merlinCLIPath.hasPrefix("/"), batchSize > 0 else {
             throw MerlinInventoryError.invalidRequest
         }
-        let panelCatalog = MerlinTaskPanelCatalog(
-            merlinCLIPath: merlinCLIPath,
-            processRunner: processRunner,
-            now: now
-        )
         loader = MerlinTaskMetricsLoader(
             merlinCLIPath: merlinCLIPath,
             processRunner: processRunner,
-            panelCatalog: panelCatalog
+            panelDataLoader: panelDataLoader,
+            dashboardURLCache: MerlinTaskDashboardURLCache()
         )
         self.batchSize = batchSize
         self.minimumRefreshInterval = max(0, minimumRefreshInterval)
+        self.failedRefreshInterval = min(
+            self.minimumRefreshInterval,
+            max(0, failedRefreshInterval)
+        )
         self.now = now
     }
 
     public func refresh(runs: [MerlinTaskRun]) async -> MerlinTaskMetricsRefresh {
+        let batch = makeRefreshBatch(runs: runs)
+        return await refresh(batch: batch)
+    }
+
+    public func makeRefreshBatch(
+        runs: [MerlinTaskRun]
+    ) -> MerlinTaskMetricsBatch {
         let refreshDate = now()
         let activeRuns = runs.filter { $0.lifecycle == .active }
-        let activeIDs = Set(activeRuns.map(\.id))
-        attemptedAtByRunID = attemptedAtByRunID.filter {
-            activeIDs.contains($0.key)
+        let activeRoutes = Set(activeRuns.map(\.metricRoute))
+        attemptedAtByRoute = attemptedAtByRoute.filter {
+            activeRoutes.contains($0.key)
         }
         let selected = activeRuns
             .filter { run in
-                guard let attemptedAt = attemptedAtByRunID[run.id] else {
+                guard let attemptedAt = attemptedAtByRoute[run.metricRoute] else {
                     return true
                 }
                 return refreshDate.timeIntervalSince(attemptedAt)
@@ -89,8 +132,8 @@ public actor MerlinTaskMetricsProvider {
             }
             .sorted { lhs, rhs in
                 switch (
-                    attemptedAtByRunID[lhs.id],
-                    attemptedAtByRunID[rhs.id]
+                    attemptedAtByRoute[lhs.metricRoute],
+                    attemptedAtByRoute[rhs.metricRoute]
                 ) {
                 case (nil, nil):
                     lhs.createdAtMilliseconds > rhs.createdAtMilliseconds
@@ -105,22 +148,123 @@ public actor MerlinTaskMetricsProvider {
                 }
             }
             .prefix(batchSize)
-        let attemptedIDs = Set(selected.map(\.id))
-        for id in attemptedIDs {
-            attemptedAtByRunID[id] = refreshDate
+        let selectedRuns = Array(selected)
+        for run in selectedRuns {
+            attemptedAtByRoute[run.metricRoute] = refreshDate
         }
 
+        return MerlinTaskMetricsBatch(
+            runs: selectedRuns,
+            refreshedAt: refreshDate
+        )
+    }
+
+    public func refresh(
+        batch: MerlinTaskMetricsBatch
+    ) async -> MerlinTaskMetricsRefresh {
         let loader = self.loader
-        let metrics = await withTaskGroup(
-            of: (String, MerlinTaskMetrics?).self,
+        let metrics = await loader.load(
+            runs: batch.runs,
+            endingAt: batch.refreshedAt
+        )
+        if Task.isCancelled {
+            releaseReservation(for: batch)
+            return MerlinTaskMetricsRefresh(
+                metricsByRunID: [:],
+                attemptedRoutesByRunID: batch.routesByRunID,
+                refreshedAt: batch.refreshedAt
+            )
+        }
+        let failedRetryOffset = minimumRefreshInterval - failedRefreshInterval
+        for run in batch.runs where !Self.isComplete(metrics[run.id], for: run) {
+            attemptedAtByRoute[run.metricRoute] = batch.refreshedAt
+                .addingTimeInterval(-failedRetryOffset)
+        }
+        return MerlinTaskMetricsRefresh(
+            metricsByRunID: metrics,
+            attemptedRoutesByRunID: batch.routesByRunID,
+            refreshedAt: batch.refreshedAt
+        )
+    }
+
+    public func abandon(batch: MerlinTaskMetricsBatch) {
+        releaseReservation(for: batch)
+    }
+
+    private static func isComplete(
+        _ metrics: MerlinTaskMetrics?,
+        for run: MerlinTaskRun
+    ) -> Bool {
+        guard let metrics, metrics.memory != nil else { return false }
+        return run.allocatedGPUCount == 0 || metrics.gpu != nil
+    }
+
+    private func releaseReservation(for batch: MerlinTaskMetricsBatch) {
+        for run in batch.runs
+            where attemptedAtByRoute[run.metricRoute] == batch.refreshedAt
+        {
+            attemptedAtByRoute.removeValue(forKey: run.metricRoute)
+        }
+    }
+}
+
+private struct MerlinTaskMetricsLoader: Sendable {
+    private static let supportedDataCenters: Set<String> = [
+        "gl", "hj", "hl", "lf", "lq", "wlby", "yg", "yx", "zc",
+    ]
+
+    private struct GroupKey: Hashable, Sendable {
+        let cluster: String
+        let dataCenter: String
+        let role: String
+    }
+
+    private struct GroupedRuns: Sendable {
+        let key: GroupKey
+        let runs: [MerlinTaskRun]
+    }
+
+    let merlinCLIPath: String
+    let processRunner: any InventoryProcessRunning
+    let panelDataLoader: any MerlinTaskPanelDataLoading
+    let dashboardURLCache: MerlinTaskDashboardURLCache
+
+    func load(
+        runs: [MerlinTaskRun],
+        endingAt: Date
+    ) async -> [String: MerlinTaskMetrics] {
+        let grouped = Dictionary(grouping: runs.compactMap { run in
+            groupKey(for: run).map { ($0, run) }
+        }, by: \.0).map { key, values in
+            GroupedRuns(key: key, runs: values.map(\.1))
+        }
+        let groupedRunIDs = Set(grouped.flatMap { $0.runs.map(\.id) })
+        let legacyRuns = runs.filter { !groupedRunIDs.contains($0.id) }
+        let groupedMetrics = await withTaskGroup(
+            of: [String: MerlinTaskMetrics].self,
             returning: [String: MerlinTaskMetrics].self
         ) { group in
-            for run in selected {
+            for groupedRuns in grouped {
                 group.addTask {
-                    (run.id, await loader.load(runID: run.id))
+                    await load(group: groupedRuns, endingAt: endingAt)
                 }
             }
             var loaded: [String: MerlinTaskMetrics] = [:]
+            for await values in group {
+                loaded.merge(values) { _, new in new }
+            }
+            return loaded
+        }
+        return await withTaskGroup(
+            of: (String, MerlinTaskMetrics?).self,
+            returning: [String: MerlinTaskMetrics].self
+        ) { group in
+            for run in legacyRuns {
+                group.addTask {
+                    (run.id, await loadLegacy(run: run))
+                }
+            }
+            var loaded = groupedMetrics
             for await (runID, sample) in group {
                 if let sample {
                     loaded[runID] = sample
@@ -128,37 +272,116 @@ public actor MerlinTaskMetricsProvider {
             }
             return loaded
         }
-        return MerlinTaskMetricsRefresh(
-            metricsByRunID: metrics,
-            attemptedRunIDs: attemptedIDs,
-            refreshedAt: refreshDate
+    }
+
+    private func load(
+        group: GroupedRuns,
+        endingAt: Date
+    ) async -> [String: MerlinTaskMetrics] {
+        let trialIDs = group.runs.compactMap(\.trialID).sorted()
+        let earliestStart = group.runs.compactMap(\.startedAtMilliseconds).min()
+        var requests: [MerlinTaskPanelDataRequest] = []
+        if
+            group.runs.contains(where: { $0.allocatedGPUCount != 0 }),
+            let gpuURL = MerlinTaskGrafanaURLBuilder.rolePanelURL(
+                cluster: group.key.cluster,
+                dataCenter: group.key.dataCenter,
+                trialIDs: trialIDs,
+                role: group.key.role,
+                panel: .gpu,
+                startingAtMilliseconds: earliestStart,
+                endingAt: endingAt
+            )
+        {
+            requests.append(.init(
+                panel: .gpu,
+                url: gpuURL,
+                seriesCountHint: group.runs.count
+            ))
+        }
+        if let memoryURL = MerlinTaskGrafanaURLBuilder.rolePanelURL(
+            cluster: group.key.cluster,
+            dataCenter: group.key.dataCenter,
+            trialIDs: trialIDs,
+            role: group.key.role,
+            panel: .memory,
+            endingAt: endingAt
+        ) {
+            requests.append(.init(
+                panel: .memory,
+                url: memoryURL,
+                seriesCountHint: group.runs.count
+            ))
+        }
+        let outputs = await panelDataLoader.load(requests)
+        return group.runs.reduce(into: [:]) { metrics, run in
+            guard
+                let trialID = run.trialID,
+                let sample = MerlinTaskMetricsParser.parse(
+                    gpuOutput: outputs[.gpu],
+                    memoryOutput: outputs[.memory],
+                    memoryTotalOverride: run.allocatedMemoryBytes,
+                    trialID: trialID
+                )
+            else { return }
+            metrics[run.id] = sample
+        }
+    }
+
+    private func loadLegacy(run: MerlinTaskRun) async -> MerlinTaskMetrics? {
+        guard let dashboardURL = await dashboardURLCache.value(
+            for: run.metricRoute,
+            load: { await dashboardURL(runID: run.id) }
+        ) else {
+            return nil
+        }
+        let role = run.metricRoleName ?? "worker"
+        var requests: [MerlinTaskPanelDataRequest] = []
+        if run.allocatedGPUCount != 0, let gpuURL =
+            MerlinTaskGrafanaURLBuilder.rolePanelURL(
+                from: dashboardURL,
+                role: role,
+                panel: .gpu,
+                startingAtMilliseconds: run.startedAtMilliseconds
+            )
+        {
+            requests.append(.init(panel: .gpu, url: gpuURL))
+        }
+        if let memoryURL = MerlinTaskGrafanaURLBuilder.rolePanelURL(
+            from: dashboardURL,
+            role: role,
+            panel: .memory
+        ) {
+            requests.append(.init(panel: .memory, url: memoryURL))
+        }
+        let outputs = await panelDataLoader.load(requests)
+        return MerlinTaskMetricsParser.parse(
+            gpuOutput: outputs[.gpu],
+            memoryOutput: outputs[.memory],
+            memoryTotalOverride: run.allocatedMemoryBytes
         )
     }
-}
 
-private struct MerlinTaskMetricsLoader: Sendable {
-    let merlinCLIPath: String
-    let processRunner: any InventoryProcessRunning
-    let panelCatalog: MerlinTaskPanelCatalog
-
-    func load(runID: String) async -> MerlinTaskMetrics? {
-        guard let dashboardURL = await dashboardURL(runID: runID) else {
-            return nil
-        }
-        guard let panelIDs = await panelCatalog.panels(for: dashboardURL) else {
-            return nil
-        }
-        async let gpuOutput = panelOutput(
-            dashboardURL: dashboardURL,
-            panelID: panelIDs.gpu
-        )
-        async let memoryOutput = panelOutput(
-            dashboardURL: dashboardURL,
-            panelID: panelIDs.memory
-        )
-        return await MerlinTaskMetricsParser.parse(
-            gpuOutput: gpuOutput,
-            memoryOutput: memoryOutput
+    private func groupKey(for run: MerlinTaskRun) -> GroupKey? {
+        guard
+            let cluster = run.clusterName?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ),
+            !cluster.isEmpty,
+            let dataCenter = run.clusterShortCode,
+            Self.supportedDataCenters.contains(dataCenter),
+            let trialID = run.trialID,
+            let numericTrialID = UInt64(trialID),
+            numericTrialID > 0
+        else { return nil }
+        let role = run.metricRoleName?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ) ?? "worker"
+        guard !role.isEmpty else { return nil }
+        return GroupKey(
+            cluster: cluster,
+            dataCenter: dataCenter,
+            role: role
         )
     }
 
@@ -176,22 +399,7 @@ private struct MerlinTaskMetricsLoader: Sendable {
                 from: data
             )
         else { return nil }
-        return fiveMinuteURL(response.grafanaURL)
-    }
-
-    private func panelOutput(
-        dashboardURL: String,
-        panelID: Int?
-    ) async -> String? {
-        guard let panelID else { return nil }
-        guard let command = try? command(
-            arguments: ["grafana", "panel-data"],
-            payload: GrafanaPanelRequest(
-                panelID: panelID,
-                url: dashboardURL
-            )
-        ) else { return nil }
-        return await output(for: command)
+        return response.grafanaURL
     }
 
     private func output(for command: CommandSpec) async -> String? {
@@ -221,233 +429,22 @@ private struct MerlinTaskMetricsLoader: Sendable {
             ]
         )
     }
-
-    private func fiveMinuteURL(_ rawURL: String) -> String? {
-        guard
-            var components = URLComponents(string: rawURL),
-            components.scheme?.lowercased() == "https",
-            components.host?.lowercased() == "grafana.byted.org"
-        else { return nil }
-        var queryItems = components.queryItems ?? []
-        queryItems.removeAll {
-            $0.name.caseInsensitiveCompare("from") == .orderedSame
-                || $0.name.caseInsensitiveCompare("to") == .orderedSame
-        }
-        queryItems.append(URLQueryItem(name: "from", value: "now-5m"))
-        queryItems.append(URLQueryItem(name: "to", value: "now"))
-        components.queryItems = queryItems
-        return components.url?.absoluteString
-    }
 }
 
-private struct MerlinTaskPanelIDs: Sendable {
-    let gpu: Int?
-    let memory: Int?
+private actor MerlinTaskDashboardURLCache {
+    private var values: [MerlinTaskMetricRoute: String] = [:]
 
-    var hasAnyPanel: Bool { gpu != nil || memory != nil }
-}
-
-/// Dashboard panel identifiers are an implementation detail of Grafana. Keep
-/// one semantic catalog per dashboard UID and coalesce concurrent discovery
-/// when several task rows share the same dashboard definition.
-private actor MerlinTaskPanelCatalog {
-    private struct Discovery {
-        let generation: UUID
-        let task: Task<Void, Never>
-        var waiters: [
-            UUID: CheckedContinuation<MerlinTaskPanelIDs?, Never>
-        ]
+    func value(
+        for route: MerlinTaskMetricRoute,
+        load: @Sendable () async -> String?
+    ) async -> String? {
+        if let value = values[route] {
+            return value
+        }
+        guard let value = await load() else { return nil }
+        values[route] = value
+        return value
     }
-
-    private static let cacheLifetime: TimeInterval = 5 * 60
-
-    private let merlinCLIPath: String
-    private let processRunner: any InventoryProcessRunning
-    private let now: @Sendable () -> Date
-    private var cached: [String: CachedMerlinTaskPanelIDs] = [:]
-    private var inFlight: [String: Discovery] = [:]
-
-    init(
-        merlinCLIPath: String,
-        processRunner: any InventoryProcessRunning,
-        now: @escaping @Sendable () -> Date
-    ) {
-        self.merlinCLIPath = merlinCLIPath
-        self.processRunner = processRunner
-        self.now = now
-    }
-
-    func panels(for dashboardURL: String) async -> MerlinTaskPanelIDs? {
-        guard let key = Self.dashboardKey(dashboardURL) else { return nil }
-        if let entry = cached[key], entry.expiresAt > now() {
-            return entry.panelIDs.hasAnyPanel ? entry.panelIDs : nil
-        }
-        cached[key] = nil
-        let waiterID = UUID()
-        return await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                if Task.isCancelled {
-                    continuation.resume(returning: nil)
-                } else {
-                    addWaiter(
-                        waiterID,
-                        continuation: continuation,
-                        dashboardKey: key,
-                        dashboardURL: dashboardURL
-                    )
-                }
-            }
-        } onCancel: {
-            Task {
-                await self.cancelWaiter(
-                    waiterID,
-                    dashboardKey: key
-                )
-            }
-        }
-    }
-
-    private func addWaiter(
-        _ waiterID: UUID,
-        continuation: CheckedContinuation<MerlinTaskPanelIDs?, Never>,
-        dashboardKey: String,
-        dashboardURL: String
-    ) {
-        if var discovery = inFlight[dashboardKey] {
-            discovery.waiters[waiterID] = continuation
-            inFlight[dashboardKey] = discovery
-            return
-        }
-
-        let merlinCLIPath = self.merlinCLIPath
-        let processRunner = self.processRunner
-        let generation = UUID()
-        let task = Task {
-            let result = await Self.load(
-                dashboardURL: dashboardURL,
-                merlinCLIPath: merlinCLIPath,
-                processRunner: processRunner
-            )
-            self.completeDiscovery(
-                result,
-                dashboardKey: dashboardKey,
-                generation: generation
-            )
-        }
-        inFlight[dashboardKey] = Discovery(
-            generation: generation,
-            task: task,
-            waiters: [waiterID: continuation]
-        )
-    }
-
-    private func completeDiscovery(
-        _ result: MerlinTaskPanelIDs?,
-        dashboardKey: String,
-        generation: UUID
-    ) {
-        guard inFlight[dashboardKey]?.generation == generation else {
-            return
-        }
-        guard let discovery = inFlight.removeValue(forKey: dashboardKey) else {
-            return
-        }
-        if let result {
-            cached[dashboardKey] = CachedMerlinTaskPanelIDs(
-                panelIDs: result,
-                expiresAt: now().addingTimeInterval(Self.cacheLifetime)
-            )
-        }
-        let visibleResult = result?.hasAnyPanel == true ? result : nil
-        for continuation in discovery.waiters.values {
-            continuation.resume(returning: visibleResult)
-        }
-    }
-
-    private func cancelWaiter(
-        _ waiterID: UUID,
-        dashboardKey: String
-    ) {
-        guard
-            var discovery = inFlight[dashboardKey],
-            let continuation = discovery.waiters.removeValue(
-                forKey: waiterID
-            )
-        else { return }
-        continuation.resume(returning: nil)
-        if discovery.waiters.isEmpty {
-            discovery.task.cancel()
-            inFlight[dashboardKey] = nil
-        } else {
-            inFlight[dashboardKey] = discovery
-        }
-    }
-
-    private static func load(
-        dashboardURL: String,
-        merlinCLIPath: String,
-        processRunner: any InventoryProcessRunning
-    ) async -> MerlinTaskPanelIDs? {
-        let commandSpec: CommandSpec
-        do {
-            commandSpec = try command(
-                merlinCLIPath: merlinCLIPath,
-                dashboardURL: dashboardURL
-            )
-        } catch {
-            return nil
-        }
-        guard
-            let output = try? await processRunner.run(commandSpec),
-            output.exitCode == 0,
-            let catalog = try? GrafanaDescribeParser.parse(output.stdout)
-        else { return nil }
-        return MerlinTaskPanelIDs(
-            gpu: catalog.panel(for: .gpuUtilization)?.id,
-            memory: catalog.panel(for: .memory)?.id
-        )
-    }
-
-    private static func command(
-        merlinCLIPath: String,
-        dashboardURL: String
-    ) throws -> CommandSpec {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        let data = try encoder.encode(
-            GrafanaDescribeRequest(url: dashboardURL)
-        )
-        guard let body = String(data: data, encoding: .utf8) else {
-            throw MerlinInventoryError.invalidRequest
-        }
-        return CommandSpec(
-            executable: merlinCLIPath,
-            arguments: [
-                "grafana", "describe",
-                "--control-plane", "cn",
-                "--json", body,
-            ]
-        )
-    }
-
-    private static func dashboardKey(_ rawURL: String) -> String? {
-        guard let components = URLComponents(string: rawURL) else { return nil }
-        let path = components.path.split(separator: "/").map(String.init)
-        guard
-            let marker = path.firstIndex(of: "d"),
-            path.indices.contains(marker + 1)
-        else { return nil }
-        let key = path[marker + 1]
-        guard key.count <= 128, !key.isEmpty else { return nil }
-        let allowed = CharacterSet.alphanumerics
-            .union(CharacterSet(charactersIn: "_-"))
-        return key.unicodeScalars.allSatisfy(allowed.contains) ? key : nil
-    }
-}
-
-private struct CachedMerlinTaskPanelIDs: Sendable {
-    let panelIDs: MerlinTaskPanelIDs
-    let expiresAt: Date
 }
 
 private struct JobGrafanaRequest: Encodable {
@@ -464,18 +461,4 @@ private struct JobGrafanaResponse: Decodable {
     enum CodingKeys: String, CodingKey {
         case grafanaURL = "grafana_url"
     }
-}
-
-private struct GrafanaPanelRequest: Encodable {
-    let panelID: Int
-    let url: String
-
-    enum CodingKeys: String, CodingKey {
-        case panelID = "panel_id"
-        case url
-    }
-}
-
-private struct GrafanaDescribeRequest: Encodable {
-    let url: String
 }

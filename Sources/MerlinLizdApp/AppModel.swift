@@ -24,6 +24,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var taskSnapshot: MerlinTaskSnapshot?
     @Published private(set) var taskMetricsByRunID: [String: MerlinTaskMetrics] = [:]
     @Published private(set) var taskMetricAttemptedRunIDs: Set<String> = []
+    @Published private(set) var taskMetricLoadingRunIDs: Set<String> = []
     @Published private(set) var isRefreshing = false
     @Published private(set) var isRefreshingTasks = false
     @Published private(set) var isRefreshingTaskMetrics = false
@@ -46,6 +47,13 @@ final class AppModel: ObservableObject {
     private var workerInventoryCache: [String: CachedWorkerInventory] = [:]
     private var taskMetricsRefreshTask: Task<Void, Never>?
     private var taskMetricsRefreshGeneration: UUID?
+    private var taskMetricRouteByRunID: [String: MerlinTaskMetricRoute] = [:]
+    private var taskMetricAttemptedRouteByRunID: [
+        String: MerlinTaskMetricRoute
+    ] = [:]
+    private var taskMetricLoadingRouteByRunID: [
+        String: MerlinTaskMetricRoute
+    ] = [:]
     private let workerInventoryCacheLifetime: TimeInterval = 60
     private let failedWorkerRetryDelay: TimeInterval = 15
     private lazy var warmupUpdateRelay = WarmupUpdateRelay(model: self)
@@ -111,6 +119,7 @@ final class AppModel: ObservableObject {
             snapshot: taskSnapshot,
             metricsByRunID: taskMetricsByRunID,
             attemptedMetricRunIDs: taskMetricAttemptedRunIDs,
+            loadingMetricRunIDs: taskMetricLoadingRunIDs,
             isRefreshingMetrics: isRefreshingTaskMetrics,
             refreshFailed: taskRefreshFailed
         )
@@ -208,10 +217,40 @@ final class AppModel: ObservableObject {
         taskMetricsRefreshGeneration = generation
         isRefreshingTaskMetrics = true
         taskMetricsRefreshTask = Task { [weak self] in
-            let refresh = await taskMetricsProvider.refresh(runs: snapshot.runs)
+            let batch = await taskMetricsProvider.makeRefreshBatch(
+                runs: snapshot.runs
+            )
+            guard !Task.isCancelled else {
+                await taskMetricsProvider.abandon(batch: batch)
+                return
+            }
+            guard !batch.runs.isEmpty else {
+                self?.finishEmptyTaskMetricsBatch(generation: generation)
+                return
+            }
+            self?.beginTaskMetricsBatch(batch, generation: generation)
+            let refresh = await taskMetricsProvider.refresh(batch: batch)
             guard !Task.isCancelled else { return }
             self?.applyTaskMetricsRefresh(refresh, generation: generation)
         }
+    }
+
+    private func beginTaskMetricsBatch(
+        _ batch: MerlinTaskMetricsBatch,
+        generation: UUID
+    ) {
+        guard taskMetricsRefreshGeneration == generation else { return }
+        taskMetricLoadingRunIDs = batch.runIDs
+        taskMetricLoadingRouteByRunID = batch.routesByRunID
+    }
+
+    private func finishEmptyTaskMetricsBatch(generation: UUID) {
+        guard taskMetricsRefreshGeneration == generation else { return }
+        taskMetricsRefreshTask = nil
+        taskMetricsRefreshGeneration = nil
+        isRefreshingTaskMetrics = false
+        taskMetricLoadingRunIDs = []
+        taskMetricLoadingRouteByRunID = [:]
     }
 
     private func applyTaskMetricsRefresh(
@@ -222,33 +261,68 @@ final class AppModel: ObservableObject {
         taskMetricsRefreshTask = nil
         taskMetricsRefreshGeneration = nil
         isRefreshingTaskMetrics = false
+        taskMetricLoadingRunIDs = []
+        taskMetricLoadingRouteByRunID = [:]
         guard let taskSnapshot else { return }
-        let visibleIDs = Set(taskSnapshot.runs.map(\.id))
-        let activeIDs = Set(taskSnapshot.runs(in: .active).map(\.id))
-        let attemptedIDs = refresh.attemptedRunIDs.intersection(visibleIDs)
+        let visibleRunsByID = Dictionary(
+            uniqueKeysWithValues: taskSnapshot.runs.map { ($0.id, $0) }
+        )
+        let activeRuns = taskSnapshot.runs(in: .active)
+        let activeIDs = Set(activeRuns.map(\.id))
+        let matchingAttemptedRuns = visibleRunsByID.values.filter {
+            refresh.attemptedRoutesByRunID[$0.id] == $0.metricRoute
+        }
+        let attemptedIDs = Set(matchingAttemptedRuns.map(\.id))
+        let acceptedMetricIDs = Set(matchingAttemptedRuns.compactMap { run in
+            refresh.metrics(for: run) == nil ? nil : run.id
+        })
         let missingIDs = attemptedIDs.intersection(activeIDs).subtracting(
-            refresh.metricsByRunID.keys
+            acceptedMetricIDs
         )
         for runID in missingIDs {
             // A failed refresh must not leave an older reading looking current.
             taskMetricsByRunID.removeValue(forKey: runID)
+            taskMetricRouteByRunID.removeValue(forKey: runID)
         }
-        for (runID, metrics) in refresh.metricsByRunID
-            where visibleIDs.contains(runID)
-        {
-            taskMetricsByRunID[runID] = metrics
+        for run in matchingAttemptedRuns {
+            taskMetricAttemptedRouteByRunID[run.id] = run.metricRoute
+            if let metrics = refresh.metrics(for: run) {
+                taskMetricsByRunID[run.id] = metrics
+                taskMetricRouteByRunID[run.id] = run.metricRoute
+            }
         }
-        taskMetricAttemptedRunIDs.formUnion(attemptedIDs)
+        taskMetricAttemptedRunIDs = Set(taskMetricAttemptedRouteByRunID.keys)
+        let pendingActiveIDs = activeIDs.subtracting(
+            taskMetricAttemptedRunIDs
+        )
+        if !pendingActiveIDs.isEmpty {
+            scheduleTaskMetricsRefresh(for: taskSnapshot)
+        }
     }
 
     private func reconcileTaskMetrics(with snapshot: MerlinTaskSnapshot) {
-        let visibleIDs = Set(snapshot.runs.map(\.id))
+        let routesByRunID = Dictionary(
+            uniqueKeysWithValues: snapshot.runs.map { ($0.id, $0.metricRoute) }
+        )
+        let visibleIDs = Set(routesByRunID.keys)
+        if taskMetricLoadingRouteByRunID.contains(where: {
+            routesByRunID[$0.key] != $0.value
+        }) {
+            cancelTaskMetricsRefresh()
+        }
         // Keep the last real sample when a running task reaches a terminal
         // lifecycle. Historical tasks are never backfilled or re-polled.
         taskMetricsByRunID = taskMetricsByRunID.filter {
-            visibleIDs.contains($0.key)
+            taskMetricRouteByRunID[$0.key] == routesByRunID[$0.key]
         }
-        taskMetricAttemptedRunIDs.formIntersection(visibleIDs)
+        taskMetricRouteByRunID = taskMetricRouteByRunID.filter {
+            taskMetricsByRunID[$0.key] != nil
+        }
+        taskMetricAttemptedRouteByRunID = taskMetricAttemptedRouteByRunID.filter {
+            $0.value == routesByRunID[$0.key]
+        }
+        taskMetricAttemptedRunIDs = Set(taskMetricAttemptedRouteByRunID.keys)
+        taskMetricLoadingRunIDs.formIntersection(visibleIDs)
     }
 
     private func cancelTaskMetricsRefresh() {
@@ -256,6 +330,8 @@ final class AppModel: ObservableObject {
         taskMetricsRefreshTask = nil
         taskMetricsRefreshGeneration = nil
         isRefreshingTaskMetrics = false
+        taskMetricLoadingRunIDs = []
+        taskMetricLoadingRouteByRunID = [:]
     }
 
     private func applyingCachedWorkerInventory(

@@ -17,11 +17,25 @@ struct MerlinTaskPageParserTests {
               "trigger_mode": "MANUAL",
               "creation_time": "800",
               "completed_time": "0",
-              "latest_trial_id": "trial-running",
+              "latest_trial_id": "389738351",
               "meta": {
                 "caption": "platform-copy-name",
                 "start_running_time": "750",
                 "total_runtime_ms": "0",
+                "job_run_params": {
+                  "resource": {
+                    "arnold_config": {
+                      "clusterName": "federationgpu-hl",
+                      "roles": [{
+                        "name": "worker",
+                        "gpu": 8,
+                        "memory": 364544,
+                        "num": 2,
+                        "queueName": "must-not-be-persisted"
+                      }]
+                    }
+                  }
+                },
                 "access_token": "must-not-be-persisted"
               }
             },
@@ -115,6 +129,15 @@ struct MerlinTaskPageParserTests {
         #expect(page.runs[0].startedAtMilliseconds == 750)
         #expect(page.runs[0].completedAtMilliseconds == nil)
         #expect(page.runs[0].totalRuntimeMilliseconds == nil)
+        #expect(page.runs[0].trialID == "389738351")
+        #expect(page.runs[0].metricRoleName == "worker")
+        #expect(page.runs[0].clusterName == "federationgpu-hl")
+        #expect(page.runs[0].clusterShortCode == "hl")
+        #expect(page.runs[0].allocatedGPUCount == 16)
+        #expect(
+            page.runs[0].allocatedMemoryBytes
+                == UInt64(364_544 * 2) * 1_048_576
+        )
         #expect(page.runs[2].status == .failed)
         #expect(page.runs[2].startedAtMilliseconds == 620)
         #expect(page.runs[2].completedAtMilliseconds == 690)
@@ -129,7 +152,7 @@ struct MerlinTaskPageParserTests {
         let encoded = try encodedTaskSnapshot(snapshot)
         #expect(!encoded.contains("must-not-be-persisted"))
         #expect(!encoded.contains("must-not-be-decoded"))
-        #expect(!encoded.contains("trial-running"))
+        #expect(encoded.contains("389738351"))
     }
 
     @Test("rejects malformed responses")

@@ -40,6 +40,11 @@ public struct MerlinTaskRun: Identifiable, Codable, Equatable, Sendable {
     public let startedAtMilliseconds: Int64?
     public let completedAtMilliseconds: Int64?
     public let totalRuntimeMilliseconds: Int64?
+    public let clusterName: String?
+    public let trialID: String?
+    public let metricRoleName: String?
+    public let allocatedGPUCount: Int?
+    public let allocatedMemoryBytes: UInt64?
 
     public init(
         id: String,
@@ -48,7 +53,12 @@ public struct MerlinTaskRun: Identifiable, Codable, Equatable, Sendable {
         createdAtMilliseconds: Int64,
         startedAtMilliseconds: Int64? = nil,
         completedAtMilliseconds: Int64? = nil,
-        totalRuntimeMilliseconds: Int64? = nil
+        totalRuntimeMilliseconds: Int64? = nil,
+        clusterName: String? = nil,
+        trialID: String? = nil,
+        metricRoleName: String? = nil,
+        allocatedGPUCount: Int? = nil,
+        allocatedMemoryBytes: UInt64? = nil
     ) {
         self.id = id
         self.name = name
@@ -58,6 +68,19 @@ public struct MerlinTaskRun: Identifiable, Codable, Equatable, Sendable {
         self.startedAtMilliseconds = startedAtMilliseconds
         self.completedAtMilliseconds = completedAtMilliseconds
         self.totalRuntimeMilliseconds = totalRuntimeMilliseconds
+        self.clusterName = clusterName
+        self.trialID = trialID
+        self.metricRoleName = metricRoleName
+        self.allocatedGPUCount = allocatedGPUCount
+        self.allocatedMemoryBytes = allocatedMemoryBytes
+    }
+
+    public var clusterShortCode: String? {
+        compactClusterCode(name: clusterName, dataCenter: nil)
+    }
+
+    public var metricRoute: MerlinTaskMetricRoute {
+        MerlinTaskMetricRoute(run: self)
     }
 
     public func runtimeSeconds(at date: Date) -> TimeInterval? {
@@ -80,6 +103,28 @@ public struct MerlinTaskRun: Identifiable, Codable, Equatable, Sendable {
             0,
             completedAtMilliseconds - startedAtMilliseconds
         )) / 1_000
+    }
+}
+
+/// Stable identity for telemetry routing. A Merlin retry can preserve the job
+/// run ID while switching to a new trial, so run ID alone is not sufficient
+/// for cache or in-flight result attribution.
+public struct MerlinTaskMetricRoute: Hashable, Sendable {
+    public let runID: String
+    public let trialID: String?
+    public let clusterName: String?
+    public let roleName: String
+
+    public init(run: MerlinTaskRun) {
+        runID = run.id
+        trialID = Self.normalized(run.trialID)
+        clusterName = Self.normalized(run.clusterName)
+        roleName = Self.normalized(run.metricRoleName) ?? "worker"
+    }
+
+    private static func normalized(_ value: String?) -> String? {
+        let value = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value?.isEmpty == false ? value : nil
     }
 }
 
