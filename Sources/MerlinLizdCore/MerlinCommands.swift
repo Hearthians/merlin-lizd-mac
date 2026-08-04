@@ -39,20 +39,27 @@ public enum MerlinCommands {
     public static func manualSSHCommand(
         for target: TerminalTarget
     ) throws -> String {
-        let command: CommandSpec
+        try ShellCommandRenderer.render(plainSSHCommand(for: target))
+    }
+
+    /// Builds an interactive shell without attaching to tmux. Callers use this
+    /// only as an explicit fallback after SSH succeeds but tmux is unavailable.
+    public static func plainSSHCommand(
+        for target: TerminalTarget
+    ) throws -> CommandSpec {
         switch target {
         case .local:
             throw CommandValidationError.remoteTargetRequired
         case let .devbox(sid, _, alias):
             try validateDevboxRoute(alias: alias, devboxSID: sid)
-            command = standaloneInteractiveSSHCommand(alias: alias)
+            return standaloneInteractiveSSHCommand(alias: alias)
         case let .worker(devboxSID, _, alias, workerID):
             let connectsDirectly = try validatesDirectWorkerRoute(
                 alias: alias,
                 devboxSID: devboxSID,
                 workerID: workerID
             )
-            command = standaloneInteractiveSSHCommand(
+            return standaloneInteractiveSSHCommand(
                 alias: alias,
                 remoteCommand: connectsDirectly
                     ? nil
@@ -60,7 +67,6 @@ public enum MerlinCommands {
                         + "mlx worker login \(workerID)"
             )
         }
-        return try ShellCommandRenderer.render(command)
     }
 
     /// Renders an interactive task shell command whose SSH target and identity
@@ -198,7 +204,9 @@ public enum MerlinCommands {
                 executable: "/usr/bin/ssh",
                 arguments: nonInteractiveSSHArguments(
                     alias: alias,
-                    remoteCommand: "tmux kill-session -t \(sessionName)"
+                    remoteCommand: boundedDevboxTmuxCommand(
+                        "kill-session -t \(sessionName)"
+                    )
                 )
             )
         case let .worker(devboxSID, _, alias, workerID):
@@ -244,7 +252,9 @@ public enum MerlinCommands {
                 executable: "/usr/bin/ssh",
                 arguments: nonInteractiveSSHArguments(
                     alias: alias,
-                    remoteCommand: "tmux rename-session -t \(currentName) \(newName)"
+                    remoteCommand: boundedDevboxTmuxCommand(
+                        "rename-session -t \(currentName) \(newName)"
+                    )
                 )
             )
         case let .worker(devboxSID, _, alias, workerID):
@@ -280,7 +290,9 @@ public enum MerlinCommands {
                 executable: "/usr/bin/ssh",
                 arguments: nonInteractiveSSHArguments(
                     alias: alias,
-                    remoteCommand: "tmux list-sessions -F#{session_name}"
+                    remoteCommand: boundedDevboxTmuxCommand(
+                        "list-sessions -F#{session_name}"
+                    )
                 )
             )
         case let .worker(devboxSID, _, alias, workerID):
@@ -444,9 +456,11 @@ public enum MerlinCommands {
         workerID: String,
         tmuxCommand: String
     ) throws -> String {
-        let tmuxInvocation = workerTmuxInvocation(
-            term: "dumb",
-            tmuxCommand: tmuxCommand
+        let tmuxInvocation = boundedRemoteCommand(
+            workerTmuxInvocation(
+                term: "dumb",
+                tmuxCommand: tmuxCommand
+            )
         )
         return try validatesDirectWorkerRoute(
             alias: alias,
@@ -454,7 +468,15 @@ public enum MerlinCommands {
             workerID: workerID
         )
             ? tmuxInvocation
-            : "NO_COLOR=1 TERM=dumb mlx worker login \(workerID) -- \(tmuxInvocation)"
+            : "NO_COLOR=1 TERM=dumb timeout -k 2s 40s mlx worker login \(workerID) -- \(tmuxInvocation)"
+    }
+
+    private static func boundedRemoteCommand(_ command: String) -> String {
+        "timeout -k 2s 10s \(command)"
+    }
+
+    private static func boundedDevboxTmuxCommand(_ tmuxCommand: String) -> String {
+        boundedRemoteCommand("env TERM=dumb tmux \(tmuxCommand)")
     }
 
     private static func interactiveSSHArguments(

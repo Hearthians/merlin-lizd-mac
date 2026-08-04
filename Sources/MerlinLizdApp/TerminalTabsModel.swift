@@ -197,7 +197,7 @@ final class TerminalTabsModel: ObservableObject {
             switch existing.state {
             case .exited, .closed:
                 reconnect(id)
-            case .idle, .running:
+            case .idle, .preparing, .blocked, .running:
                 break
             }
         } else {
@@ -244,13 +244,44 @@ final class TerminalTabsModel: ObservableObject {
 
         do {
             let command = try command(for: tab, destination: .swiftTerm)
+            let plainSSHCommand: CommandSpec?
+            let startPreparation: TerminalSession.StartPreparation?
+            if MerlinCommands.sshConnectionTarget(for: tab.target) != nil {
+                plainSSHCommand = try managedTerminalCommands.plainSSHCommand(
+                    target: tab.target
+                )
+                let discovery = tmuxSessionDiscovery
+                let target = tab.target
+                startPreparation = { forceRetry in
+                    let result = if forceRetry {
+                        await discovery.retryAttachment(target: target)
+                    } else {
+                        await discovery.preflightAttachment(target: target)
+                    }
+                    return switch result {
+                    case .ready:
+                        .startRequestedCommand
+                    case .sshUnavailable:
+                        .blocked(.sshUnavailable)
+                    case .workerNotReady:
+                        .blocked(.workerNotReady)
+                    case .tmuxUnavailable:
+                        .blocked(.tmuxUnavailable)
+                    }
+                }
+            } else {
+                plainSSHCommand = nil
+                startPreparation = nil
+            }
             let session = TerminalSession(
                 id: UUID(uuidString: tab.id) ?? UUID(),
                 command: command,
+                plainSSHCommand: plainSSHCommand,
                 currentDirectory: tab.target == .local
                     ? FileManager.default.homeDirectoryForCurrentUser.path
                     : nil,
-                terminalType: TerminalTerminfo.term(for: tab.target)
+                terminalType: TerminalTerminfo.term(for: tab.target),
+                startPreparation: startPreparation
             )
             sessions[id] = session
             return session
@@ -399,8 +430,38 @@ final class TerminalTabsModel: ObservableObject {
         guard let tab = tabs.first(where: { $0.id == id }) else {
             throw TerminalTabOperationError.sessionUnavailable
         }
+        if MerlinCommands.sshConnectionTarget(for: tab.target) != nil {
+            switch await tmuxSessionDiscovery.retryAttachment(target: tab.target) {
+            case .ready:
+                break
+            case .sshUnavailable:
+                throw TerminalTabOperationError.sshUnavailable
+            case .workerNotReady:
+                throw TerminalTabOperationError.workerNotReady
+            case .tmuxUnavailable:
+                throw TerminalTabOperationError.tmuxUnavailable
+            }
+        }
         try await externalTerminalLauncher.open(
             command(for: tab, destination: .externalTerminal)
+        )
+    }
+
+    func openPlainSSHInTerminal(_ id: String) async throws {
+        guard
+            let tab = tabs.first(where: { $0.id == id }),
+            let alias = MerlinCommands.sshConnectionTarget(for: tab.target)
+        else {
+            throw TerminalTabOperationError.sessionUnavailable
+        }
+        guard await runtime.sshMasterPool.prepare(
+            alias: alias,
+            priority: .foreground
+        ) == .ready else {
+            throw TerminalTabOperationError.sshUnavailable
+        }
+        try await externalTerminalLauncher.open(
+            managedTerminalCommands.plainSSHCommand(target: tab.target)
         )
     }
 
@@ -564,6 +625,8 @@ enum TerminalTabOperationError: LocalizedError {
     case sessionUnavailable
     case localTmuxNotFound
     case workerNotReady
+    case sshUnavailable
+    case tmuxUnavailable
     case commandFailed(exitCode: Int32)
 
     var errorDescription: String? {
@@ -578,6 +641,10 @@ enum TerminalTabOperationError: LocalizedError {
             "本机未找到 tmux。"
         case .workerNotReady:
             "工作机尚未就绪，暂时无法操作 tmux 会话。"
+        case .sshUnavailable:
+            "SSH 连接不可用，请检查认证或网络后重试。"
+        case .tmuxUnavailable:
+            "SSH 可用，但 tmux 未在限定时间内响应。已停止连接，避免继续堆积客户端。"
         case let .commandFailed(exitCode):
             "tmux 操作失败（退出码 \(exitCode)）。"
         }

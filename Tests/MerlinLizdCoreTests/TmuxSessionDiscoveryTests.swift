@@ -144,6 +144,215 @@ struct TmuxSessionDiscoveryTests {
         #expect(await discovery.peekSnapshot(target: tmuxTestTarget)?.sessions == first.sessions)
     }
 
+    @Test("two consecutive failures suspend automatic probes until cooldown")
+    func repeatedFailuresOpenCircuit() async {
+        let clock = TmuxTestClock()
+        let runner = TmuxSnapshotRunner(steps: [
+            .failure,
+            .failure,
+            .output(.init(stdout: "recovered\n", stderr: "", exitCode: 0)),
+        ])
+        let discovery = TmuxSessionDiscovery(
+            processRunner: runner,
+            now: { clock.now }
+        )
+
+        _ = await discovery.refresh(target: tmuxTestTarget)
+        let secondFailure = await discovery.refresh(target: tmuxTestTarget)
+        let suspended = await discovery.refresh(target: tmuxTestTarget)
+
+        #expect(secondFailure.lastError == .transport)
+        #expect(suspended.lastError == .transport)
+        #expect(await runner.runCount == 2)
+
+        clock.advance(by: 300)
+        let recovered = await discovery.refresh(target: tmuxTestTarget)
+        #expect(recovered.sessions.map(\.name) == ["recovered"])
+        #expect(recovered.lastError == nil)
+        #expect(await runner.runCount == 3)
+    }
+
+    @Test("attachment preflight distinguishes an unresponsive tmux server")
+    func attachmentPreflightReportsTmuxUnavailable() async {
+        let runner = TmuxSnapshotRunner(steps: [
+            .output(.init(stdout: "", stderr: "", exitCode: 124))
+        ])
+        let discovery = TmuxSessionDiscovery(processRunner: runner)
+
+        let result = await discovery.preflightAttachment(target: tmuxTestTarget)
+
+        #expect(result == .tmuxUnavailable)
+        #expect(await runner.runCount == 1)
+    }
+
+    @Test("attachment preflight classifies SSH exit 255 separately")
+    func attachmentPreflightReportsSSHUnavailable() async {
+        let runner = TmuxSnapshotRunner(steps: [
+            .output(.init(stdout: "", stderr: "permission denied", exitCode: 255))
+        ])
+        let discovery = TmuxSessionDiscovery(processRunner: runner)
+
+        let result = await discovery.preflightAttachment(target: tmuxTestTarget)
+
+        #expect(result == .sshUnavailable)
+        #expect(await runner.runCount == 1)
+    }
+
+    @Test("explicit attachment retry bypasses an open circuit once")
+    func attachmentRetryBypassesCircuit() async {
+        let runner = TmuxSnapshotRunner(steps: [
+            .failure,
+            .failure,
+            .output(.init(stdout: "recovered\n", stderr: "", exitCode: 0)),
+        ])
+        let discovery = TmuxSessionDiscovery(processRunner: runner)
+
+        _ = await discovery.preflightAttachment(target: tmuxTestTarget)
+        _ = await discovery.preflightAttachment(target: tmuxTestTarget)
+        let retried = await discovery.retryAttachment(target: tmuxTestTarget)
+
+        #expect(retried == .ready)
+        #expect(await runner.runCount == 3)
+    }
+
+    @Test("manual refresh bypasses an open circuit once")
+    func manualRefreshBypassesCircuit() async {
+        let runner = TmuxSnapshotRunner(steps: [
+            .failure,
+            .failure,
+            .output(.init(stdout: "recovered\n", stderr: "", exitCode: 0)),
+        ])
+        let discovery = TmuxSessionDiscovery(processRunner: runner)
+
+        _ = await discovery.refresh(target: tmuxTestTarget)
+        _ = await discovery.refresh(target: tmuxTestTarget)
+        let retried = await discovery.retryRefresh(target: tmuxTestTarget)
+
+        #expect(retried.sessions.map(\.name) == ["recovered"])
+        #expect(await runner.runCount == 3)
+    }
+
+    @Test("one explicit retry reserves the circuit across routes")
+    func explicitRetryIsSingleHalfOpenProbe() async {
+        let runner = TmuxSnapshotRunner(steps: [
+            .failure,
+            .failure,
+            .gatedFailure,
+            .output(.init(stdout: "intruder\n", stderr: "", exitCode: 0)),
+            .output(.init(stdout: "late\n", stderr: "", exitCode: 0)),
+        ])
+        let discovery = TmuxSessionDiscovery(processRunner: runner)
+        let rerouted = TerminalTarget.devbox(
+            sid: "dbx_135679",
+            name: "wt_hl_renamed",
+            alias: "hl_gpu_reconnected"
+        )
+
+        _ = await discovery.refresh(target: tmuxTestTarget)
+        _ = await discovery.refresh(target: tmuxTestTarget)
+        let retry = Task {
+            await discovery.retryRefresh(target: tmuxTestTarget)
+        }
+        await runner.waitUntilRunCount(3)
+
+        let concurrent = await discovery.refresh(target: rerouted)
+        #expect(concurrent.lastError != nil)
+        #expect(await runner.runCount == 3)
+
+        await runner.releaseGate()
+        _ = await retry.value
+        _ = await discovery.refresh(target: rerouted)
+        #expect(await runner.runCount == 3)
+    }
+
+    @Test("attachment retry rechecks a new route after an old refresh")
+    func attachmentRetryDoesNotTrustOldRouteRefresh() async {
+        let runner = TmuxSnapshotRunner(steps: [
+            .gated(.init(stdout: "old-route\n", stderr: "", exitCode: 0)),
+            .output(.init(stdout: "new-route\n", stderr: "", exitCode: 0)),
+        ])
+        let discovery = TmuxSessionDiscovery(processRunner: runner)
+        let newRoute = TerminalTarget.devbox(
+            sid: "dbx_135679",
+            name: "wt_hl_renamed",
+            alias: "hl_gpu_reconnected"
+        )
+
+        let oldRefresh = Task {
+            await discovery.refresh(target: tmuxTestTarget)
+        }
+        await runner.waitUntilRunCount(1)
+        let retry = Task {
+            await discovery.retryAttachment(target: newRoute)
+        }
+        await Task.yield()
+        #expect(await runner.runCount == 1)
+
+        await runner.releaseGate()
+        _ = await oldRefresh.value
+        #expect(await retry.value == .ready)
+        #expect(await runner.runCount == 2)
+    }
+
+    @Test("an open circuit follows Worker identity across route changes")
+    func circuitSurvivesRouteChange() async {
+        let timeout = InventoryProcessOutput(
+            stdout: "", stderr: "", exitCode: 124
+        )
+        let runner = TmuxSnapshotRunner(steps: [
+            .output(timeout),
+            .output(timeout),
+        ])
+        let discovery = TmuxSessionDiscovery(processRunner: runner)
+        let original = TerminalTarget.worker(
+            devboxSID: "dbx_135679",
+            devboxName: "wt_hl",
+            alias: "hl_gpu_2",
+            workerID: "3960209"
+        )
+        let rerouted = TerminalTarget.worker(
+            devboxSID: "dbx_135679",
+            devboxName: "wt_hl_renamed",
+            alias: "hl_gpu_reconnected",
+            workerID: "3960209"
+        )
+
+        _ = await discovery.refresh(target: original)
+        _ = await discovery.refresh(target: original)
+        let blocked = await discovery.refresh(target: rerouted)
+
+        #expect(blocked.target == rerouted)
+        #expect(blocked.lastError == .commandFailed(exitCode: 124))
+        #expect(await runner.runCount == 2)
+    }
+
+    @Test("an identity circuit cannot be bypassed by an old successful route")
+    func successfulOldRouteDoesNotBypassCircuit() async {
+        let timeout = InventoryProcessOutput(
+            stdout: "", stderr: "", exitCode: 124
+        )
+        let runner = TmuxSnapshotRunner(steps: [
+            .output(.init(stdout: "old-session\n", stderr: "", exitCode: 0)),
+            .output(timeout),
+            .output(timeout),
+        ])
+        let discovery = TmuxSessionDiscovery(processRunner: runner)
+        let oldRoute = tmuxTestTarget
+        let newRoute = TerminalTarget.devbox(
+            sid: "dbx_135679",
+            name: "wt_hl_renamed",
+            alias: "hl_gpu_reconnected"
+        )
+
+        _ = await discovery.refresh(target: oldRoute)
+        _ = await discovery.refresh(target: newRoute)
+        _ = await discovery.refresh(target: newRoute)
+        let preflight = await discovery.preflightAttachment(target: oldRoute)
+
+        #expect(preflight == .tmuxUnavailable)
+        #expect(await runner.runCount == 3)
+    }
+
     @Test("in-flight transport failure preserves an authoritative rename")
     func failedRefreshPreservesConcurrentRename() async {
         let clock = TmuxTestClock()
@@ -503,7 +712,7 @@ struct TmuxSessionDiscoveryTests {
         #expect(sessions.map(\.name) == ["one", "two"])
         let remote = await runner.recordedCommand()?.arguments.last
         #expect(remote ==
-            "NO_COLOR=1 TERM=dumb mlx worker login 3966762 -- env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux list-sessions -F#{session_name}")
+            "NO_COLOR=1 TERM=dumb timeout -k 2s 40s mlx worker login 3966762 -- timeout -k 2s 10s env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux list-sessions -F#{session_name}")
     }
 
     @Test("Worker discovery finds sessions in the socket directory used by terminals")

@@ -56,6 +56,28 @@ struct SSHMasterCommands: Sendable {
         try operation("check", alias: alias)
     }
 
+    /// Opens one no-op session through an existing control socket. `-O check`
+    /// only proves that the master process answers control messages; a master
+    /// can still be unable to open new session channels. The false proxy makes
+    /// this probe fail closed: a healthy mux bypasses normal connection setup,
+    /// while a missing or refusing mux cannot silently cold-connect and turn a
+    /// broken health check into exit status zero.
+    func probe(alias: String) throws -> CommandSpec {
+        let path = try socketPath(alias: alias)
+        return CommandSpec(
+            executable: "/usr/bin/ssh",
+            arguments: [
+                "-nT", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                "-o", "ConnectionAttempts=1",
+                "-o", "ClearAllForwardings=yes",
+                "-o", "ControlMaster=no", "-o", "ControlPath=\(path)",
+                "-o", "ProxyCommand=/usr/bin/false",
+            ] + MerlinCommands.sshPortArguments(forConnectionTarget: alias) + [
+                alias, "true",
+            ]
+        )
+    }
+
     func stop(alias: String) throws -> CommandSpec {
         try operation("stop", alias: alias)
     }
@@ -75,7 +97,10 @@ struct SSHMasterCommands: Sendable {
         let path = try socketPath(alias: alias)
         var arguments = command.arguments
         arguments.insert(contentsOf: [
-            "-o", "ControlMaster=auto",
+            // The pool is the only owner allowed to create a master. Children
+            // reuse its socket when available and cold-connect when it is not,
+            // without attempting to bind the same ControlPath themselves.
+            "-o", "ControlMaster=no",
             "-o", "ControlPath=\(path)",
             "-o", "ControlPersist=600",
         ], at: parsed.insertionIndex)

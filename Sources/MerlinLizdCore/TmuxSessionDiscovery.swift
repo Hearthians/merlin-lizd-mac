@@ -25,6 +25,13 @@ public enum TmuxReadinessEvidence: Equatable, Sendable {
     case unknown
 }
 
+public enum TmuxAttachPreflightResult: Equatable, Sendable {
+    case ready
+    case sshUnavailable
+    case workerNotReady
+    case tmuxUnavailable
+}
+
 public struct TmuxSessionSnapshot: Equatable, Sendable {
     public let target: TerminalTarget
     public let sessions: [TmuxSessionRecord]
@@ -44,6 +51,27 @@ public struct TmuxSessionSnapshot: Equatable, Sendable {
 }
 
 public actor TmuxSessionDiscovery {
+    private enum FailureCircuit {
+        case closed(
+            consecutiveFailures: Int,
+            lastError: TmuxSessionDiscoveryError
+        )
+        case open(
+            retryAt: Date,
+            lastError: TmuxSessionDiscoveryError
+        )
+        case halfOpen(lastError: TmuxSessionDiscoveryError)
+
+        var lastError: TmuxSessionDiscoveryError {
+            switch self {
+            case let .closed(_, lastError),
+                let .open(_, lastError),
+                let .halfOpen(lastError):
+                lastError
+            }
+        }
+    }
+
     private enum SnapshotMutation: Sendable {
         case rename(from: String, to: String)
         case terminate(Set<String>)
@@ -60,6 +88,8 @@ public actor TmuxSessionDiscovery {
     private let backgroundExecutionPolicy: BoundedAsyncOperationRunner?
     private let localTmuxPath: String?
     private let now: @Sendable () -> Date
+    private let failureThreshold: Int
+    private let circuitOpenInterval: TimeInterval
     private var snapshots: [TerminalTarget: TmuxSessionSnapshot] = [:]
     private var refreshes: [
         TerminalTarget: Task<TmuxSessionSnapshot, Never>
@@ -67,6 +97,7 @@ public actor TmuxSessionDiscovery {
     private var refreshGenerations: [TerminalTarget: UInt64] = [:]
     private var mutationRevisions: [TerminalTarget: UInt64] = [:]
     private var mutationJournal: [TerminalTarget: [VersionedMutation]] = [:]
+    private var failureCircuits: [TerminalTargetIdentity: FailureCircuit] = [:]
 
     public init(
         sshMasterPool: SSHMasterPool,
@@ -99,6 +130,8 @@ public actor TmuxSessionDiscovery {
         self.sshMasterPool = sshMasterPool
         localTmuxPath = LocalTmuxResolver.resolve()
         now = Date.init
+        failureThreshold = 2
+        circuitOpenInterval = 300
     }
 
     init(
@@ -106,15 +139,21 @@ public actor TmuxSessionDiscovery {
         processRunner: any InventoryProcessRunning,
         localTmuxPath: String? = "/opt/homebrew/bin/tmux",
         now: @escaping @Sendable () -> Date = Date.init,
+        failureThreshold: Int = 2,
+        circuitOpenInterval: TimeInterval = 300,
         foregroundExecutionPolicy: BoundedAsyncOperationRunner? = nil,
         backgroundExecutionPolicy: BoundedAsyncOperationRunner? = nil
     ) {
+        precondition(failureThreshold > 0)
+        precondition(circuitOpenInterval > 0)
         self.sshMasterPool = sshMasterPool
         self.foregroundExecutionPolicy = foregroundExecutionPolicy
         self.backgroundExecutionPolicy = backgroundExecutionPolicy
         self.processRunner = processRunner
         self.localTmuxPath = localTmuxPath
         self.now = now
+        self.failureThreshold = failureThreshold
+        self.circuitOpenInterval = circuitOpenInterval
     }
 
     public func snapshot(
@@ -123,7 +162,11 @@ public actor TmuxSessionDiscovery {
         guard let snapshot = snapshots[target] else { return nil }
         guard !snapshot.isFresh(at: now()) else { return snapshot }
         if refreshes[target] == nil {
-            _ = startRefresh(target: target, lane: .background)
+            if admitRefresh(target: target) {
+                _ = startRefresh(target: target, lane: .background)
+            } else {
+                return blockedSnapshot(target: target)
+            }
         }
         return snapshots[target]
     }
@@ -139,8 +182,40 @@ public actor TmuxSessionDiscovery {
         target: TerminalTarget,
         lane: TmuxRefreshLane = .foreground
     ) async -> TmuxSessionSnapshot {
-        let task = refreshes[target] ?? startRefresh(target: target, lane: lane)
+        if let task = refreshes[target] {
+            return await task.value
+        }
+        guard admitRefresh(target: target) else {
+            return blockedSnapshot(target: target)
+        }
+        let task = startRefresh(target: target, lane: lane)
         return await task.value
+    }
+
+    private func cachedSnapshot(
+        for target: TerminalTarget
+    ) -> TmuxSessionSnapshot? {
+        if let exact = snapshots[target] { return exact }
+        guard let previous = snapshots.values
+            .filter({ $0.target.identity == target.identity })
+            .max(by: { $0.fetchedAt < $1.fetchedAt })
+        else { return nil }
+        return TmuxSessionSnapshot(
+            target: target,
+            sessions: previous.sessions,
+            readiness: previous.readiness,
+            fetchedAt: previous.fetchedAt,
+            verification: .idle,
+            lastError: previous.lastError
+        )
+    }
+
+    private func refreshTask(
+        for identity: TerminalTargetIdentity
+    ) -> Task<TmuxSessionSnapshot, Never>? {
+        refreshes.first(where: { target, _ in
+            target.identity == identity
+        })?.value
     }
 
     /// Atomically joins current verification, returns fresh evidence, or starts
@@ -150,12 +225,109 @@ public actor TmuxSessionDiscovery {
         maximumAge: TimeInterval = 60,
         lane: TmuxRefreshLane = .foreground
     ) async -> TmuxSessionSnapshot {
-        if let snapshot = snapshots[target],
+        if !circuitBlocksRefresh(target: target),
+            let snapshot = snapshots[target],
             snapshot.isFresh(at: now(), maximumAge: maximumAge)
         {
             return snapshot
         }
         return await refresh(target: target, lane: lane)
+    }
+
+    public func preflightAttachment(
+        target: TerminalTarget
+    ) async -> TmuxAttachPreflightResult {
+        guard !Task.isCancelled else { return .tmuxUnavailable }
+        if circuitBlocksRefresh(target: target) {
+            return attachmentResult(for: blockedSnapshot(target: target))
+        }
+        if let alias = MerlinCommands.sshConnectionTarget(for: target),
+            let sshMasterPool,
+            await sshMasterPool.prepare(alias: alias, priority: .foreground) != .ready
+        {
+            return .sshUnavailable
+        }
+        guard !Task.isCancelled else { return .tmuxUnavailable }
+
+        let snapshot = await refresh(target: target, lane: .foreground)
+        return attachmentResult(for: snapshot)
+    }
+
+    private func attachmentResult(
+        for snapshot: TmuxSessionSnapshot
+    ) -> TmuxAttachPreflightResult {
+        switch snapshot.lastError {
+        case nil:
+            return snapshot.readiness == .ready ? .ready : .tmuxUnavailable
+        case .workerNotReady:
+            return .workerNotReady
+        case .commandFailed(exitCode: 255):
+            return .sshUnavailable
+        case .localTmuxNotFound, .commandFailed, .transport:
+            return .tmuxUnavailable
+        }
+    }
+
+    public func retryAttachment(
+        target: TerminalTarget
+    ) async -> TmuxAttachPreflightResult {
+        if let task = refreshes[target] {
+            return attachmentResult(for: await task.value)
+        }
+        if let task = refreshTask(for: target.identity) {
+            _ = await task.value
+            guard !Task.isCancelled else { return .tmuxUnavailable }
+            return await retryAttachment(target: target)
+        }
+        guard target.identity != .local else {
+            return attachmentResult(for: await retryRefresh(target: target))
+        }
+        guard let previousError = reserveExplicitRetry(target: target) else {
+            return attachmentResult(for: blockedSnapshot(target: target))
+        }
+
+        if let alias = MerlinCommands.sshConnectionTarget(for: target),
+            let sshMasterPool,
+            await sshMasterPool.prepare(alias: alias, priority: .foreground) != .ready
+        {
+            reopenReservedCircuit(
+                target: target,
+                error: .commandFailed(exitCode: 255)
+            )
+            return .sshUnavailable
+        }
+        guard !Task.isCancelled else {
+            reopenReservedCircuit(target: target, error: previousError)
+            return .tmuxUnavailable
+        }
+
+        let task = startRefresh(target: target, lane: .foreground)
+        return attachmentResult(for: await task.value)
+    }
+
+    /// Explicit user retries may run one probe even while automatic refreshes
+    /// remain suspended by the target's failure circuit.
+    public func retryRefresh(
+        target: TerminalTarget,
+        lane: TmuxRefreshLane = .foreground
+    ) async -> TmuxSessionSnapshot {
+        if let task = refreshes[target] {
+            return await task.value
+        }
+        if let task = refreshTask(for: target.identity) {
+            _ = await task.value
+            guard !Task.isCancelled else {
+                return blockedSnapshot(target: target)
+            }
+            return await retryRefresh(target: target, lane: lane)
+        }
+        guard target.identity != .local else {
+            return await refresh(target: target, lane: lane)
+        }
+        guard reserveExplicitRetry(target: target) != nil else {
+            return blockedSnapshot(target: target)
+        }
+        return await startRefresh(target: target, lane: lane).value
     }
 
     func cancelRefresh(target: TerminalTarget) {
@@ -276,11 +448,13 @@ public actor TmuxSessionDiscovery {
                 localTmuxPath: localTmuxPath,
                 now: now
             )
+            let wasCancelled = Task.isCancelled
             return self.completeRefresh(
                 result,
                 target: target,
                 generation: generation,
-                startingMutationRevision: startingMutationRevision
+                startingMutationRevision: startingMutationRevision,
+                countFailure: !wasCancelled
             )
         }
         refreshes[target] = task
@@ -291,7 +465,8 @@ public actor TmuxSessionDiscovery {
         _ snapshot: TmuxSessionSnapshot,
         target: TerminalTarget,
         generation: UInt64,
-        startingMutationRevision: UInt64
+        startingMutationRevision: UInt64,
+        countFailure: Bool
     ) -> TmuxSessionSnapshot {
         guard refreshGenerations[target] == generation else {
             return snapshots[target] ?? snapshot
@@ -320,7 +495,123 @@ public actor TmuxSessionDiscovery {
         snapshots[target] = committed
         mutationJournal[target] = nil
         refreshes[target] = nil
+        updateFailureCircuit(
+            target: target,
+            error: committed.lastError,
+            countFailure: countFailure
+        )
         return committed
+    }
+
+    private func admitRefresh(target: TerminalTarget) -> Bool {
+        guard target.identity != .local else { return true }
+        switch failureCircuits[target.identity] {
+        case nil, .closed:
+            return true
+        case let .open(retryAt, lastError):
+            guard now() >= retryAt else { return false }
+            failureCircuits[target.identity] = .halfOpen(
+                lastError: lastError
+            )
+            return true
+        case .halfOpen:
+            return false
+        }
+    }
+
+    private func circuitBlocksRefresh(target: TerminalTarget) -> Bool {
+        guard target.identity != .local else { return false }
+        switch failureCircuits[target.identity] {
+        case let .open(retryAt, _):
+            return now() < retryAt
+        case .halfOpen:
+            return true
+        case nil, .closed:
+            return false
+        }
+    }
+
+    private func blockedSnapshot(
+        target: TerminalTarget
+    ) -> TmuxSessionSnapshot {
+        Self.failureSnapshot(
+            target: target,
+            previous: cachedSnapshot(for: target),
+            error: failureCircuits[target.identity]?.lastError ?? .transport,
+            now: now()
+        )
+    }
+
+    private func reserveExplicitRetry(
+        target: TerminalTarget
+    ) -> TmuxSessionDiscoveryError? {
+        if case .halfOpen = failureCircuits[target.identity] {
+            return nil
+        }
+        let lastError = failureCircuits[target.identity]?.lastError
+            ?? cachedSnapshot(for: target)?.lastError
+            ?? .transport
+        failureCircuits[target.identity] = .halfOpen(lastError: lastError)
+        return lastError
+    }
+
+    private func reopenReservedCircuit(
+        target: TerminalTarget,
+        error: TmuxSessionDiscoveryError
+    ) {
+        guard case .halfOpen = failureCircuits[target.identity] else { return }
+        failureCircuits[target.identity] = .open(
+            retryAt: now().addingTimeInterval(circuitOpenInterval),
+            lastError: error
+        )
+    }
+
+    private func updateFailureCircuit(
+        target: TerminalTarget,
+        error: TmuxSessionDiscoveryError?,
+        countFailure: Bool
+    ) {
+        guard target.identity != .local else { return }
+        guard let error else {
+            failureCircuits[target.identity] = nil
+            return
+        }
+        switch error {
+        case .localTmuxNotFound, .workerNotReady:
+            failureCircuits[target.identity] = nil
+        case .transport, .commandFailed:
+            guard countFailure else {
+                if case let .halfOpen(lastError) = failureCircuits[target.identity] {
+                    failureCircuits[target.identity] = .open(
+                        retryAt: now().addingTimeInterval(circuitOpenInterval),
+                        lastError: lastError
+                    )
+                }
+                return
+            }
+            let nextFailureCount: Int
+            switch failureCircuits[target.identity] {
+            case let .closed(consecutiveFailures, _):
+                nextFailureCount = consecutiveFailures + 1
+            case .halfOpen:
+                nextFailureCount = failureThreshold
+            case .open:
+                nextFailureCount = failureThreshold
+            case nil:
+                nextFailureCount = 1
+            }
+            if nextFailureCount >= failureThreshold {
+                failureCircuits[target.identity] = .open(
+                    retryAt: now().addingTimeInterval(circuitOpenInterval),
+                    lastError: error
+                )
+            } else {
+                failureCircuits[target.identity] = .closed(
+                    consecutiveFailures: nextFailureCount,
+                    lastError: error
+                )
+            }
+        }
     }
 
     private func recordMutation(

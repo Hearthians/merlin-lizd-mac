@@ -60,7 +60,10 @@ final class TmuxSessionBrowserModel: ObservableObject {
         let target = target
         refreshTask = Task { [weak self] in
             let snapshot = if force {
-                await discovery.refresh(target: target, lane: .foreground)
+                await discovery.retryRefresh(
+                    target: target,
+                    lane: .foreground
+                )
             } else {
                 await discovery.refreshIfStale(
                     target: target,

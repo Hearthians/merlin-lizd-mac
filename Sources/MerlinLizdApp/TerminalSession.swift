@@ -6,27 +6,49 @@ import MerlinLizdCore
 
 @MainActor
 final class TerminalSession: ObservableObject, Identifiable, LocalProcessTerminalViewDelegate {
+    enum StartupBlock: Equatable, Sendable {
+        case sshUnavailable
+        case workerNotReady
+        case tmuxUnavailable
+    }
+
+    enum LaunchMode: Equatable, Sendable {
+        case requestedCommand
+        case plainSSH
+    }
+
+    enum StartupDisposition: Equatable, Sendable {
+        case startRequestedCommand
+        case blocked(StartupBlock)
+    }
+
     enum State: Equatable {
         case idle
-        case running
+        case preparing
+        case blocked(StartupBlock)
+        case running(LaunchMode)
         case exited(Int32?)
         case closed
     }
 
     typealias TitleHandler = @MainActor (String) -> Void
     typealias ProcessExitHandler = @MainActor (Int32?) -> Void
+    typealias StartPreparation = @Sendable (Bool) async -> StartupDisposition
 
     let id: UUID
     let terminalView: LocalProcessTerminalView
 
-    private let command: CommandSpec
+    private let requestedCommand: CommandSpec
+    private let plainSSHCommand: CommandSpec?
     private let currentDirectory: String?
     private let terminalType: String
+    private let startPreparation: StartPreparation?
 
     @Published private(set) var state: State = .idle
     private(set) var title: String?
     private(set) var hasStarted = false
     private var didReportExit = false
+    private var startupTask: Task<Void, Never>?
 
     var onTitleChange: TitleHandler?
     var onProcessExit: ProcessExitHandler?
@@ -34,15 +56,19 @@ final class TerminalSession: ObservableObject, Identifiable, LocalProcessTermina
     init(
         id: UUID = UUID(),
         command: CommandSpec,
+        plainSSHCommand: CommandSpec? = nil,
         currentDirectory: String? = nil,
         terminalType: String = "xterm-256color",
+        startPreparation: StartPreparation? = nil,
         onTitleChange: TitleHandler? = nil,
         onProcessExit: ProcessExitHandler? = nil
     ) {
         self.id = id
-        self.command = command
+        requestedCommand = command
+        self.plainSSHCommand = plainSSHCommand
         self.currentDirectory = currentDirectory
         self.terminalType = terminalType
+        self.startPreparation = startPreparation
         self.onTitleChange = onTitleChange
         self.onProcessExit = onProcessExit
 
@@ -57,13 +83,61 @@ final class TerminalSession: ObservableObject, Identifiable, LocalProcessTermina
         }
 
         hasStarted = true
+        beginStartup(forceRetry: false)
+    }
+
+    func retryRequestedCommand() {
+        guard case .blocked = state else { return }
+        beginStartup(forceRetry: true)
+    }
+
+    func startPlainSSH() {
+        guard
+            case .blocked(.tmuxUnavailable) = state,
+            let plainSSHCommand
+        else { return }
+        startupTask?.cancel()
+        startupTask = nil
+        startProcess(command: plainSSHCommand, mode: .plainSSH)
+    }
+
+    private func beginStartup(forceRetry: Bool) {
+        guard state != .closed else { return }
+        guard let startPreparation else {
+            startProcess(command: requestedCommand, mode: .requestedCommand)
+            return
+        }
+
+        state = .preparing
+        startupTask = Task { [weak self] in
+            let disposition = await startPreparation(forceRetry)
+            guard
+                !Task.isCancelled,
+                let self,
+                self.state != .closed
+            else { return }
+
+            self.startupTask = nil
+            switch disposition {
+            case .startRequestedCommand:
+                self.startProcess(
+                    command: self.requestedCommand,
+                    mode: .requestedCommand
+                )
+            case let .blocked(reason):
+                self.state = .blocked(reason)
+            }
+        }
+    }
+
+    private func startProcess(command: CommandSpec, mode: LaunchMode) {
         terminalView.startProcess(
             executable: command.executable,
             args: command.arguments,
             environment: TerminalProcessEnvironment.inherited(terminalType: terminalType),
             currentDirectory: currentDirectory
         )
-        state = .running
+        state = .running(mode)
     }
 
     /// Ends the local process for a terminal tab that the user explicitly closed.
@@ -73,9 +147,17 @@ final class TerminalSession: ObservableObject, Identifiable, LocalProcessTermina
             return
         }
 
-        let shouldTerminate = state == .running && terminalView.process.running
+        let isRunning: Bool
+        if case .running = state {
+            isRunning = true
+        } else {
+            isRunning = false
+        }
+        let shouldTerminate = isRunning && terminalView.process.running
         let processID = shouldTerminate ? terminalView.process.shellPid : 0
         state = .closed
+        startupTask?.cancel()
+        startupTask = nil
 
         // LocalProcess retains its last PID after exit. Calling terminate() when
         // it is no longer running could therefore signal an unrelated reused PID.

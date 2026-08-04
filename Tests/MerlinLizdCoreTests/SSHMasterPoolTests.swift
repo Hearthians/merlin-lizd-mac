@@ -52,6 +52,146 @@ struct SSHMasterPoolTests {
         #expect(await runner.childCommandCount(alias: "hl_gpu_2") == 2)
     }
 
+    @Test("live master that refuses session channels is gracefully rotated")
+    func rotatesSessionRefusingMaster() async {
+        let refusedSession = InventoryProcessOutput(
+            stdout: "",
+            stderr: """
+                mux_client_request_session: session request failed: \
+                Session open refused by peer
+                """,
+            exitCode: 255
+        )
+        let runner = SSHMasterScriptedRunner(actions: [
+            .exit(255), .succeed,
+            .succeed, .output(refusedSession),
+            .succeed, .succeed,
+        ])
+        let pool = SSHMasterPool(
+            testDirectory: temporarySSHDirectory(), runner: runner
+        )
+
+        #expect(await pool.prepare(
+            alias: "hl_gpu_2", priority: .background
+        ) == .ready)
+        #expect(await pool.prepare(
+            alias: "hl_gpu_2", priority: .foreground
+        ) == .ready)
+
+        #expect(await runner.count(argumentsContaining: "stop") == 1)
+        #expect(await runner.count(argumentsContaining: "ControlMaster=yes") == 2)
+        #expect(await runner.count(argumentsContaining: "ProxyCommand=") == 2)
+    }
+
+    @Test("live master with a healthy session channel is reused")
+    func reusesSessionCapableMaster() async {
+        let runner = SSHMasterScriptedRunner(actions: [
+            .exit(255), .succeed,
+            .succeed, .succeed,
+        ])
+        let pool = SSHMasterPool(
+            testDirectory: temporarySSHDirectory(), runner: runner
+        )
+
+        #expect(await pool.prepare(
+            alias: "hl_gpu_2", priority: .background
+        ) == .ready)
+        #expect(await pool.prepare(
+            alias: "hl_gpu_2", priority: .foreground
+        ) == .ready)
+
+        #expect(await runner.count(argumentsContaining: "stop") == 0)
+        #expect(await runner.count(argumentsContaining: "ControlMaster=yes") == 1)
+    }
+
+    @Test("an indeterminate session probe never declares the master ready")
+    func rejectsIndeterminateSessionProbe() async {
+        let runner = SSHMasterScriptedRunner(actions: [
+            .exit(255), .succeed,
+            .succeed, .fail(.transport),
+        ])
+        let pool = SSHMasterPool(
+            testDirectory: temporarySSHDirectory(), runner: runner
+        )
+
+        #expect(await pool.prepare(
+            alias: "hl_gpu_2", priority: .background
+        ) == .ready)
+        #expect(await pool.prepare(
+            alias: "hl_gpu_2", priority: .foreground
+        ) == .failed)
+
+        #expect(await runner.count(argumentsContaining: "stop") == 0)
+        #expect(await runner.count(argumentsContaining: "ControlMaster=yes") == 1)
+    }
+
+    @Test("master lifecycle commands have a hard deadline")
+    func boundsMasterLifecycleCommands() async {
+        let runner = CancellationAwareHangingSSHRunner()
+        let pool = SSHMasterPool(
+            testDirectory: temporarySSHDirectory(),
+            runner: runner,
+            lifecycleTimeout: .milliseconds(20)
+        )
+
+        #expect(await pool.prepare(
+            alias: "hl_gpu_2", priority: .foreground
+        ) == .failed)
+        #expect(await runner.runCount == 1)
+    }
+
+    @Test("replacement master is checked once and failure does not loop")
+    func boundsRefusingMasterRepair() async {
+        let refusedSession = InventoryProcessOutput(
+            stdout: "", stderr: "Session open refused by peer", exitCode: 255
+        )
+        let runner = SSHMasterScriptedRunner(actions: [
+            .exit(255), .succeed,
+            .succeed, .output(refusedSession),
+            .succeed, .succeed, .output(refusedSession),
+        ])
+        let pool = SSHMasterPool(
+            testDirectory: temporarySSHDirectory(), runner: runner
+        )
+
+        #expect(await pool.prepare(
+            alias: "hl_gpu_2", priority: .background
+        ) == .ready)
+        #expect(await pool.prepare(
+            alias: "hl_gpu_2", priority: .foreground
+        ) == .failed)
+
+        #expect(await runner.count(argumentsContaining: "stop") == 1)
+        #expect(await runner.count(argumentsContaining: "ControlMaster=yes") == 2)
+        #expect(await runner.count(argumentsContaining: "ProxyCommand=") == 2)
+    }
+
+    @Test("failed graceful stop preserves the live socket")
+    func preservesSocketWhenRefusingMasterCannotStop() async throws {
+        let directory = temporarySSHDirectory()
+        let refusedSession = InventoryProcessOutput(
+            stdout: "", stderr: "Session open refused by peer", exitCode: 255
+        )
+        let runner = SSHMasterScriptedRunner(actions: [
+            .exit(255), .succeed,
+            .succeed, .output(refusedSession), .exit(1),
+        ])
+        let pool = SSHMasterPool(testDirectory: directory, runner: runner)
+
+        #expect(await pool.prepare(
+            alias: "hl_gpu_2", priority: .background
+        ) == .ready)
+        let socketPath = try SSHMasterCommands(directory: directory)
+            .socketPath(alias: "hl_gpu_2")
+        try createEmptyFile(atPath: socketPath)
+
+        #expect(await pool.prepare(
+            alias: "hl_gpu_2", priority: .foreground
+        ) == .failed)
+        #expect(fileExists(atPath: socketPath))
+        #expect(await runner.count(argumentsContaining: "ControlMaster=yes") == 1)
+    }
+
     @Test("mutation command is never replayed")
     func neverReplaysMutation() async {
         let runner = SSHMasterScriptedRunner(actions: [.exit(255), .succeed, .exit(255)])
@@ -163,8 +303,8 @@ struct SSHMasterPoolTests {
         #expect(!fileExists(atPath: socketPath))
     }
 
-    @Test("keeps a socket when check fails without proving abandonment")
-    func keepsSocketAfterThrownCheck() async throws {
+    @Test("fails safely when check cannot prove a socket abandoned")
+    func failsSafelyAfterThrownCheck() async throws {
         let directory = temporarySSHDirectory()
         try createDirectory(at: directory)
         let socketPath = try SSHMasterCommands(directory: directory)
@@ -173,8 +313,9 @@ struct SSHMasterPoolTests {
         let runner = SSHMasterScriptedRunner(actions: [.fail(.transport), .succeed])
         let pool = SSHMasterPool(testDirectory: directory, runner: runner)
 
-        #expect(await pool.prepare(alias: "hl_gpu_2", priority: .background) == .ready)
+        #expect(await pool.prepare(alias: "hl_gpu_2", priority: .background) == .failed)
         #expect(fileExists(atPath: socketPath))
+        #expect(await runner.count(argumentsContaining: "ControlMaster=yes") == 0)
     }
 
     @Test("shutdown stops masters without issuing tmux commands")
@@ -400,4 +541,14 @@ private actor SSHMasterDiagnosticRunner: InventoryProcessRunning {
     }
 
     func childCommands() -> Int { childCount }
+}
+
+private actor CancellationAwareHangingSSHRunner: InventoryProcessRunning {
+    private(set) var runCount = 0
+
+    func run(_ command: CommandSpec) async throws -> InventoryProcessOutput {
+        runCount += 1
+        try await Task.sleep(for: .seconds(3_600))
+        throw CancellationError()
+    }
 }

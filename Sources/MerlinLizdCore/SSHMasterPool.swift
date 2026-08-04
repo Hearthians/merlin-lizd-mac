@@ -24,6 +24,7 @@ enum SSHMasterPoolError: Error, Equatable, Sendable {
 public final class SSHMasterPool: @unchecked Sendable {
     private let commands: SSHMasterCommands
     private let runner: any InventoryProcessRunning
+    private let lifecycleRunner: any InventoryProcessRunning
     private let state: SSHMasterPoolState
     private let shutdownCoordinator = SSHMasterShutdownCoordinator()
     private let managedOwnership: SSHManagedOwnershipRegistry
@@ -35,6 +36,7 @@ public final class SSHMasterPool: @unchecked Sendable {
         self.init(
             directory: directory,
             runner: FoundationInventoryProcessRunner(),
+            lifecycleTimeout: .seconds(15),
             maxConcurrentPreparations: maxConcurrentPreparations,
             retryBoundaryHook: nil,
             retryInvalidationHook: nil
@@ -51,6 +53,7 @@ public final class SSHMasterPool: @unchecked Sendable {
     convenience init(
         testDirectory: URL,
         runner: any InventoryProcessRunning,
+        lifecycleTimeout: Duration = .seconds(15),
         maxConcurrentPreparations: Int = 4,
         retryBoundaryHook: (@Sendable () async -> Void)? = nil,
         retryInvalidationHook: (@Sendable () async -> Void)? = nil
@@ -58,6 +61,7 @@ public final class SSHMasterPool: @unchecked Sendable {
         self.init(
             directory: testDirectory,
             runner: runner,
+            lifecycleTimeout: lifecycleTimeout,
             maxConcurrentPreparations: maxConcurrentPreparations,
             retryBoundaryHook: retryBoundaryHook,
             retryInvalidationHook: retryInvalidationHook
@@ -67,6 +71,7 @@ public final class SSHMasterPool: @unchecked Sendable {
     private init(
         directory: URL,
         runner: any InventoryProcessRunning,
+        lifecycleTimeout: Duration,
         maxConcurrentPreparations: Int,
         retryBoundaryHook: (@Sendable () async -> Void)?,
         retryInvalidationHook: (@Sendable () async -> Void)?
@@ -75,12 +80,17 @@ public final class SSHMasterPool: @unchecked Sendable {
         commands = SSHMasterCommands(directory: directory)
         managedOwnership = SSHManagedOwnershipRegistry(directory: directory)
         self.runner = runner
+        let lifecycleRunner = TimedInventoryProcessRunner(
+            timeout: lifecycleTimeout,
+            underlying: runner
+        )
+        self.lifecycleRunner = lifecycleRunner
         self.retryBoundaryHook = retryBoundaryHook
         self.retryInvalidationHook = retryInvalidationHook
         state = SSHMasterPoolState(
             directory: directory,
             commands: commands,
-            runner: runner,
+            runner: lifecycleRunner,
             maxConcurrentPreparations: maxConcurrentPreparations
         )
     }
@@ -186,10 +196,10 @@ public final class SSHMasterPool: @unchecked Sendable {
             .union(managedOwnership.aliasesForShutdown())
         for alias in aliases {
             guard let stop = try? commands.stop(alias: alias) else { continue }
-            _ = try? await runner.run(stop)
+            _ = try? await lifecycleRunner.run(stop)
             guard
                 let check = try? commands.check(alias: alias),
-                let output = try? await runner.run(check),
+                let output = try? await lifecycleRunner.run(check),
                 output.exitCode != 0,
                 let socketPath = try? commands.socketPath(alias: alias)
             else { continue }
@@ -338,6 +348,12 @@ private actor SSHMasterShutdownCoordinator {
 }
 
 private actor SSHMasterPoolState {
+    private enum SessionProbeResult: Equatable {
+        case healthy
+        case refusing
+        case indeterminate
+    }
+
     private struct PreparationWaiter {
         let alias: String
         let continuation: CheckedContinuation<Bool, Never>
@@ -544,26 +560,76 @@ private actor SSHMasterPoolState {
     private func establish(alias: String) async -> SSHLinkState {
         guard ensureDirectory() else { return .failed }
         guard let check = try? commands.check(alias: alias) else { return .failed }
+        var replacedRefusingMaster = false
 
         do {
             let output = try await runner.run(check)
             if output.exitCode == 0 {
-                return .ready
+                switch await probeSession(alias: alias) {
+                case .healthy:
+                    return .ready
+                case .refusing:
+                    guard await retireRefusingMaster(alias: alias) else {
+                        return .failed
+                    }
+                    replacedRefusingMaster = true
+                case .indeterminate:
+                    return .failed
+                }
             }
             if let socketPath = try? commands.socketPath(alias: alias) {
                 try? FileManager.default.removeItem(atPath: socketPath)
             }
         } catch {
-            // A thrown check did not prove that the socket is abandoned.
+            // A thrown check did not prove that the socket is abandoned. Do
+            // not start `-MNf` on the same path: OpenSSH can disable muxing,
+            // leave a plain background connection, and still exit zero.
+            return .failed
         }
 
         guard let prepare = try? commands.prepare(alias: alias) else { return .failed }
         do {
             let output = try await runner.run(prepare)
-            return output.exitCode == 0 ? .ready : .failed
+            guard output.exitCode == 0 else { return .failed }
+            if replacedRefusingMaster {
+                guard await probeSession(alias: alias) == .healthy else {
+                    return .failed
+                }
+            }
+            return .ready
         } catch {
             return .failed
         }
+    }
+
+    private func probeSession(alias: String) async -> SessionProbeResult {
+        guard let probe = try? commands.probe(alias: alias) else {
+            return .indeterminate
+        }
+        guard let output = try? await runner.run(probe) else {
+            // Preserve the existing socket when the probe itself is unknown,
+            // but never claim that it can open a new session.
+            return .indeterminate
+        }
+        return output.exitCode == 0 ? .healthy : .refusing
+    }
+
+    private func retireRefusingMaster(alias: String) async -> Bool {
+        guard let stop = try? commands.stop(alias: alias) else {
+            return false
+        }
+        guard
+            let output = try? await runner.run(stop),
+            output.exitCode == 0
+        else { return false }
+
+        // `ssh -O stop` preserves existing channels while removing the mux
+        // listener. Once acknowledged, this pathname no longer names a master
+        // that should accept App traffic and can safely be replaced.
+        if let socketPath = try? commands.socketPath(alias: alias) {
+            try? FileManager.default.removeItem(atPath: socketPath)
+        }
+        return true
     }
 
     private func ensureDirectory() -> Bool {

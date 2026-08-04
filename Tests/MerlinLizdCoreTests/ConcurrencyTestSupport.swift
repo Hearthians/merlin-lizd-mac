@@ -154,6 +154,7 @@ actor SSHMasterScriptedRunner: InventoryProcessRunning {
     indirect enum Action: Sendable {
         case succeed
         case exit(Int32)
+        case output(InventoryProcessOutput)
         case fail(SSHMasterTestError)
         case wait(AsyncStartGate, then: Action)
     }
@@ -218,6 +219,8 @@ actor SSHMasterScriptedRunner: InventoryProcessRunning {
             return output(exitCode: 0)
         case let .exit(exitCode):
             return output(exitCode: exitCode)
+        case let .output(output):
+            return output
         case let .fail(error):
             throw error
         case let .wait(gate, then: next):

@@ -129,6 +129,49 @@ struct CommandBuilderTests {
         #expect(command.arguments.last?.contains("mlx worker login 3960209") == true)
     }
 
+    @Test("plain SSH fallback reaches a direct Worker without starting tmux")
+    func buildsManagedDirectWorkerPlainSSHCommand() throws {
+        let destination =
+            "3960209.lizhuodong.worker@merlin-ssh-proxy-cn.byted.org"
+        let pool = SSHMasterPool(
+            testDirectory: temporarySSHDirectory(),
+            runner: SSHMasterScriptedRunner()
+        )
+        let builder = ManagedTerminalCommandBuilder(sshMasterPool: pool)
+
+        let command = try builder.plainSSHCommand(target: .worker(
+            devboxSID: "dbx_135679",
+            devboxName: "wt_hl",
+            alias: destination,
+            workerID: "3960209"
+        ))
+
+        #expect(command.arguments.last == destination)
+        #expect(command.arguments.contains("-tt"))
+        #expect(!command.arguments.contains { $0.contains("tmux") })
+        #expect(!command.arguments.contains { $0.contains("mlx worker login") })
+    }
+
+    @Test("plain SSH fallback enters a relayed Worker without starting tmux")
+    func buildsManagedRelayedWorkerPlainSSHCommand() throws {
+        let pool = SSHMasterPool(
+            testDirectory: temporarySSHDirectory(),
+            runner: SSHMasterScriptedRunner()
+        )
+        let builder = ManagedTerminalCommandBuilder(sshMasterPool: pool)
+
+        let command = try builder.plainSSHCommand(target: .worker(
+            devboxSID: "dbx_135679",
+            devboxName: "wt_hl",
+            alias: "hl_gpu_2",
+            workerID: "3960209"
+        ))
+
+        #expect(command.arguments.last ==
+            "exec env NO_COLOR=1 TERM=dumb mlx worker login 3960209")
+        #expect(!command.arguments.contains { $0.contains("tmux") })
+    }
+
     private func assertManagedInteractiveCommand(
         _ command: CommandSpec,
         expectedPath: String
@@ -481,8 +524,22 @@ struct CommandBuilderTests {
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=10",
             "hl_gpu_2",
-            "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux list-sessions -F#{session_name}"
+            "NO_COLOR=1 TERM=dumb timeout -k 2s 40s mlx worker login 3960209 -- timeout -k 2s 10s env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux list-sessions -F#{session_name}"
         ])
+    }
+
+    @Test("bounds remote Devbox tmux discovery inside the remote host")
+    func boundsDevboxTmuxListCommand() throws {
+        let command = try MerlinCommands.listTmuxSessions(
+            target: .devbox(
+                sid: "dbx_135679",
+                name: "wt_hl",
+                alias: "hl_gpu_2"
+            )
+        )
+
+        #expect(command.arguments.last ==
+            "timeout -k 2s 10s env TERM=dumb tmux list-sessions -F#{session_name}")
     }
 
     @Test("lists Worker tmux sessions through the direct SSH proxy destination")
@@ -504,7 +561,7 @@ struct CommandBuilderTests {
             "-o", "ConnectTimeout=10",
             "-p", "22222",
             destination,
-            "env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux list-sessions -F#{session_name}",
+            "timeout -k 2s 10s env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux list-sessions -F#{session_name}",
         ])
         #expect(!command.arguments.contains { $0.contains("mlx worker login") })
     }
@@ -523,7 +580,7 @@ struct CommandBuilderTests {
         )
 
         #expect(command.arguments.last ==
-            "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux rename-session -t mlz-old training-main")
+            "NO_COLOR=1 TERM=dumb timeout -k 2s 40s mlx worker login 3960209 -- timeout -k 2s 10s env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux rename-session -t mlz-old training-main")
     }
 
     @Test("renames a Worker tmux session through its direct SSH destination")
@@ -541,7 +598,7 @@ struct CommandBuilderTests {
         )
 
         #expect(command.arguments.last ==
-            "env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux rename-session -t mlz-old training-main")
+            "timeout -k 2s 10s env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux rename-session -t mlz-old training-main")
     }
 
     @Test("terminates one Worker tmux session through its parent Devbox")
@@ -557,7 +614,7 @@ struct CommandBuilderTests {
         )
 
         #expect(command.arguments.last ==
-            "NO_COLOR=1 TERM=dumb mlx worker login 3960209 -- env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux kill-session -t mlz-finished-run")
+            "NO_COLOR=1 TERM=dumb timeout -k 2s 40s mlx worker login 3960209 -- timeout -k 2s 10s env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux kill-session -t mlz-finished-run")
     }
 
     @Test("terminates a Worker tmux session through its direct SSH destination")
@@ -574,7 +631,7 @@ struct CommandBuilderTests {
         )
 
         #expect(command.arguments.last ==
-            "env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux kill-session -t mlz-finished-run")
+            "timeout -k 2s 10s env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux kill-session -t mlz-finished-run")
     }
 
     @Test("rejects shell syntax in a tmux termination target")

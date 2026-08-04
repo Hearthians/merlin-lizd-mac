@@ -63,6 +63,17 @@ struct SSHMasterCommandsTests {
                 "-o", "ControlPath=\(socketPath)", "hl_gpu_2",
             ]
         ))
+        #expect(try commands.probe(alias: "hl_gpu_2") == CommandSpec(
+            executable: "/usr/bin/ssh",
+            arguments: [
+                "-nT", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                "-o", "ConnectionAttempts=1",
+                "-o", "ClearAllForwardings=yes",
+                "-o", "ControlMaster=no", "-o", "ControlPath=\(socketPath)",
+                "-o", "ProxyCommand=/usr/bin/false",
+                "hl_gpu_2", "true",
+            ]
+        ))
     }
 
     @Test("inserts multiplexing options before the validated destination")
@@ -79,7 +90,7 @@ struct SSHMasterCommandsTests {
             executable: "/usr/bin/ssh",
             arguments: [
                 "-nT",
-                "-o", "ControlMaster=auto",
+                "-o", "ControlMaster=no",
                 "-o", "ControlPath=/tmp/mlz-tests/m-cac93519225495d659065a87",
                 "-o", "ControlPersist=600",
                 "hl_gpu_2", "tmux list-sessions",
@@ -101,7 +112,7 @@ struct SSHMasterCommandsTests {
         let managed = try commands.managed(child, alias: destination)
 
         #expect(managed.arguments.contains(destination))
-        #expect(managed.arguments.contains("ControlMaster=auto"))
+        #expect(managed.arguments.contains("ControlMaster=no"))
         #expect(managed.arguments.contains { $0.hasPrefix("ControlPath=") })
     }
 
@@ -116,6 +127,7 @@ struct SSHMasterCommandsTests {
         for command in [
             try commands.prepare(alias: destination),
             try commands.check(alias: destination),
+            try commands.probe(alias: destination),
             try commands.stop(alias: destination),
         ] {
             let destinationIndex = try #require(
@@ -140,7 +152,7 @@ struct SSHMasterCommandsTests {
 
         #expect(managed.arguments == [
             "-v", "-p", "22",
-            "-o", "ControlMaster=auto",
+            "-o", "ControlMaster=no",
             "-o", "ControlPath=/tmp/mlz-tests/m-cac93519225495d659065a87",
             "-o", "ControlPersist=600",
             "--", "hl_gpu_2", "true",

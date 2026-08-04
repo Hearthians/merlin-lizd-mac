@@ -37,6 +37,18 @@ public struct ManagedTerminalCommandBuilder: Sendable {
         )
     }
 
+    public func plainSSHCommand(
+        target: TerminalTarget
+    ) throws -> CommandSpec {
+        guard let alias = MerlinCommands.sshConnectionTarget(for: target) else {
+            throw ManagedTerminalCommandError.remoteTargetRequired
+        }
+        return try sshMasterPool.managedCommand(
+            MerlinCommands.plainSSHCommand(for: target),
+            alias: alias
+        )
+    }
+
     private func managedRemoteCommand(
         target: TerminalTarget,
         sessionName: String,

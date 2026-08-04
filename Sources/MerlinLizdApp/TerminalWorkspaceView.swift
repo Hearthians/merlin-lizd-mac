@@ -35,6 +35,61 @@ private struct TerminalSessionContent: View {
             TerminalSessionHost(session: session)
                 .background(Color.black)
 
+            if case .preparing = session.state {
+                HStack(spacing: 10) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("正在检查 SSH 连接…")
+                }
+                .font(.callout)
+                .padding(10)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
+                    .padding(12)
+            }
+
+            if case let .blocked(reason) = session.state {
+                VStack(alignment: .leading, spacing: 8) {
+                    Label(
+                        blockedTitle(reason),
+                        systemImage: reason == .tmuxUnavailable
+                            ? "rectangle.stack.badge.exclamationmark"
+                            : "network.slash"
+                    )
+                    .font(.headline)
+                    Text(blockedDescription(reason))
+                        .foregroundStyle(.secondary)
+                    HStack {
+                        if reason == .tmuxUnavailable {
+                            Button("仅 SSH 登录", systemImage: "terminal") {
+                                session.startPlainSSH()
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                        Button("重试 tmux", systemImage: "arrow.clockwise") {
+                            session.retryRequestedCommand()
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+                .font(.callout)
+                .padding(12)
+                .frame(maxWidth: 560, alignment: .leading)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
+                .padding(12)
+            }
+
+            if case .running(.plainSSH) = session.state {
+                Label(
+                    "当前为纯 SSH，未接入 tmux；关闭标签不会影响原 tmux 会话。",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.callout)
+                .foregroundStyle(.orange)
+                .padding(10)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
+                .padding(12)
+            }
+
             if case let .exited(exitCode) = session.state {
                 HStack(spacing: 10) {
                     Label(
@@ -50,6 +105,28 @@ private struct TerminalSessionContent: View {
                 .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
                 .padding(12)
             }
+        }
+    }
+
+    private func blockedTitle(_ reason: TerminalSession.StartupBlock) -> String {
+        switch reason {
+        case .sshUnavailable:
+            "SSH 连接不可用"
+        case .workerNotReady:
+            "工作机尚未就绪"
+        case .tmuxUnavailable:
+            "tmux 无响应，尚未连接"
+        }
+    }
+
+    private func blockedDescription(_ reason: TerminalSession.StartupBlock) -> String {
+        switch reason {
+        case .sshUnavailable:
+            "请检查 SSH 认证或网络后重试。"
+        case .workerNotReady:
+            "等待工作机就绪后再重试连接。"
+        case .tmuxUnavailable:
+            "SSH 可用，但 tmux 未在限定时间内响应。为避免继续堆积客户端，MerlinHub 没有发起 tmux 连接。"
         }
     }
 }
@@ -250,6 +327,17 @@ struct TerminalTabBar: View {
                         try await terminals.openInTerminal(tab.id)
                     } catch {
                         operationErrorMessage = operationErrorText(error)
+                    }
+                }
+            }
+            if tab.target != .local {
+                Button("仅用 SSH 在 Terminal 中打开") {
+                    Task {
+                        do {
+                            try await terminals.openPlainSSHInTerminal(tab.id)
+                        } catch {
+                            operationErrorMessage = operationErrorText(error)
+                        }
                     }
                 }
             }
