@@ -160,7 +160,10 @@ struct MerlinRootView: View {
                 terminals.openWorker(worker, on: machine)
             }
         case .tasks:
-            TaskLifecycleView(state: model.taskPageState)
+            TaskLifecycleView(
+                state: model.taskPageState,
+                onBrowseTmux: { sessionBrowserTarget = $0 }
+            )
         case .local:
             LocalTerminalLandingView(
                 onOpen: terminals.openLocal,

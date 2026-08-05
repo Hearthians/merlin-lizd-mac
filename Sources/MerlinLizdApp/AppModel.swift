@@ -733,8 +733,9 @@ final class AppModel: ObservableObject {
             return
         }
         // MerlinTaskSnapshot contains only the safe task projection: identity,
-        // display/status timestamps, and runtime. Raw CLI metadata,
-        // Grafana routes, queries, and credentials are never cached.
+        // display/status timestamps, runtime, owner username, and role counts.
+        // Raw CLI metadata, Pod routes, Grafana queries, and credentials are
+        // never cached.
         UserDefaults.standard.set(data, forKey: Self.taskCacheKey)
     }
 

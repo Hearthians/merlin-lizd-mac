@@ -4,6 +4,7 @@ public enum TerminalTargetIdentity: Equatable, Hashable, Sendable {
     case local
     case devbox(sid: String)
     case worker(devboxSID: String, workerID: String)
+    case task(runID: String, instanceID: String)
 }
 
 public enum TerminalTarget: Codable, Equatable, Hashable, Sendable {
@@ -15,6 +16,12 @@ public enum TerminalTarget: Codable, Equatable, Hashable, Sendable {
         alias: String,
         workerID: String
     )
+    case task(
+        runID: String,
+        name: String,
+        instanceID: String,
+        alias: String
+    )
 
     public var sessionAttachmentTitle: String {
         switch self {
@@ -24,6 +31,8 @@ public enum TerminalTarget: Codable, Equatable, Hashable, Sendable {
             name
         case let .worker(_, _, _, workerID):
             "Worker \(workerID)"
+        case let .task(_, name, _, _):
+            name
         }
     }
 
@@ -37,6 +46,8 @@ public enum TerminalTarget: Codable, Equatable, Hashable, Sendable {
             .devbox(sid: sid)
         case let .worker(devboxSID, _, _, workerID):
             .worker(devboxSID: devboxSID, workerID: workerID)
+        case let .task(runID, _, instanceID, _):
+            .task(runID: runID, instanceID: instanceID)
         }
     }
 
@@ -75,6 +86,8 @@ public enum TerminalTarget: Codable, Equatable, Hashable, Sendable {
                 return nil
             }
             return machine.workerTerminalTarget(for: worker)
+        case .task:
+            return self
         }
     }
 }

@@ -429,6 +429,7 @@ struct TerminalTabBar: View {
         case .local: "macbook"
         case .devbox: "server.rack"
         case .worker: "cpu"
+        case .task: "shippingbox"
         }
     }
 

@@ -56,10 +56,11 @@ struct TaskWideRow: View {
     let gpuMetricState: TaskMetricAvailability
     let memoryMetricState: TaskMetricAvailability
     let now: Date
+    let onBrowseTmux: (TerminalTarget) -> Void
 
     var body: some View {
         HStack(spacing: 16) {
-            TaskIdentity(run: run)
+            TaskIdentity(run: run, onBrowseTmux: onBrowseTmux)
                 .frame(minWidth: 220, maxWidth: .infinity, alignment: .leading)
             TaskStatusPill(status: run.status)
                 .frame(width: 92, alignment: .leading)
@@ -102,6 +103,7 @@ struct TaskCompactRow: View {
     let gpuMetricState: TaskMetricAvailability
     let memoryMetricState: TaskMetricAvailability
     let now: Date
+    let onBrowseTmux: (TerminalTarget) -> Void
 
     private let columns = [
         GridItem(.flexible(minimum: 120), alignment: .leading),
@@ -111,7 +113,7 @@ struct TaskCompactRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 12) {
-                TaskIdentity(run: run)
+                TaskIdentity(run: run, onBrowseTmux: onBrowseTmux)
                 Spacer(minLength: 8)
                 TaskStatusPill(status: run.status)
             }
@@ -156,6 +158,7 @@ struct TaskCompactRow: View {
 
 private struct TaskIdentity: View {
     let run: MerlinTaskRun
+    let onBrowseTmux: (TerminalTarget) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -171,9 +174,59 @@ private struct TaskIdentity: View {
                 }
                 if run.status == .running {
                     TaskSSHCopyButton(runID: run.id)
+                    TaskTmuxButton(
+                        run: run,
+                        onBrowseTmux: onBrowseTmux
+                    )
                 }
             }
         }
+    }
+}
+
+private struct TaskTmuxButton: View {
+    let run: MerlinTaskRun
+    let onBrowseTmux: (TerminalTarget) -> Void
+
+    var body: some View {
+        let instances = run.taskInstances
+        if let instance = instances.first, instances.count == 1 {
+            Button {
+                onBrowseTmux(instance.terminalTarget)
+            } label: {
+                label
+            }
+            .buttonStyle(.plain)
+            .help("管理 \(instance.displayName) 上的 tmux 会话")
+        } else {
+            Menu {
+                ForEach(instances) { instance in
+                    Button(instance.displayName) {
+                        onBrowseTmux(instance.terminalTarget)
+                    }
+                }
+            } label: {
+                label
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .disabled(instances.isEmpty)
+            .help(
+                instances.isEmpty
+                    ? "任务实例 SSH 信息不可用"
+                    : "选择任务实例并管理 tmux 会话"
+            )
+        }
+    }
+
+    private var label: some View {
+        Label("tmux", systemImage: "rectangle.stack")
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .background(.quaternary.opacity(0.8), in: Capsule())
     }
 }
 

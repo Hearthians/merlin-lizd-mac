@@ -771,7 +771,10 @@ public actor TmuxSessionDiscovery {
         diagnostic.contains("no server running")
             || diagnostic.contains("no sessions")
             || (
-                diagnostic.contains("error connecting to /dev/shm/tmux-")
+                (
+                    diagnostic.contains("error connecting to /dev/shm/tmux-")
+                        || diagnostic.contains("error connecting to /tmp/tmux-")
+                )
                     && diagnostic.contains("(no such file or directory)")
             )
     }

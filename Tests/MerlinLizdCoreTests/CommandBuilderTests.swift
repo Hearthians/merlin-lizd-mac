@@ -227,6 +227,73 @@ struct CommandBuilderTests {
         #expect(!rendered.contains("~/.ssh"))
     }
 
+    @Test("builds an interactive tmux launch for one task instance")
+    func buildsTaskInstanceTerminal() throws {
+        let alias =
+            "4e8d5bcf80b8bb10.executor_0.job.lizhuodong"
+                + "@merlin-ssh-proxy-cn.byted.org"
+
+        let command = try MerlinCommands.taskTerminal(
+            alias: alias,
+            runID: "4e8d5bcf80b8bb10",
+            instanceID: "executor_0",
+            sessionName: "mlz-training",
+            workingDirectory: "/opt/tiger/my project"
+        )
+
+        #expect(command == CommandSpec(
+            executable: "/usr/bin/ssh",
+            arguments: [
+                "-tt",
+                "-o", "ServerAliveInterval=10",
+                "-o", "ServerAliveCountMax=3",
+                "-p", "22222",
+                alias,
+                "exec env -u TMUX TERM=xterm tmux new-session -A -s mlz-training "
+                    + "-c '/opt/tiger/my project'",
+            ]
+        ))
+    }
+
+    @Test("lists task-instance tmux sessions through direct SSH")
+    func listsTaskInstanceTmuxSessions() throws {
+        let alias =
+            "4e8d5bcf80b8bb10.executor_0.job.lizhuodong"
+                + "@merlin-ssh-proxy-cn.byted.org"
+        let command = try MerlinCommands.listTmuxSessions(
+            target: .task(
+                runID: "4e8d5bcf80b8bb10",
+                name: "training",
+                instanceID: "executor_0",
+                alias: alias
+            )
+        )
+
+        #expect(command.arguments == [
+            "-nT",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=10",
+            "-p", "22222",
+            alias,
+            "timeout -k 2s 10s env -u TMUX TERM=dumb "
+                + "tmux list-sessions -F#{session_name}",
+        ])
+    }
+
+    @Test("rejects unsafe task-instance selectors")
+    func rejectsUnsafeTaskInstanceSelector() {
+        #expect(throws: CommandValidationError.invalidTaskInstanceID) {
+            try MerlinCommands.plainSSHCommand(
+                for: .task(
+                    runID: "026d090ddd50fc87",
+                    name: "training",
+                    instanceID: "worker_1;touch",
+                    alias: "invalid"
+                )
+            )
+        }
+    }
+
     @Test("renders a direct Worker SSH command without a Devbox relay")
     func rendersManualDirectWorkerSSHCommand() throws {
         let destination =

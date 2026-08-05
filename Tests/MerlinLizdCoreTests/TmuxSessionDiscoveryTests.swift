@@ -932,6 +932,32 @@ struct TmuxSessionDiscoveryTests {
         #expect(await discovery.snapshot(target: target)?.sessions == [])
     }
 
+    @Test("task-instance discovery treats a missing tmux server as empty")
+    func discoversTaskInstanceWithoutTmuxServer() async {
+        let runner = TmuxScriptedRunner(output: InventoryProcessOutput(
+            stdout: "",
+            stderr: "error connecting to /tmp/tmux-1000/default (No such file or directory)",
+            exitCode: 1
+        ))
+        let discovery = TmuxSessionDiscovery(processRunner: runner)
+        let target = TerminalTarget.task(
+            runID: "026d090ddd50fc87",
+            name: "training",
+            instanceID: "worker_1",
+            alias: "026d090ddd50fc87.worker_1.job.lizhuodong"
+                + "@merlin-ssh-proxy-cn.byted.org"
+        )
+
+        let snapshot = await discovery.refresh(target: target)
+
+        #expect(snapshot.sessions.isEmpty)
+        #expect(snapshot.readiness == .ready)
+        #expect(snapshot.lastError == nil)
+        #expect(await runner.recordedCommand()?.arguments.last ==
+            "timeout -k 2s 10s env -u TMUX TERM=dumb "
+                + "tmux list-sessions -F#{session_name}")
+    }
+
     @Test("pooled discovery caches authoritative no-server output")
     func pooledDiscoveryCachesNoServer() async throws {
         let runner = TmuxPoolRunner(childOutput: InventoryProcessOutput(

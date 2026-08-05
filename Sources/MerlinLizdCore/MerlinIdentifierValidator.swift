@@ -41,6 +41,29 @@ public enum MerlinIdentifierValidator {
         )
     }
 
+    public static func isTaskSSHProxyDestination(
+        _ value: String,
+        runID: String,
+        instanceID: String
+    ) -> Bool {
+        guard
+            isJobRunID(runID),
+            isTaskInstanceID(instanceID)
+        else {
+            return false
+        }
+        let escapedRunID = NSRegularExpression.escapedPattern(for: runID)
+        let escapedInstanceID = NSRegularExpression.escapedPattern(
+            for: instanceID
+        )
+        return matches(
+            value,
+            pattern: #"^"# + escapedRunID + #"\."# + escapedInstanceID
+                + #"\.job\.[A-Za-z0-9][A-Za-z0-9._-]{0,127}@"#
+                + #"merlin-ssh-proxy-[A-Za-z0-9-]{1,63}\.byted\.org$"#
+        )
+    }
+
     public static func sshPort(forConnectionTarget value: String) -> Int? {
         guard matches(
             value,
@@ -71,6 +94,14 @@ public enum MerlinIdentifierValidator {
 
     public static func isJobRunID(_ value: String) -> Bool {
         matches(value, pattern: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"#)
+    }
+
+    public static func isMerlinUsername(_ value: String) -> Bool {
+        matches(value, pattern: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"#)
+    }
+
+    public static func isTaskInstanceID(_ value: String) -> Bool {
+        matches(value, pattern: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$"#)
     }
 
     public static func isTmuxSessionName(_ value: String) -> Bool {

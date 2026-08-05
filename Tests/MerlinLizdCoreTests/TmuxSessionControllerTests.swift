@@ -127,6 +127,32 @@ struct TmuxSessionControllerTests {
         #expect(await runner.lastCommand()?.arguments.last ==
             "NO_COLOR=1 TERM=dumb timeout -k 2s 40s mlx worker login 3960209 -- timeout -k 2s 10s env -u TMUX TERM=dumb TMUX_TMPDIR=/dev/shm tmux kill-session -t mlz-finished-run")
     }
+
+    @Test("renames a task-instance session through direct SSH")
+    func renamesTaskInstanceSession() async throws {
+        let runner = MutationRecordingRunner(output: InventoryProcessOutput(
+            stdout: "",
+            stderr: "",
+            exitCode: 0
+        ))
+        let controller = TmuxSessionController(processRunner: runner)
+
+        try await controller.rename(
+            target: .task(
+                runID: "026d090ddd50fc87",
+                name: "training",
+                instanceID: "worker_1",
+                alias: "026d090ddd50fc87.worker_1.job.lizhuodong"
+                    + "@merlin-ssh-proxy-cn.byted.org"
+            ),
+            from: "mlz-old",
+            to: "training-main"
+        )
+
+        #expect(await runner.lastCommand()?.arguments.last ==
+            "timeout -k 2s 10s env -u TMUX TERM=dumb "
+                + "tmux rename-session -t mlz-old training-main")
+    }
 }
 
 private actor MutationPoolRunner: InventoryProcessRunning {

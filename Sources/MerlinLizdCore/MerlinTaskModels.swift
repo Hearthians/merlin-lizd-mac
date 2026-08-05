@@ -28,6 +28,52 @@ public enum MerlinTaskStatus: String, Codable, Equatable, Sendable {
     }
 }
 
+public struct MerlinTaskRole: Codable, Equatable, Hashable, Sendable {
+    public let name: String
+    public let instanceCount: Int
+
+    public init?(name: String, instanceCount: Int) {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard
+            instanceCount > 0,
+            MerlinIdentifierValidator.isTaskInstanceID("\(name)_0")
+        else {
+            return nil
+        }
+        self.name = name
+        self.instanceCount = instanceCount
+    }
+}
+
+public struct MerlinTaskInstance: Identifiable, Equatable, Hashable, Sendable {
+    public let runID: String
+    public let taskName: String
+    public let instanceID: String
+    public let username: String
+
+    public var id: String {
+        "\(runID):\(instanceID)"
+    }
+
+    public var displayName: String {
+        instanceID.replacingOccurrences(of: "_", with: "-")
+    }
+
+    public var connectionTarget: String {
+        "\(runID).\(instanceID).job.\(username)"
+            + "@merlin-ssh-proxy-cn.byted.org"
+    }
+
+    public var terminalTarget: TerminalTarget {
+        .task(
+            runID: runID,
+            name: "\(taskName) · \(displayName)",
+            instanceID: instanceID,
+            alias: connectionTarget
+        )
+    }
+}
+
 /// The deliberately small, persistable projection used by MerlinHub.
 /// Raw job responses can contain credentials, environment variables, mounts,
 /// and other operational details; none of those fields cross this boundary.
@@ -45,6 +91,8 @@ public struct MerlinTaskRun: Identifiable, Codable, Equatable, Sendable {
     public let metricRoleName: String?
     public let allocatedGPUCount: Int?
     public let allocatedMemoryBytes: UInt64?
+    public let createdBy: String?
+    public let taskRoles: [MerlinTaskRole]?
 
     public init(
         id: String,
@@ -58,7 +106,9 @@ public struct MerlinTaskRun: Identifiable, Codable, Equatable, Sendable {
         trialID: String? = nil,
         metricRoleName: String? = nil,
         allocatedGPUCount: Int? = nil,
-        allocatedMemoryBytes: UInt64? = nil
+        allocatedMemoryBytes: UInt64? = nil,
+        createdBy: String? = nil,
+        taskRoles: [MerlinTaskRole] = []
     ) {
         self.id = id
         self.name = name
@@ -73,6 +123,8 @@ public struct MerlinTaskRun: Identifiable, Codable, Equatable, Sendable {
         self.metricRoleName = metricRoleName
         self.allocatedGPUCount = allocatedGPUCount
         self.allocatedMemoryBytes = allocatedMemoryBytes
+        self.createdBy = createdBy
+        self.taskRoles = taskRoles
     }
 
     public var clusterShortCode: String? {
@@ -81,6 +133,25 @@ public struct MerlinTaskRun: Identifiable, Codable, Equatable, Sendable {
 
     public var metricRoute: MerlinTaskMetricRoute {
         MerlinTaskMetricRoute(run: self)
+    }
+
+    public var taskInstances: [MerlinTaskInstance] {
+        guard
+            let createdBy,
+            MerlinIdentifierValidator.isMerlinUsername(createdBy)
+        else {
+            return []
+        }
+        return (taskRoles ?? []).flatMap { role in
+            (0..<role.instanceCount).map { index in
+                MerlinTaskInstance(
+                    runID: id,
+                    taskName: name,
+                    instanceID: "\(role.name)_\(index)",
+                    username: createdBy
+                )
+            }
+        }
     }
 
     public func runtimeSeconds(at date: Date) -> TimeInterval? {

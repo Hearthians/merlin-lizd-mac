@@ -210,6 +210,18 @@ struct TerminalStateCodecTests {
                     sessionName: "merlin-lizd-train",
                     workingDirectory: "/mnt/training"
                 ),
+                TerminalTabRecord(
+                    id: "tab-task",
+                    title: "training · worker-1",
+                    target: .task(
+                        runID: "026d090ddd50fc87",
+                        name: "training",
+                        instanceID: "worker_1",
+                        alias: "026d090ddd50fc87.worker_1.job.lizhuodong"
+                            + "@merlin-ssh-proxy-cn.byted.org"
+                    ),
+                    sessionName: "mlz-task"
+                ),
             ]
         )
 
@@ -219,6 +231,7 @@ struct TerminalStateCodecTests {
         #expect(decoded == state)
         #expect(!encoded.contains("ProxyCommand"))
         #expect(!encoded.contains("ssh_proxy_cmd"))
+        #expect(!encoded.contains("access_token"))
     }
 
     @Test("restores older tabs without a working directory")

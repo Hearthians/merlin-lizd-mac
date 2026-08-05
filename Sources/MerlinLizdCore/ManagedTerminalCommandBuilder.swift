@@ -76,6 +76,15 @@ public struct ManagedTerminalCommandBuilder: Sendable {
                 sessionName: sessionName,
                 workingDirectory: workingDirectory
             )
+        case let .task(runID, _, instanceID, targetAlias):
+            alias = targetAlias
+            command = try MerlinCommands.taskTerminal(
+                alias: targetAlias,
+                runID: runID,
+                instanceID: instanceID,
+                sessionName: sessionName,
+                workingDirectory: workingDirectory
+            )
         }
         return try sshMasterPool.managedCommand(command, alias: alias)
     }

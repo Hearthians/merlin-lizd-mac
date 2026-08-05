@@ -3,6 +3,7 @@ import SwiftUI
 
 struct TaskLifecycleView: View {
     let state: TaskPageState
+    let onBrowseTmux: (TerminalTarget) -> Void
 
     @ViewBuilder
     var body: some View {
@@ -144,7 +145,8 @@ struct TaskLifecycleView: View {
                     cpuMetricState: state.cpuMetricAvailability(for: run),
                     gpuMetricState: state.gpuMetricAvailability(for: run),
                     memoryMetricState: state.memoryMetricAvailability(for: run),
-                    now: now
+                    now: now,
+                    onBrowseTmux: onBrowseTmux
                 )
             }
         }
@@ -165,7 +167,8 @@ struct TaskLifecycleView: View {
                     cpuMetricState: state.cpuMetricAvailability(for: run),
                     gpuMetricState: state.gpuMetricAvailability(for: run),
                     memoryMetricState: state.memoryMetricAvailability(for: run),
-                    now: now
+                    now: now,
+                    onBrowseTmux: onBrowseTmux
                 )
             }
         }

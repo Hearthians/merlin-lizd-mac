@@ -174,6 +174,10 @@ struct TmuxSessionBrowserView: View {
                     Task { await model.load(force: true) }
                 }
                 .disabled(model.isVerifying || isTerminating)
+                Button("新建", systemImage: "plus") {
+                    requestNewSession()
+                }
+                .disabled(isTerminating)
                 Button("完成") {
                     dismiss()
                 }
@@ -398,6 +402,15 @@ struct TmuxSessionBrowserView: View {
         }
     }
 
+    private func requestNewSession() {
+        let target = model.target
+        dismiss()
+        Task { @MainActor in
+            await Task.yield()
+            terminals.requestNewTmuxSession(on: target)
+        }
+    }
+
     private var targetLabel: String {
         switch model.target {
         case .local:
@@ -406,6 +419,8 @@ struct TmuxSessionBrowserView: View {
             name
         case let .worker(_, devboxName, _, workerID):
             "\(devboxName) · Worker \(workerID)"
+        case let .task(runID, name, _, _):
+            "\(name) · \(runID)"
         }
     }
 
@@ -415,6 +430,8 @@ struct TmuxSessionBrowserView: View {
             "本机尚无可接入的 tmux 会话；“打开终端”会启动普通登录 shell。"
         case .devbox, .worker:
             "打开新终端时，App 会自动创建一个可恢复的会话。"
+        case .task:
+            "可以新建一个由 MerlinHub 管理的任务实例 tmux 会话。"
         }
     }
 }

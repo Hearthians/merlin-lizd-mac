@@ -3,7 +3,7 @@ public enum TerminalTerminfo {
         switch target {
         case .local:
             "xterm-256color"
-        case .devbox, .worker:
+        case .devbox, .worker, .task:
             "xterm"
         }
     }

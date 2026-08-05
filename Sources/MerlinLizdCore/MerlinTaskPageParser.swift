@@ -51,7 +51,8 @@ public enum MerlinTaskPageParser {
             name = definitionName
         }
         guard !id.isEmpty, !name.isEmpty else { return nil }
-        let metricRole = metricRole(from: payload.meta?.jobRunParameters)
+        let parameters = payload.meta?.jobRunParameters
+        let metricRole = metricRole(from: parameters)
         return MerlinTaskRun(
             id: id,
             name: name,
@@ -67,8 +68,21 @@ public enum MerlinTaskPageParser {
             trialID: nonempty(payload.latestTrialID),
             metricRoleName: metricRole?.name,
             allocatedGPUCount: metricRole?.allocatedGPUCount,
-            allocatedMemoryBytes: metricRole?.allocatedMemoryBytes
+            allocatedMemoryBytes: metricRole?.allocatedMemoryBytes,
+            createdBy: nonempty(payload.createdBy),
+            taskRoles: taskRoles(from: parameters)
         )
+    }
+
+    private static func taskRoles(
+        from parameters: JobRunParameters?
+    ) -> [MerlinTaskRole] {
+        (parameters?.resource?.arnoldConfiguration?.roles ?? []).compactMap {
+            MerlinTaskRole(
+                name: $0.name,
+                instanceCount: max(1, $0.count ?? 1)
+            )
+        }
     }
 
     private static func metricRole(
@@ -120,6 +134,7 @@ public enum MerlinTaskPageParser {
         let status: String
         let jobType: String
         let triggerMode: String
+        let createdBy: String?
         let creationTime: FlexibleInt64
         let completedTime: FlexibleInt64?
         let latestTrialID: String?
@@ -131,6 +146,7 @@ public enum MerlinTaskPageParser {
             case status
             case jobType = "job_type"
             case triggerMode = "trigger_mode"
+            case createdBy = "created_by"
             case creationTime = "creation_time"
             case completedTime = "completed_time"
             case latestTrialID = "latest_trial_id"

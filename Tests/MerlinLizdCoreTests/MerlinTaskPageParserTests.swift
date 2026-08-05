@@ -15,6 +15,7 @@ struct MerlinTaskPageParserTests {
               "status": "RUNNING",
               "job_type": "Train",
               "trigger_mode": "MANUAL",
+              "created_by": "lizhuodong",
               "creation_time": "800",
               "completed_time": "0",
               "latest_trial_id": "389738351",
@@ -137,6 +138,15 @@ struct MerlinTaskPageParserTests {
         #expect(
             page.runs[0].allocatedMemoryBytes
                 == UInt64(364_544 * 2) * 1_048_576
+        )
+        #expect(page.runs[0].createdBy == "lizhuodong")
+        #expect(page.runs[0].taskInstances.map(\.instanceID) == [
+            "worker_0", "worker_1",
+        ])
+        #expect(
+            page.runs[0].taskInstances[1].connectionTarget
+                == "run-running.worker_1.job.lizhuodong"
+                    + "@merlin-ssh-proxy-cn.byted.org"
         )
         #expect(page.runs[2].status == .failed)
         #expect(page.runs[2].startedAtMilliseconds == 620)

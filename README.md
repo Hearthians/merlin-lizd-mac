@@ -19,6 +19,12 @@ identifies the active data source and marks direct-only data as degraded. Leavin
 the page cancels and reaps active processes; telemetry and signed monitoring
 URLs are never persisted.
 
+Running training and data-processing tasks expose per-role instances in the
+Tasks workspace. Each instance uses its validated Merlin SSH proxy identity,
+such as `jobRunID.executor_0.job.username@merlin-ssh-proxy-cn.byted.org`, so the
+same tmux browser can list, create, attach, rename, and terminate sessions
+without persisting Pod addresses, ports, tokens, or raw task metadata.
+
 ## SSH reuse and session prewarming
 
 At launch, the app prepares App-owned OpenSSH control sockets for active

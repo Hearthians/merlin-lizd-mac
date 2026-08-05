@@ -22,6 +22,7 @@ public enum CommandValidationError: Error, Equatable, Sendable {
     case invalidMetricsInterval
     case invalidWorkerPageSize
     case invalidJobRunID
+    case invalidTaskInstanceID
 }
 
 public enum MerlinCommands {
@@ -29,7 +30,9 @@ public enum MerlinCommands {
         switch target {
         case .local:
             nil
-        case let .devbox(_, _, alias), let .worker(_, _, alias, _):
+        case let .devbox(_, _, alias),
+            let .worker(_, _, alias, _),
+            let .task(_, _, _, alias):
             alias
         }
     }
@@ -39,7 +42,7 @@ public enum MerlinCommands {
     public static func manualSSHCommand(
         for target: TerminalTarget
     ) throws -> String {
-        try ShellCommandRenderer.render(plainSSHCommand(for: target))
+        return try ShellCommandRenderer.render(plainSSHCommand(for: target))
     }
 
     /// Builds an interactive shell without attaching to tmux. Callers use this
@@ -66,6 +69,13 @@ public enum MerlinCommands {
                     : "exec env NO_COLOR=1 TERM=dumb "
                         + "mlx worker login \(workerID)"
             )
+        case let .task(runID, _, instanceID, alias):
+            try validateTaskRoute(
+                alias: alias,
+                runID: runID,
+                instanceID: instanceID
+            )
+            return standaloneInteractiveSSHCommand(alias: alias)
         }
     }
 
@@ -92,6 +102,36 @@ public enum MerlinCommands {
                 "--json", payload,
             ]
         ))
+    }
+
+    public static func taskTerminal(
+        alias: String,
+        runID: String,
+        instanceID: String,
+        sessionName: String,
+        workingDirectory: String? = nil
+    ) throws -> CommandSpec {
+        try validateTaskRoute(
+            alias: alias,
+            runID: runID,
+            instanceID: instanceID
+        )
+        try validateSessionName(sessionName)
+        let directoryArgument = try tmuxWorkingDirectoryArgument(
+            workingDirectory
+        )
+        return CommandSpec(
+            executable: "/usr/bin/ssh",
+            arguments: interactiveSSHArguments(
+                alias: alias,
+                remoteCommand: "exec "
+                    + taskTmuxInvocation(
+                        term: "xterm",
+                        tmuxCommand: "new-session -A "
+                            + "-s \(sessionName)\(directoryArgument)"
+                    )
+            )
+        )
     }
 
     private static func standaloneInteractiveSSHCommand(
@@ -222,6 +262,24 @@ public enum MerlinCommands {
                     )
                 )
             )
+        case let .task(runID, _, instanceID, alias):
+            try validateTaskRoute(
+                alias: alias,
+                runID: runID,
+                instanceID: instanceID
+            )
+            return CommandSpec(
+                executable: "/usr/bin/ssh",
+                arguments: nonInteractiveSSHArguments(
+                    alias: alias,
+                    remoteCommand: boundedRemoteCommand(
+                        taskTmuxInvocation(
+                            term: "dumb",
+                            tmuxCommand: "kill-session -t \(sessionName)"
+                        )
+                    )
+                )
+            )
         }
     }
 
@@ -270,6 +328,25 @@ public enum MerlinCommands {
                     )
                 )
             )
+        case let .task(runID, _, instanceID, alias):
+            try validateTaskRoute(
+                alias: alias,
+                runID: runID,
+                instanceID: instanceID
+            )
+            return CommandSpec(
+                executable: "/usr/bin/ssh",
+                arguments: nonInteractiveSSHArguments(
+                    alias: alias,
+                    remoteCommand: boundedRemoteCommand(
+                        taskTmuxInvocation(
+                            term: "dumb",
+                            tmuxCommand: "rename-session "
+                                + "-t \(currentName) \(newName)"
+                        )
+                    )
+                )
+            )
         }
     }
 
@@ -308,6 +385,24 @@ public enum MerlinCommands {
                         devboxSID: devboxSID,
                         workerID: workerID,
                         tmuxCommand: "list-sessions -F#{session_name}"
+                    )
+                )
+            )
+        case let .task(runID, _, instanceID, alias):
+            try validateTaskRoute(
+                alias: alias,
+                runID: runID,
+                instanceID: instanceID
+            )
+            return CommandSpec(
+                executable: "/usr/bin/ssh",
+                arguments: nonInteractiveSSHArguments(
+                    alias: alias,
+                    remoteCommand: boundedRemoteCommand(
+                        taskTmuxInvocation(
+                            term: "dumb",
+                            tmuxCommand: "list-sessions -F#{session_name}"
+                        )
                     )
                 )
             )
@@ -448,6 +543,13 @@ public enum MerlinCommands {
         tmuxCommand: String
     ) -> String {
         "env -u TMUX TERM=\(term) TMUX_TMPDIR=/dev/shm tmux \(tmuxCommand)"
+    }
+
+    private static func taskTmuxInvocation(
+        term: String,
+        tmuxCommand: String
+    ) -> String {
+        "env -u TMUX TERM=\(term) tmux \(tmuxCommand)"
     }
 
     private static func workerTmuxRemoteCommand(
@@ -624,6 +726,26 @@ public enum MerlinCommands {
             return
         }
         try validateAlias(alias)
+    }
+
+    private static func validateTaskRoute(
+        alias: String,
+        runID: String,
+        instanceID: String
+    ) throws {
+        guard MerlinIdentifierValidator.isJobRunID(runID) else {
+            throw CommandValidationError.invalidJobRunID
+        }
+        guard MerlinIdentifierValidator.isTaskInstanceID(instanceID) else {
+            throw CommandValidationError.invalidTaskInstanceID
+        }
+        guard MerlinIdentifierValidator.isTaskSSHProxyDestination(
+            alias,
+            runID: runID,
+            instanceID: instanceID
+        ) else {
+            throw CommandValidationError.invalidAlias
+        }
     }
 
     private static func validateWorkerID(_ value: String) throws {

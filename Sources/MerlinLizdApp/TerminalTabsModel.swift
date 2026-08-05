@@ -91,6 +91,15 @@ final class TerminalTabsModel: ObservableObject {
         )
     }
 
+    func requestNewTmuxSession(on target: TerminalTarget) {
+        let title = target.sessionAttachmentTitle
+        requestTmuxCreation(
+            title: title,
+            target: target,
+            sessionName: makeSessionName(label: title)
+        )
+    }
+
     func reconcileRemoteRoutes(with snapshot: InventorySnapshot) {
         var migratedCreation = tmuxCreation
         if migratedCreation.retarget(using: snapshot) {
@@ -246,7 +255,7 @@ final class TerminalTabsModel: ObservableObject {
             let command = try command(for: tab, destination: .swiftTerm)
             let plainSSHCommand: CommandSpec?
             let startPreparation: TerminalSession.StartPreparation?
-            if MerlinCommands.sshConnectionTarget(for: tab.target) != nil {
+            if tab.target != .local {
                 plainSSHCommand = try managedTerminalCommands.plainSSHCommand(
                     target: tab.target
                 )
@@ -443,14 +452,18 @@ final class TerminalTabsModel: ObservableObject {
             }
         }
         try await externalTerminalLauncher.open(
-            command(for: tab, destination: .externalTerminal)
+            command(
+                for: tab,
+                destination: .externalTerminal
+            )
         )
     }
 
     func openPlainSSHInTerminal(_ id: String) async throws {
-        guard
-            let tab = tabs.first(where: { $0.id == id }),
-            let alias = MerlinCommands.sshConnectionTarget(for: tab.target)
+        guard let tab = tabs.first(where: { $0.id == id }) else {
+            throw TerminalTabOperationError.sessionUnavailable
+        }
+        guard let alias = MerlinCommands.sshConnectionTarget(for: tab.target)
         else {
             throw TerminalTabOperationError.sessionUnavailable
         }
@@ -521,7 +534,7 @@ final class TerminalTabsModel: ObservableObject {
             let configuredShell = ProcessInfo.processInfo.environment["SHELL"]
             let shell = configuredShell.flatMap { $0.hasPrefix("/") ? $0 : nil } ?? "/bin/zsh"
             return CommandSpec(executable: shell, arguments: ["-l"])
-        case .devbox, .worker:
+        case .devbox, .worker, .task:
             guard let sessionName = tab.sessionName else {
                 throw CommandValidationError.invalidSessionName
             }
