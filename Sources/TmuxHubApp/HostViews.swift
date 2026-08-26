@@ -3,8 +3,12 @@ import TmuxHubCore
 import SwiftUI
 
 struct HostOverviewView: View {
-    let hosts: [SSHHost]
+    let sections: [SSHHostRecencySection]
     let onSelect: (String) -> Void
+
+    private var hosts: [SSHHost] {
+        sections.flatMap(\.hosts)
+    }
 
     private var configuredCount: Int {
         hosts.filter { $0.source == .configuration }.count
@@ -49,33 +53,45 @@ struct HostOverviewView: View {
                     }
                     .frame(maxWidth: .infinity, minHeight: 300)
                 } else {
-                    LazyVGrid(
-                        columns: [GridItem(.adaptive(minimum: 230), spacing: 12)],
-                        spacing: 12
-                    ) {
-                        ForEach(hosts) { host in
-                            Button {
-                                onSelect(host.destination)
-                            } label: {
-                                SurfaceCard {
-                                    HStack {
-                                        Image(systemName: "server.rack")
-                                            .font(.title2)
-                                            .foregroundStyle(.green)
-                                        Spacer()
-                                        Image(systemName: "chevron.right")
-                                            .foregroundStyle(.tertiary)
+                    VStack(alignment: .leading, spacing: 20) {
+                        ForEach(sections) { section in
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text(section.bucket.displayTitle)
+                                    .font(.headline)
+                                    .foregroundStyle(.secondary)
+                                LazyVGrid(
+                                    columns: [GridItem(
+                                        .adaptive(minimum: 230),
+                                        spacing: 12
+                                    )],
+                                    spacing: 12
+                                ) {
+                                    ForEach(section.hosts) { host in
+                                        Button {
+                                            onSelect(host.destination)
+                                        } label: {
+                                            SurfaceCard {
+                                                HStack {
+                                                    Image(systemName: "server.rack")
+                                                        .font(.title2)
+                                                        .foregroundStyle(.green)
+                                                    Spacer()
+                                                    Image(systemName: "chevron.right")
+                                                        .foregroundStyle(.tertiary)
+                                                }
+                                                Text(host.destination)
+                                                    .font(.headline.monospaced())
+                                                    .lineLimit(1)
+                                                Text(host.source == .configuration
+                                                    ? "来自 SSH config" : "手动目标")
+                                                    .font(.caption)
+                                                    .foregroundStyle(.secondary)
+                                            }
+                                        }
+                                        .buttonStyle(.plain)
                                     }
-                                    Text(host.destination)
-                                        .font(.headline.monospaced())
-                                        .lineLimit(1)
-                                    Text(host.source == .configuration
-                                        ? "来自 SSH config" : "手动目标")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
                                 }
                             }
-                            .buttonStyle(.plain)
                         }
                     }
                 }

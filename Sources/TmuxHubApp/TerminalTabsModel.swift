@@ -9,6 +9,9 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         didSet {
             persist()
             guard let selectedTab else { return }
+            if case let .ssh(destination) = selectedTab.target {
+                noteHostUse(destination)
+            }
             runtime.prepare(selectedTab.target)
         }
     }
@@ -21,10 +24,16 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     private let tmuxSessionController: TmuxSessionController
     private let externalTerminalLauncher = ExternalTerminalLauncher()
     private let persistenceKey = "terminal-state-v2"
+    private let onRemoteHostUsed: (String, Date) -> Void
 
-    init(runtime: HubRuntime, defaults: UserDefaults = .standard) {
+    init(
+        runtime: HubRuntime,
+        defaults: UserDefaults = .standard,
+        onRemoteHostUsed: @escaping (String, Date) -> Void = { _, _ in }
+    ) {
         self.runtime = runtime
         self.defaults = defaults
+        self.onRemoteHostUsed = onRemoteHostUsed
         managedTerminalCommands = ManagedTerminalCommandBuilder(
             sshMasterPool: runtime.sshMasterPool
         )
@@ -81,6 +90,11 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
 
     func removePassword(for destination: String) throws {
         try runtime.removePassword(for: destination)
+    }
+
+    func noteHostUse(_ destination: String, at date: Date = Date()) {
+        guard IdentifierValidator.isSSHDestination(destination) else { return }
+        onRemoteHostUsed(destination, date)
     }
 
     func attachExistingSession(

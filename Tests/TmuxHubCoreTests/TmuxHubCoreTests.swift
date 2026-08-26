@@ -159,6 +159,41 @@ struct SSHConfigCatalogTests {
         let hosts = SSHConfigCatalog(homeDirectory: root).load()
         #expect(hosts.map(\.destination) == ["alpha", "beta"])
     }
+
+    @Test("orders recent hosts first and separates 3-day and 7-day boundaries")
+    func groupsHostsByRecency() {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let day: TimeInterval = 24 * 60 * 60
+        let destinations = [
+            "never-b", "day-7", "recent-2", "day-3",
+            "recent-1", "day-6", "never-a",
+        ]
+        let hosts = destinations.map {
+            SSHHost(destination: $0, source: .configuration)
+        }
+        let sections = SSHHostRecencyOrganizer.sections(
+            hosts: hosts,
+            lastUsedAt: [
+                "recent-1": now.addingTimeInterval(-day),
+                "recent-2": now.addingTimeInterval(-2 * day),
+                "day-3": now.addingTimeInterval(-3 * day),
+                "day-6": now.addingTimeInterval(-6 * day),
+                "day-7": now.addingTimeInterval(-7 * day),
+            ],
+            now: now
+        )
+
+        #expect(sections.map(\.bucket) == [
+            .withinThreeDays,
+            .threeToSevenDays,
+            .olderThanSevenDays,
+            .neverUsed,
+        ])
+        #expect(sections[0].hosts.map(\.destination) == ["recent-1", "recent-2"])
+        #expect(sections[1].hosts.map(\.destination) == ["day-3", "day-6"])
+        #expect(sections[2].hosts.map(\.destination) == ["day-7"])
+        #expect(sections[3].hosts.map(\.destination) == ["never-a", "never-b"])
+    }
 }
 
 @Suite("tmux sessions")

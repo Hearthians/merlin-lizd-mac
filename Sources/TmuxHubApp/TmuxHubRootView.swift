@@ -12,7 +12,7 @@ struct TmuxHubRootView: View {
             SidebarView(
                 model: model,
                 terminals: terminals,
-                onBrowseSessions: { sessionBrowserTarget = $0 }
+                onBrowseSessions: browseSessions
             )
             .navigationSplitViewColumnWidth(min: 230, ideal: 275, max: 360)
         } detail: {
@@ -61,7 +61,7 @@ struct TmuxHubRootView: View {
     private var selectedContent: some View {
         switch model.selection {
         case .overview:
-            HostOverviewView(hosts: model.hosts) { destination in
+            HostOverviewView(sections: model.hostSections()) { destination in
                 model.selection = .host(destination)
             }
         case .local:
@@ -76,7 +76,7 @@ struct TmuxHubRootView: View {
                     host: host,
                     onNewSession: { terminals.openSSH(destination) },
                     onBrowseSessions: {
-                        sessionBrowserTarget = .ssh(destination: destination)
+                        browseSessions(.ssh(destination: destination))
                     },
                     hasSavedPassword: {
                         try terminals.hasSavedPassword(for: destination)
@@ -96,5 +96,12 @@ struct TmuxHubRootView: View {
                 )
             }
         }
+    }
+
+    private func browseSessions(_ target: TerminalTarget) {
+        if case let .ssh(destination) = target {
+            terminals.noteHostUse(destination)
+        }
+        sessionBrowserTarget = target
     }
 }

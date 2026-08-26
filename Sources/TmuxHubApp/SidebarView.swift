@@ -12,11 +12,8 @@ struct SidebarView: View {
     @State private var newDestination = ""
     @State private var errorMessage: String?
 
-    private var filteredHosts: [SSHHost] {
-        guard !searchText.isEmpty else { return model.hosts }
-        return model.hosts.filter {
-            $0.destination.localizedCaseInsensitiveContains(searchText)
-        }
+    private var filteredSections: [SSHHostRecencySection] {
+        model.hostSections(matching: searchText)
     }
 
     var body: some View {
@@ -37,69 +34,28 @@ struct SidebarView: View {
                 .onTapGesture(count: 2) { terminals.openLocalShell() }
             }
 
-            Section {
-                ForEach(filteredHosts) { host in
-                    let selection = SidebarSelection.host(host.destination)
-                    HStack(spacing: 9) {
-                        Image(systemName: "server.rack")
-                            .foregroundStyle(.green)
-                            .frame(width: 26, height: 26)
-                            .background(
-                                Color.green.opacity(0.12),
-                                in: RoundedRectangle(cornerRadius: 7)
-                            )
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(host.destination)
-                                .font(.callout.weight(
-                                    model.selection == selection
-                                        ? .semibold : .medium
-                                ))
-                                .lineLimit(1)
-                            Text(host.source == .configuration
-                                ? "SSH config" : "手动添加")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer(minLength: 4)
-                    }
-                    .padding(.vertical, 3)
-                    .contentShape(Rectangle())
-                    .tag(selection)
-                    .onTapGesture { show(selection) }
-                    .onTapGesture(count: 2) {
-                        show(selection)
-                        onBrowseSessions(.ssh(destination: host.destination))
-                    }
-                    .contextMenu {
-                        Button("查看 tmux 会话") {
-                            onBrowseSessions(.ssh(destination: host.destination))
-                        }
-                        Button("新建 tmux 会话") {
-                            terminals.openSSH(host.destination)
-                        }
-                        Button("复制 SSH 目标") {
-                            copy(host.destination)
-                        }
-                        if model.isCustom(host.destination) {
-                            Divider()
-                            Button("移除手动目标", role: .destructive) {
-                                model.removeCustomHost(host.destination)
-                            }
-                        }
-                    }
+            if filteredSections.isEmpty {
+                Section {
+                    Text(searchText.isEmpty ? "尚无 SSH 主机" : "没有匹配的 SSH 主机")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } header: {
+                    hostSectionHeader(title: "SSH 主机", showsAddButton: true)
                 }
-            } header: {
-                HStack {
-                    Text("SSH 主机")
-                    Spacer()
-                    Button {
-                        newDestination = ""
-                        isAddingHost = true
-                    } label: {
-                        Image(systemName: "plus.circle")
+            } else {
+                ForEach(filteredSections) { section in
+                    Section {
+                        ForEach(section.hosts) { host in
+                            hostRow(host)
+                        }
+                    } header: {
+                        hostSectionHeader(
+                            title: section.id == filteredSections.first?.id
+                                ? "SSH 主机 · \(section.bucket.displayTitle)"
+                                : section.bucket.displayTitle,
+                            showsAddButton: section.id == filteredSections.first?.id
+                        )
                     }
-                    .buttonStyle(.plain)
-                    .help("添加 SSH 目标")
                 }
             }
         }
@@ -111,7 +67,7 @@ struct SidebarView: View {
             Button("添加") { addHost() }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("使用现有 ~/.ssh/config 和 SSH Agent；不会保存密码或私钥。")
+            Text("使用现有 ~/.ssh/config 和 SSH Agent；密码回退可在主机详情中启用。")
         }
         .alert("无法添加主机", isPresented: Binding(
             get: { errorMessage != nil },
@@ -144,6 +100,75 @@ struct SidebarView: View {
         .contentShape(Rectangle())
         .tag(selection)
         .onTapGesture { show(selection) }
+    }
+
+    private func hostRow(_ host: SSHHost) -> some View {
+        let selection = SidebarSelection.host(host.destination)
+        return HStack(spacing: 9) {
+            Image(systemName: "server.rack")
+                .foregroundStyle(.green)
+                .frame(width: 26, height: 26)
+                .background(
+                    Color.green.opacity(0.12),
+                    in: RoundedRectangle(cornerRadius: 7)
+                )
+            VStack(alignment: .leading, spacing: 2) {
+                Text(host.destination)
+                    .font(.callout.weight(
+                        model.selection == selection ? .semibold : .medium
+                    ))
+                    .lineLimit(1)
+                Text(host.source == .configuration ? "SSH config" : "手动添加")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 4)
+        }
+        .padding(.vertical, 3)
+        .contentShape(Rectangle())
+        .tag(selection)
+        .onTapGesture { show(selection) }
+        .onTapGesture(count: 2) {
+            show(selection)
+            onBrowseSessions(.ssh(destination: host.destination))
+        }
+        .contextMenu {
+            Button("查看 tmux 会话") {
+                onBrowseSessions(.ssh(destination: host.destination))
+            }
+            Button("新建 tmux 会话") {
+                terminals.openSSH(host.destination)
+            }
+            Button("复制 SSH 目标") {
+                copy(host.destination)
+            }
+            if model.isCustom(host.destination) {
+                Divider()
+                Button("移除手动目标", role: .destructive) {
+                    model.removeCustomHost(host.destination)
+                }
+            }
+        }
+    }
+
+    private func hostSectionHeader(
+        title: String,
+        showsAddButton: Bool
+    ) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            if showsAddButton {
+                Button {
+                    newDestination = ""
+                    isAddingHost = true
+                } label: {
+                    Image(systemName: "plus.circle")
+                }
+                .buttonStyle(.plain)
+                .help("添加 SSH 目标")
+            }
+        }
     }
 
     private var selectionBinding: Binding<SidebarSelection> {

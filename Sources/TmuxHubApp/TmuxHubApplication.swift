@@ -12,10 +12,16 @@ struct TmuxHubApplication: App {
 
     init() {
         let runtime = HubRuntime()
+        let model = AppModel()
         self.runtime = runtime
-        _model = StateObject(wrappedValue: AppModel())
+        _model = StateObject(wrappedValue: model)
         _terminals = StateObject(
-            wrappedValue: TerminalTabsModel(runtime: runtime)
+            wrappedValue: TerminalTabsModel(
+                runtime: runtime,
+                onRemoteHostUsed: { [weak model] destination, date in
+                    model?.recordUse(of: destination, at: date)
+                }
+            )
         )
         appDelegate.configure(runtime: runtime)
     }
