@@ -3,51 +3,74 @@
 import PackageDescription
 
 let package = Package(
-    name: "MerlinHubX",
+    name: "SSHTmuxHub",
     platforms: [
         .macOS(.v14)
     ],
     products: [
-        .library(name: "MerlinLizdCore", targets: ["MerlinLizdCore"]),
-        .library(
-            name: "MerlinLizdCodexAdapter",
-            targets: ["MerlinLizdCodexAdapter"]
-        ),
-        .executable(name: "MerlinHubX", targets: ["MerlinLizdApp"]),
-        .executable(name: "MerlinLizdCoreTests", targets: ["MerlinLizdCoreTests"])
+        .library(name: "SSHTmuxHubCore", targets: ["SSHTmuxHubCore"]),
+        .executable(name: "SSHTmuxHub", targets: ["SSHTmuxHubApp"]),
+        .executable(
+            name: "SSHTmuxHubCoreTests",
+            targets: ["SSHTmuxHubCoreTests"]
+        )
     ],
     dependencies: [
         .package(path: "Vendor/SwiftTerm")
     ],
     targets: [
-        .target(name: "MerlinLizdCore"),
         .target(
-            name: "MerlinLizdCodexAdapter",
-            dependencies: ["MerlinLizdCore"]
+            name: "SSHTmuxHubCore",
+            path: "Sources/SSHTmuxHubCore",
+            sources: [
+                "ExternalTerminalLauncher.swift",
+                "IdentifierValidator.swift",
+                "InventoryProcess.swift",
+                "ManagedTerminalCommandBuilder.swift",
+                "SSHHost.swift",
+                "SSHTmuxCommands.swift",
+                "SSHMasterCommands.swift",
+                "SSHMasterPool.swift",
+                "TerminalState.swift",
+                "TerminalTabTmuxCoordinator.swift",
+                "TmuxSessionController.swift",
+                "TmuxSessionDiscovery.swift",
+                "TmuxSessionParser.swift",
+            ]
         ),
         .target(
             name: "_Testing_Foundation",
             path: "Sources/TestingFoundationShim"
         ),
         .executableTarget(
-            name: "MerlinLizdApp",
+            name: "SSHTmuxHubApp",
             dependencies: [
-                "MerlinLizdCore",
-                "MerlinLizdCodexAdapter",
+                "SSHTmuxHubCore",
                 .product(name: "SwiftTerm", package: "SwiftTerm"),
+            ],
+            path: "Sources/SSHTmuxHubApp",
+            sources: [
+                "AppModel.swift",
+                "DesignSystem.swift",
+                "HostViews.swift",
+                "HubRuntime.swift",
+                "SSHTmuxHubApplication.swift",
+                "SSHTmuxHubRootView.swift",
+                "SidebarView.swift",
+                "TerminalSession.swift",
+                "TerminalSessionHost.swift",
+                "TerminalTabsModel.swift",
+                "TerminalWorkspaceView.swift",
+                "TmuxSessionBrowserView.swift",
             ]
         ),
         .executableTarget(
-            name: "MerlinLizdCoreTests",
+            name: "SSHTmuxHubCoreTests",
             dependencies: [
-                "MerlinLizdCore",
-                "MerlinLizdCodexAdapter",
+                "SSHTmuxHubCore",
                 "_Testing_Foundation",
             ],
-            path: "Tests/MerlinLizdCoreTests",
-            resources: [
-                .copy("Fixtures")
-            ],
+            path: "Tests/SSHTmuxHubCoreTests",
             swiftSettings: [
                 .unsafeFlags([
                     "-F", "/Library/Developer/CommandLineTools/Library/Developer/Frameworks"

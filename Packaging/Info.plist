@@ -5,17 +5,17 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
-	<string>MerlinHubX</string>
+	<string>SSH Tmux Hub</string>
 	<key>CFBundleExecutable</key>
-	<string>MerlinHubX</string>
+	<string>SSHTmuxHub</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.lizd.merlinhubx</string>
+	<string>fun.gfyh.ssh-tmux-hub</string>
 	<key>CFBundleIconFile</key>
 	<string>AppIcon.icns</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>MerlinHubX</string>
+	<string>SSH Tmux Hub</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

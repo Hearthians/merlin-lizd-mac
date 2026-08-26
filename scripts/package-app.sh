@@ -3,14 +3,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-PRODUCT_NAME="MerlinHubX"
-APP_NAME="MerlinHubX"
+PRODUCT_NAME="SSHTmuxHub"
+APP_NAME="SSH Tmux Hub"
 DIST_DIR="${DIST_DIR:-$PROJECT_ROOT/dist}"
 APP_PATH="$DIST_DIR/$APP_NAME.app"
 INFO_PLIST="$PROJECT_ROOT/Packaging/Info.plist"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
-    print -u2 "error: packaging MerlinHubX requires macOS"
+    print -u2 "error: packaging SSH Tmux Hub requires macOS"
     exit 1
 fi
 
@@ -26,7 +26,7 @@ if [[ ! -x "$EXECUTABLE" ]]; then
     exit 1
 fi
 
-STAGING_ROOT="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/merlin-hub-x-package.XXXXXX")"
+STAGING_ROOT="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/ssh-tmux-hub-package.XXXXXX")"
 trap '/bin/rm -rf "$STAGING_ROOT"' EXIT
 
 STAGED_APP="$STAGING_ROOT/$APP_NAME.app"

@@ -2,7 +2,7 @@
 //  TerminalProgressBarView.swift
 //  SwiftTerm
 //
-//  Created by Codex on 2/1/26.
+//  Local vendored addition, 2/1/26.
 //
 
 #if os(macOS)

@@ -1,4 +1,0 @@
-{"id":"tool-req-1","method":"item/tool/call","params":{"arguments":{},"callId":"call-1","threadId":"thread-1","tool":"observe_screen","turnId":"turn-1","namespace":"merlin_tmux"}}
-{"id":"tool-req-1","result":{"contentItems":[{"type":"inputText","text":"{\"revision\":12}"}],"success":true}}
-{"id":"tool-req-2","method":"item/tool/call","params":{"arguments":{},"callId":"call-2","threadId":"thread-1","tool":"observe_screen","turnId":"turn-2"}}
-{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":1784000102000,"item":{"id":"call-1","type":"dynamicToolCall","tool":"observe_screen","arguments":{},"namespace":"merlin_tmux","status":"completed","contentItems":[{"type":"inputText","text":"{\"revision\":12}"}],"success":true}}}
