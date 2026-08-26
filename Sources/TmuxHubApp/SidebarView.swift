@@ -1,5 +1,5 @@
 import AppKit
-import SSHTmuxHubCore
+import TmuxHubCore
 import SwiftUI
 
 struct SidebarView: View {
@@ -104,7 +104,7 @@ struct SidebarView: View {
             }
         }
         .listStyle(.sidebar)
-        .navigationTitle("SSH Tmux Hub")
+        .navigationTitle("TmuxHub")
         .searchable(text: $searchText, placement: .sidebar, prompt: "搜索 SSH 主机")
         .alert("添加 SSH 目标", isPresented: $isAddingHost) {
             TextField("alias 或 user@host", text: $newDestination)

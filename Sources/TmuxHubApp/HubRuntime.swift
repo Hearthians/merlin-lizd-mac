@@ -1,4 +1,4 @@
-import SSHTmuxHubCore
+import TmuxHubCore
 
 @MainActor
 final class HubRuntime {

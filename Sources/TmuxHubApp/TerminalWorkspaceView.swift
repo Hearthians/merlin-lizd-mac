@@ -1,5 +1,5 @@
 import AppKit
-import SSHTmuxHubCore
+import TmuxHubCore
 import SwiftUI
 
 struct TerminalWorkspaceView: View {

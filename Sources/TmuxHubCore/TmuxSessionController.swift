@@ -49,7 +49,7 @@ public actor TmuxSessionController {
         to newName: String,
         identity: TmuxSessionIdentity? = nil
     ) async throws {
-        let command = try SSHTmuxCommands.renameTmuxSession(
+        let command = try TmuxCommands.renameTmuxSession(
             target: target,
             from: currentName,
             to: newName,
@@ -63,7 +63,7 @@ public actor TmuxSessionController {
         target: TerminalTarget,
         sessionName: String
     ) async throws {
-        let command = try SSHTmuxCommands.terminateTmuxSession(
+        let command = try TmuxCommands.terminateTmuxSession(
             target: target,
             sessionName: sessionName,
             localTmuxPath: try resolvedLocalTmuxPath(for: target)

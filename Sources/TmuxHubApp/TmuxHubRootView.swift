@@ -1,8 +1,8 @@
 import AppKit
-import SSHTmuxHubCore
+import TmuxHubCore
 import SwiftUI
 
-struct SSHTmuxHubRootView: View {
+struct TmuxHubRootView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var terminals: TerminalTabsModel
     @State private var sessionBrowserTarget: TerminalTarget?

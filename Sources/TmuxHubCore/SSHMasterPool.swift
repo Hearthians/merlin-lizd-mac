@@ -45,7 +45,7 @@ public final class SSHMasterPool: @unchecked Sendable {
     /// systems whose per-user temporary directory has a long sandboxed path.
     static func defaultSocketDirectory() -> URL {
         URL(fileURLWithPath: "/tmp", isDirectory: true)
-            .appendingPathComponent("ssh-tmux-hub-\(getuid())", isDirectory: true)
+            .appendingPathComponent("tmuxhub-\(getuid())", isDirectory: true)
     }
 
     convenience init(

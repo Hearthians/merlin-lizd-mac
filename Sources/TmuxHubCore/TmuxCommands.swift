@@ -19,7 +19,7 @@ public enum CommandValidationError: Error, Equatable, Sendable {
 
 /// Builds argv-only OpenSSH and tmux commands for local machines and arbitrary
 /// destinations understood by the user's existing OpenSSH configuration.
-public enum SSHTmuxCommands {
+public enum TmuxCommands {
     public static func sshDestination(for target: TerminalTarget) -> String? {
         target.sshDestination
     }

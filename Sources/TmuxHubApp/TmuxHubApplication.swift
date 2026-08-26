@@ -1,10 +1,10 @@
 import AppKit
-import SSHTmuxHubCore
+import TmuxHubCore
 import SwiftUI
 
 @main
-struct SSHTmuxHubApplication: App {
-    @NSApplicationDelegateAdaptor(SSHTmuxHubApplicationDelegate.self)
+struct TmuxHubApplication: App {
+    @NSApplicationDelegateAdaptor(TmuxHubApplicationDelegate.self)
     private var appDelegate
     @StateObject private var model: AppModel
     @StateObject private var terminals: TerminalTabsModel
@@ -21,8 +21,8 @@ struct SSHTmuxHubApplication: App {
     }
 
     var body: some Scene {
-        WindowGroup("SSH Tmux Hub") {
-            SSHTmuxHubRootView(model: model, terminals: terminals)
+        WindowGroup("TmuxHub") {
+            TmuxHubRootView(model: model, terminals: terminals)
                 .frame(minWidth: 900, minHeight: 600)
         }
         .defaultSize(width: 1160, height: 760)
@@ -53,7 +53,7 @@ struct SSHTmuxHubApplication: App {
 }
 
 @MainActor
-private final class SSHTmuxHubApplicationDelegate: NSObject,
+private final class TmuxHubApplicationDelegate: NSObject,
     NSApplicationDelegate
 {
     private var runtime: HubRuntime?

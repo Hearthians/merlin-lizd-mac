@@ -1,7 +1,7 @@
 import Combine
 import Darwin
 import Foundation
-import SSHTmuxHubCore
+import TmuxHubCore
 @preconcurrency import SwiftTerm
 
 @MainActor

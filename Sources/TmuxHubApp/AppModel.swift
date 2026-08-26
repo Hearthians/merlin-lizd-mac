@@ -1,5 +1,5 @@
 import Foundation
-import SSHTmuxHubCore
+import TmuxHubCore
 
 enum SidebarSelection: Hashable {
     case overview

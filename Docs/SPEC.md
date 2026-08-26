@@ -1,4 +1,4 @@
-# SSH Tmux Hub Technical Specification
+# TmuxHub Technical Specification
 
 ## Scope
 

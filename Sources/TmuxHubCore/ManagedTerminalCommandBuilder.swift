@@ -38,7 +38,7 @@ public struct ManagedTerminalCommandBuilder: Sendable {
             throw ManagedTerminalCommandError.remoteTargetRequired
         case let .ssh(destination):
             alias = destination
-            command = try SSHTmuxCommands.remoteTerminal(
+            command = try TmuxCommands.remoteTerminal(
                 destination: destination,
                 sessionName: sessionName
             )

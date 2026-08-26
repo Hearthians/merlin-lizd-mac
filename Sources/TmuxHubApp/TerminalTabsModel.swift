@@ -1,5 +1,5 @@
 import Foundation
-import SSHTmuxHubCore
+import TmuxHubCore
 import SwiftUI
 
 @MainActor

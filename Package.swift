@@ -3,16 +3,16 @@
 import PackageDescription
 
 let package = Package(
-    name: "SSHTmuxHub",
+    name: "TmuxHub",
     platforms: [
         .macOS(.v14)
     ],
     products: [
-        .library(name: "SSHTmuxHubCore", targets: ["SSHTmuxHubCore"]),
-        .executable(name: "SSHTmuxHub", targets: ["SSHTmuxHubApp"]),
+        .library(name: "TmuxHubCore", targets: ["TmuxHubCore"]),
+        .executable(name: "TmuxHub", targets: ["TmuxHubApp"]),
         .executable(
-            name: "SSHTmuxHubCoreTests",
-            targets: ["SSHTmuxHubCoreTests"]
+            name: "TmuxHubCoreTests",
+            targets: ["TmuxHubCoreTests"]
         )
     ],
     dependencies: [
@@ -20,15 +20,15 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "SSHTmuxHubCore",
-            path: "Sources/SSHTmuxHubCore",
+            name: "TmuxHubCore",
+            path: "Sources/TmuxHubCore",
             sources: [
                 "ExternalTerminalLauncher.swift",
                 "IdentifierValidator.swift",
                 "InventoryProcess.swift",
                 "ManagedTerminalCommandBuilder.swift",
                 "SSHHost.swift",
-                "SSHTmuxCommands.swift",
+                "TmuxCommands.swift",
                 "SSHMasterCommands.swift",
                 "SSHMasterPool.swift",
                 "TerminalState.swift",
@@ -43,19 +43,19 @@ let package = Package(
             path: "Sources/TestingFoundationShim"
         ),
         .executableTarget(
-            name: "SSHTmuxHubApp",
+            name: "TmuxHubApp",
             dependencies: [
-                "SSHTmuxHubCore",
+                "TmuxHubCore",
                 .product(name: "SwiftTerm", package: "SwiftTerm"),
             ],
-            path: "Sources/SSHTmuxHubApp",
+            path: "Sources/TmuxHubApp",
             sources: [
                 "AppModel.swift",
                 "DesignSystem.swift",
                 "HostViews.swift",
                 "HubRuntime.swift",
-                "SSHTmuxHubApplication.swift",
-                "SSHTmuxHubRootView.swift",
+                "TmuxHubApplication.swift",
+                "TmuxHubRootView.swift",
                 "SidebarView.swift",
                 "TerminalSession.swift",
                 "TerminalSessionHost.swift",
@@ -65,12 +65,12 @@ let package = Package(
             ]
         ),
         .executableTarget(
-            name: "SSHTmuxHubCoreTests",
+            name: "TmuxHubCoreTests",
             dependencies: [
-                "SSHTmuxHubCore",
+                "TmuxHubCore",
                 "_Testing_Foundation",
             ],
-            path: "Tests/SSHTmuxHubCoreTests",
+            path: "Tests/TmuxHubCoreTests",
             swiftSettings: [
                 .unsafeFlags([
                     "-F", "/Library/Developer/CommandLineTools/Library/Developer/Frameworks"

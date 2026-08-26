@@ -1,6 +1,6 @@
-# SSH Tmux Hub for macOS
+# TmuxHub for macOS
 
-SSH Tmux Hub 是一个原生 macOS SSH/tmux 会话管理器。它直接使用系统
+TmuxHub 是一个原生 macOS SSH/tmux 会话管理器。它直接使用系统
 OpenSSH、`~/.ssh/config`、SSH Agent 和远端 `tmux`，不依赖任何云平台 CLI，
 也不保存密码、私钥或平台 token。
 
@@ -44,7 +44,7 @@ Include ~/.ssh/conf.d/*.conf
 ```sh
 ./scripts/test.sh
 /usr/bin/swift build
-/usr/bin/swift run SSHTmuxHub
+/usr/bin/swift run TmuxHub
 ```
 
 测试使用本地 fake process，不会连接或修改真实 SSH 主机。
@@ -61,7 +61,7 @@ Include ~/.ssh/conf.d/*.conf
 
 ```sh
 ./scripts/package-app.sh
-open "dist/SSH Tmux Hub.app"
+open "dist/TmuxHub.app"
 ```
 
 脚本会构建 release product、组装 `.app` 并做本地 ad-hoc 签名。分发给其他
@@ -73,7 +73,7 @@ Mac 前仍需使用 Developer ID 签名并公证。
 - SSH 目标拒绝空白、控制字符、shell 元字符和前导 `-`，避免 option 注入。
 - tmux 会话名限制为 1–64 个安全字符。
 - 后台 SSH 查询使用 `BatchMode=yes` 和超时；交互终端仍由 OpenSSH 正常处理认证。
-- Control socket 位于当前用户专属的 `/tmp/ssh-tmux-hub-<uid>`，退出时清理。
+- Control socket 位于当前用户专属的 `/tmp/tmuxhub-<uid>`，退出时清理。
 - 只有用户明确选择“终止 tmux”时才会执行 `kill-session`。
 
 SwiftTerm 1.14.0 vendored 在 `Vendor/SwiftTerm`，其中保留了让 Metal shader

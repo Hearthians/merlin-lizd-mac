@@ -5,17 +5,17 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
-	<string>SSH Tmux Hub</string>
+	<string>TmuxHub</string>
 	<key>CFBundleExecutable</key>
-	<string>SSHTmuxHub</string>
+	<string>TmuxHub</string>
 	<key>CFBundleIdentifier</key>
-	<string>fun.gfyh.ssh-tmux-hub</string>
+	<string>fun.gfyh.tmuxhub</string>
 	<key>CFBundleIconFile</key>
 	<string>AppIcon.icns</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>SSH Tmux Hub</string>
+	<string>TmuxHub</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-@testable import SSHTmuxHubCore
+@testable import TmuxHubCore
 
 @Suite("SSH and tmux command safety")
 struct CommandTests {
@@ -19,7 +19,7 @@ struct CommandTests {
 
     @Test("builds a direct interactive SSH tmux command")
     func buildsRemoteTerminal() throws {
-        let command = try SSHTmuxCommands.remoteTerminal(
+        let command = try TmuxCommands.remoteTerminal(
             destination: "lizd@gfyh.fun",
             sessionName: "hub-main"
         )
@@ -35,7 +35,7 @@ struct CommandTests {
 
     @Test("quotes a server session id when renaming remotely")
     func quotesIdentitySelector() throws {
-        let command = try SSHTmuxCommands.renameTmuxSession(
+        let command = try TmuxCommands.renameTmuxSession(
             target: .ssh(destination: "prod"),
             from: "old",
             to: "new",
@@ -47,7 +47,7 @@ struct CommandTests {
     @Test("rejects unsafe session names")
     func rejectsUnsafeSessionName() {
         #expect(throws: CommandValidationError.invalidSessionName) {
-            try SSHTmuxCommands.remoteTerminal(
+            try TmuxCommands.remoteTerminal(
                 destination: "prod",
                 sessionName: "unsafe$(id)"
             )

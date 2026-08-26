@@ -250,7 +250,7 @@ public actor TmuxSessionDiscovery {
         }
 
         do {
-            let command = try SSHTmuxCommands.listTmuxSessions(
+            let command = try TmuxCommands.listTmuxSessions(
                 target: target,
                 localTmuxPath: localPath
             )
