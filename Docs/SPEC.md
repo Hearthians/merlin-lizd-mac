@@ -33,6 +33,14 @@ destination. Concurrent preparations are coalesced; foreground requests take
 priority, read-only operations may reconnect and replay once after exit 255,
 and mutations never replay automatically.
 
+Authentication remains key-first. A destination may opt into a password
+fallback stored as a macOS Keychain generic-password item. For that destination,
+OpenSSH tries public-key authentication before keyboard-interactive/password.
+The packaged AskPass helper receives the password only through the child-process
+environment; it never appears in argv, rendered Terminal.app commands, logs or
+SSH configuration. Password fallback uses `StrictHostKeyChecking=accept-new`,
+which accepts a host only on first contact and still rejects changed host keys.
+
 Interactive terminals use `ssh -tt` plus the same control socket and run:
 
 ```text
@@ -62,6 +70,7 @@ remote sessions were confirmed terminated.
 
 ## Persistence
 
-Only validated target destinations, tab titles, session names and stable tmux
-identities are persisted. Credentials, raw SSH config, command output and
-ControlPath values are not persisted.
+Validated target destinations, tab titles, session names and stable tmux
+identities are persisted in UserDefaults. Optional SSH passwords are isolated in
+macOS Keychain under service `fun.gfyh.tmuxhub.ssh-password`. Private keys, raw
+SSH config, command output and ControlPath values are not persisted by TmuxHub.

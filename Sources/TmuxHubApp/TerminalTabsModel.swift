@@ -71,6 +71,18 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         )
     }
 
+    func hasSavedPassword(for destination: String) throws -> Bool {
+        try runtime.hasSavedPassword(for: destination)
+    }
+
+    func savePassword(_ password: String, for destination: String) throws {
+        try runtime.savePassword(password, for: destination)
+    }
+
+    func removePassword(for destination: String) throws {
+        try runtime.removePassword(for: destination)
+    }
+
     func attachExistingSession(
         _ session: TmuxSessionRecord,
         target: TerminalTarget

@@ -106,6 +106,13 @@ struct SSHHostDetailView: View {
     let host: SSHHost
     let onNewSession: () -> Void
     let onBrowseSessions: () -> Void
+    let hasSavedPassword: () throws -> Bool
+    let onSavePassword: (String) throws -> Void
+    let onRemovePassword: () throws -> Void
+    @State private var password = ""
+    @State private var passwordIsSaved = false
+    @State private var passwordStatusMessage: String?
+    @State private var passwordErrorMessage: String?
 
     var body: some View {
         ScrollView {
@@ -161,13 +168,99 @@ struct SSHHostDetailView: View {
                         systemImage: "bolt.horizontal.circle"
                     )
                     Label(
-                        "认证完全交给 ~/.ssh/config、SSH Agent 或交互式 SSH。",
+                        "优先使用 ~/.ssh/config 和 SSH Agent；需要时再启用密码回退。",
                         systemImage: "key"
                     )
                 }
                 .foregroundStyle(.secondary)
+
+                SurfaceCard("密码回退（可选）") {
+                    Text(
+                        "仅当密钥认证不可用时使用。密码保存在 macOS 钥匙串，"
+                            + "不会写入 SSH 配置、命令行或日志。"
+                    )
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+
+                    HStack(spacing: 10) {
+                        SecureField(
+                            passwordIsSaved ? "输入新密码以替换" : "SSH 密码",
+                            text: $password
+                        )
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit(savePassword)
+
+                        Button(passwordIsSaved ? "更新" : "保存并启用") {
+                            savePassword()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(password.isEmpty)
+
+                        if passwordIsSaved {
+                            Button("移除", role: .destructive) {
+                                removePassword()
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+
+                    if passwordIsSaved {
+                        Label("已为此主机启用钥匙串密码回退", systemImage: "checkmark.shield")
+                            .foregroundStyle(.green)
+                    } else {
+                        Label("未保存密码，继续使用密钥或终端交互认证", systemImage: "key")
+                            .foregroundStyle(.secondary)
+                    }
+                    if let passwordStatusMessage {
+                        Text(passwordStatusMessage)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if let passwordErrorMessage {
+                        Text(passwordErrorMessage)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
+                }
             }
             .padding(24)
+        }
+        .task(id: host.destination) {
+            refreshPasswordStatus()
+        }
+    }
+
+    private func refreshPasswordStatus() {
+        do {
+            passwordIsSaved = try hasSavedPassword()
+            passwordErrorMessage = nil
+        } catch {
+            passwordIsSaved = false
+            passwordErrorMessage = error.localizedDescription
+        }
+    }
+
+    private func savePassword() {
+        do {
+            try onSavePassword(password)
+            password = ""
+            passwordIsSaved = true
+            passwordStatusMessage = "密码已保存；后续连接会先尝试密钥，再回退到密码。"
+            passwordErrorMessage = nil
+        } catch {
+            passwordErrorMessage = error.localizedDescription
+        }
+    }
+
+    private func removePassword() {
+        do {
+            try onRemovePassword()
+            password = ""
+            passwordIsSaved = false
+            passwordStatusMessage = "已移除密码；现有 SSH 连接不会被中断。"
+            passwordErrorMessage = nil
+        } catch {
+            passwordErrorMessage = error.localizedDescription
         }
     }
 }

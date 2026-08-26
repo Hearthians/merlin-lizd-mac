@@ -27,15 +27,20 @@ public final class SSHMasterPool: @unchecked Sendable {
     private let state: SSHMasterPoolState
     private let shutdownCoordinator = SSHMasterShutdownCoordinator()
     private let managedOwnership: SSHManagedOwnershipRegistry
+    private let passwordProvider: SSHPasswordProvider
     private let retryBoundaryHook: (@Sendable () async -> Void)?
     private let retryInvalidationHook: (@Sendable () async -> Void)?
 
-    public convenience init(maxConcurrentPreparations: Int = 4) {
+    public convenience init(
+        maxConcurrentPreparations: Int = 4,
+        passwordProvider: @escaping SSHPasswordProvider = { _ in nil }
+    ) {
         let directory = Self.defaultSocketDirectory()
         self.init(
             directory: directory,
             runner: FoundationInventoryProcessRunner(),
             maxConcurrentPreparations: maxConcurrentPreparations,
+            passwordProvider: passwordProvider,
             retryBoundaryHook: nil,
             retryInvalidationHook: nil
         )
@@ -52,6 +57,7 @@ public final class SSHMasterPool: @unchecked Sendable {
         testDirectory: URL,
         runner: any InventoryProcessRunning,
         maxConcurrentPreparations: Int = 4,
+        passwordProvider: @escaping SSHPasswordProvider = { _ in nil },
         retryBoundaryHook: (@Sendable () async -> Void)? = nil,
         retryInvalidationHook: (@Sendable () async -> Void)? = nil
     ) {
@@ -59,6 +65,7 @@ public final class SSHMasterPool: @unchecked Sendable {
             directory: testDirectory,
             runner: runner,
             maxConcurrentPreparations: maxConcurrentPreparations,
+            passwordProvider: passwordProvider,
             retryBoundaryHook: retryBoundaryHook,
             retryInvalidationHook: retryInvalidationHook
         )
@@ -68,6 +75,7 @@ public final class SSHMasterPool: @unchecked Sendable {
         directory: URL,
         runner: any InventoryProcessRunning,
         maxConcurrentPreparations: Int,
+        passwordProvider: @escaping SSHPasswordProvider,
         retryBoundaryHook: (@Sendable () async -> Void)?,
         retryInvalidationHook: (@Sendable () async -> Void)?
     ) {
@@ -75,13 +83,15 @@ public final class SSHMasterPool: @unchecked Sendable {
         commands = SSHMasterCommands(directory: directory)
         managedOwnership = SSHManagedOwnershipRegistry(directory: directory)
         self.runner = runner
+        self.passwordProvider = passwordProvider
         self.retryBoundaryHook = retryBoundaryHook
         self.retryInvalidationHook = retryInvalidationHook
         state = SSHMasterPoolState(
             directory: directory,
             commands: commands,
             runner: runner,
-            maxConcurrentPreparations: maxConcurrentPreparations
+            maxConcurrentPreparations: maxConcurrentPreparations,
+            passwordProvider: passwordProvider
         )
     }
 
@@ -99,7 +109,11 @@ public final class SSHMasterPool: @unchecked Sendable {
         _ command: CommandSpec,
         alias: String
     ) throws -> CommandSpec {
-        let managed = try commands.managed(command, alias: alias)
+        let managed = try commands.managed(
+            command,
+            alias: alias,
+            authentication: passwordProvider(alias)
+        )
         try managedOwnership.register(alias: alias)
         return managed
     }
@@ -347,6 +361,7 @@ private actor SSHMasterPoolState {
     private let commands: SSHMasterCommands
     private let runner: any InventoryProcessRunning
     private let maxConcurrentPreparations: Int
+    private let passwordProvider: SSHPasswordProvider
 
     private var readyAliases: Set<String> = []
     private var ownedAliases: Set<String> = []
@@ -373,12 +388,14 @@ private actor SSHMasterPoolState {
         directory: URL,
         commands: SSHMasterCommands,
         runner: any InventoryProcessRunning,
-        maxConcurrentPreparations: Int
+        maxConcurrentPreparations: Int,
+        passwordProvider: @escaping SSHPasswordProvider
     ) {
         self.directory = directory
         self.commands = commands
         self.runner = runner
         self.maxConcurrentPreparations = maxConcurrentPreparations
+        self.passwordProvider = passwordProvider
     }
 
     func prepare(
@@ -557,7 +574,10 @@ private actor SSHMasterPoolState {
             // A thrown check did not prove that the socket is abandoned.
         }
 
-        guard let prepare = try? commands.prepare(alias: alias) else { return .failed }
+        guard let prepare = try? commands.prepare(
+            alias: alias,
+            authentication: passwordProvider(alias)
+        ) else { return .failed }
         do {
             let output = try await runner.run(prepare)
             return output.exitCode == 0 ? .ready : .failed

@@ -63,6 +63,61 @@ struct CommandTests {
         #expect(rendered ==
             #"'/usr/bin/printf' '%s' 'it'\''s $(not-a-command); $HOME'"#)
     }
+
+    @Test("adds an optional password fallback without exposing it in argv")
+    func buildsPasswordFallback() throws {
+        let directory = URL(fileURLWithPath: "/tmp/th-auth", isDirectory: true)
+        let commands = SSHMasterCommands(directory: directory)
+        let authentication = try #require(SSHPasswordAuthentication(
+            password: "example password",
+            askPassExecutable: "/tmp/TmuxHubAskPass"
+        ))
+        let base = try TmuxCommands.listTmuxSessions(
+            target: .ssh(destination: "prod")
+        )
+        let managed = try commands.managed(
+            base,
+            alias: "prod",
+            authentication: authentication
+        )
+
+        #expect(!managed.arguments.contains("BatchMode=yes"))
+        #expect(managed.arguments.contains("BatchMode=no"))
+        #expect(managed.arguments.contains(
+            "PreferredAuthentications=publickey,keyboard-interactive,password"
+        ))
+        #expect(managed.environment["SSH_ASKPASS"] == "/tmp/TmuxHubAskPass")
+        #expect(managed.environment["TMUXHUB_SSH_PASSWORD"] == "example password")
+        #expect(!managed.arguments.contains("example password"))
+        let rendered = try ShellCommandRenderer.render(managed)
+        #expect(!rendered.contains("example password"))
+    }
+
+    @Test("keeps interactive SSH prompts enabled without a saved password")
+    func preservesInteractiveAuthentication() throws {
+        let directory = URL(fileURLWithPath: "/tmp/th-interactive", isDirectory: true)
+        let commands = SSHMasterCommands(directory: directory)
+        let base = try TmuxCommands.remoteTerminal(
+            destination: "prod",
+            sessionName: "main"
+        )
+        let managed = try commands.managed(base, alias: "prod")
+        #expect(!managed.arguments.contains("BatchMode=yes"))
+        #expect(managed.environment.isEmpty)
+    }
+
+    @Test("passes command-specific environment to child processes")
+    func passesEnvironment() async throws {
+        let output = try await FoundationInventoryProcessRunner().run(
+            CommandSpec(
+                executable: "/usr/bin/printenv",
+                arguments: ["TMUXHUB_TEST_MARKER"],
+                environment: ["TMUXHUB_TEST_MARKER": "available"]
+            )
+        )
+        #expect(output.exitCode == 0)
+        #expect(output.stdout == "available\n")
+    }
 }
 
 @Suite("OpenSSH config catalog")

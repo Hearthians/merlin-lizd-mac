@@ -77,6 +77,15 @@ struct TmuxHubRootView: View {
                     onNewSession: { terminals.openSSH(destination) },
                     onBrowseSessions: {
                         sessionBrowserTarget = .ssh(destination: destination)
+                    },
+                    hasSavedPassword: {
+                        try terminals.hasSavedPassword(for: destination)
+                    },
+                    onSavePassword: {
+                        try terminals.savePassword($0, for: destination)
+                    },
+                    onRemovePassword: {
+                        try terminals.removePassword(for: destination)
                     }
                 )
             } else {

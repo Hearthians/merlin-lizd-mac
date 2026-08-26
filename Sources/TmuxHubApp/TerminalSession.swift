@@ -17,7 +17,7 @@ final class TerminalSession: ObservableObject, Identifiable,
 
     let id: UUID
     let terminalView: LocalProcessTerminalView
-    private let command: CommandSpec
+    private var command: CommandSpec?
     private let currentDirectory: String?
 
     @Published private(set) var state: State = .idle
@@ -37,19 +37,23 @@ final class TerminalSession: ObservableObject, Identifiable,
     }
 
     func startIfNeeded() {
-        guard !hasStarted, state != .closed else { return }
+        guard !hasStarted, state != .closed, let command else { return }
         hasStarted = true
         terminalView.startProcess(
             executable: command.executable,
             args: command.arguments,
-            environment: TerminalProcessEnvironment.inherited(),
+            environment: TerminalProcessEnvironment.inherited(
+                overrides: command.environment
+            ),
             currentDirectory: currentDirectory
         )
+        self.command = nil
         state = .running
     }
 
     func close() {
         guard state != .closed else { return }
+        command = nil
         let shouldTerminate = state == .running && terminalView.process.running
         let processID = shouldTerminate ? terminalView.process.shellPid : 0
         state = .closed
@@ -126,11 +130,12 @@ private enum TerminalProcessReaper {
 }
 
 private enum TerminalProcessEnvironment {
-    static func inherited() -> [String] {
+    static func inherited(overrides: [String: String]) -> [String] {
         var environment = ProcessInfo.processInfo.environment
         environment["TERM"] = "xterm-256color"
         environment["COLORTERM"] = "truecolor"
         environment["LANG"] = environment["LANG"] ?? "en_US.UTF-8"
+        environment.merge(overrides, uniquingKeysWith: { _, override in override })
         return environment.map { "\($0.key)=\($0.value)" }
     }
 }

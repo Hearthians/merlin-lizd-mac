@@ -2,7 +2,8 @@
 
 TmuxHub 是一个原生 macOS SSH/tmux 会话管理器。它直接使用系统
 OpenSSH、`~/.ssh/config`、SSH Agent 和远端 `tmux`，不依赖任何云平台 CLI，
-也不保存密码、私钥或平台 token。
+也不保存私钥或平台 token。用户可以按主机选择是否把 SSH 密码安全保存到
+macOS 钥匙串，作为密钥认证失败后的回退。
 
 原 Merlin 平台版本完整保存在 `merlin` 分支；当前分支只包含通用 SSH/tmux
 功能。
@@ -15,6 +16,7 @@ OpenSSH、`~/.ssh/config`、SSH Agent 和远端 `tmux`，不依赖任何云平�
 - 每个远程终端都由 tmux 托管；关闭 App 标签只断开 SSH，远端任务继续运行。
 - SSH 断开后可以原地重连同一个 tmux 会话。
 - 使用 App 自己的 OpenSSH ControlMaster 复用连接，加快刷新与 tmux 操作。
+- 每个主机可选密码回退；默认仍优先使用 SSH config、私钥和 SSH Agent。
 - 可以把同一会话安全地交给 macOS Terminal.app 打开。
 - 保存本地标签和 tmux 身份，tmux 改名后仍能正确关联会话。
 
@@ -24,7 +26,7 @@ OpenSSH、`~/.ssh/config`、SSH Agent 和远端 `tmux`，不依赖任何云平�
 - Apple Command Line Tools，Swift 6
 - 本机 `/usr/bin/ssh`
 - 远端已安装 `tmux`
-- 推荐配置 SSH Agent 或非交互式认证，以便会话列表可以后台刷新
+- 推荐配置 SSH Agent；也可以在主机详情中保存密码，以便会话列表后台刷新
 
 示例 SSH 配置：
 
@@ -72,7 +74,10 @@ Mac 前仍需使用 Developer ID 签名并公证。
 - 所有本地命令都以 executable + argv 表示，不拼接本地 shell 命令。
 - SSH 目标拒绝空白、控制字符、shell 元字符和前导 `-`，避免 option 注入。
 - tmux 会话名限制为 1–64 个安全字符。
-- 后台 SSH 查询使用 `BatchMode=yes` 和超时；交互终端仍由 OpenSSH 正常处理认证。
+- 未配置密码时，后台 SSH 查询使用 `BatchMode=yes` 和超时。
+- 配置密码后，OpenSSH 仍先尝试公钥，再通过随 App 签名的 AskPass helper
+  获取本次连接所需密码；密码不进入 argv、日志或 SSH 配置。
+- 密码只作为对应 SSH 目标的 macOS 钥匙串项目持久化，可随时在主机详情移除。
 - Control socket 位于当前用户专属的 `/tmp/tmuxhub-<uid>`，退出时清理。
 - 只有用户明确选择“终止 tmux”时才会执行 `kill-session`。
 

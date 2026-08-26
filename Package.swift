@@ -10,6 +10,7 @@ let package = Package(
     products: [
         .library(name: "TmuxHubCore", targets: ["TmuxHubCore"]),
         .executable(name: "TmuxHub", targets: ["TmuxHubApp"]),
+        .executable(name: "TmuxHubAskPass", targets: ["TmuxHubAskPass"]),
         .executable(
             name: "TmuxHubCoreTests",
             targets: ["TmuxHubCoreTests"]
@@ -28,6 +29,7 @@ let package = Package(
                 "InventoryProcess.swift",
                 "ManagedTerminalCommandBuilder.swift",
                 "SSHHost.swift",
+                "SSHPasswordStore.swift",
                 "TmuxCommands.swift",
                 "SSHMasterCommands.swift",
                 "SSHMasterPool.swift",
@@ -36,7 +38,8 @@ let package = Package(
                 "TmuxSessionController.swift",
                 "TmuxSessionDiscovery.swift",
                 "TmuxSessionParser.swift",
-            ]
+            ],
+            linkerSettings: [.linkedFramework("Security")]
         ),
         .target(
             name: "_Testing_Foundation",
@@ -63,6 +66,10 @@ let package = Package(
                 "TerminalWorkspaceView.swift",
                 "TmuxSessionBrowserView.swift",
             ]
+        ),
+        .executableTarget(
+            name: "TmuxHubAskPass",
+            path: "Sources/TmuxHubAskPass"
         ),
         .executableTarget(
             name: "TmuxHubCoreTests",

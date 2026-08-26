@@ -740,17 +740,41 @@ private final class RunningProcessBox: @unchecked Sendable {
         }
         arguments.append(nil)
 
+        var environment: [UnsafeMutablePointer<CChar>?] = []
+        defer {
+            for case let value? in environment {
+                free(value)
+            }
+        }
+        let processEnvironment = ProcessInfo.processInfo.environment.merging(
+            command.environment,
+            uniquingKeysWith: { _, override in override }
+        )
+        for (key, value) in processEnvironment.sorted(by: { $0.key < $1.key }) {
+            guard !key.contains("="),
+                !key.contains("\0"),
+                !value.contains("\0"),
+                let duplicatedValue = strdup("\(key)=\(value)")
+            else {
+                throw posixError(EINVAL)
+            }
+            environment.append(duplicatedValue)
+        }
+        environment.append(nil)
+
         var spawnedProcessID: pid_t = 0
         let spawnResult = command.executable.withCString { executable in
             arguments.withUnsafeMutableBufferPointer { argumentBuffer in
-                posix_spawn(
-                    &spawnedProcessID,
-                    executable,
-                    &fileActions,
-                    &attributes,
-                    argumentBuffer.baseAddress,
-                    environ
-                )
+                environment.withUnsafeMutableBufferPointer { environmentBuffer in
+                    posix_spawn(
+                        &spawnedProcessID,
+                        executable,
+                        &fileActions,
+                        &attributes,
+                        argumentBuffer.baseAddress,
+                        environmentBuffer.baseAddress
+                    )
+                }
             }
         }
         try checkPOSIX(spawnResult)
