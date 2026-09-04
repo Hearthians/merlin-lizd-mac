@@ -26,8 +26,9 @@ than selectable destinations and are omitted. Users may add validated custom
 destinations, which are persisted in UserDefaults.
 
 The app records the last local use time for each destination in UserDefaults.
-Hosts are ordered newest-first and grouped into rolling 3-day, 3-to-7-day,
-older-than-7-day and never-used sections. No remote history is queried.
+Hosts are ordered newest-first and grouped into rolling 1-day, 1-to-3-day,
+3-to-7-day, older-than-7-day and never-used sections. No remote history is
+queried.
 
 ## SSH transport
 

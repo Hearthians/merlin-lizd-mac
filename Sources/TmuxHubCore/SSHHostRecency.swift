@@ -1,7 +1,8 @@
 import Foundation
 
 public enum SSHHostRecencyBucket: Int, CaseIterable, Identifiable, Sendable {
-    case withinThreeDays
+    case withinOneDay
+    case oneToThreeDays
     case threeToSevenDays
     case olderThanSevenDays
     case neverUsed
@@ -64,7 +65,8 @@ public enum SSHHostRecencyOrganizer {
     ) -> SSHHostRecencyBucket {
         guard let lastUsedAt else { return .neverUsed }
         let age = max(0, now.timeIntervalSince(lastUsedAt))
-        if age < 3 * day { return .withinThreeDays }
+        if age < day { return .withinOneDay }
+        if age < 3 * day { return .oneToThreeDays }
         if age < 7 * day { return .threeToSevenDays }
         return .olderThanSevenDays
     }

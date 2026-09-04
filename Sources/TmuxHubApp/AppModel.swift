@@ -21,7 +21,8 @@ enum HostCatalogError: LocalizedError {
 extension SSHHostRecencyBucket {
     var displayTitle: String {
         switch self {
-        case .withinThreeDays: "3 天内"
+        case .withinOneDay: "1 天内"
+        case .oneToThreeDays: "1–3 天前"
         case .threeToSevenDays: "3–7 天前"
         case .olderThanSevenDays: "7 天以前"
         case .neverUsed: "从未使用"

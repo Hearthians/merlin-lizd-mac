@@ -166,7 +166,7 @@ struct SSHConfigCatalogTests {
         let day: TimeInterval = 24 * 60 * 60
         let destinations = [
             "never-b", "day-7", "recent-2", "day-3",
-            "recent-1", "day-6", "never-a",
+            "recent-1", "recent-hours", "day-6", "never-a",
         ]
         let hosts = destinations.map {
             SSHHost(destination: $0, source: .configuration)
@@ -174,6 +174,7 @@ struct SSHConfigCatalogTests {
         let sections = SSHHostRecencyOrganizer.sections(
             hosts: hosts,
             lastUsedAt: [
+                "recent-hours": now.addingTimeInterval(-day / 2),
                 "recent-1": now.addingTimeInterval(-day),
                 "recent-2": now.addingTimeInterval(-2 * day),
                 "day-3": now.addingTimeInterval(-3 * day),
@@ -184,15 +185,17 @@ struct SSHConfigCatalogTests {
         )
 
         #expect(sections.map(\.bucket) == [
-            .withinThreeDays,
+            .withinOneDay,
+            .oneToThreeDays,
             .threeToSevenDays,
             .olderThanSevenDays,
             .neverUsed,
         ])
-        #expect(sections[0].hosts.map(\.destination) == ["recent-1", "recent-2"])
-        #expect(sections[1].hosts.map(\.destination) == ["day-3", "day-6"])
-        #expect(sections[2].hosts.map(\.destination) == ["day-7"])
-        #expect(sections[3].hosts.map(\.destination) == ["never-a", "never-b"])
+        #expect(sections[0].hosts.map(\.destination) == ["recent-hours"])
+        #expect(sections[1].hosts.map(\.destination) == ["recent-1", "recent-2"])
+        #expect(sections[2].hosts.map(\.destination) == ["day-3", "day-6"])
+        #expect(sections[3].hosts.map(\.destination) == ["day-7"])
+        #expect(sections[4].hosts.map(\.destination) == ["never-a", "never-b"])
     }
 }
 
