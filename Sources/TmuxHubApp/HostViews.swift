@@ -20,7 +20,7 @@ struct HostOverviewView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("SSH 主机")
                         .font(.largeTitle.bold())
-                    Text("从 OpenSSH 配置读取目标，集中管理远程 tmux 会话。")
+                    Text("从 OpenSSH 配置读取目标，集中管理 tmux 会话和 Herdr 工作区。")
                         .foregroundStyle(.secondary)
                 }
 
@@ -122,6 +122,7 @@ struct SSHHostDetailView: View {
     let host: SSHHost
     let onNewSession: () -> Void
     let onBrowseSessions: () -> Void
+    let onBrowseHerdr: () -> Void
     let hasSavedPassword: () throws -> Bool
     let onSavePassword: (String) throws -> Void
     let onRemovePassword: () throws -> Void
@@ -174,9 +175,25 @@ struct SSHHostDetailView: View {
                     .controlSize(.large)
                 }
 
+                SurfaceCard {
+                    HStack(spacing: 16) {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Label("Herdr 工作区", systemImage: "square.stack.3d.up")
+                                .font(.headline)
+                            Text("按工作区查看 Agent 和终端，选择后直接接入。")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 8)
+                        Button("浏览工作区", action: onBrowseHerdr)
+                            .buttonStyle(.bordered)
+                            .controlSize(.large)
+                    }
+                }
+
                 SurfaceCard("连接行为") {
                     Label(
-                        "每个远程标签都运行在 tmux 中；关闭标签只断开 SSH，不终止远程任务。",
+                        "tmux 与 Herdr 标签均可恢复；关闭标签只断开连接，不终止远程任务。",
                         systemImage: "arrow.trianglehead.2.clockwise.rotate.90"
                     )
                     Label(
@@ -285,6 +302,7 @@ struct LocalTerminalLandingView: View {
     let onOpenShell: () -> Void
     let onNewTmux: () -> Void
     let onBrowseSessions: () -> Void
+    let onBrowseHerdr: () -> Void
 
     var body: some View {
         VStack(spacing: 18) {
@@ -293,7 +311,7 @@ struct LocalTerminalLandingView: View {
                 .foregroundStyle(.tint)
             Text("本机终端")
                 .font(.title.bold())
-            Text("可以打开普通登录 shell，也可以统一管理本机 tmux。")
+            Text("打开本机 Shell、管理 tmux 会话，或直接接入 Herdr 终端。")
                 .foregroundStyle(.secondary)
             HStack {
                 Button("登录 Shell", systemImage: "terminal", action: onOpenShell)
@@ -301,6 +319,8 @@ struct LocalTerminalLandingView: View {
                 Button("新建 tmux", systemImage: "plus", action: onNewTmux)
                     .buttonStyle(.borderedProminent)
                 Button("现有 tmux 会话", systemImage: "rectangle.stack", action: onBrowseSessions)
+                    .buttonStyle(.bordered)
+                Button("Herdr 工作区", systemImage: "square.stack.3d.up", action: onBrowseHerdr)
                     .buttonStyle(.bordered)
             }
             .controlSize(.large)

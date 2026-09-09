@@ -266,6 +266,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 #endif
 
     var cellDimension: CellDimension!
+    // Cell dimensions are snapped to the display's pixel grid, so they must
+    // be recomputed when a view moves between Retina and 1x displays.
+    var fontBackingScaleFactor: CGFloat?
     var caretView: CaretView!
     var _fontSmoothing: Bool = true
     var _lineSpacing: CGFloat = 1.0
@@ -550,11 +553,40 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     open override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         startWindowMouseMovedFallback()
+        refreshDisplayScale()
 #if canImport(MetalKit)
         guard useMetalRenderer, let currentWindow = window else { return }
         if currentWindow !== metalBoundWindow {
             rebindMetalRendererToWindow(currentWindow)
         }
+#endif
+    }
+
+    open override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        refreshDisplayScale()
+        needsDisplay = true
+    }
+
+    private func refreshDisplayScale() {
+        guard let window, terminal != nil, cellDimension != nil,
+              fontBackingScaleFactor != window.backingScaleFactor else { return }
+        resetCaches()
+        cellDimension = computeFontDimensions()
+        // Use the same scroller-aware grid calculation as a window resize.
+        // resetFont() uses the full frame width and can add an extra column.
+        let resized = processSizeChange(newSize: frame.size)
+        updateCaretView()
+        updateCursorPosition()
+        if !resized {
+            // Pixel dimensions can change even when rows/columns do not.
+            terminalDelegate?.sizeChanged(source: self, newCols: terminal.cols,
+                                         newRows: terminal.rows)
+        }
+        needsDisplay = true
+#if canImport(MetalKit)
+        // The renderer's cache signature includes scale and cell dimensions.
+        requestMetalDisplay()
 #endif
     }
     
@@ -1002,7 +1034,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         return response
     }
     
-    public override func resignFirstResponder() -> Bool {
+    open override func resignFirstResponder() -> Bool {
         let response = super.resignFirstResponder()
         if response {
             caretView.disableAnimations()
@@ -1246,7 +1278,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     // doCommand/noop: - but more research needs to take place to figure out the priority
     // of those keys.
     //
-    public override func keyDown(with event: NSEvent) {
+    open override func keyDown(with event: NSEvent) {
         selection.active = false
         let eventFlags = event.modifierFlags
 
@@ -2326,6 +2358,12 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         let clipboard = NSPasteboard.general
         let text = clipboard.string(forType: .string)
         insertText(text ?? "", replacementRange: NSRange(location: 0, length: 0), isPaste: true)
+    }
+
+    /// Paste supplied text without replacing the user's clipboard. Preserves
+    /// bracketed-paste and enhanced-keyboard handling, just like Cmd-V.
+    public func pasteText(_ text: String) {
+        insertText(text, replacementRange: NSRange(location: 0, length: 0), isPaste: true)
     }
     
     @objc

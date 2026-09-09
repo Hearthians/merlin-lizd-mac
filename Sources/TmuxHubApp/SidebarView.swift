@@ -6,6 +6,7 @@ struct SidebarView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var terminals: TerminalTabsModel
     let onBrowseSessions: (TerminalTarget) -> Void
+    let onBrowseHerdr: (TerminalTarget) -> Void
 
     @State private var searchText = ""
     @State private var isAddingHost = false
@@ -25,13 +26,22 @@ struct SidebarView: View {
                     tint: .blue,
                     selection: .overview
                 )
-                sidebarRow(
-                    title: "本机",
-                    symbol: "macbook",
-                    tint: .cyan,
-                    selection: .local
-                )
-                .onTapGesture(count: 2) { terminals.openLocalShell() }
+                HStack {
+                    sidebarRow(
+                        title: "本机",
+                        symbol: "macbook",
+                        tint: .cyan,
+                        selection: .local
+                    )
+                    .onTapGesture(count: 2) { terminals.openLocalShell() }
+                    herdrButton(for: .local)
+                }
+                .tag(SidebarSelection.local)
+                .contextMenu {
+                    Button("Herdr 工作区") { onBrowseHerdr(.local) }
+                    Button("查看 tmux 会话") { onBrowseSessions(.local) }
+                    Button("登录 Shell") { terminals.openLocalShell() }
+                }
             }
 
             if filteredSections.isEmpty {
@@ -123,6 +133,7 @@ struct SidebarView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer(minLength: 4)
+            herdrButton(for: .ssh(destination: host.destination))
         }
         .padding(.vertical, 3)
         .contentShape(Rectangle())
@@ -133,6 +144,9 @@ struct SidebarView: View {
             onBrowseSessions(.ssh(destination: host.destination))
         }
         .contextMenu {
+            Button("Herdr 工作区") {
+                onBrowseHerdr(.ssh(destination: host.destination))
+            }
             Button("查看 tmux 会话") {
                 onBrowseSessions(.ssh(destination: host.destination))
             }
@@ -149,6 +163,19 @@ struct SidebarView: View {
                 }
             }
         }
+    }
+
+    private func herdrButton(for target: TerminalTarget) -> some View {
+        Button {
+            onBrowseHerdr(target)
+        } label: {
+            Image(systemName: "square.stack.3d.up")
+                .foregroundStyle(.secondary)
+                .frame(width: 24, height: 26)
+        }
+        .buttonStyle(.borderless)
+        .help("浏览 Herdr 工作区")
+        .accessibilityLabel("浏览 Herdr 工作区")
     }
 
     private func hostSectionHeader(

@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Darwin
 import Foundation
@@ -16,9 +17,18 @@ final class TerminalSession: ObservableObject, Identifiable,
     }
 
     let id: UUID
-    let terminalView: LocalProcessTerminalView
+    let terminalView: AttachmentTerminalView
+    let attachmentModel: TerminalAttachmentModel
+    @Published private(set) var linkTransferMessage: String?
+    @Published private(set) var isLinkTransferActive = false
+    var isSelected = false {
+        didSet { if oldValue != isSelected { attachmentModel.noteInteraction() } }
+    }
     private var command: CommandSpec?
-    private let currentDirectory: String?
+    private var currentDirectory: String?
+    private let attachmentService: AttachmentTransferService
+    private var linkTask: Task<Void, Never>?
+    private var savePanel: NSSavePanel?
 
     @Published private(set) var state: State = .idle
     private(set) var hasStarted = false
@@ -27,13 +37,47 @@ final class TerminalSession: ObservableObject, Identifiable,
     init(
         id: UUID = UUID(),
         command: CommandSpec,
+        attachmentModel: TerminalAttachmentModel,
+        service: AttachmentTransferService,
         currentDirectory: String? = nil
     ) {
         self.id = id
         self.command = command
+        self.attachmentModel = attachmentModel
+        attachmentService = service
         self.currentDirectory = currentDirectory
-        terminalView = LocalProcessTerminalView(frame: .zero)
+        terminalView = AttachmentTerminalView(frame: .zero)
         terminalView.processDelegate = self
+        terminalView.receiveAttachments = { [weak attachmentModel] board, preferImage in
+            attachmentModel?.receive(board, preferImage: preferImage) ?? false
+        }
+        terminalView.hoverChanged = { [weak attachmentModel] in attachmentModel?.isDropTargeted = $0 }
+        terminalView.inputChanged = { [weak attachmentModel] in attachmentModel?.noteInteraction() }
+        terminalView.openLink = { [weak self] link, _ in self?.open(link: link) }
+        attachmentModel.bind(
+            canInsert: { [weak self] in
+                guard let self else { return false }
+                return self.state == .running && self.isSelected
+                    && self.terminalView.window?.isKeyWindow == true
+            },
+            canAutoInsert: { [weak self] in
+                guard let self else { return false }
+                return self.terminalView.window?.firstResponder === self.terminalView
+            },
+            focusTerminal: { [weak self] in
+                guard let self, self.isSelected else { return }
+                self.terminalView.window?.makeFirstResponder(self.terminalView)
+            },
+            insert: { [weak self] text in
+                guard let self else { return }
+                self.terminalView.window?.makeFirstResponder(self.terminalView)
+                self.terminalView.pasteText(text)
+            },
+            localDirectory: { [weak self] in
+                self?.localWorkingDirectory()
+                    ?? FileManager.default.homeDirectoryForCurrentUser.path
+            }
+        )
     }
 
     func startIfNeeded() {
@@ -54,6 +98,11 @@ final class TerminalSession: ObservableObject, Identifiable,
     func close() {
         guard state != .closed else { return }
         command = nil
+        attachmentModel.noteInteraction()
+        linkTask?.cancel()
+        linkTask = nil
+        savePanel?.cancel(nil)
+        savePanel = nil
         let shouldTerminate = state == .running && terminalView.process.running
         let processID = shouldTerminate ? terminalView.process.shellPid : 0
         state = .closed
@@ -62,6 +111,139 @@ final class TerminalSession: ObservableObject, Identifiable,
             TerminalProcessReaper.reap(processID: processID)
         }
         terminalView.processDelegate = nil
+    }
+
+    func dismissLinkTransferMessage() {
+        guard !isLinkTransferActive else { return }
+        linkTransferMessage = nil
+    }
+
+    private func open(link: String) {
+        guard state == .running, isSelected, linkTask == nil,
+            savePanel == nil else { return }
+        if let url = URL(string: link), let scheme = url.scheme,
+            scheme.lowercased() != "file"
+        {
+            NSWorkspace.shared.open(url)
+            return
+        }
+        linkTransferMessage = "正在定位文件…"
+        isLinkTransferActive = true
+        linkTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let context = try await attachmentService.context(
+                    target: attachmentModel.target,
+                    sessionName: attachmentModel.sessionName,
+                    localDirectory: localWorkingDirectory(),
+                    herdrReference: attachmentModel.herdrReference
+                )
+                let resolvedPath = try await attachmentService.resolveDownloadPath(
+                    link,
+                    context: context
+                )
+                try Task.checkCancellation()
+                switch context.target {
+                case .local:
+                    linkTask = nil
+                    isLinkTransferActive = false
+                    linkTransferMessage = nil
+                    NSWorkspace.shared.open(URL(fileURLWithPath: resolvedPath))
+                case .ssh:
+                    linkTask = nil
+                    isLinkTransferActive = false
+                    linkTransferMessage = nil
+                    presentSavePanel(for: resolvedPath, context: context)
+                }
+            } catch is CancellationError {
+                linkTask = nil
+                isLinkTransferActive = false
+            } catch {
+                linkTask = nil
+                isLinkTransferActive = false
+                linkTransferMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func presentSavePanel(for remotePath: String, context: AttachmentContext) {
+        guard state == .running, isSelected, let window = terminalView.window else { return }
+        let filename = (remotePath as NSString).lastPathComponent
+        guard !filename.isEmpty, filename != ".", filename != ".." else {
+            linkTransferMessage = AttachmentError.invalidPath.localizedDescription
+            return
+        }
+        let panel = NSSavePanel()
+        savePanel = panel
+        panel.canCreateDirectories = true
+        panel.nameFieldStringValue = filename
+        panel.title = "下载远端文件"
+        panel.message = "从 \(attachmentModel.target.sshDestination ?? "远端") 下载：\(remotePath)"
+        do {
+            let downloads = FileManager.default.urls(
+                for: .downloadsDirectory,
+                in: .userDomainMask
+            ).first ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Downloads", isDirectory: true)
+            let defaultDirectory = downloads.appendingPathComponent(
+                "_tmuxhub_download",
+                isDirectory: true
+            )
+            try FileManager.default.createDirectory(
+                at: defaultDirectory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            panel.directoryURL = defaultDirectory
+        } catch {
+            savePanel = nil
+            linkTransferMessage = "无法创建默认下载目录 ~/Downloads/_tmuxhub_download。"
+            return
+        }
+        panel.beginSheetModal(for: window) { [weak self] response in
+            Task { @MainActor in
+                guard let self else { return }
+                self.savePanel = nil
+                guard response == .OK, let destination = panel.url else { return }
+                self.download(remotePath: remotePath, context: context, to: destination)
+            }
+        }
+    }
+
+    private func download(
+        remotePath: String,
+        context: AttachmentContext,
+        to destination: URL
+    ) {
+        guard linkTask == nil else { return }
+        linkTransferMessage = "正在下载 \(destination.lastPathComponent)…"
+        isLinkTransferActive = true
+        linkTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await attachmentService.download(
+                    remotePath: remotePath,
+                    context: context,
+                    destination: destination
+                )
+                let opened = NSWorkspace.shared.open(destination)
+                linkTransferMessage = opened
+                    ? "已下载并打开 \(destination.path)"
+                    : "已下载到 \(destination.path)，但未找到可打开它的默认应用。"
+            } catch is CancellationError {
+                linkTransferMessage = "下载已取消。"
+            } catch {
+                linkTransferMessage = error.localizedDescription
+            }
+            isLinkTransferActive = false
+            linkTask = nil
+        }
+    }
+
+    private func localWorkingDirectory() -> String {
+        LocalProcessDirectory.path(processID: terminalView.process.shellPid)
+            ?? currentDirectory
+            ?? FileManager.default.homeDirectoryForCurrentUser.path
     }
 
     nonisolated func sizeChanged(
@@ -78,7 +260,15 @@ final class TerminalSession: ObservableObject, Identifiable,
     nonisolated func hostCurrentDirectoryUpdate(
         source: TerminalView,
         directory: String?
-    ) {}
+    ) {
+        Task { @MainActor [weak self] in
+            guard let self, self.attachmentModel.target == .local,
+                let directory else { return }
+            let path = directory.hasPrefix("file:") ? URL(string: directory)?.path : directory
+            guard let path, (try? AttachmentPaths.validate(path)) != nil else { return }
+            self.currentDirectory = path
+        }
+    }
 
     nonisolated func processTerminated(
         source: TerminalView,

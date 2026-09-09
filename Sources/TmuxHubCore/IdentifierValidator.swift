@@ -19,6 +19,13 @@ public enum IdentifierValidator {
         matches(value, pattern: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"#)
     }
 
+    /// Returns the name tmux actually stores. Validate before normalization so
+    /// unsupported input cannot become a valid command argument by replacement.
+    public static func normalizedTmuxSessionName(_ value: String) -> String? {
+        guard isTmuxSessionName(value) else { return nil }
+        return value.replacingOccurrences(of: ".", with: "_")
+    }
+
     public static func isTmuxSessionID(_ value: String) -> Bool {
         matches(value, pattern: #"^\$[0-9]+$"#)
     }

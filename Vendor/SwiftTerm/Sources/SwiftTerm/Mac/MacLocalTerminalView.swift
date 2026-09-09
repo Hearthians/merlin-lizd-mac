@@ -129,6 +129,18 @@ open class LocalProcessTerminalView: TerminalView, TerminalViewDelegate, LocalPr
     public func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {
         processDelegate?.hostCurrentDirectoryUpdate(source: source, directory: directory)
     }
+
+    /// Declared on the class (rather than relying only on the protocol's
+    /// default witness) so embedding applications can override link handling.
+    open func requestOpenLink(
+        source: TerminalView,
+        link: String,
+        params: [String: String]
+    ) {
+        if let url = URL(string: link) {
+            NSWorkspace.shared.open(url)
+        }
+    }
     
 
     /**

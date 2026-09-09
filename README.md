@@ -1,11 +1,11 @@
 # TmuxHub for macOS
 
-TmuxHub 是一个原生 macOS SSH/tmux 会话管理器。它直接使用系统
-OpenSSH、`~/.ssh/config`、SSH Agent 和远端 `tmux`，不依赖任何云平台 CLI，
+TmuxHub 是一个原生 macOS SSH 终端管理器，支持 tmux 和 Herdr。它直接使用系统
+OpenSSH、`~/.ssh/config`、SSH Agent 和目标主机上的终端服务，不依赖任何云平台 CLI，
 也不保存私钥或平台 token。用户可以按主机选择是否把 SSH 密码安全保存到
 macOS 钥匙串，作为密钥认证失败后的回退。
 
-原 Merlin 平台版本完整保存在 `merlin` 分支；当前分支只包含通用 SSH/tmux
+原 Merlin 平台版本完整保存在 `merlin` 分支；当前分支包含通用 SSH 终端
 功能。
 
 ## 功能
@@ -14,19 +14,81 @@ macOS 钥匙串，作为密钥认证失败后的回退。
 - 支持手动添加 alias、hostname、IP、`user@host` 和 IPv6 目标。
 - 最近使用的主机优先显示，并按 1 天内、1–3 天、3–7 天、7 天以前分组。
 - 浏览、创建、接入、重命名和批量终止本机或远端 tmux 会话。
-- 每个远程终端都由 tmux 托管；关闭 App 标签只断开 SSH，远端任务继续运行。
-- SSH 断开后可以原地重连同一个 tmux 会话。
+- 浏览本机或远端 Herdr 工作区、Agent 和终端，直接打开所选终端。
+- 远程终端由 tmux 或 Herdr 托管；关闭 App 标签只断开 SSH，远端任务继续运行。
+- SSH 断开后可以原地重连同一个 tmux 会话或 Herdr 终端。
 - 使用 App 自己的 OpenSSH ControlMaster 复用连接，加快刷新与 tmux 操作。
 - 每个主机可选密码回退；默认仍优先使用 SSH config、私钥和 SSH Agent。
 - 可以把同一会话安全地交给 macOS Terminal.app 打开。
 - 保存本地标签和 tmux 身份，tmux 改名后仍能正确关联会话。
+- 拖入文件、粘贴 Finder 文件或 ⌘V 截图，传输完成后把可访问路径插入当前终端。
+- 附件栏提供缩略图、状态、取消、重试、复制路径和手动插入；始终不自动按 Enter。
+
+## Herdr 工作区
+
+在侧边栏主机行点击 Herdr 图标，或在主机详情的「Herdr 工作区」中点击「浏览工作区」，即可按
+会话、工作区浏览现有终端。点击 Agent 或终端会直接打开对应的终端标签；已有标签
+会被选中。列表在打开时读取最新状态，也可手动刷新。
+
+- 目标主机需要已安装并运行支持 `api snapshot` 和 `terminal attach` 的 Herdr；
+  已使用 Herdr 0.9.0 验证。本机和远程连接均可使用。
+- TmuxHub 使用 Herdr 官方直接连接命令，不需要再套一层 tmux。
+- 每个标签保存服务器会话名和稳定的 terminal ID。切换 Herdr 焦点或移动 pane
+  不会把附件传给另一个 Agent；原终端不存在时需要重新选择。
+- Herdr 未提供工作目录时仍可打开终端，但附件操作会提示目录不可用；未提供
+  Agent 会话标识时，上传结果会保留为「就绪」，由你点击插入。
+- 关闭标签只断开连接。也可按 Ctrl+B、再按 q 断开；输入 Ctrl+B 本身需连按两次。
+- Herdr 同一终端仅允许一个直接控制客户端。如果已有客户端占用，连接会显示错误；
+  请先断开原客户端，再重连。TmuxHub 不自动接管控制权。
+- 本版只接入现有工作区和终端；创建、停止工作区仍在 Herdr 中操作。
+
+参考：[Herdr 直接终端连接](https://herdr.dev/docs/cli-reference/#direct-terminal-attach)。
+
+## 给 agent CLI 添加附件
+
+把一个或多个文件拖到终端，或在截图后按 ⌘V。普通文字仍按原样粘贴；也可以
+使用终端底部的「添加文件」和「粘贴截图」按钮。
+
+- 远程会话：通过独立 SFTP 通道复用已认证的 SSH ControlMaster，上传到当前
+  tmux pane 或所选 Herdr 终端工作目录的 `.tmuxhub/attachments/<唯一 ID>/`。服务器须开启 SFTP。
+- 本机文件：直接引用原路径；剪贴板截图转为 PNG 并保存到上述附件目录。
+- 目录按钮可为会话指定一个已存在的绝对路径，作为 `.tmuxhub/attachments` 的父目录。
+- 文件完整上传后才插入路径。如果期间输入文字、切换标签、离开终端焦点，或检测到
+  pane、前台程序、工作目录改变，附件会保留为「就绪」，由你点击插入。
+- 支持每批 32 个普通文件，单个最大 100 MiB。不接收文件夹、软件包、符号链接或
+  带控制字符的路径；请先自行打包。最多保留 100 条附件记录。
+- 附件队列在当前 App 运行期间跨重连保留；关闭标签或退出 App 会取消传输。
+  移除记录不会删除已保存或上传的附件。取消或失败可能在唯一目录中留下未完成文件。
+  本机剪贴板暂存会在移除记录或关闭标签时清理；异常退出后的缓存可能保留。
+
+这是通用的**文件传输 + 路径粘贴**，不是某个 agent 的专有图片协议。是否能把路径
+识别为原生图片附件取决于 CLI；也可告诉 agent「读取这张图片」。若 agent 运行在
+容器或权限受限的工作区中，请把附件目录设为它能访问的挂载路径。
+附件目录不会自动加入 `.gitignore`；可按需忽略 `.tmuxhub/attachments/`。
+
+## 打开终端文件链接
+
+终端中的 HTTP 等常规 URL 可以直接点击打开。形如
+`temp_output/r256/model/38.ply`、`./result.png` 或绝对路径的文件链接也可以直接点击：
+
+- 远程 SSH/tmux 标签会先按点击瞬间的 pane 工作目录解析相对路径。若 agent 管理器
+  的工作区与 pane 目录不同，TmuxHub 会在主目录下常见的一、二级工作区布局中按完整
+  相对路径查找，并且只接受唯一结果。随后弹出 macOS 保存面板选择本地位置；面板默认
+  打开 `~/Downloads/_tmuxhub_download/`，并通过现有 SSH ControlMaster 的独立 SFTP
+  通道下载。
+- 本机标签中的文件路径直接使用默认 App 打开。
+- Herdr 标签始终按所选终端的实际工作目录解析文件；不存在时直接提示失败，
+  不会搜索其他工作区代替。
+- 下载先写入所选目录中的唯一临时文件，成功后再替换最终文件；取消、失败或关闭标签
+  会清理临时文件。选择已有文件时，macOS 保存面板会先要求确认覆盖。下载完成后
+  TmuxHub 会立即用系统默认应用打开文件。
 
 ## 要求
 
 - macOS 14 或更新版本
 - Apple Command Line Tools，Swift 6
 - 本机 `/usr/bin/ssh`
-- 远端已安装 `tmux`
+- 目标主机已安装所需后端：`tmux` 或 Herdr
 - 推荐配置 SSH Agent；也可以在主机详情中保存密码，以便会话列表后台刷新
 
 示例 SSH 配置：
@@ -46,11 +108,16 @@ Include ~/.ssh/conf.d/*.conf
 
 ```sh
 ./scripts/test.sh
+./scripts/test-attachments-ui.sh
+./scripts/test-display-ui.sh
 /usr/bin/swift build
 /usr/bin/swift run TmuxHub
 ```
 
-测试使用本地 fake process，不会连接或修改真实 SSH 主机。
+默认测试包含本地 fake process、临时文件和本机 SFTP 协议往返，不连接真实 SSH
+主机。AppKit smoke test 使用私有剪贴板，不会替换系统剪贴板。
+显示测试会在已连接的 Retina / 普通显示器之间移动独立测试窗口，检查文字单元格、
+分隔线、光标和终端网格是否同步；只有一种缩放比例时会跳过。
 
 完成认证配置后，可对指定主机执行一个会自动清理的真实 tmux 生命周期测试：
 
@@ -59,6 +126,18 @@ Include ~/.ssh/conf.d/*.conf
 ```
 
 脚本使用唯一会话名验证创建、结构化发现、重命名和终止，并在异常退出时尝试清理。
+
+附件真实联调（仅对你授权的主机运行；创建并清理唯一的临时目录和 tmux 会话）：
+
+```sh
+TMUXHUB_LIVE_ATTACHMENT_HOST=user@example.com ./scripts/test.sh
+```
+
+Herdr 真实联调使用独立的临时命名会话及目录，并在结束时清理：
+
+```sh
+TMUXHUB_LIVE_HERDR_HOST=user@example.com ./scripts/test.sh
+```
 
 ## 打包
 

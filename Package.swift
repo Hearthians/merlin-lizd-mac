@@ -24,7 +24,9 @@ let package = Package(
             name: "TmuxHubCore",
             path: "Sources/TmuxHubCore",
             sources: [
+                "AttachmentTransfer.swift",
                 "ExternalTerminalLauncher.swift",
+                "Herdr.swift",
                 "IdentifierValidator.swift",
                 "InventoryProcess.swift",
                 "ManagedTerminalCommandBuilder.swift",
@@ -54,9 +56,13 @@ let package = Package(
             ],
             path: "Sources/TmuxHubApp",
             sources: [
+                "AttachmentTerminalView.swift",
+                "TerminalAttachmentModel.swift",
+                "TerminalAttachmentBar.swift",
                 "AppModel.swift",
                 "DesignSystem.swift",
                 "HostViews.swift",
+                "HerdrBrowserView.swift",
                 "HubRuntime.swift",
                 "TmuxHubApplication.swift",
                 "TmuxHubRootView.swift",
@@ -77,6 +83,7 @@ let package = Package(
             dependencies: [
                 "TmuxHubCore",
                 "_Testing_Foundation",
+                .product(name: "SwiftTerm", package: "SwiftTerm"),
             ],
             path: "Tests/TmuxHubCoreTests",
             swiftSettings: [

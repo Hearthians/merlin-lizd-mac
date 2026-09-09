@@ -35,7 +35,7 @@ struct TerminalWorkspaceView: View {
         ContentUnavailableView(
             "无法启动终端",
             systemImage: "terminal.fill",
-            description: Text("SSH 目标、tmux 会话名或本地 shell 无效。")
+            description: Text("请检查连接目标及终端是否仍然可用。")
         )
     }
 }
@@ -45,9 +45,17 @@ private struct TerminalSessionContent: View {
     let onReconnect: () -> Void
 
     var body: some View {
+        VStack(spacing: 0) {
+            terminal
+            TerminalAttachmentBar(model: session.attachmentModel)
+        }
+    }
+
+    private var terminal: some View {
         ZStack(alignment: .top) {
             TerminalSessionHost(session: session)
                 .background(Color.black)
+                .overlay { AttachmentDropOverlay(model: session.attachmentModel) }
 
             if case let .exited(exitCode) = session.state {
                 HStack(spacing: 10) {
@@ -67,7 +75,48 @@ private struct TerminalSessionContent: View {
                 .padding(10)
                 .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
                 .padding(12)
+            } else if let message = session.linkTransferMessage {
+                HStack(spacing: 10) {
+                    if session.isLinkTransferActive {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: message.hasPrefix("已下载")
+                            ? "checkmark.circle.fill"
+                            : "exclamationmark.triangle.fill")
+                    }
+                    Text(message).lineLimit(2)
+                    Spacer()
+                    if !session.isLinkTransferActive {
+                        Button { session.dismissLinkTransferMessage() } label: {
+                            Image(systemName: "xmark")
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .font(.callout)
+                .padding(10)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
+                .padding(12)
             }
+        }
+    }
+}
+
+private struct AttachmentDropOverlay: View {
+    @ObservedObject var model: TerminalAttachmentModel
+
+    var body: some View {
+        if model.isDropTargeted {
+            ZStack {
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(Color.accentColor.opacity(0.15))
+                RoundedRectangle(cornerRadius: 12)
+                    .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [8]))
+                Label("松开添加附件 · 传输后插入路径，不自动发送", systemImage: "tray.and.arrow.down")
+                    .padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+            }
+            .padding(12)
+            .allowsHitTesting(false)
         }
     }
 }
@@ -134,7 +183,9 @@ struct TerminalTabBar: View {
             }
             Button("取消", role: .cancel) { pendingCloseID = nil }
         } message: {
-            if pendingCloseTab?.sessionName != nil {
+            if pendingCloseTab?.herdrReference != nil {
+                Text("仅断开当前终端连接；Herdr 工作区和 Agent 会继续运行。")
+            } else if pendingCloseTab?.sessionName != nil {
                 Text("默认仅断开当前标签；远程 tmux 和任务会继续运行。")
             } else {
                 Text("将结束本机登录 shell。")
@@ -187,7 +238,7 @@ struct TerminalTabBar: View {
                 terminals.select(tab.id)
             } label: {
                 HStack(spacing: 6) {
-                    Image(systemName: tab.target == .local ? "macbook" : "server.rack")
+                    Image(systemName: tab.herdrReference != nil ? "square.stack.3d.up" : (tab.target == .local ? "macbook" : "server.rack"))
                     Text(tab.title)
                         .lineLimit(1)
                         .frame(maxWidth: 210)
@@ -250,7 +301,7 @@ struct TerminalTabBar: View {
             Divider()
             Button("关闭…", role: .destructive) { pendingCloseID = tab.id }
         }
-        .help(tab.sessionName.map { "tmux: \($0)" } ?? "本机登录 shell")
+        .help(tab.herdrReference.map { "Herdr: \($0.terminalID)" } ?? tab.sessionName.map { "tmux: \($0)" } ?? "本机登录 shell")
     }
 
     private var addTerminalMenu: some View {

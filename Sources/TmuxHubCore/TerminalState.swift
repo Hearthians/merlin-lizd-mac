@@ -16,19 +16,22 @@ public struct TerminalTabRecord: Codable, Equatable, Hashable, Identifiable, Sen
     public let target: TerminalTarget
     public var sessionName: String?
     public var tmuxIdentity: TmuxSessionIdentity?
+    public var herdrReference: HerdrTerminalReference?
 
     public init(
         id: String,
         title: String,
         target: TerminalTarget,
         sessionName: String?,
-        tmuxIdentity: TmuxSessionIdentity? = nil
+        tmuxIdentity: TmuxSessionIdentity? = nil,
+        herdrReference: HerdrTerminalReference? = nil
     ) {
         self.id = id
         self.title = title
         self.target = target
         self.sessionName = sessionName
         self.tmuxIdentity = tmuxIdentity
+        self.herdrReference = herdrReference
     }
 }
 

@@ -7,6 +7,9 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     @Published private(set) var tabs: [TerminalTabRecord]
     @Published var selectedTabID: String? {
         didSet {
+            if oldValue != selectedTabID {
+                for (id, session) in sessions { session.isSelected = id == selectedTabID }
+            }
             persist()
             guard let selectedTab else { return }
             if case let .ssh(destination) = selectedTab.target {
@@ -17,10 +20,12 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     }
 
     private var sessions: [String: TerminalSession] = [:]
+    private var attachments: [String: TerminalAttachmentModel] = [:]
     private let defaults: UserDefaults
     private let managedTerminalCommands: ManagedTerminalCommandBuilder
     private let runtime: HubRuntime
     let tmuxSessionDiscovery: TmuxSessionDiscovery
+    var herdrService: HerdrService { runtime.herdrService }
     private let tmuxSessionController: TmuxSessionController
     private let externalTerminalLauncher = ExternalTerminalLauncher()
     private let persistenceKey = "terminal-state-v2"
@@ -43,11 +48,19 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         if let encoded = defaults.string(forKey: persistenceKey),
             let restored = try? TerminalStateCodec.decode(encoded)
         {
-            let validTabs = restored.tabs.filter(Self.isValidRestoredTab)
+            let validTabs = restored.tabs.compactMap { tab -> TerminalTabRecord? in
+                guard let normalized = Self.normalizedRestoredTab(tab) else { return nil }
+                TerminalAttachmentModel.migrateDirectoryOverride(
+                    target: tab.target, from: tab.sessionName,
+                    to: normalized.sessionName, defaults: defaults
+                )
+                return normalized
+            }
             tabs = validTabs
             selectedTabID = validTabs.contains(where: {
                 $0.id == restored.selectedTabID
             }) ? restored.selectedTabID : nil
+            if validTabs != restored.tabs { persist() }
         } else {
             tabs = []
             selectedTabID = nil
@@ -64,19 +77,35 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     }
 
     func openLocalTmux(sessionName: String? = nil) {
-        let name = sessionName ?? makeSessionName(label: "local")
-        guard TmuxSessionParser.isAttachable(name) else { return }
+        guard let name = IdentifierValidator.normalizedTmuxSessionName(
+            sessionName ?? makeSessionName(label: "local")
+        ) else { return }
         open(title: "本机 · \(name)", target: .local, sessionName: name)
     }
 
     func openSSH(_ destination: String, sessionName: String? = nil) {
         guard IdentifierValidator.isSSHDestination(destination) else { return }
-        let name = sessionName ?? makeSessionName(label: destination)
-        guard TmuxSessionParser.isAttachable(name) else { return }
+        guard let name = IdentifierValidator.normalizedTmuxSessionName(
+            sessionName ?? makeSessionName(label: destination)
+        ) else { return }
         open(
             title: "\(destination) · \(name)",
             target: .ssh(destination: destination),
             sessionName: name
+        )
+    }
+
+    func openHerdr(_ pane: HerdrPaneRecord, target: TerminalTarget, workspaceLabel: String) {
+        if let existing = tabs.first(where: {
+            $0.target == target && $0.herdrReference == pane.reference
+        }) {
+            select(existing.id)
+            return
+        }
+        let host = target.sshDestination ?? "本机"
+        open(
+            title: "\(host) · \(workspaceLabel) · \(pane.agent ?? pane.label)",
+            target: target, sessionName: nil, herdrReference: pane.reference
         )
     }
 
@@ -101,15 +130,17 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         _ session: TmuxSessionRecord,
         target: TerminalTarget
     ) {
-        guard TmuxSessionParser.isAttachable(session.name) else { return }
+        guard let name = IdentifierValidator.normalizedTmuxSessionName(session.name) else {
+            return
+        }
         let label = switch target {
         case .local: "本机"
         case let .ssh(destination): destination
         }
         open(
-            title: "\(label) · \(session.name)",
+            title: "\(label) · \(name)",
             target: target,
-            sessionName: session.name,
+            sessionName: name,
             tmuxIdentity: session.identity
         )
     }
@@ -169,13 +200,26 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         if let existing = sessions[id] { return existing }
         guard let tab = tabs.first(where: { $0.id == id }) else { return nil }
         do {
+            // Restored tabs do not pass through selectedTabID's didSet during
+            // initialization, so start their password-aware master preparation
+            // here without delaying construction of the interactive terminal.
+            runtime.prepare(tab.target)
+            let attachmentModel = attachments[id] ?? TerminalAttachmentModel(
+                target: tab.target, sessionName: tab.sessionName,
+                service: runtime.attachmentService, defaults: defaults,
+                herdrReference: tab.herdrReference
+            )
+            attachments[id] = attachmentModel
             let session = TerminalSession(
                 id: UUID(uuidString: tab.id) ?? UUID(),
                 command: try command(for: tab),
+                attachmentModel: attachmentModel,
+                service: runtime.attachmentService,
                 currentDirectory: tab.target == .local
                     ? FileManager.default.homeDirectoryForCurrentUser.path
                     : nil
             )
+            session.isSelected = selectedTabID == id
             sessions[id] = session
             return session
         } catch {
@@ -190,6 +234,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     }
 
     func close(_ id: String) {
+        attachments.removeValue(forKey: id)?.cancelAll()
         sessions.removeValue(forKey: id)?.close()
         guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
         let wasSelected = selectedTabID == id
@@ -215,10 +260,10 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     }
 
     func renameTmuxSession(_ id: String, to proposedName: String) async throws {
-        let newName = proposedName.trimmingCharacters(
+        let trimmedName = proposedName.trimmingCharacters(
             in: .whitespacesAndNewlines
         )
-        guard TmuxSessionParser.isAttachable(newName) else {
+        guard let newName = IdentifierValidator.normalizedTmuxSessionName(trimmedName) else {
             throw TerminalTabOperationError.invalidSessionName
         }
         do {
@@ -303,7 +348,17 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     func terminalTabsSnapshot() -> [TerminalTabRecord] { tabs }
 
     func replaceTerminalTabs(_ tabs: [TerminalTabRecord]) {
+        for tab in tabs {
+            if let model = attachments[tab.id], model.sessionName != tab.sessionName {
+                model.noteInteraction()
+                model.sessionName = tab.sessionName
+            }
+        }
         self.tabs = tabs
+    }
+
+    func cancelAllAttachments() {
+        for model in attachments.values { model.cancelAll() }
     }
 
     func persistTerminalTabs() { persist() }
@@ -312,7 +367,8 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         title: String,
         target: TerminalTarget,
         sessionName: String?,
-        tmuxIdentity: TmuxSessionIdentity? = nil
+        tmuxIdentity: TmuxSessionIdentity? = nil,
+        herdrReference: HerdrTerminalReference? = nil
     ) {
         let id = UUID().uuidString
         tabs.append(TerminalTabRecord(
@@ -320,7 +376,8 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
             title: title,
             target: target,
             sessionName: sessionName,
-            tmuxIdentity: tmuxIdentity
+            tmuxIdentity: tmuxIdentity,
+            herdrReference: herdrReference
         ))
         selectedTabID = id
         _ = session(for: id)
@@ -328,6 +385,13 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     }
 
     private func command(for tab: TerminalTabRecord) throws -> CommandSpec {
+        if let reference = tab.herdrReference {
+            let command = try HerdrCommands.attach(target: tab.target, reference: reference)
+            if let destination = tab.target.sshDestination {
+                return try runtime.sshMasterPool.managedCommand(command, alias: destination)
+            }
+            return command
+        }
         switch tab.target {
         case .local:
             if let sessionName = tab.sessionName {
@@ -411,6 +475,11 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     }
 
     private static func isValidRestoredTab(_ tab: TerminalTabRecord) -> Bool {
+        if let reference = tab.herdrReference {
+            guard tab.sessionName == nil, tab.tmuxIdentity == nil,
+                reference.isValid else { return false }
+            return tab.target.sshDestination.map(IdentifierValidator.isSSHDestination) ?? true
+        }
         switch tab.target {
         case .local:
             return tab.sessionName.map(TmuxSessionParser.isAttachable) ?? true
@@ -418,6 +487,15 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
             return IdentifierValidator.isSSHDestination(destination)
                 && tab.sessionName.map(TmuxSessionParser.isAttachable) == true
         }
+    }
+
+    private static func normalizedRestoredTab(_ tab: TerminalTabRecord) -> TerminalTabRecord? {
+        guard isValidRestoredTab(tab) else { return nil }
+        var restored = tab
+        restored.sessionName = tab.sessionName.flatMap(
+            IdentifierValidator.normalizedTmuxSessionName
+        )
+        return restored
     }
 }
 

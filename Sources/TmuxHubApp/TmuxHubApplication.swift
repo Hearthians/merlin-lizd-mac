@@ -15,15 +15,14 @@ struct TmuxHubApplication: App {
         let model = AppModel()
         self.runtime = runtime
         _model = StateObject(wrappedValue: model)
-        _terminals = StateObject(
-            wrappedValue: TerminalTabsModel(
+        let terminals = TerminalTabsModel(
                 runtime: runtime,
                 onRemoteHostUsed: { [weak model] destination, date in
                     model?.recordUse(of: destination, at: date)
                 }
-            )
         )
-        appDelegate.configure(runtime: runtime)
+        _terminals = StateObject(wrappedValue: terminals)
+        appDelegate.configure(runtime: runtime, terminals: terminals)
     }
 
     var body: some Scene {
@@ -63,11 +62,13 @@ private final class TmuxHubApplicationDelegate: NSObject,
     NSApplicationDelegate
 {
     private var runtime: HubRuntime?
+    private weak var terminals: TerminalTabsModel?
     private var terminationTask: Task<Void, Never>?
 
-    func configure(runtime: HubRuntime) {
+    func configure(runtime: HubRuntime, terminals: TerminalTabsModel) {
         precondition(self.runtime == nil || self.runtime === runtime)
         self.runtime = runtime
+        self.terminals = terminals
     }
 
     func applicationShouldTerminate(
@@ -75,6 +76,7 @@ private final class TmuxHubApplicationDelegate: NSObject,
     ) -> NSApplication.TerminateReply {
         guard terminationTask == nil else { return .terminateLater }
         guard let runtime else { return .terminateNow }
+        terminals?.cancelAllAttachments()
         terminationTask = Task {
             await runtime.shutdown()
             sender.reply(toApplicationShouldTerminate: true)

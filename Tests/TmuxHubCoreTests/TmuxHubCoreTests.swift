@@ -33,6 +33,45 @@ struct CommandTests {
         ])
     }
 
+    @Test("normalizes dotted session names without broadening accepted input")
+    func normalizesSessionNames() {
+        #expect(IdentifierValidator.normalizedTmuxSessionName(
+            "hub-zhuodongli-10.30.45.144-d9823c18"
+        ) == "hub-zhuodongli-10_30_45_144-d9823c18")
+        #expect(IdentifierValidator.normalizedTmuxSessionName("hub-main_1") == "hub-main_1")
+        let maximumLengthName = "a" + String(repeating: ".", count: 63)
+        #expect(IdentifierValidator.normalizedTmuxSessionName(maximumLengthName)
+            == "a" + String(repeating: "_", count: 63))
+        for value in ["", ".main", "-main", "main:1", "main;id", "main\n", "main name",
+                      String(repeating: "a", count: 65)] {
+            #expect(IdentifierValidator.normalizedTmuxSessionName(value) == nil)
+        }
+    }
+
+    @Test("uses tmux's stored session name for connection and mutation commands")
+    func normalizesSessionCommandArguments() throws {
+        let original = "hub-zhuodongli-10.30.45.144-d9823c18"
+        let normalized = "hub-zhuodongli-10_30_45_144-d9823c18"
+        let terminal = try TmuxCommands.remoteTerminal(
+            destination: "zhuodongli@10.30.45.144", sessionName: original
+        )
+        #expect(terminal.arguments.last == "exec tmux new-session -A -s \(normalized)")
+        #expect(terminal.arguments.contains("zhuodongli@10.30.45.144"))
+        let termination = try TmuxCommands.terminateTmuxSession(
+            target: .local, sessionName: original
+        )
+        #expect(termination.arguments == ["kill-session", "-t", normalized])
+        let rename = try TmuxCommands.renameTmuxSession(
+            target: .ssh(destination: "prod"), from: original, to: "new.name"
+        )
+        #expect(rename.arguments.last == "tmux rename-session -t \(normalized) new_name")
+        let identityRename = try TmuxCommands.renameTmuxSession(
+            target: .ssh(destination: "prod"), from: original, to: "new.name",
+            identity: .init(serverSessionID: "$3", createdAtEpoch: 100)
+        )
+        #expect(identityRename.arguments.last == "tmux rename-session -t '$3' new_name")
+    }
+
     @Test("quotes a server session id when renaming remotely")
     func quotesIdentitySelector() throws {
         let command = try TmuxCommands.renameTmuxSession(
@@ -117,6 +156,32 @@ struct CommandTests {
         )
         #expect(output.exitCode == 0)
         #expect(output.stdout == "available\n")
+    }
+
+    @Test("managed commands never query Keychain credentials synchronously")
+    func preparedCommandsAvoidPasswordLookup() async throws {
+        let counter = LockedCounter()
+        let runner = ScriptedRunner(outputs: [
+            .init(stdout: "", stderr: "", exitCode: 0), // master check
+            .init(stdout: "", stderr: "", exitCode: 0), // remote command
+        ])
+        let pool = SSHMasterPool(
+            testDirectory: URL(fileURLWithPath: "/tmp/th-no-password-requery"),
+            runner: runner,
+            passwordProvider: { _ in
+                counter.increment()
+                return nil
+            }
+        )
+        let command = try TmuxCommands.listTmuxSessions(
+            target: .ssh(destination: "prod")
+        )
+        let output = try await pool.run(command, alias: "prod", replay: .readOnly)
+        #expect(output.exitCode == 0)
+        #expect(counter.value == 0)
+
+        _ = try pool.managedCommand(command, alias: "prod")
+        #expect(counter.value == 0)
     }
 }
 
@@ -314,6 +379,14 @@ private actor ScriptedRunner: InventoryProcessRunning {
     }
 
     func runCount() -> Int { count }
+}
+
+private final class LockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = 0
+
+    func increment() { lock.withLock { storage += 1 } }
+    var value: Int { lock.withLock { storage } }
 }
 
 private actor BlockingRefreshRunner: InventoryProcessRunning {

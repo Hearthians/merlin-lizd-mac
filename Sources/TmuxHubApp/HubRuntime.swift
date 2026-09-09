@@ -14,6 +14,8 @@ final class HubRuntime {
     let sshMasterPool: SSHMasterPool
     let tmuxDiscovery: TmuxSessionDiscovery
     let tmuxController: TmuxSessionController
+    let attachmentService: AttachmentTransferService
+    let herdrService: HerdrService
     private let passwordStore: SSHPasswordStore
     private let askPassExecutable: String?
     private var isShuttingDown = false
@@ -35,6 +37,9 @@ final class HubRuntime {
             }
         )
         sshMasterPool = pool
+        let herdr = HerdrService(sshMasterPool: pool)
+        herdrService = herdr
+        attachmentService = AttachmentTransferService(sshMasterPool: pool, herdrService: herdr)
         tmuxDiscovery = TmuxSessionDiscovery(
             sshMasterPool: pool,
             maxConcurrentBackgroundRefreshes: 8

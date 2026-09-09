@@ -35,7 +35,7 @@ public enum TmuxCommands {
         sessionName: String,
         localTmuxPath: String = "/opt/homebrew/bin/tmux"
     ) throws -> CommandSpec {
-        try validateSessionName(sessionName)
+        let sessionName = try normalizedSessionName(sessionName)
         return try tmuxCommand(
             target: target,
             arguments: ["kill-session", "-t", sessionName],
@@ -50,8 +50,8 @@ public enum TmuxCommands {
         identity: TmuxSessionIdentity? = nil,
         localTmuxPath: String = "/opt/homebrew/bin/tmux"
     ) throws -> CommandSpec {
-        try validateSessionName(currentName)
-        try validateSessionName(newName)
+        let currentName = try normalizedSessionName(currentName)
+        let newName = try normalizedSessionName(newName)
         let selector: String
         if let identity {
             guard identity.createdAtEpoch >= 0,
@@ -89,7 +89,7 @@ public enum TmuxCommands {
         sessionName: String
     ) throws -> CommandSpec {
         try validateDestination(destination)
-        try validateSessionName(sessionName)
+        let sessionName = try normalizedSessionName(sessionName)
         return CommandSpec(
             executable: "/usr/bin/ssh",
             arguments: [
@@ -138,10 +138,11 @@ public enum TmuxCommands {
         }
     }
 
-    private static func validateSessionName(_ value: String) throws {
-        guard IdentifierValidator.isTmuxSessionName(value) else {
+    private static func normalizedSessionName(_ value: String) throws -> String {
+        guard let normalized = IdentifierValidator.normalizedTmuxSessionName(value) else {
             throw CommandValidationError.invalidSessionName
         }
+        return normalized
     }
 
     private static func validateExecutablePath(_ value: String) throws {

@@ -67,6 +67,19 @@ struct SSHMasterCommands: Sendable {
         try operation("stop", alias: alias)
     }
 
+    func sftp(batchFile: URL, alias: String) throws -> CommandSpec {
+        let path = try socketPath(alias: alias)
+        // Batch transfers must use the prepared master. If it disappears,
+        // fail instead of opening an unprompted second authentication flow.
+        return CommandSpec(executable: "/usr/bin/sftp", arguments: [
+            "-q", "-b", batchFile.path,
+            "-o", "BatchMode=yes", "-o", "ControlMaster=no",
+            "-o", "ControlPath=\(path)",
+            "-o", "ProxyCommand=/usr/bin/false",
+            AttachmentPaths.sftpDestination(alias),
+        ])
+    }
+
     func managed(
         _ command: CommandSpec,
         alias: String,

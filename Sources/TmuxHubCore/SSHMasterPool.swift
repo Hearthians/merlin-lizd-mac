@@ -109,11 +109,18 @@ public final class SSHMasterPool: @unchecked Sendable {
         _ command: CommandSpec,
         alias: String
     ) throws -> CommandSpec {
-        let managed = try commands.managed(
-            command,
-            alias: alias,
-            authentication: passwordProvider(alias)
-        )
+        try preparedMasterCommand(command, alias: alias)
+    }
+
+    /// Managed commands reuse a shared master when one is available and retain
+    /// normal interactive SSH prompting otherwise. Saved-password lookup belongs
+    /// exclusively to asynchronous master preparation so a Keychain request can
+    /// never block terminal construction or another background command.
+    private func preparedMasterCommand(
+        _ command: CommandSpec,
+        alias: String
+    ) throws -> CommandSpec {
+        let managed = try commands.managed(command, alias: alias)
         try managedOwnership.register(alias: alias)
         return managed
     }
@@ -136,7 +143,7 @@ public final class SSHMasterPool: @unchecked Sendable {
             throw SSHMasterPoolError.shuttingDown
         }
 
-        let managed = try managedCommand(command, alias: alias)
+        let managed = try preparedMasterCommand(command, alias: alias)
         let output: InventoryProcessOutput?
         do {
             output = try await runAdmitted(managed)
@@ -176,11 +183,20 @@ public final class SSHMasterPool: @unchecked Sendable {
         }
 
         try Task.checkCancellation()
-        let replayed = try await runAdmitted(managedCommand(command, alias: alias))
+        let replayed = try await runAdmitted(preparedMasterCommand(command, alias: alias))
         guard replayed.exitCode != 255 else {
             throw SSHMasterPoolError.commandFailed(exitCode: replayed.exitCode)
         }
         return replayed
+    }
+
+    func transfer(batchFile: URL, alias: String) async throws -> InventoryProcessOutput {
+        try Task.checkCancellation()
+        guard await prepare(alias: alias, priority: .foreground) == .ready else {
+            throw SSHMasterPoolError.commandFailed(exitCode: 255)
+        }
+        // Never replay a file transfer automatically.
+        return try await runAdmitted(commands.sftp(batchFile: batchFile, alias: alias))
     }
 
     public func shutdown() async {

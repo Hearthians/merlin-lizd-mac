@@ -6,13 +6,15 @@ struct TmuxHubRootView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var terminals: TerminalTabsModel
     @State private var sessionBrowserTarget: TerminalTarget?
+    @State private var herdrBrowserTarget: TerminalTarget?
 
     var body: some View {
         NavigationSplitView {
             SidebarView(
                 model: model,
                 terminals: terminals,
-                onBrowseSessions: browseSessions
+                onBrowseSessions: browseSessions,
+                onBrowseHerdr: browseHerdr
             )
             .navigationSplitViewColumnWidth(min: 230, ideal: 275, max: 360)
         } detail: {
@@ -55,6 +57,26 @@ struct TmuxHubRootView: View {
                 )
             }
         }
+        .sheet(
+            isPresented: Binding(
+                get: { herdrBrowserTarget != nil },
+                set: { if !$0 { herdrBrowserTarget = nil } }
+            )
+        ) {
+            if let herdrBrowserTarget {
+                HerdrBrowserView(
+                    target: herdrBrowserTarget,
+                    service: terminals.herdrService
+                ) { pane, workspaceLabel in
+                    terminals.openHerdr(
+                        pane,
+                        target: herdrBrowserTarget,
+                        workspaceLabel: workspaceLabel
+                    )
+                    self.herdrBrowserTarget = nil
+                }
+            }
+        }
     }
 
     @ViewBuilder
@@ -68,7 +90,8 @@ struct TmuxHubRootView: View {
             LocalTerminalLandingView(
                 onOpenShell: terminals.openLocalShell,
                 onNewTmux: { terminals.openLocalTmux() },
-                onBrowseSessions: { sessionBrowserTarget = .local }
+                onBrowseSessions: { sessionBrowserTarget = .local },
+                onBrowseHerdr: { browseHerdr(.local) }
             )
         case let .host(destination):
             if let host = model.host(destination: destination) {
@@ -77,6 +100,9 @@ struct TmuxHubRootView: View {
                     onNewSession: { terminals.openSSH(destination) },
                     onBrowseSessions: {
                         browseSessions(.ssh(destination: destination))
+                    },
+                    onBrowseHerdr: {
+                        browseHerdr(.ssh(destination: destination))
                     },
                     hasSavedPassword: {
                         try terminals.hasSavedPassword(for: destination)
@@ -103,5 +129,12 @@ struct TmuxHubRootView: View {
             terminals.noteHostUse(destination)
         }
         sessionBrowserTarget = target
+    }
+
+    private func browseHerdr(_ target: TerminalTarget) {
+        if case let .ssh(destination) = target {
+            terminals.noteHostUse(destination)
+        }
+        herdrBrowserTarget = target
     }
 }
