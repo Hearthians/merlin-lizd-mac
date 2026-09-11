@@ -58,7 +58,12 @@ CONTENTS="$STAGED_APP/Contents"
 
 /bin/mkdir -p "$DIST_DIR"
 /bin/rm -rf "$APP_PATH"
-/usr/bin/ditto "$STAGED_APP" "$APP_PATH"
+/usr/bin/ditto --norsrc --noextattr "$STAGED_APP" "$APP_PATH"
+# Finder and synced folders can attach metadata while the bundle is copied.
+# Strip it before validating the artifact users will actually launch.
+/usr/bin/xattr -cr "$APP_PATH"
+/usr/bin/xattr -d com.apple.FinderInfo "$APP_PATH" 2>/dev/null || true
+/usr/bin/codesign --verify --deep --strict "$APP_PATH"
 
 print "Packaged: $APP_PATH"
 print "Open with: open '$APP_PATH'"

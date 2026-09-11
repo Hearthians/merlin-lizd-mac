@@ -22,13 +22,15 @@ identity files and proxy commands remain owned by OpenSSH configuration.
 `SSHConfigCatalog` reads concrete `Host` declarations from `~/.ssh/config`,
 recursively follows `Include`, expands include globs, prevents cycles and limits
 the number and size of files. Wildcard and negated Host patterns are rules rather
-than selectable destinations and are omitted. Users may add validated custom
-destinations, which are persisted in UserDefaults.
+than selectable destinations and are omitted. This complete result is a
+searchable catalog, not the navigation model. Users may add validated custom
+destinations, which are persisted in UserDefaults and pinned by default.
 
-The app records the last local use time for each destination in UserDefaults.
-Hosts are ordered newest-first and grouped into rolling 1-day, 1-to-3-day,
-3-to-7-day, older-than-7-day and never-used sections. No remote history is
-queried.
+Navigation contains all explicitly pinned destinations plus at most six
+unpinned destinations successfully reached during the previous seven days.
+Literal IPv4 and IPv6 destinations remain valid connection targets but are
+hidden from the library overview unless pinned, recent, searched or explicitly
+revealed. Usage history is local; missing catalog/custom destinations are pruned.
 
 ## SSH transport
 
@@ -51,6 +53,11 @@ Interactive terminals use `ssh -tt` plus the same control socket and run:
 ```text
 exec tmux new-session -A -s <validated-name>
 ```
+
+Quick connect first selects an existing tab for the destination. When none
+exists, it derives one deterministic, bounded tmux session name from the exact
+SSH destination. Explicit "new session" actions continue to create a unique
+session name.
 
 ## Session discovery and identity
 
@@ -75,7 +82,10 @@ remote sessions were confirmed terminated.
 
 ## Persistence
 
-Validated target destinations, tab titles, session names and stable tmux
-identities are persisted in UserDefaults. Optional SSH passwords are isolated in
-macOS Keychain under service `fun.gfyh.tmuxhub.ssh-password`. Private keys, raw
-SSH config, command output and ControlPath values are not persisted by TmuxHub.
+Validated custom destinations, pinned destinations, successful-use timestamps,
+tab titles, session names and stable tmux identities are persisted in
+UserDefaults. On first migration, named custom destinations become pins while
+literal IP destinations remain unpinned. An existing empty pin set is respected.
+Optional SSH passwords are isolated in macOS Keychain under service
+`fun.gfyh.tmuxhub.ssh-password`. Private keys, raw SSH config, command output and
+ControlPath values are not persisted by TmuxHub.

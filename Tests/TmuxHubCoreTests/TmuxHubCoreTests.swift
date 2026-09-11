@@ -17,6 +17,19 @@ struct CommandTests {
         }
     }
 
+    @Test("classifies literal addresses without treating aliases as IPs")
+    func classifiesIPAddressDestinations() {
+        for value in [
+            "10.0.0.8", "lizd@10.0.0.8", "2001:db8::8",
+            "[2001:db8::8]", "lizd@[fe80::1%en0]",
+        ] {
+            #expect(IdentifierValidator.isIPAddressDestination(value))
+        }
+        for value in ["prod", "prod.example.com", "lizd@gfyh.fun", "host:22"] {
+            #expect(!IdentifierValidator.isIPAddressDestination(value))
+        }
+    }
+
     @Test("builds a direct interactive SSH tmux command")
     func buildsRemoteTerminal() throws {
         let command = try TmuxCommands.remoteTerminal(
@@ -46,6 +59,25 @@ struct CommandTests {
                       String(repeating: "a", count: 65)] {
             #expect(IdentifierValidator.normalizedTmuxSessionName(value) == nil)
         }
+    }
+
+    @Test("builds a stable bounded session name for quick connect")
+    func buildsStableSessionNames() throws {
+        let first = try #require(IdentifierValidator.stableTmuxSessionName(
+            for: "zhuodongli@10.30.45.144"
+        ))
+        let repeated = try #require(IdentifierValidator.stableTmuxSessionName(
+            for: "zhuodongli@10.30.45.144"
+        ))
+        let other = try #require(IdentifierValidator.stableTmuxSessionName(
+            for: "zhuodongli@10.30.45.145"
+        ))
+
+        #expect(first == repeated)
+        #expect(first != other)
+        #expect(first.hasPrefix("tmuxhub-zhuodongli-10_30_45_144-"))
+        #expect(first.count <= 64)
+        #expect(IdentifierValidator.stableTmuxSessionName(for: "host name") == nil)
     }
 
     @Test("uses tmux's stored session name for connection and mutation commands")
@@ -225,42 +257,75 @@ struct SSHConfigCatalogTests {
         #expect(hosts.map(\.destination) == ["alpha", "beta"])
     }
 
-    @Test("orders recent hosts first and separates 3-day and 7-day boundaries")
-    func groupsHostsByRecency() {
+    @Test("quick access contains every pin and only a bounded recent set")
+    func organizesQuickAccessHosts() {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let day: TimeInterval = 24 * 60 * 60
-        let destinations = [
-            "never-b", "day-7", "recent-2", "day-3",
-            "recent-1", "recent-hours", "day-6", "never-a",
-        ]
-        let hosts = destinations.map {
-            SSHHost(destination: $0, source: .configuration)
-        }
-        let sections = SSHHostRecencyOrganizer.sections(
+        let hosts = [
+            "pinned-unused", "pinned-recent", "recent-a", "recent-b",
+            "recent-c", "expired", "never",
+        ].map { SSHHost(destination: $0, source: .configuration) }
+
+        let sections = SSHHostQuickAccessOrganizer.sections(
             hosts: hosts,
+            pinnedDestinations: ["pinned-unused", "pinned-recent"],
             lastUsedAt: [
-                "recent-hours": now.addingTimeInterval(-day / 2),
-                "recent-1": now.addingTimeInterval(-day),
-                "recent-2": now.addingTimeInterval(-2 * day),
-                "day-3": now.addingTimeInterval(-3 * day),
-                "day-6": now.addingTimeInterval(-6 * day),
-                "day-7": now.addingTimeInterval(-7 * day),
+                "pinned-recent": now.addingTimeInterval(-day),
+                "recent-a": now.addingTimeInterval(-day / 2),
+                "recent-b": now.addingTimeInterval(-day),
+                "recent-c": now.addingTimeInterval(-2 * day),
+                "expired": now.addingTimeInterval(-8 * day),
             ],
-            now: now
+            now: now,
+            recentLimit: 2
         )
 
-        #expect(sections.map(\.bucket) == [
-            .withinOneDay,
-            .oneToThreeDays,
-            .threeToSevenDays,
-            .olderThanSevenDays,
-            .neverUsed,
+        #expect(sections.map(\.bucket) == [.pinned, .recent])
+        #expect(sections[0].hosts.map(\.destination) == [
+            "pinned-recent", "pinned-unused",
         ])
-        #expect(sections[0].hosts.map(\.destination) == ["recent-hours"])
-        #expect(sections[1].hosts.map(\.destination) == ["recent-1", "recent-2"])
-        #expect(sections[2].hosts.map(\.destination) == ["day-3", "day-6"])
-        #expect(sections[3].hosts.map(\.destination) == ["day-7"])
-        #expect(sections[4].hosts.map(\.destination) == ["never-a", "never-b"])
+        #expect(sections[1].hosts.map(\.destination) == ["recent-a", "recent-b"])
+    }
+
+    @Test("quick access expires the seven-day boundary and honors a zero limit")
+    func appliesRecentBoundaryAndLimit() {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let day: TimeInterval = 24 * 60 * 60
+        let hosts = ["inside", "boundary"].map {
+            SSHHost(destination: $0, source: .configuration)
+        }
+        let lastUsedAt = [
+            "inside": now.addingTimeInterval(-7 * day + 1),
+            "boundary": now.addingTimeInterval(-7 * day),
+        ]
+
+        let visible = SSHHostQuickAccessOrganizer.sections(
+            hosts: hosts,
+            pinnedDestinations: [],
+            lastUsedAt: lastUsedAt,
+            now: now
+        )
+        #expect(visible.count == 1)
+        #expect(visible[0].hosts.map(\.destination) == ["inside"])
+
+        let limited = SSHHostQuickAccessOrganizer.sections(
+            hosts: hosts,
+            pinnedDestinations: [],
+            lastUsedAt: lastUsedAt,
+            now: now,
+            recentLimit: 0
+        )
+        #expect(limited.isEmpty)
+    }
+
+    @Test("first migration pins named custom targets but leaves IPs transient")
+    func migratesInitialPins() {
+        let pins = SSHHostQuickAccessOrganizer.initialPins(
+            customDestinations: [
+                "prod", "lizd@example.com", "10.0.0.8", "lizd@10.0.0.8",
+            ]
+        )
+        #expect(pins == ["prod", "lizd@example.com"])
     }
 }
 

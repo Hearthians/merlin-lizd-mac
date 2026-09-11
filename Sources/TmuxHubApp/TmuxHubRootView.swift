@@ -22,7 +22,7 @@ struct TmuxHubRootView: View {
                 if !terminals.tabs.isEmpty {
                     TerminalTabBar(
                         terminals: terminals,
-                        hosts: model.hosts
+                        hosts: model.quickAccessHosts
                     )
                 }
                 if terminals.selectedTabID != nil {
@@ -83,7 +83,7 @@ struct TmuxHubRootView: View {
     private var selectedContent: some View {
         switch model.selection {
         case .overview:
-            HostOverviewView(sections: model.hostSections()) { destination in
+            HostOverviewView(model: model) { destination in
                 model.selection = .host(destination)
             }
         case .local:
@@ -97,6 +97,7 @@ struct TmuxHubRootView: View {
             if let host = model.host(destination: destination) {
                 SSHHostDetailView(
                     host: host,
+                    onConnect: { terminals.openOrResumeSSH(destination) },
                     onNewSession: { terminals.openSSH(destination) },
                     onBrowseSessions: {
                         browseSessions(.ssh(destination: destination))
@@ -125,16 +126,10 @@ struct TmuxHubRootView: View {
     }
 
     private func browseSessions(_ target: TerminalTarget) {
-        if case let .ssh(destination) = target {
-            terminals.noteHostUse(destination)
-        }
         sessionBrowserTarget = target
     }
 
     private func browseHerdr(_ target: TerminalTarget) {
-        if case let .ssh(destination) = target {
-            terminals.noteHostUse(destination)
-        }
         herdrBrowserTarget = target
     }
 }

@@ -13,15 +13,23 @@ struct SidebarView: View {
     @State private var newDestination = ""
     @State private var errorMessage: String?
 
-    private var filteredSections: [SSHHostRecencySection] {
-        model.hostSections(matching: searchText)
+    private var quickSections: [SSHHostQuickAccessSection] {
+        model.quickAccessSections()
+    }
+
+    private var searchResults: [SSHHost] {
+        model.searchHosts(matching: searchText)
+    }
+
+    private var isSearching: Bool {
+        !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     var body: some View {
         List(selection: selectionBinding) {
             Section("工作区") {
                 sidebarRow(
-                    title: "主机总览",
+                    title: "主机库",
                     symbol: "rectangle.grid.2x2.fill",
                     tint: .blue,
                     selection: .overview
@@ -44,26 +52,38 @@ struct SidebarView: View {
                 }
             }
 
-            if filteredSections.isEmpty {
+            if isSearching {
                 Section {
-                    Text(searchText.isEmpty ? "尚无 SSH 主机" : "没有匹配的 SSH 主机")
+                    if searchResults.isEmpty {
+                        Text("没有匹配的 SSH 主机")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(searchResults) { host in
+                            hostRow(host)
+                        }
+                    }
+                } header: {
+                    hostSectionHeader(title: "搜索结果", showsAddButton: true)
+                }
+            } else if quickSections.isEmpty {
+                Section {
+                    Text("固定常用主机后，它们会显示在这里")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } header: {
-                    hostSectionHeader(title: "SSH 主机", showsAddButton: true)
+                    hostSectionHeader(title: "快捷主机", showsAddButton: true)
                 }
             } else {
-                ForEach(filteredSections) { section in
+                ForEach(quickSections) { section in
                     Section {
                         ForEach(section.hosts) { host in
                             hostRow(host)
                         }
                     } header: {
                         hostSectionHeader(
-                            title: section.id == filteredSections.first?.id
-                                ? "SSH 主机 · \(section.bucket.displayTitle)"
-                                : section.bucket.displayTitle,
-                            showsAddButton: section.id == filteredSections.first?.id
+                            title: section.bucket.displayTitle,
+                            showsAddButton: section.id == quickSections.first?.id
                         )
                     }
                 }
@@ -71,13 +91,13 @@ struct SidebarView: View {
         }
         .listStyle(.sidebar)
         .navigationTitle("TmuxHub")
-        .searchable(text: $searchText, placement: .sidebar, prompt: "搜索 SSH 主机")
+        .searchable(text: $searchText, placement: .sidebar, prompt: "搜索主机库")
         .alert("添加 SSH 目标", isPresented: $isAddingHost) {
             TextField("alias 或 user@host", text: $newDestination)
             Button("添加") { addHost() }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("使用现有 ~/.ssh/config 和 SSH Agent；密码回退可在主机详情中启用。")
+            Text("添加后会固定到侧边栏；连接参数仍由 ~/.ssh/config 和 SSH Agent 管理。")
         }
         .alert("无法添加主机", isPresented: Binding(
             get: { errorMessage != nil },
@@ -128,11 +148,21 @@ struct SidebarView: View {
                         model.selection == selection ? .semibold : .medium
                     ))
                     .lineLimit(1)
-                Text(host.source == .configuration ? "SSH config" : "手动添加")
+                Text(hostRowSubtitle(host))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
             Spacer(minLength: 4)
+            Button {
+                terminals.openOrResumeSSH(host.destination)
+            } label: {
+                Image(systemName: "terminal")
+                    .foregroundStyle(.secondary)
+                    .frame(width: 24, height: 26)
+            }
+            .buttonStyle(.borderless)
+            .help("连接或继续")
+            .accessibilityLabel("连接或继续 \(host.destination)")
             herdrButton(for: .ssh(destination: host.destination))
         }
         .padding(.vertical, 3)
@@ -141,9 +171,12 @@ struct SidebarView: View {
         .onTapGesture { show(selection) }
         .onTapGesture(count: 2) {
             show(selection)
-            onBrowseSessions(.ssh(destination: host.destination))
+            terminals.openOrResumeSSH(host.destination)
         }
         .contextMenu {
+            Button("连接或继续", systemImage: "terminal") {
+                terminals.openOrResumeSSH(host.destination)
+            }
             Button("Herdr 工作区") {
                 onBrowseHerdr(.ssh(destination: host.destination))
             }
@@ -156,8 +189,17 @@ struct SidebarView: View {
             Button("复制 SSH 目标") {
                 copy(host.destination)
             }
+            Divider()
+            if model.isPinned(host.destination) {
+                Button("从侧边栏取消固定", systemImage: "pin.slash") {
+                    model.setPinned(false, destination: host.destination)
+                }
+            } else {
+                Button("固定到侧边栏", systemImage: "pin") {
+                    model.setPinned(true, destination: host.destination)
+                }
+            }
             if model.isCustom(host.destination) {
-                Divider()
                 Button("移除手动目标", role: .destructive) {
                     model.removeCustomHost(host.destination)
                 }
@@ -216,6 +258,13 @@ struct SidebarView: View {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    private func hostRowSubtitle(_ host: SSHHost) -> String {
+        if model.isPinned(host.destination) {
+            return "已固定"
+        }
+        return host.source == .configuration ? "SSH config" : "手动目标"
     }
 
     private func copy(_ value: String) {

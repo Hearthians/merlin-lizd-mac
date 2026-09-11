@@ -12,10 +12,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
             }
             persist()
             guard let selectedTab else { return }
-            if case let .ssh(destination) = selectedTab.target {
-                noteHostUse(destination)
-            }
-            runtime.prepare(selectedTab.target)
+            prepareForUse(selectedTab.target)
         }
     }
 
@@ -95,6 +92,19 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         )
     }
 
+    func openOrResumeSSH(_ destination: String) {
+        guard IdentifierValidator.isSSHDestination(destination) else { return }
+        let target = TerminalTarget.ssh(destination: destination)
+        if let existing = tabs.last(where: { $0.target == target }) {
+            select(existing.id)
+            return
+        }
+        guard let stableName = IdentifierValidator.stableTmuxSessionName(
+            for: destination
+        ) else { return }
+        openSSH(destination, sessionName: stableName)
+    }
+
     func openHerdr(_ pane: HerdrPaneRecord, target: TerminalTarget, workspaceLabel: String) {
         if let existing = tabs.first(where: {
             $0.target == target && $0.herdrReference == pane.reference
@@ -115,6 +125,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
 
     func savePassword(_ password: String, for destination: String) throws {
         try runtime.savePassword(password, for: destination)
+        prepareForUse(.ssh(destination: destination))
     }
 
     func removePassword(for destination: String) throws {
@@ -203,7 +214,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
             // Restored tabs do not pass through selectedTabID's didSet during
             // initialization, so start their password-aware master preparation
             // here without delaying construction of the interactive terminal.
-            runtime.prepare(tab.target)
+            prepareForUse(tab.target)
             let attachmentModel = attachments[id] ?? TerminalAttachmentModel(
                 target: tab.target, sessionName: tab.sessionName,
                 service: runtime.attachmentService, defaults: defaults,
@@ -382,6 +393,12 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         selectedTabID = id
         _ = session(for: id)
         persist()
+    }
+
+    private func prepareForUse(_ target: TerminalTarget) {
+        runtime.prepare(target) { [weak self] destination in
+            self?.noteHostUse(destination)
+        }
     }
 
     private func command(for tab: TerminalTabRecord) throws -> CommandSpec {

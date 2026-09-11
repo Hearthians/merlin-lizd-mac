@@ -50,15 +50,21 @@ final class HubRuntime {
         )
     }
 
-    func prepare(_ target: TerminalTarget) {
+    func prepare(
+        _ target: TerminalTarget,
+        onReady: ((String) -> Void)? = nil
+    ) {
         guard !isShuttingDown, let destination = target.sshDestination else {
             return
         }
         Task {
-            _ = await sshMasterPool.prepare(
+            let state = await sshMasterPool.prepare(
                 alias: destination,
                 priority: .foreground
             )
+            if state == .ready {
+                onReady?(destination)
+            }
         }
     }
 

@@ -3,49 +3,80 @@ import TmuxHubCore
 import SwiftUI
 
 struct HostOverviewView: View {
-    let sections: [SSHHostRecencySection]
+    @ObservedObject var model: AppModel
     let onSelect: (String) -> Void
+    @State private var searchText = ""
+    @State private var showsRawAddresses = false
 
-    private var hosts: [SSHHost] {
-        sections.flatMap(\.hosts)
+    private var quickSections: [SSHHostQuickAccessSection] {
+        model.quickAccessSections()
     }
 
-    private var configuredCount: Int {
-        hosts.filter { $0.source == .configuration }.count
+    private var quickHosts: [SSHHost] {
+        quickSections.flatMap(\.hosts)
+    }
+
+    private var libraryHosts: [SSHHost] {
+        model.libraryHosts(
+            matching: searchText,
+            includeRawAddresses: showsRawAddresses
+                || !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        )
+    }
+
+    private var pinnedCount: Int {
+        quickSections.first(where: { $0.bucket == .pinned })?.hosts.count ?? 0
+    }
+
+    private var recentCount: Int {
+        quickSections.first(where: { $0.bucket == .recent })?.hosts.count ?? 0
     }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("SSH 主机")
+                    Text("主机库")
                         .font(.largeTitle.bold())
-                    Text("从 OpenSSH 配置读取目标，集中管理 tmux 会话和 Herdr 工作区。")
+                    Text("侧边栏只保留已固定和最近使用的主机；其余 SSH 配置按需搜索。")
                         .foregroundStyle(.secondary)
                 }
 
                 HStack(spacing: 12) {
                     summaryTile(
-                        title: "可选主机",
-                        value: "\(hosts.count)",
+                        title: "快捷入口",
+                        value: "\(quickHosts.count)",
                         symbol: "server.rack",
                         tint: .blue
                     )
                     summaryTile(
-                        title: "SSH config",
-                        value: "\(configuredCount)",
-                        symbol: "doc.text",
+                        title: "已固定",
+                        value: "\(pinnedCount)",
+                        symbol: "pin.fill",
                         tint: .green
                     )
                     summaryTile(
-                        title: "手动添加",
-                        value: "\(hosts.count - configuredCount)",
-                        symbol: "plus.circle",
+                        title: "最近使用",
+                        value: "\(recentCount)",
+                        symbol: "clock",
                         tint: .orange
                     )
                 }
 
-                if hosts.isEmpty {
+                HStack(spacing: 12) {
+                    TextField("搜索 SSH alias、主机名或 IP", text: $searchText)
+                        .textFieldStyle(.roundedBorder)
+                    if model.hiddenRawAddressCount > 0 {
+                        Toggle(
+                            "显示原始地址（\(model.hiddenRawAddressCount)）",
+                            isOn: $showsRawAddresses
+                        )
+                        .toggleStyle(.checkbox)
+                        .fixedSize()
+                    }
+                }
+
+                if model.hosts.isEmpty {
                     ContentUnavailableView {
                         Label("尚无 SSH 主机", systemImage: "server.rack")
                     } description: {
@@ -54,50 +85,76 @@ struct HostOverviewView: View {
                     .frame(maxWidth: .infinity, minHeight: 300)
                 } else {
                     VStack(alignment: .leading, spacing: 20) {
-                        ForEach(sections) { section in
-                            VStack(alignment: .leading, spacing: 10) {
-                                Text(section.bucket.displayTitle)
-                                    .font(.headline)
-                                    .foregroundStyle(.secondary)
-                                LazyVGrid(
-                                    columns: [GridItem(
-                                        .adaptive(minimum: 230),
-                                        spacing: 12
-                                    )],
-                                    spacing: 12
-                                ) {
-                                    ForEach(section.hosts) { host in
-                                        Button {
-                                            onSelect(host.destination)
-                                        } label: {
-                                            SurfaceCard {
-                                                HStack {
-                                                    Image(systemName: "server.rack")
-                                                        .font(.title2)
-                                                        .foregroundStyle(.green)
-                                                    Spacer()
-                                                    Image(systemName: "chevron.right")
-                                                        .foregroundStyle(.tertiary)
-                                                }
-                                                Text(host.destination)
-                                                    .font(.headline.monospaced())
-                                                    .lineLimit(1)
-                                                Text(host.source == .configuration
-                                                    ? "来自 SSH config" : "手动目标")
-                                                    .font(.caption)
-                                                    .foregroundStyle(.secondary)
-                                            }
-                                        }
-                                        .buttonStyle(.plain)
-                                    }
-                                }
-                            }
+                        ForEach(quickSections) { section in
+                            hostGrid(
+                                title: section.bucket.displayTitle,
+                                hosts: section.hosts
+                            )
+                        }
+                        if !libraryHosts.isEmpty {
+                            hostGrid(title: "SSH 配置中的其他主机", hosts: libraryHosts)
+                        } else if !searchText.isEmpty {
+                            ContentUnavailableView.search(text: searchText)
                         }
                     }
                 }
             }
             .padding(24)
         }
+    }
+
+    private func hostGrid(title: String, hosts: [SSHHost]) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title)
+                .font(.headline)
+                .foregroundStyle(.secondary)
+            LazyVGrid(
+                columns: [GridItem(.adaptive(minimum: 230), spacing: 12)],
+                spacing: 12
+            ) {
+                ForEach(hosts) { host in
+                    SurfaceCard {
+                        HStack {
+                            Image(systemName: "server.rack")
+                                .font(.title2)
+                                .foregroundStyle(.green)
+                            Spacer()
+                            Button {
+                                togglePin(host)
+                            } label: {
+                                Image(systemName: model.isPinned(host.destination)
+                                    ? "pin.fill" : "pin")
+                            }
+                            .buttonStyle(.plain)
+                            .help(model.isPinned(host.destination)
+                                ? "取消固定" : "固定到侧边栏")
+                        }
+                        Text(host.destination)
+                            .font(.headline.monospaced())
+                            .lineLimit(1)
+                        Text(host.source == .configuration
+                            ? "来自 SSH config" : "手动目标")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture { onSelect(host.destination) }
+                    .contextMenu {
+                        Button(model.isPinned(host.destination)
+                            ? "取消固定" : "固定到侧边栏") {
+                            togglePin(host)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func togglePin(_ host: SSHHost) {
+        model.setPinned(
+            !model.isPinned(host.destination),
+            destination: host.destination
+        )
     }
 
     private func summaryTile(
@@ -120,6 +177,7 @@ struct HostOverviewView: View {
 
 struct SSHHostDetailView: View {
     let host: SSHHost
+    let onConnect: () -> Void
     let onNewSession: () -> Void
     let onBrowseSessions: () -> Void
     let onBrowseHerdr: () -> Void
@@ -152,10 +210,16 @@ struct SSHHostDetailView: View {
                 }
 
                 HStack(spacing: 10) {
-                    Button("新建 tmux 会话", systemImage: "plus.rectangle.on.rectangle") {
-                        onNewSession()
+                    Button("连接或继续", systemImage: "terminal") {
+                        onConnect()
                     }
                     .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+
+                    Button("新建会话", systemImage: "plus.rectangle.on.rectangle") {
+                        onNewSession()
+                    }
+                    .buttonStyle(.bordered)
                     .controlSize(.large)
 
                     Button("浏览现有会话", systemImage: "rectangle.stack") {

@@ -18,14 +18,11 @@ enum HostCatalogError: LocalizedError {
     }
 }
 
-extension SSHHostRecencyBucket {
+extension SSHHostQuickAccessBucket {
     var displayTitle: String {
         switch self {
-        case .withinOneDay: "1 天内"
-        case .oneToThreeDays: "1–3 天前"
-        case .threeToSevenDays: "3–7 天前"
-        case .olderThanSevenDays: "7 天以前"
-        case .neverUsed: "从未使用"
+        case .pinned: "已固定"
+        case .recent: "最近使用"
         }
     }
 }
@@ -39,8 +36,10 @@ final class AppModel: ObservableObject {
     private let catalog: SSHConfigCatalog
     private let customHostsKey = "custom-ssh-hosts-v1"
     private let lastUsedHostsKey = "ssh-host-last-used-v1"
+    private let pinnedHostsKey = "pinned-ssh-hosts-v1"
     private var customDestinations: Set<String>
     private var lastUsedAt: [String: Date]
+    private var pinnedDestinations: Set<String>
 
     init(
         defaults: UserDefaults = .standard,
@@ -54,6 +53,17 @@ final class AppModel: ObservableObject {
         lastUsedAt = Self.loadLastUsedHosts(
             defaults.dictionary(forKey: lastUsedHostsKey) ?? [:]
         )
+        if let savedPins = defaults.stringArray(forKey: pinnedHostsKey) {
+            pinnedDestinations = Set(savedPins)
+        } else {
+            // Existing manually added destinations were explicit choices, so
+            // preserve named targets as favorites when upgrading. Literal IPs
+            // stay available and recent, but do not become permanent clutter.
+            pinnedDestinations = SSHHostQuickAccessOrganizer.initialPins(
+                customDestinations: customDestinations
+            )
+            defaults.set(pinnedDestinations.sorted(), forKey: pinnedHostsKey)
+        }
         refresh()
     }
 
@@ -71,10 +81,18 @@ final class AppModel: ObservableObject {
                 )
             }
         }
-        hosts = SSHHostRecencyOrganizer.sections(
-            hosts: Array(byDestination.values),
-            lastUsedAt: lastUsedAt
-        ).flatMap(\.hosts)
+        let knownDestinations = Set(byDestination.keys)
+        let retainedUsage = lastUsedAt.filter {
+            knownDestinations.contains($0.key)
+        }
+        if retainedUsage.count != lastUsedAt.count {
+            lastUsedAt = retainedUsage
+            persistLastUsedHosts()
+        }
+        hosts = byDestination.values.sorted {
+            $0.destination.localizedStandardCompare($1.destination)
+                == .orderedAscending
+        }
         if case let .host(destination) = selection,
             !hosts.contains(where: { $0.destination == destination })
         {
@@ -91,7 +109,9 @@ final class AppModel: ObservableObject {
             throw HostCatalogError.invalidDestination
         }
         customDestinations.insert(destination)
+        pinnedDestinations.insert(destination)
         persistCustomHosts()
+        persistPinnedHosts()
         refresh()
         selection = .host(destination)
         return hosts.first(where: { $0.destination == destination })
@@ -100,7 +120,11 @@ final class AppModel: ObservableObject {
 
     func removeCustomHost(_ destination: String) {
         guard customDestinations.remove(destination) != nil else { return }
+        pinnedDestinations.remove(destination)
+        lastUsedAt.removeValue(forKey: destination)
         persistCustomHosts()
+        persistPinnedHosts()
+        persistLastUsedHosts()
         refresh()
     }
 
@@ -112,29 +136,98 @@ final class AppModel: ObservableObject {
         hosts.first { $0.destination == destination }
     }
 
-    func recordUse(of destination: String, at date: Date = Date()) {
-        guard IdentifierValidator.isSSHDestination(destination) else { return }
-        lastUsedAt[destination] = date
-        persistLastUsedHosts()
-        hosts = SSHHostRecencyOrganizer.sections(
-            hosts: hosts,
-            lastUsedAt: lastUsedAt,
-            now: date
-        ).flatMap(\.hosts)
+    func isPinned(_ destination: String) -> Bool {
+        pinnedDestinations.contains(destination)
     }
 
-    func hostSections(
-        matching searchText: String = "",
-        now: Date = Date()
-    ) -> [SSHHostRecencySection] {
-        let values = searchText.isEmpty ? hosts : hosts.filter {
-            $0.destination.localizedCaseInsensitiveContains(searchText)
+    func setPinned(_ pinned: Bool, destination: String) {
+        guard hosts.contains(where: { $0.destination == destination }) else {
+            return
         }
-        return SSHHostRecencyOrganizer.sections(
-            hosts: values,
+        objectWillChange.send()
+        if pinned {
+            pinnedDestinations.insert(destination)
+        } else {
+            pinnedDestinations.remove(destination)
+        }
+        persistPinnedHosts()
+    }
+
+    func recordUse(of destination: String, at date: Date = Date()) {
+        guard IdentifierValidator.isSSHDestination(destination) else { return }
+        objectWillChange.send()
+        lastUsedAt[destination] = date
+        persistLastUsedHosts()
+    }
+
+    func quickAccessSections(
+        now: Date = Date()
+    ) -> [SSHHostQuickAccessSection] {
+        SSHHostQuickAccessOrganizer.sections(
+            hosts: hosts,
+            pinnedDestinations: pinnedDestinations,
             lastUsedAt: lastUsedAt,
             now: now
         )
+    }
+
+    var quickAccessHosts: [SSHHost] {
+        quickAccessSections().flatMap(\.hosts)
+    }
+
+    func searchHosts(matching searchText: String) -> [SSHHost] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return [] }
+        return orderedByUse(hosts.filter {
+            $0.destination.localizedCaseInsensitiveContains(query)
+        })
+    }
+
+    func libraryHosts(
+        matching searchText: String = "",
+        includeRawAddresses: Bool = false,
+        now: Date = Date()
+    ) -> [SSHHost] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let quickDestinations = Set(
+            quickAccessSections(now: now).flatMap(\.hosts).map(\.destination)
+        )
+        return orderedByUse(hosts.filter { host in
+            guard !quickDestinations.contains(host.destination) else {
+                return false
+            }
+            guard includeRawAddresses
+                || !IdentifierValidator.isIPAddressDestination(host.destination)
+            else { return false }
+            return query.isEmpty
+                || host.destination.localizedCaseInsensitiveContains(query)
+        })
+    }
+
+    var hiddenRawAddressCount: Int {
+        let quickDestinations = Set(
+            quickAccessSections().flatMap(\.hosts).map(\.destination)
+        )
+        return hosts.filter {
+            !quickDestinations.contains($0.destination)
+                && IdentifierValidator.isIPAddressDestination($0.destination)
+        }.count
+    }
+
+    private func orderedByUse(_ values: [SSHHost]) -> [SSHHost] {
+        values.sorted { lhs, rhs in
+            switch (lastUsedAt[lhs.destination], lastUsedAt[rhs.destination]) {
+            case let (left?, right?) where left != right:
+                return left > right
+            case (_?, nil):
+                return true
+            case (nil, _?):
+                return false
+            default:
+                return lhs.destination.localizedStandardCompare(rhs.destination)
+                    == .orderedAscending
+            }
+        }
     }
 
     private func persistCustomHosts() {
@@ -146,6 +239,10 @@ final class AppModel: ObservableObject {
             lastUsedAt.mapValues(\.timeIntervalSince1970),
             forKey: lastUsedHostsKey
         )
+    }
+
+    private func persistPinnedHosts() {
+        defaults.set(pinnedDestinations.sorted(), forKey: pinnedHostsKey)
     }
 
     private static func loadLastUsedHosts(

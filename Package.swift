@@ -31,7 +31,7 @@ let package = Package(
                 "InventoryProcess.swift",
                 "ManagedTerminalCommandBuilder.swift",
                 "SSHHost.swift",
-                "SSHHostRecency.swift",
+                "SSHHostQuickAccess.swift",
                 "SSHPasswordStore.swift",
                 "TmuxCommands.swift",
                 "SSHMasterCommands.swift",
