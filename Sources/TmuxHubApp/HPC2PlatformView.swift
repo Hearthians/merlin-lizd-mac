@@ -111,20 +111,22 @@ struct HPC2PlatformView: View {
         case let .stale(date, message):
             VStack(alignment: .leading, spacing: 8) {
                 MessageBanner(
-                    text: date == nil
-                        ? message
-                        : "暂时无法刷新，仍显示上次成功读取的数据。\n\(message)",
+                    text: date.map {
+                        "暂时无法刷新，当前显示缓存数据（更新于 \($0.formatted(date: .abbreviated, time: .standard))）。\n\(message)"
+                    } ?? "未能读取 Slurm 任务，当前任务数量与状态未知。\n\(message)",
                     kind: .warning
                 )
                 HStack {
                     Button("重试") { Task { await model.refresh(force: true) } }
+                        .disabled(model.isRefreshing)
                     Button("打开登录 Shell", action: onOpenLoginShell)
+                    if model.isRefreshing { ProgressView().controlSize(.small) }
                 }
                 .buttonStyle(.bordered)
             }
         }
 
-        if let notice = model.notice {
+        if let notice = model.visibleNotice {
             HStack(alignment: .top, spacing: 8) {
                 MessageBanner(text: notice, kind: .info)
                 Button {
@@ -142,19 +144,21 @@ struct HPC2PlatformView: View {
         HStack(spacing: 12) {
             metricCard(
                 title: "运行中",
-                value: model.runningJobCount,
+                value: model.hasLoadedJobs ? model.runningJobCount : nil,
                 symbol: "play.circle.fill",
                 tint: .green
             )
             metricCard(
                 title: "排队中",
-                value: model.pendingJobCount + model.unresolvedRuns.count,
+                value: model.hasLoadedJobs
+                    ? model.pendingJobCount + model.unresolvedRuns.count : nil,
                 symbol: "clock.fill",
                 tint: .orange
             )
             metricCard(
                 title: "当前任务",
-                value: model.activeJobs.count + model.unresolvedRuns.count,
+                value: model.hasLoadedJobs
+                    ? model.activeJobs.count + model.unresolvedRuns.count : nil,
                 symbol: "square.stack.3d.up.fill",
                 tint: .blue
             )
@@ -175,21 +179,34 @@ struct HPC2PlatformView: View {
     private var currentJobs: some View {
         let jobs = model.activeJobs
         let unresolved = model.unresolvedRuns
-        if jobs.isEmpty, unresolved.isEmpty, !model.isRefreshing {
-            ContentUnavailableView(
-                "当前没有 Slurm 任务",
-                systemImage: "cpu",
-                description: Text("启动一个交互环境，或在登录节点提交任务后刷新。")
-            )
-            .frame(maxWidth: .infinity, minHeight: 240)
-        } else {
-            LazyVStack(spacing: 10) {
-                ForEach(unresolved) { run in
-                    unresolvedRow(run)
+        LazyVStack(spacing: 10) {
+            if !model.hasLoadedJobs {
+                if case .stale = model.connectionState {
+                    ContentUnavailableView(
+                        "未能读取 Slurm 任务",
+                        systemImage: "exclamationmark.triangle",
+                        description: Text("当前任务状态尚未确认，请恢复连接后重试。")
+                    )
+                    .frame(maxWidth: .infinity, minHeight: 240)
+                } else if unresolved.isEmpty {
+                    ProgressView("正在读取 Slurm 任务…")
+                        .frame(maxWidth: .infinity, minHeight: 240)
                 }
-                ForEach(jobs) { job in
-                    jobRow(job)
-                }
+            } else if jobs.isEmpty, unresolved.isEmpty {
+                ContentUnavailableView(
+                    model.isShowingCachedJobs ? "上次读取时没有 Slurm 任务" : "当前没有 Slurm 任务",
+                    systemImage: "cpu",
+                    description: Text(model.isShowingCachedJobs
+                        ? "当前状态尚未确认，请恢复连接后刷新。"
+                        : "启动一个交互环境，或在登录节点提交任务后刷新。")
+                )
+                .frame(maxWidth: .infinity, minHeight: 240)
+            }
+            ForEach(unresolved) { run in
+                unresolvedRow(run)
+            }
+            ForEach(jobs) { job in
+                jobRow(job)
             }
         }
     }
@@ -327,7 +344,7 @@ struct HPC2PlatformView: View {
 
     private func metricCard(
         title: String,
-        value: Int,
+        value: Int?,
         symbol: String,
         tint: Color
     ) -> some View {
@@ -336,8 +353,9 @@ struct HPC2PlatformView: View {
                 Label(title, systemImage: symbol)
                     .foregroundStyle(tint)
                 Spacer()
-                Text("\(value)")
+                Text(value.map(String.init) ?? "—")
                     .font(.title2.bold().monospacedDigit())
+                    .accessibilityLabel(value.map(String.init) ?? "未知")
             }
         }
     }

@@ -117,6 +117,24 @@ final class HPC2PlatformModel: ObservableObject {
         activeJobs.filter { $0.state == .running }.count
     }
 
+    var hasLoadedJobs: Bool {
+        lastSuccessfulRefresh != nil
+    }
+
+    var isShowingCachedJobs: Bool {
+        if case .stale = connectionState {
+            return hasLoadedJobs
+        }
+        return false
+    }
+
+    var visibleNotice: String? {
+        if case let .stale(_, message) = connectionState, notice == message {
+            return nil
+        }
+        return notice
+    }
+
     var unresolvedRuns: [HPC2ManagedRunRecord] {
         let visibleJobIDs = Set(jobs.map(\.jobID))
         return managedRuns.filter { run in
@@ -186,7 +204,6 @@ final class HPC2PlatformModel: ObservableObject {
         } catch {
             guard !Task.isCancelled, profile == requestedProfile else { return }
             connectionState = .stale(lastSuccessfulRefresh, error.localizedDescription)
-            notice = error.localizedDescription
         }
     }
 

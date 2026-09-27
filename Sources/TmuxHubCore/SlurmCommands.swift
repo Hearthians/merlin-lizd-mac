@@ -115,7 +115,7 @@ public enum SlurmCommands {
             command -v tmux >/dev/null 2>&1 || exit 127
             command -v srun >/dev/null 2>&1 || exit 127
             if tmux has-session -t \(shellQuote(target)) 2>/dev/null; then exit 73; fi
-            exec tmux new-session -d -s \(shellQuote(receipt.tmuxSessionName)) /bin/sh -c \(shellQuote(srunScript))
+            exec tmux new-session -d -s \(shellQuote(receipt.tmuxSessionName)) /bin/bash -lc \(shellQuote(srunScript))
             """
         return try remoteShell(platform: platform, script: script, interactive: false)
     }
@@ -257,8 +257,17 @@ public enum SlurmCommands {
             executable: "/usr/bin/ssh",
             arguments: options + [
                 platform.loginDestination,
-                "exec /bin/sh -c " + shellQuote(script),
+                loginShell(script: script),
             ]
         )
+    }
+
+    /// Slurm is added to PATH by the cluster's login profile. Keep profile
+    /// banners on stderr so stdout remains a machine-readable queue response.
+    /// The pane launched in an existing tmux server also needs its own login
+    /// shell, since that server may still hold the old PATH.
+    private static func loginShell(script: String) -> String {
+        let payload = "exec 1>&3 3>&-\n" + script
+        return "exec /bin/bash -lc " + shellQuote(payload) + " 3>&1 1>&2"
     }
 }
