@@ -10,6 +10,11 @@ public enum TerminalTarget: Codable, Equatable, Hashable, Sendable {
     }
 }
 
+public enum TmuxSessionLaunchMode: String, Codable, Equatable, Hashable, Sendable {
+    case createOrAttach
+    case attachOnly
+}
+
 public struct TerminalTabRecord: Codable, Equatable, Hashable, Identifiable, Sendable {
     public let id: String
     public var title: String
@@ -17,6 +22,11 @@ public struct TerminalTabRecord: Codable, Equatable, Hashable, Identifiable, Sen
     public var sessionName: String?
     public var tmuxIdentity: TmuxSessionIdentity?
     public var herdrReference: HerdrTerminalReference?
+    public var tmuxLaunchMode: TmuxSessionLaunchMode
+
+    public var allowsTmuxLifecycleMutation: Bool {
+        tmuxLaunchMode == .createOrAttach
+    }
 
     public init(
         id: String,
@@ -24,7 +34,8 @@ public struct TerminalTabRecord: Codable, Equatable, Hashable, Identifiable, Sen
         target: TerminalTarget,
         sessionName: String?,
         tmuxIdentity: TmuxSessionIdentity? = nil,
-        herdrReference: HerdrTerminalReference? = nil
+        herdrReference: HerdrTerminalReference? = nil,
+        tmuxLaunchMode: TmuxSessionLaunchMode = .createOrAttach
     ) {
         self.id = id
         self.title = title
@@ -32,6 +43,48 @@ public struct TerminalTabRecord: Codable, Equatable, Hashable, Identifiable, Sen
         self.sessionName = sessionName
         self.tmuxIdentity = tmuxIdentity
         self.herdrReference = herdrReference
+        self.tmuxLaunchMode = tmuxLaunchMode
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case target
+        case sessionName
+        case tmuxIdentity
+        case herdrReference
+        case tmuxLaunchMode
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        title = try container.decode(String.self, forKey: .title)
+        target = try container.decode(TerminalTarget.self, forKey: .target)
+        sessionName = try container.decodeIfPresent(String.self, forKey: .sessionName)
+        tmuxIdentity = try container.decodeIfPresent(
+            TmuxSessionIdentity.self,
+            forKey: .tmuxIdentity
+        )
+        herdrReference = try container.decodeIfPresent(
+            HerdrTerminalReference.self,
+            forKey: .herdrReference
+        )
+        tmuxLaunchMode = try container.decodeIfPresent(
+            TmuxSessionLaunchMode.self,
+            forKey: .tmuxLaunchMode
+        ) ?? .createOrAttach
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(title, forKey: .title)
+        try container.encode(target, forKey: .target)
+        try container.encodeIfPresent(sessionName, forKey: .sessionName)
+        try container.encodeIfPresent(tmuxIdentity, forKey: .tmuxIdentity)
+        try container.encodeIfPresent(herdrReference, forKey: .herdrReference)
+        try container.encode(tmuxLaunchMode, forKey: .tmuxLaunchMode)
     }
 }
 

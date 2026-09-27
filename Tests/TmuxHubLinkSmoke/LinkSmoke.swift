@@ -71,6 +71,9 @@ struct LinkSmoke {
         precondition(opened.isEmpty, "Releasing on a different link must not download")
 
         view.mouseDown(with: event(.leftMouseDown, col: 1))
+        // SwiftTerm starts its selection on the first drag event and extends
+        // it on subsequent movement, as AppKit does during a physical drag.
+        view.mouseDragged(with: event(.leftMouseDragged, col: 2))
         view.mouseDragged(with: event(.leftMouseDragged, col: 8))
         view.mouseUp(with: event(.leftMouseUp, col: 8))
         precondition(opened.isEmpty, "Text selection must not activate a file")

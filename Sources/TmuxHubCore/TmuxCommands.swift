@@ -86,10 +86,17 @@ public enum TmuxCommands {
 
     public static func remoteTerminal(
         destination: String,
-        sessionName: String
+        sessionName: String,
+        launchMode: TmuxSessionLaunchMode = .createOrAttach
     ) throws -> CommandSpec {
         try validateDestination(destination)
         let sessionName = try normalizedSessionName(sessionName)
+        let remoteCommand = switch launchMode {
+        case .createOrAttach:
+            "exec tmux new-session -A -s \(sessionName)"
+        case .attachOnly:
+            "exec tmux attach-session -t =\(sessionName)"
+        }
         return CommandSpec(
             executable: "/usr/bin/ssh",
             arguments: [
@@ -97,7 +104,7 @@ public enum TmuxCommands {
                 "-o", "ServerAliveInterval=10",
                 "-o", "ServerAliveCountMax=3",
                 destination,
-                "exec tmux new-session -A -s \(sessionName)",
+                remoteCommand,
             ]
         )
     }

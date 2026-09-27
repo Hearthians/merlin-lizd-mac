@@ -52,6 +52,15 @@ struct SidebarView: View {
                 }
             }
 
+            Section("计算平台") {
+                sidebarRow(
+                    title: "HKUST HPC2",
+                    symbol: "cpu",
+                    tint: .purple,
+                    selection: .platform("hkust-hpc2")
+                )
+            }
+
             if isSearching {
                 Section {
                     if searchResults.isEmpty {

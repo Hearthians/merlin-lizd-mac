@@ -166,7 +166,9 @@ struct TerminalTabBar: View {
                 if let pendingCloseID { terminals.close(pendingCloseID) }
                 pendingCloseID = nil
             }
-            if pendingCloseTab?.sessionName != nil {
+            if pendingCloseTab?.sessionName != nil,
+                pendingCloseTab.map(terminals.allowsTmuxLifecycleMutation) == true
+            {
                 Button("关闭标签并终止 tmux", role: .destructive) {
                     guard let id = pendingCloseID else { return }
                     pendingCloseID = nil
@@ -185,6 +187,8 @@ struct TerminalTabBar: View {
         } message: {
             if pendingCloseTab?.herdrReference != nil {
                 Text("仅断开当前终端连接；Herdr 工作区和 Agent 会继续运行。")
+            } else if pendingCloseTab?.tmuxLaunchMode == .attachOnly {
+                Text("仅断开当前终端；如需释放计算资源，请在 HPC 平台页取消对应任务。")
             } else if pendingCloseTab?.sessionName != nil {
                 Text("默认仅断开当前标签；远程 tmux 和任务会继续运行。")
             } else {
@@ -279,9 +283,11 @@ struct TerminalTabBar: View {
                 renameID = tab.id
             }
             if let sessionName = tab.sessionName {
-                Button("重命名 tmux 会话") {
-                    renameSessionText = sessionName
-                    renameSessionID = tab.id
+                if terminals.allowsTmuxLifecycleMutation(tab) {
+                    Button("重命名 tmux 会话") {
+                        renameSessionText = sessionName
+                        renameSessionID = tab.id
+                    }
                 }
                 Button("复制 tmux 会话名") {
                     NSPasteboard.general.clearContents()

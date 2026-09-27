@@ -46,6 +46,18 @@ struct CommandTests {
         ])
     }
 
+    @Test("attach-only terminals select an exact existing tmux session")
+    func buildsAttachOnlyRemoteTerminal() throws {
+        let command = try TmuxCommands.remoteTerminal(
+            destination: "hpc2",
+            sessionName: "tmuxhub-job-123",
+            launchMode: .attachOnly
+        )
+        #expect(command.arguments.last ==
+            "exec tmux attach-session -t =tmuxhub-job-123")
+        #expect(!command.arguments.last!.contains("new-session"))
+    }
+
     @Test("normalizes dotted session names without broadening accepted input")
     func normalizesSessionNames() {
         #expect(IdentifierValidator.normalizedTmuxSessionName(
@@ -363,6 +375,31 @@ struct TmuxSessionTests {
             )]
         )
         #expect(try TerminalStateCodec.decode(TerminalStateCodec.encode(state)) == state)
+    }
+
+    @Test("terminal state preserves attach-only tabs and defaults legacy tabs")
+    func preservesTmuxLaunchMode() throws {
+        let legacy = #"{"selectedTabID":"old","tabs":[{"id":"old","title":"Old","target":{"ssh":{"destination":"hpc2"}},"sessionName":"main"}]}"#
+        let legacyState = try TerminalStateCodec.decode(legacy)
+        #expect(legacyState.tabs[0].tmuxLaunchMode == .createOrAttach)
+        #expect(legacyState.tabs[0].allowsTmuxLifecycleMutation)
+
+        let managedState = TerminalState(
+            selectedTabID: "managed",
+            tabs: [.init(
+                id: "managed",
+                title: "HPC task 123",
+                target: .ssh(destination: "hpc2"),
+                sessionName: "tmuxhub-job-123",
+                tmuxLaunchMode: .attachOnly
+            )]
+        )
+        let restored = try TerminalStateCodec.decode(
+            TerminalStateCodec.encode(managedState)
+        )
+        #expect(restored == managedState)
+        #expect(restored.tabs[0].tmuxLaunchMode == .attachOnly)
+        #expect(!restored.tabs[0].allowsTmuxLifecycleMutation)
     }
 
     @Test("discovery treats an absent tmux server as an empty healthy result")

@@ -184,6 +184,10 @@ struct TmuxSessionBrowserView: View {
                             .padding()
                     }
                     List(model.sessions) { session in
+                        let externallyManaged = terminals.isTmuxSessionManagedExternally(
+                            sessionName: session.name,
+                            target: model.target
+                        )
                         HStack {
                             Button {
                                 toggleSelection(session.name)
@@ -195,10 +199,16 @@ struct TmuxSessionBrowserView: View {
                             .buttonStyle(.plain)
                             .foregroundStyle(selectedSessionNames.contains(session.name)
                                 ? Color.accentColor : Color.secondary)
+                            .disabled(externallyManaged || isTerminating)
                             Image(systemName: "rectangle.stack.fill")
                                 .foregroundStyle(.tint)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(session.name).font(.body.monospaced())
+                                if externallyManaged {
+                                    Label("由计算平台管理", systemImage: "lock.fill")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
                                 if let identity = session.identity {
                                     Text(identity.stableDisplayString)
                                         .font(.caption2.monospaced())
@@ -228,7 +238,14 @@ struct TmuxSessionBrowserView: View {
         .frame(minWidth: 560, minHeight: 400)
         .task { await model.load(force: false) }
         .onChange(of: model.sessions) { _, sessions in
-            selectedSessionNames.formIntersection(Set(sessions.map(\.name)))
+            selectedSessionNames.formIntersection(Set(sessions.lazy
+                .filter { session in
+                    !terminals.isTmuxSessionManagedExternally(
+                        sessionName: session.name,
+                        target: model.target
+                    )
+                }
+                .map(\.name)))
         }
         .alert("新建 tmux 会话", isPresented: $isCreatingSession) {
             TextField("留空自动命名", text: $newSessionName)
@@ -285,12 +302,18 @@ struct TmuxSessionBrowserView: View {
         HStack(spacing: 10) {
             Button("选择 Hub 会话", systemImage: "wand.and.stars") {
                 selectedSessionNames = Set(model.sessions.lazy
-                    .filter { $0.name.hasPrefix("hub-") }
+                    .filter {
+                        $0.name.hasPrefix("hub-")
+                            && !terminals.isTmuxSessionManagedExternally(
+                                sessionName: $0.name,
+                                target: model.target
+                            )
+                    }
                     .map(\.name))
             }
             Button(allSessionsSelected ? "取消全选" : "全选") {
                 selectedSessionNames = allSessionsSelected
-                    ? [] : Set(model.sessions.map(\.name))
+                    ? [] : selectableSessionNames
             }
             Spacer()
             Text("已选择 \(selectedSessionNames.count) 个")
@@ -314,11 +337,26 @@ struct TmuxSessionBrowserView: View {
     }
 
     private var allSessionsSelected: Bool {
-        !model.sessions.isEmpty
-            && selectedSessionNames.count == model.sessions.count
+        !selectableSessionNames.isEmpty
+            && selectedSessionNames == selectableSessionNames
+    }
+
+    private var selectableSessionNames: Set<String> {
+        Set(model.sessions.lazy
+            .filter {
+                !terminals.isTmuxSessionManagedExternally(
+                    sessionName: $0.name,
+                    target: model.target
+                )
+            }
+            .map(\.name))
     }
 
     private func toggleSelection(_ name: String) {
+        guard !terminals.isTmuxSessionManagedExternally(
+            sessionName: name,
+            target: model.target
+        ) else { return }
         if selectedSessionNames.contains(name) {
             selectedSessionNames.remove(name)
         } else {

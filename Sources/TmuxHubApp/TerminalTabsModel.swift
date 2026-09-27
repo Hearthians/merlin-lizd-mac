@@ -78,7 +78,13 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         guard let name = IdentifierValidator.normalizedTmuxSessionName(
             sessionName ?? makeSessionName(label: "local")
         ) else { return }
-        open(title: "本机 · \(name)", target: .local, sessionName: name)
+        open(
+            title: "本机 · \(name)",
+            target: .local,
+            sessionName: name,
+            tmuxLaunchMode: Self.isPlatformManagedTmuxSessionName(name)
+                ? .attachOnly : .createOrAttach
+        )
     }
 
     func openSSH(_ destination: String, sessionName: String? = nil) {
@@ -89,14 +95,48 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         open(
             title: "\(destination) · \(name)",
             target: .ssh(destination: destination),
-            sessionName: name
+            sessionName: name,
+            tmuxLaunchMode: Self.isPlatformManagedTmuxSessionName(name)
+                ? .attachOnly : .createOrAttach
+        )
+    }
+
+    func openAttachOnlyRemoteTmux(
+        destination: String,
+        sessionName: String,
+        title: String? = nil,
+        tmuxIdentity: TmuxSessionIdentity? = nil
+    ) {
+        guard IdentifierValidator.isSSHDestination(destination),
+            let name = IdentifierValidator.normalizedTmuxSessionName(sessionName)
+        else { return }
+        let target = TerminalTarget.ssh(destination: destination)
+        if let index = tabs.lastIndex(where: {
+            $0.target == target && $0.sessionName == name
+        }) {
+            tabs[index].tmuxLaunchMode = .attachOnly
+            if let tmuxIdentity { tabs[index].tmuxIdentity = tmuxIdentity }
+            persist()
+            select(tabs[index].id)
+            return
+        }
+        open(
+            title: title ?? "\(destination) · \(name)",
+            target: target,
+            sessionName: name,
+            tmuxIdentity: tmuxIdentity,
+            tmuxLaunchMode: .attachOnly
         )
     }
 
     func openOrResumeSSH(_ destination: String) {
         guard IdentifierValidator.isSSHDestination(destination) else { return }
         let target = TerminalTarget.ssh(destination: destination)
-        if let existing = tabs.last(where: { $0.target == target }) {
+        if let existing = tabs.last(where: {
+            $0.target == target
+                && $0.herdrReference == nil
+                && allowsTmuxLifecycleMutation($0)
+        }) {
             select(existing.id)
             return
         }
@@ -169,12 +209,45 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         case .local: "本机"
         case let .ssh(destination): destination
         }
+        let externallyManaged = isTmuxSessionManagedExternally(
+            sessionName: name,
+            target: target
+        )
+        if externallyManaged,
+            let index = tabs.lastIndex(where: {
+                $0.target == target && $0.sessionName == name
+            })
+        {
+            tabs[index].tmuxLaunchMode = .attachOnly
+            tabs[index].tmuxIdentity = session.identity
+            persist()
+            select(tabs[index].id)
+            return
+        }
         open(
             title: "\(label) · \(name)",
             target: target,
             sessionName: name,
-            tmuxIdentity: session.identity
+            tmuxIdentity: session.identity,
+            tmuxLaunchMode: externallyManaged ? .attachOnly : .createOrAttach
         )
+    }
+
+    func isTmuxSessionManagedExternally(
+        sessionName: String,
+        target: TerminalTarget
+    ) -> Bool {
+        Self.isPlatformManagedTmuxSessionName(sessionName)
+            || tabs.contains {
+                $0.target == target
+                    && $0.sessionName == sessionName
+                    && $0.tmuxLaunchMode == .attachOnly
+            }
+    }
+
+    func allowsTmuxLifecycleMutation(_ tab: TerminalTabRecord) -> Bool {
+        tab.allowsTmuxLifecycleMutation
+            && !Self.isPlatformManagedTmuxSessionName(tab.sessionName)
     }
 
     func knownTmuxSessions(for target: TerminalTarget) -> [TmuxSessionRecord] {
@@ -292,6 +365,12 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     }
 
     func renameTmuxSession(_ id: String, to proposedName: String) async throws {
+        guard let tab = tabs.first(where: { $0.id == id }) else {
+            throw TerminalTabOperationError.sessionUnavailable
+        }
+        guard allowsTmuxLifecycleMutation(tab) else {
+            throw TerminalTabOperationError.externallyManagedSession
+        }
         let trimmedName = proposedName.trimmingCharacters(
             in: .whitespacesAndNewlines
         )
@@ -314,9 +393,13 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     }
 
     func terminateTmuxSessionAndClose(_ id: String) async throws {
-        guard let tab = tabs.first(where: { $0.id == id }),
-            let sessionName = tab.sessionName
-        else {
+        guard let tab = tabs.first(where: { $0.id == id }) else {
+            throw TerminalTabOperationError.sessionUnavailable
+        }
+        guard allowsTmuxLifecycleMutation(tab) else {
+            throw TerminalTabOperationError.externallyManagedSession
+        }
+        guard let sessionName = tab.sessionName else {
             throw TerminalTabOperationError.sessionUnavailable
         }
         do {
@@ -338,8 +421,12 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         _ sessionNames: Set<String>,
         target: TerminalTarget
     ) async -> TmuxBatchTerminationResult {
-        let validNames = Set(sessionNames.filter(TmuxSessionParser.isAttachable))
-        let invalidNames = sessionNames.subtracting(validNames)
+        let attachableNames = Set(sessionNames.filter(TmuxSessionParser.isAttachable))
+        let protectedNames = Set(attachableNames.filter {
+            isTmuxSessionManagedExternally(sessionName: $0, target: target)
+        })
+        let validNames = attachableNames.subtracting(protectedNames)
+        let invalidNames = sessionNames.subtracting(attachableNames)
         let controller = tmuxSessionController
         let results = await withTaskGroup(of: (String, Bool).self) { group in
             for sessionName in validNames {
@@ -362,6 +449,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         let succeeded = Set(results.compactMap { $0.1 ? $0.0 : nil })
         let failed = Set(results.compactMap { $0.1 ? nil : $0.0 })
             .union(invalidNames)
+            .union(protectedNames)
         await tmuxSessionDiscovery.recordTermination(
             target: target,
             sessionNames: succeeded
@@ -400,7 +488,8 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         target: TerminalTarget,
         sessionName: String?,
         tmuxIdentity: TmuxSessionIdentity? = nil,
-        herdrReference: HerdrTerminalReference? = nil
+        herdrReference: HerdrTerminalReference? = nil,
+        tmuxLaunchMode: TmuxSessionLaunchMode = .createOrAttach
     ) {
         let id = UUID().uuidString
         tabs.append(TerminalTabRecord(
@@ -409,7 +498,8 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
             target: target,
             sessionName: sessionName,
             tmuxIdentity: tmuxIdentity,
-            herdrReference: herdrReference
+            herdrReference: herdrReference,
+            tmuxLaunchMode: tmuxLaunchMode
         ))
         selectedTabID = id
         _ = session(for: id)
@@ -436,9 +526,15 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
                 guard let tmux = resolvedLocalTmuxPath() else {
                     throw CommandValidationError.invalidExecutablePath
                 }
+                let arguments: [String] = switch tab.tmuxLaunchMode {
+                case .createOrAttach:
+                    ["new-session", "-A", "-s", sessionName]
+                case .attachOnly:
+                    ["attach-session", "-t", "=\(sessionName)"]
+                }
                 return CommandSpec(
                     executable: tmux,
-                    arguments: ["new-session", "-A", "-s", sessionName]
+                    arguments: arguments
                 )
             }
             let configuredShell = ProcessInfo.processInfo.environment["SHELL"]
@@ -452,7 +548,8 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
             }
             return try managedTerminalCommands.swiftTermCommand(
                 target: tab.target,
-                sessionName: sessionName
+                sessionName: sessionName,
+                launchMode: tab.tmuxLaunchMode
             )
         }
     }
@@ -515,9 +612,11 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     private static func isValidRestoredTab(_ tab: TerminalTabRecord) -> Bool {
         if let reference = tab.herdrReference {
             guard tab.sessionName == nil, tab.tmuxIdentity == nil,
+                tab.tmuxLaunchMode == .createOrAttach,
                 reference.isValid else { return false }
             return tab.target.sshDestination.map(IdentifierValidator.isSSHDestination) ?? true
         }
+        if tab.tmuxLaunchMode == .attachOnly, tab.sessionName == nil { return false }
         switch tab.target {
         case .local:
             return tab.sessionName.map(TmuxSessionParser.isAttachable) ?? true
@@ -533,7 +632,14 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         restored.sessionName = tab.sessionName.flatMap(
             IdentifierValidator.normalizedTmuxSessionName
         )
+        if isPlatformManagedTmuxSessionName(restored.sessionName) {
+            restored.tmuxLaunchMode = .attachOnly
+        }
         return restored
+    }
+
+    private static func isPlatformManagedTmuxSessionName(_ sessionName: String?) -> Bool {
+        sessionName?.hasPrefix("tmuxhub-slurm-") == true
     }
 }
 
@@ -552,6 +658,7 @@ enum TerminalTabOperationError: LocalizedError {
     case invalidSessionName
     case sessionUnavailable
     case localTmuxNotFound
+    case externallyManagedSession
     case commandFailed(exitCode: Int32)
 
     var errorDescription: String? {
@@ -562,6 +669,8 @@ enum TerminalTabOperationError: LocalizedError {
             "这个标签没有可操作的 tmux 会话，或会话已被替换。"
         case .localTmuxNotFound:
             "本机未找到 tmux。请先通过 Homebrew 安装 tmux。"
+        case .externallyManagedSession:
+            "这个 tmux 会话由外部任务管理，请从对应任务中停止或修改它。"
         case let .commandFailed(exitCode):
             "tmux 操作失败（退出码 \(exitCode)）。"
         }
