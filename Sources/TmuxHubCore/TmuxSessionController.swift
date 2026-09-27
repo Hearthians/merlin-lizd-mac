@@ -11,6 +11,7 @@ public actor TmuxSessionController {
     private let sshMasterPool: SSHMasterPool?
     private let executionPolicy: BoundedAsyncOperationRunner?
     private let localTmuxPath: String?
+    private var configuringTargets: Set<TerminalTarget> = []
 
     public init(
         sshMasterPool: SSHMasterPool,
@@ -41,6 +42,29 @@ public actor TmuxSessionController {
         self.processRunner = processRunner
         executionPolicy = nil
         self.localTmuxPath = localTmuxPath
+    }
+
+    public func applyConfiguration(target: TerminalTarget) async throws -> TmuxConfigurationResult {
+        guard configuringTargets.insert(target).inserted else {
+            throw TmuxConfigurationError.alreadyApplying
+        }
+        defer { configuringTargets.remove(target) }
+        if case .local = target, localTmuxPath == nil {
+            throw TmuxConfigurationError.tmuxNotFound
+        }
+        let command = try TmuxConfigurationPreset.command(
+            target: target,
+            localTmuxPath: localTmuxPath ?? "/opt/homebrew/bin/tmux"
+        )
+        let output = try await run(command, target: target)
+        if output.exitCode == 10 { throw TmuxConfigurationError.tmuxNotFound }
+        guard output.exitCode == 0 else {
+            throw TmuxConfigurationError.commandFailed(
+                exitCode: output.exitCode,
+                detail: String(output.stderr.suffix(2_000)).trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        }
+        return try TmuxConfigurationResult.parse(output.stdout)
     }
 
     public func rename(

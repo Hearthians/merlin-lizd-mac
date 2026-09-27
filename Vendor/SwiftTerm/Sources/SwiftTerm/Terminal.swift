@@ -6066,7 +6066,11 @@ open class Terminal {
         }
 
         let searchRange = NSRange(lineMap.text.startIndex..<lineMap.text.endIndex, in: lineMap.text)
+        // Keep URLs and paths first so a filename within one never replaces
+        // the complete link. Bare names also appear in colorized `ls` output;
+        // the terminal cell map has already removed its ANSI styling.
         let matches = regex.matches(in: lineMap.text, options: [], range: searchRange)
+            + (Self.bareFilenameRegex?.matches(in: lineMap.text, options: [], range: searchRange) ?? [])
         for match in matches {
             guard match.range.length > 0,
                   let textRange = Range(match.range, in: lineMap.text)
@@ -6238,6 +6242,16 @@ open class Terminal {
         return try? NSRegularExpression(pattern: regex, options: [])
     }()
 
+    // A basename with an extension can be resolved against the pane's working
+    // directory just like a relative path. Accept arbitrary alphabetic
+    // extensions (including custom formats), but not numeric version suffixes
+    // or fragments of command flags, variable references, and larger paths.
+    // Keep this separate from the Ghostty regex: a bare name must not cause
+    // unrelated rows of a multi-column listing to be heuristically joined.
+    private static let bareFilenameRegex = try? NSRegularExpression(
+        pattern: #"(?<![\w.\/~:@$%+=-])\.?[\w][\w.\-]*\.[\p{L}][\p{L}\p{N}]*(?![\w.\/~:@$%+=-])"#
+    )
+
     private static let ghosttyContinuationCharacters = CharacterSet(
         charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~:/?#[]@!$&*+,;=%()"
     )
@@ -6286,12 +6300,16 @@ open class Terminal {
             if rawLimit <= 0 {
                 continue
             }
-            let lineLimit = min(rawLimit, line.getTrimmedLength())
+            // A real terminal wrap preserves spaces at the seam. Removing
+            // them would merge separate filenames in a wrapped `ls` listing.
+            let wrapsIntoNextRow = row < endRow && buffer.lines[row + 1].isWrapped
+            let lineLimit = wrapsIntoNextRow ? rawLimit : min(rawLimit, line.getTrimmedLength())
             if lineLimit <= 0 {
                 continue
             }
             let isContinuationRow = isImplicitContinuationRow(row, startRow: startRow, in: buffer)
-            let startCol = isContinuationRow ? firstNonWhitespaceColumn(in: line, lineLimit: lineLimit) : 0
+            let startCol = isContinuationRow && !line.isWrapped
+                ? firstNonWhitespaceColumn(in: line, lineLimit: lineLimit) : 0
             guard startCol < lineLimit else {
                 continue
             }

@@ -5,6 +5,7 @@ import SwiftUI
 @MainActor
 final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     @Published private(set) var tabs: [TerminalTabRecord]
+    @Published private(set) var tmuxConfigurationStates: [TerminalTarget: TmuxConfigurationState] = [:]
     @Published var selectedTabID: String? {
         didSet {
             if oldValue != selectedTabID {
@@ -119,17 +120,37 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         )
     }
 
-    func hasSavedPassword(for destination: String) throws -> Bool {
-        try runtime.hasSavedPassword(for: destination)
+    func hasSavedPassword(for destination: String) async throws -> Bool {
+        try await runtime.hasSavedPassword(for: destination)
     }
 
-    func savePassword(_ password: String, for destination: String) throws {
-        try runtime.savePassword(password, for: destination)
+    func savePassword(_ password: String, for destination: String) async throws {
+        try await runtime.savePassword(password, for: destination)
         prepareForUse(.ssh(destination: destination))
     }
 
-    func removePassword(for destination: String) throws {
-        try runtime.removePassword(for: destination)
+    func authorizeSavedPassword(for destination: String) async throws {
+        try await runtime.authorizeSavedPassword(for: destination)
+    }
+
+    func removePassword(for destination: String) async throws {
+        try await runtime.removePassword(for: destination)
+    }
+
+    func applyTmuxConfiguration(to target: TerminalTarget) async {
+        guard tmuxConfigurationStates[target] != .applying else { return }
+        tmuxConfigurationStates[target] = .applying
+        do {
+            let result = try await tmuxSessionController.applyConfiguration(target: target)
+            tmuxConfigurationStates[target] = .applied(result)
+            if let destination = target.sshDestination { noteHostUse(destination) }
+        } catch let TmuxSessionMutationError.commandFailed(exitCode) {
+            tmuxConfigurationStates[target] = .failed(
+                "无法完成主机连接（退出码 \(exitCode)），请检查 SSH 认证及网络后重试。"
+            )
+        } catch {
+            tmuxConfigurationStates[target] = .failed(error.localizedDescription)
+        }
     }
 
     func noteHostUse(_ destination: String, at date: Date = Date()) {
@@ -514,6 +535,12 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         )
         return restored
     }
+}
+
+enum TmuxConfigurationState: Equatable {
+    case applying
+    case applied(TmuxConfigurationResult)
+    case failed(String)
 }
 
 struct TmuxBatchTerminationResult: Sendable {

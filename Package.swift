@@ -34,6 +34,7 @@ let package = Package(
                 "SSHHostQuickAccess.swift",
                 "SSHPasswordStore.swift",
                 "TmuxCommands.swift",
+                "TmuxConfiguration.swift",
                 "SSHMasterCommands.swift",
                 "SSHMasterPool.swift",
                 "TerminalState.swift",
@@ -42,7 +43,7 @@ let package = Package(
                 "TmuxSessionDiscovery.swift",
                 "TmuxSessionParser.swift",
             ],
-            linkerSettings: [.linkedFramework("Security")]
+            linkerSettings: [.linkedFramework("Security"), .linkedFramework("LocalAuthentication")]
         ),
         .target(
             name: "_Testing_Foundation",
@@ -72,6 +73,7 @@ let package = Package(
                 "TerminalTabsModel.swift",
                 "TerminalWorkspaceView.swift",
                 "TmuxSessionBrowserView.swift",
+                "TmuxConfigurationCard.swift",
             ]
         ),
         .executableTarget(

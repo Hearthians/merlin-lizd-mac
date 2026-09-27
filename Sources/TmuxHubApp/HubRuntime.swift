@@ -68,20 +68,40 @@ final class HubRuntime {
         }
     }
 
-    func hasSavedPassword(for destination: String) throws -> Bool {
-        try passwordStore.containsPassword(for: destination)
+    func hasSavedPassword(for destination: String) async throws -> Bool {
+        let store = passwordStore
+        return try await Task.detached(priority: .userInitiated) {
+            try store.containsPassword(for: destination)
+        }.value
     }
 
-    func savePassword(_ password: String, for destination: String) throws {
+    func savePassword(_ password: String, for destination: String) async throws {
         guard askPassExecutable != nil else {
             throw PasswordAuthenticationSetupError.askPassHelperUnavailable
         }
-        try passwordStore.setPassword(password, for: destination)
+        let store = passwordStore
+        try await Task.detached(priority: .userInitiated) {
+            try store.setPassword(password, for: destination)
+        }.value
         prepare(.ssh(destination: destination))
     }
 
-    func removePassword(for destination: String) throws {
-        try passwordStore.removePassword(for: destination)
+    func authorizeSavedPassword(for destination: String) async throws {
+        guard askPassExecutable != nil else {
+            throw PasswordAuthenticationSetupError.askPassHelperUnavailable
+        }
+        let store = passwordStore
+        try await Task.detached(priority: .userInitiated) {
+            try store.authorizePassword(for: destination)
+        }.value
+        prepare(.ssh(destination: destination))
+    }
+
+    func removePassword(for destination: String) async throws {
+        let store = passwordStore
+        try await Task.detached(priority: .userInitiated) {
+            try store.removePassword(for: destination)
+        }.value
     }
 
     func shutdown() async {

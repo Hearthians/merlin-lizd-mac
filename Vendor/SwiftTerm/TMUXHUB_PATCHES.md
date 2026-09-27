@@ -25,6 +25,21 @@ user types or moves focus. These methods otherwise retain upstream behavior.
 instead of relying only on the protocol-extension default. TmuxHub overrides it
 to route terminal file links into its local-open/remote-download workflow.
 
+`TerminalView.link(at:)` exposes the existing event-to-link lookup, and
+`shouldActivateLink(_:with:)` lets the embedding app decline normal link
+activation while retaining mouse reporting and selection cleanup. TmuxHub uses
+these hooks to require Command + right-click for file links; the default
+SwiftTerm activation policy stays unchanged.
+
+Implicit link detection also recognizes bare filenames with alphabetic
+extensions, including custom formats, in plain or colorized terminal output.
+It reuses the terminal cell mapping for highlighting and click targets, with
+URLs and directory paths taking precedence. This filename rule is excluded
+from heuristic row joining so separate rows of `ls` output stay separate;
+numeric versions and command flags are not treated as filenames.
+Actual terminal wraps preserve spaces between columns, so names on either
+side of a wrap are not combined into a nonexistent filename.
+
 Display changes refresh the pixel-snapped character dimensions when a view is
 attached to a window or its backing scale changes. The grid, cursor, and PTY
 dimensions are updated together and the full view is redrawn, preventing stale

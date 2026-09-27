@@ -88,6 +88,7 @@ struct TmuxHubRootView: View {
             }
         case .local:
             LocalTerminalLandingView(
+                terminals: terminals,
                 onOpenShell: terminals.openLocalShell,
                 onNewTmux: { terminals.openLocalTmux() },
                 onBrowseSessions: { sessionBrowserTarget = .local },
@@ -97,6 +98,7 @@ struct TmuxHubRootView: View {
             if let host = model.host(destination: destination) {
                 SSHHostDetailView(
                     host: host,
+                    terminals: terminals,
                     onConnect: { terminals.openOrResumeSSH(destination) },
                     onNewSession: { terminals.openSSH(destination) },
                     onBrowseSessions: {
@@ -106,15 +108,19 @@ struct TmuxHubRootView: View {
                         browseHerdr(.ssh(destination: destination))
                     },
                     hasSavedPassword: {
-                        try terminals.hasSavedPassword(for: destination)
+                        try await terminals.hasSavedPassword(for: destination)
                     },
                     onSavePassword: {
-                        try terminals.savePassword($0, for: destination)
+                        try await terminals.savePassword($0, for: destination)
+                    },
+                    onAuthorizePassword: {
+                        try await terminals.authorizeSavedPassword(for: destination)
                     },
                     onRemovePassword: {
-                        try terminals.removePassword(for: destination)
+                        try await terminals.removePassword(for: destination)
                     }
                 )
+                .id(destination)
             } else {
                 ContentUnavailableView(
                     "SSH 目标已移除",
