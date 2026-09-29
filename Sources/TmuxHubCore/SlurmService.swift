@@ -3,6 +3,7 @@ import Foundation
 public enum SlurmServiceError: Error, Equatable, LocalizedError, Sendable {
     case commandFailed(exitCode: Int32, message: String)
     case transportUnavailable
+    case connectionFailed(message: String)
     case submissionOutcomeUnknown(SlurmLaunchReceipt)
     case cancellationOutcomeUnknown(SlurmManagedJob)
     case ambiguousLaunch(SlurmLaunchReceipt)
@@ -16,6 +17,8 @@ public enum SlurmServiceError: Error, Equatable, LocalizedError, Sendable {
                 ? "Slurm 命令失败（退出码 \(exitCode)）。"
                 : "Slurm 命令失败（退出码 \(exitCode)）：\(message)"
         case .transportUnavailable: "无法通过登录节点读取 Slurm。"
+        case let .connectionFailed(message):
+            "\(connectionFailureSummary ?? "无法连接登录节点。")\n\n\(message)"
         case .submissionOutcomeUnknown:
             "启动连接在结果确认前中断。请按启动凭据查询，避免重复提交。"
         case .cancellationOutcomeUnknown:
@@ -24,6 +27,21 @@ public enum SlurmServiceError: Error, Equatable, LocalizedError, Sendable {
         case let .jobUnavailable(jobID): "作业 \(jobID.rawValue) 已不在活动队列中。"
         case .identityMismatch: "作业身份已经变化，已拒绝取消。"
         }
+    }
+
+    /// A short recovery hint for views that show the SSH diagnostic separately.
+    public var connectionFailureSummary: String? {
+        guard case let .connectionFailed(message) = self else { return nil }
+        if message.contains("REMOTE HOST IDENTIFICATION HAS CHANGED") {
+            return "登录节点的 SSH 主机密钥与本机记录不一致，连接已被 SSH 拒绝。请联系集群管理员核实主机指纹后，再更新本机主机记录。"
+        }
+        if message.contains("Host key verification failed") {
+            return "登录节点的 SSH 身份尚未通过验证。请打开登录 Shell 查看详情，并核实服务器身份。"
+        }
+        if message.contains("Permission denied") {
+            return "SSH 认证未通过。请打开登录 Shell 完成登录后重试。"
+        }
+        return "无法连接登录节点。请查看连接详情，或打开登录 Shell 检查。"
     }
 }
 
@@ -161,6 +179,13 @@ public actor SlurmService {
                 alias: platform.loginDestination,
                 replay: .readOnly
             )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let SSHMasterPoolError.connectionFailed(_, message) {
+            let diagnostic = Self.safeMessage(message, limit: 4_096)
+            throw diagnostic.isEmpty
+                ? SlurmServiceError.transportUnavailable
+                : SlurmServiceError.connectionFailed(message: diagnostic)
         } catch {
             throw SlurmServiceError.transportUnavailable
         }
@@ -175,10 +200,10 @@ public actor SlurmService {
         )
     }
 
-    private static func safeMessage(_ value: String) -> String {
+    private static func safeMessage(_ value: String, limit: Int = 512) -> String {
         let filtered = String(String.UnicodeScalarView(value.unicodeScalars.filter {
             !CharacterSet.controlCharacters.contains($0) || $0 == "\n"
         }))
-        return String(filtered.trimmingCharacters(in: .whitespacesAndNewlines).prefix(512))
+        return String(filtered.trimmingCharacters(in: .whitespacesAndNewlines).prefix(limit))
     }
 }

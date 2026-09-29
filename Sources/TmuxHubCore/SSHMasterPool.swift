@@ -18,7 +18,36 @@ public enum SSHLinkState: Equatable, Sendable {
 
 enum SSHMasterPoolError: Error, Equatable, Sendable {
     case commandFailed(exitCode: Int32)
+    case connectionFailed(exitCode: Int32, message: String)
     case shuttingDown
+}
+
+/// Keep the diagnostic attached to the shared preparation result so concurrent
+/// callers cannot accidentally receive a later attempt's failure.
+private struct SSHPreparationResult: Sendable {
+    let linkState: SSHLinkState
+    let failure: SSHMasterPoolError?
+
+    static let ready = SSHPreparationResult(linkState: .ready, failure: nil)
+    static let failed = SSHPreparationResult(
+        linkState: .failed,
+        failure: .commandFailed(exitCode: 255)
+    )
+
+    static func failure(_ output: InventoryProcessOutput) -> SSHPreparationResult {
+        SSHPreparationResult(linkState: .failed, failure: sshCommandFailure(output))
+    }
+}
+
+private func sshCommandFailure(_ output: InventoryProcessOutput) -> SSHMasterPoolError {
+    let filtered = String(String.UnicodeScalarView(output.stderr.unicodeScalars.filter {
+        !CharacterSet.controlCharacters.contains($0) || $0 == "\n"
+    }))
+    let message = String(filtered.trimmingCharacters(in: .whitespacesAndNewlines).prefix(4_096))
+    guard !message.isEmpty else {
+        return .commandFailed(exitCode: output.exitCode)
+    }
+    return .connectionFailed(exitCode: output.exitCode, message: message)
 }
 
 public final class SSHMasterPool: @unchecked Sendable {
@@ -102,7 +131,7 @@ public final class SSHMasterPool: @unchecked Sendable {
         guard (try? commands.socketPath(alias: alias)) != nil else {
             return .failed
         }
-        return await state.prepare(alias: alias, priority: priority)
+        return await state.prepare(alias: alias, priority: priority).linkState
     }
 
     public func managedCommand(
@@ -133,11 +162,12 @@ public final class SSHMasterPool: @unchecked Sendable {
         if await state.shuttingDown() {
             throw SSHMasterPoolError.shuttingDown
         }
-        guard await prepare(alias: alias, priority: .foreground) == .ready else {
+        let preparation = await state.prepare(alias: alias, priority: .foreground)
+        guard preparation.linkState == .ready else {
             if await state.shuttingDown() {
                 throw SSHMasterPoolError.shuttingDown
             }
-            throw SSHMasterPoolError.commandFailed(exitCode: 255)
+            throw preparation.failure ?? SSHMasterPoolError.commandFailed(exitCode: 255)
         }
         if await state.shuttingDown() {
             throw SSHMasterPoolError.shuttingDown
@@ -159,7 +189,8 @@ public final class SSHMasterPool: @unchecked Sendable {
             return output
         }
         guard replay == .readOnly else {
-            throw SSHMasterPoolError.commandFailed(exitCode: 255)
+            throw output.map(sshCommandFailure)
+                ?? SSHMasterPoolError.commandFailed(exitCode: 255)
         }
 
         if let retryBoundaryHook {
@@ -171,11 +202,12 @@ public final class SSHMasterPool: @unchecked Sendable {
             await retryInvalidationHook()
         }
         try Task.checkCancellation()
-        guard await prepare(alias: alias, priority: .foreground) == .ready else {
+        let retryPreparation = await state.prepare(alias: alias, priority: .foreground)
+        guard retryPreparation.linkState == .ready else {
             if await state.shuttingDown() {
                 throw SSHMasterPoolError.shuttingDown
             }
-            throw SSHMasterPoolError.commandFailed(exitCode: 255)
+            throw retryPreparation.failure ?? SSHMasterPoolError.commandFailed(exitCode: 255)
         }
         try Task.checkCancellation()
         if await state.shuttingDown() {
@@ -185,15 +217,16 @@ public final class SSHMasterPool: @unchecked Sendable {
         try Task.checkCancellation()
         let replayed = try await runAdmitted(preparedMasterCommand(command, alias: alias))
         guard replayed.exitCode != 255 else {
-            throw SSHMasterPoolError.commandFailed(exitCode: replayed.exitCode)
+            throw sshCommandFailure(replayed)
         }
         return replayed
     }
 
     func transfer(batchFile: URL, alias: String) async throws -> InventoryProcessOutput {
         try Task.checkCancellation()
-        guard await prepare(alias: alias, priority: .foreground) == .ready else {
-            throw SSHMasterPoolError.commandFailed(exitCode: 255)
+        let preparation = await state.prepare(alias: alias, priority: .foreground)
+        guard preparation.linkState == .ready else {
+            throw preparation.failure ?? SSHMasterPoolError.commandFailed(exitCode: 255)
         }
         // Never replay a file transfer automatically.
         return try await runAdmitted(commands.sftp(batchFile: batchFile, alias: alias))
@@ -381,7 +414,7 @@ private actor SSHMasterPoolState {
 
     private var readyAliases: Set<String> = []
     private var ownedAliases: Set<String> = []
-    private var preparations: [String: Task<SSHLinkState, Never>] = [:]
+    private var preparations: [String: Task<SSHPreparationResult, Never>] = [:]
     private var preparationPriorities: [String: SSHWarmupPriority] = [:]
     private var foregroundWaiters: [PreparationWaiter] = []
     private var backgroundWaiters: [PreparationWaiter] = []
@@ -417,7 +450,7 @@ private actor SSHMasterPoolState {
     func prepare(
         alias: String,
         priority: SSHWarmupPriority
-    ) async -> SSHLinkState {
+    ) async -> SSHPreparationResult {
         guard !isShuttingDown else { return .failed }
         if let task = preparations[alias] {
             promotePreparationIfNeeded(alias: alias, priority: priority)
@@ -439,7 +472,7 @@ private actor SSHMasterPoolState {
         isShuttingDown
     }
 
-    func beginShutdown() async -> [Task<SSHLinkState, Never>] {
+    func beginShutdown() async -> [Task<SSHPreparationResult, Never>] {
         if !isShuttingDown {
             isShuttingDown = true
             shutdownWaiters.forEach { $0.resume() }
@@ -520,7 +553,7 @@ private actor SSHMasterPoolState {
     private func performPreparation(
         alias: String,
         priority: SSHWarmupPriority
-    ) async -> SSHLinkState {
+    ) async -> SSHPreparationResult {
         guard await acquireSlot(alias: alias, priority: priority) else {
             preparations.removeValue(forKey: alias)
             preparationPriorities.removeValue(forKey: alias)
@@ -528,7 +561,7 @@ private actor SSHMasterPoolState {
         }
 
         let result = await establish(alias: alias)
-        if result == .ready {
+        if result.linkState == .ready {
             readyAliases.insert(alias)
             ownedAliases.insert(alias)
         } else {
@@ -574,7 +607,7 @@ private actor SSHMasterPoolState {
         }
     }
 
-    private func establish(alias: String) async -> SSHLinkState {
+    private func establish(alias: String) async -> SSHPreparationResult {
         guard ensureDirectory() else { return .failed }
         guard let check = try? commands.check(alias: alias) else { return .failed }
 
@@ -596,7 +629,7 @@ private actor SSHMasterPoolState {
         ) else { return .failed }
         do {
             let output = try await runner.run(prepare)
-            return output.exitCode == 0 ? .ready : .failed
+            return output.exitCode == 0 ? .ready : .failure(output)
         } catch {
             return .failed
         }

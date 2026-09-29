@@ -116,6 +116,15 @@ struct HPC2PlatformView: View {
                     } ?? "未能读取 Slurm 任务，当前任务数量与状态未知。\n\(message)",
                     kind: .warning
                 )
+                if let diagnostic = model.connectionDiagnostic {
+                    DisclosureGroup("连接详情") {
+                        Text(diagnostic)
+                            .font(.caption.monospaced())
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 6)
+                    }
+                }
                 HStack {
                     Button("重试") { Task { await model.refresh(force: true) } }
                         .disabled(model.isRefreshing)

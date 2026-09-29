@@ -50,6 +50,7 @@ final class HPC2PlatformModel: ObservableObject {
     @Published private(set) var jobs: [SlurmJobSnapshot] = []
     @Published private(set) var managedRuns: [HPC2ManagedRunRecord]
     @Published private(set) var connectionState: HPC2ConnectionState = .idle
+    @Published private(set) var connectionDiagnostic: String?
     @Published private(set) var isRefreshing = false
     @Published private(set) var isStarting = false
     @Published private(set) var cancellingRequestIDs: Set<UUID> = []
@@ -197,13 +198,25 @@ final class HPC2PlatformModel: ObservableObject {
             jobs = refreshedJobs.sorted(by: Self.jobOrdering)
             reconcileRuns(with: refreshedJobs, at: refreshDate)
             lastSuccessfulRefresh = refreshDate
+            connectionDiagnostic = nil
             connectionState = .ready(refreshDate)
             notice = nil
         } catch is CancellationError {
             return
         } catch {
             guard !Task.isCancelled, profile == requestedProfile else { return }
-            connectionState = .stale(lastSuccessfulRefresh, error.localizedDescription)
+            if let failure = error as? SlurmServiceError,
+                case let .connectionFailed(message) = failure
+            {
+                connectionDiagnostic = message
+                connectionState = .stale(
+                    lastSuccessfulRefresh,
+                    failure.connectionFailureSummary ?? error.localizedDescription
+                )
+            } else {
+                connectionDiagnostic = nil
+                connectionState = .stale(lastSuccessfulRefresh, error.localizedDescription)
+            }
         }
     }
 
@@ -248,6 +261,7 @@ final class HPC2PlatformModel: ObservableObject {
         if identityChanged {
             jobs = []
             lastSuccessfulRefresh = nil
+            connectionDiagnostic = nil
             connectionState = .idle
         }
         defaultPreset = preset
