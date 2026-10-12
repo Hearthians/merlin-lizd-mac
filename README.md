@@ -167,3 +167,11 @@ Mac 前仍需使用 Developer ID 签名并公证。
 
 SwiftTerm 1.14.0 vendored 在 `Vendor/SwiftTerm`，其中保留了让 Metal shader
 进入标准 app resource 路径的小型打包补丁。
+
+## Windows 远程版
+
+`windows/` 包含独立的 .NET 8 Windows 客户端。它只连接远端 tmux/Herdr，直接使用
+Windows OpenSSH，并在独立控制台打开交互 SSH；不提供本机 tmux 或内嵌终端。
+构建、测试和安装方法见 [`windows/README.md`](windows/README.md)。安装脚本将
+framework-dependent `win-x64` 输出发布到 `windows/publish`，并创建
+`D:\lizd\app\TmuxHub.lnk`。

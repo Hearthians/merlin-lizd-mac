@@ -4,3 +4,6 @@
 /.worktrees
 *.xcuserstate
 .DS_Store
+/windows/**/bin/
+/windows/**/obj/
+/windows/publish/
