@@ -13,6 +13,8 @@ tmux、Herdr 和 Slurm，并在独立控制台中打开交互终端。不安装�
 - Windows “OpenSSH Client” 可选功能，默认程序路径为
   `C:\Windows\System32\OpenSSH\ssh.exe`。
 - 远端已安装 tmux；如使用 Herdr 页面，远端还需已有可连接的 Herdr 服务。
+- 如使用 Slurm 页面，远端的 `squeue` 需支持 `--json`；Windows 版不会回退到
+  无转义的文本列格式。
 - 建议先在普通控制台运行一次 `ssh <目标>`，完成主机密钥确认与密钥/Agent 认证。
 
 主机库读取 `%USERPROFILE%\.ssh\config` 以及其中的 `Include`。端口、用户名、私钥、
@@ -39,7 +41,7 @@ dotnet run --project .\windows\TmuxHub.Windows.Tests\TmuxHub.Windows.Tests.cspro
 ```
 
 测试不连接真实 SSH 主机，覆盖目标与 tmux 标识校验、稳定会话名哈希、tmux 列表解析、
-Windows SSH `Include`、状态持久化，以及本地/远端参数边界。
+Slurm JSON 与异常自由文本、Windows SSH `Include`、状态持久化，以及本地/远端参数边界。
 
 ## 安装
 
