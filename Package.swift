@@ -33,7 +33,12 @@ let package = Package(
                 "SSHHost.swift",
                 "SSHHostQuickAccess.swift",
                 "SSHPasswordStore.swift",
+                "SlurmCommands.swift",
+                "SlurmModels.swift",
+                "SlurmParser.swift",
+                "SlurmService.swift",
                 "TmuxCommands.swift",
+                "TmuxConfiguration.swift",
                 "SSHMasterCommands.swift",
                 "SSHMasterPool.swift",
                 "TerminalState.swift",
@@ -42,7 +47,7 @@ let package = Package(
                 "TmuxSessionDiscovery.swift",
                 "TmuxSessionParser.swift",
             ],
-            linkerSettings: [.linkedFramework("Security")]
+            linkerSettings: [.linkedFramework("Security"), .linkedFramework("LocalAuthentication")]
         ),
         .target(
             name: "_Testing_Foundation",
@@ -63,6 +68,9 @@ let package = Package(
                 "DesignSystem.swift",
                 "HostViews.swift",
                 "HerdrBrowserView.swift",
+                "HPC2PlatformModel.swift",
+                "HPC2PlatformView.swift",
+                "HPC2StartSheet.swift",
                 "HubRuntime.swift",
                 "TmuxHubApplication.swift",
                 "TmuxHubRootView.swift",
@@ -72,6 +80,7 @@ let package = Package(
                 "TerminalTabsModel.swift",
                 "TerminalWorkspaceView.swift",
                 "TmuxSessionBrowserView.swift",
+                "TmuxConfigurationCard.swift",
             ]
         ),
         .executableTarget(

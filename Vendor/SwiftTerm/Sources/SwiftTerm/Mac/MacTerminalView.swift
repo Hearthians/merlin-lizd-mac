@@ -2519,14 +2519,28 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     var didSelectionDrag: Bool = false
+
+    /// Resolves a link using the same cell mapping and visibility rules as a
+    /// normal click. Embedders can use this for alternative pointer gestures.
+    public func link(at event: NSEvent) -> (link: String, params: [String: String])? {
+        let point = convert(event.locationInWindow, from: nil)
+        guard bounds.contains(point) else { return nil }
+        let hit = calculateMouseHit(at: point).grid
+        updateHoverLink(at: hit, commandOverride: commandActive || event.modifierFlags.contains(.command))
+        return linkForClick(at: hit, hasCommandModifier: event.modifierFlags.contains(.command))
+    }
+
+    /// Returning false leaves the event available for terminal mouse reporting
+    /// and selection cleanup instead of consuming it as a link activation.
+    open func shouldActivateLink(_ link: String, with event: NSEvent) -> Bool {
+        true
+    }
     
     open override func mouseUp(with event: NSEvent) {
         stopSelectionAutoScrollTimer()
         autoScrollDelta = 0
         lastSelectionDragPoint = nil
-        let hit = calculateMouseHit(with: event).grid
-        updateHoverLink(at: hit, commandOverride: commandActive || event.modifierFlags.contains(.command))
-        if let result = linkForClick(at: hit, hasCommandModifier: event.modifierFlags.contains(.command)) {
+        if let result = link(at: event), shouldActivateLink(result.link, with: event) {
             terminalDelegate?.requestOpenLink(source: self, link: result.link, params: result.params)
             return
         }

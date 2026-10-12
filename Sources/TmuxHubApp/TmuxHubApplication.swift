@@ -8,6 +8,7 @@ struct TmuxHubApplication: App {
     private var appDelegate
     @StateObject private var model: AppModel
     @StateObject private var terminals: TerminalTabsModel
+    @StateObject private var hpc2: HPC2PlatformModel
     private let runtime: HubRuntime
 
     init() {
@@ -22,12 +23,15 @@ struct TmuxHubApplication: App {
                 }
         )
         _terminals = StateObject(wrappedValue: terminals)
+        _hpc2 = StateObject(wrappedValue: HPC2PlatformModel(
+            service: runtime.slurmService
+        ))
         appDelegate.configure(runtime: runtime, terminals: terminals)
     }
 
     var body: some Scene {
         WindowGroup("TmuxHub") {
-            TmuxHubRootView(model: model, terminals: terminals)
+            TmuxHubRootView(model: model, terminals: terminals, hpc2: hpc2)
                 .frame(minWidth: 900, minHeight: 600)
         }
         .defaultSize(width: 1160, height: 760)

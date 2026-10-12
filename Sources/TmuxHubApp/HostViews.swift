@@ -177,17 +177,20 @@ struct HostOverviewView: View {
 
 struct SSHHostDetailView: View {
     let host: SSHHost
+    @ObservedObject var terminals: TerminalTabsModel
     let onConnect: () -> Void
     let onNewSession: () -> Void
     let onBrowseSessions: () -> Void
     let onBrowseHerdr: () -> Void
-    let hasSavedPassword: () throws -> Bool
-    let onSavePassword: (String) throws -> Void
-    let onRemovePassword: () throws -> Void
+    let hasSavedPassword: () async throws -> Bool
+    let onSavePassword: (String) async throws -> Void
+    let onAuthorizePassword: () async throws -> Void
+    let onRemovePassword: () async throws -> Void
     @State private var password = ""
     @State private var passwordIsSaved = false
     @State private var passwordStatusMessage: String?
     @State private var passwordErrorMessage: String?
+    @State private var isManagingPassword = false
 
     var body: some View {
         ScrollView {
@@ -255,6 +258,11 @@ struct SSHHostDetailView: View {
                     }
                 }
 
+                TmuxConfigurationCard(
+                    target: .ssh(destination: host.destination),
+                    terminals: terminals
+                )
+
                 SurfaceCard("连接行为") {
                     Label(
                         "tmux 与 Herdr 标签均可恢复；关闭标签只断开连接，不终止远程任务。",
@@ -300,11 +308,28 @@ struct SSHHostDetailView: View {
                             .buttonStyle(.bordered)
                         }
                     }
+                    .disabled(isManagingPassword)
+
+                    if passwordIsSaved || passwordErrorMessage != nil {
+                        HStack(spacing: 10) {
+                            Button("授权使用已存密码", systemImage: "lock.open") {
+                                authorizePassword()
+                            }
+                            .disabled(isManagingPassword)
+                            .accessibilityIdentifier("authorize-saved-ssh-password")
+                            if isManagingPassword {
+                                ProgressView().controlSize(.small)
+                            }
+                        }
+                        Text("需要系统许可时，请点此授权。弹窗使用 Mac 登录钥匙串密码；后台不会自动弹窗。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
 
                     if passwordIsSaved {
-                        Label("已为此主机启用钥匙串密码回退", systemImage: "checkmark.shield")
+                        Label("已保存此主机的 SSH 密码", systemImage: "checkmark.shield")
                             .foregroundStyle(.green)
-                    } else {
+                    } else if passwordErrorMessage == nil {
                         Label("未保存密码，继续使用密钥或终端交互认证", systemImage: "key")
                             .foregroundStyle(.secondary)
                     }
@@ -323,46 +348,82 @@ struct SSHHostDetailView: View {
             .padding(24)
         }
         .task(id: host.destination) {
-            refreshPasswordStatus()
+            await refreshPasswordStatus()
         }
     }
 
-    private func refreshPasswordStatus() {
+    private func refreshPasswordStatus() async {
+        isManagingPassword = true
+        defer { isManagingPassword = false }
         do {
-            passwordIsSaved = try hasSavedPassword()
+            let saved = try await hasSavedPassword()
+            guard !Task.isCancelled else { return }
+            passwordIsSaved = saved
             passwordErrorMessage = nil
         } catch {
+            guard !Task.isCancelled else { return }
             passwordIsSaved = false
             passwordErrorMessage = error.localizedDescription
         }
     }
 
     private func savePassword() {
-        do {
-            try onSavePassword(password)
-            password = ""
-            passwordIsSaved = true
-            passwordStatusMessage = "密码已保存；后续连接会先尝试密钥，再回退到密码。"
-            passwordErrorMessage = nil
-        } catch {
-            passwordErrorMessage = error.localizedDescription
+        guard !isManagingPassword, !password.isEmpty else { return }
+        isManagingPassword = true
+        passwordStatusMessage = nil
+        let submittedPassword = password
+        Task {
+            defer { isManagingPassword = false }
+            do {
+                try await onSavePassword(submittedPassword)
+                password = ""
+                passwordIsSaved = true
+                passwordStatusMessage = "密码已保存；后续连接会先尝试密钥，再回退到密码。"
+                passwordErrorMessage = nil
+            } catch {
+                passwordErrorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func authorizePassword() {
+        guard !isManagingPassword else { return }
+        isManagingPassword = true
+        passwordStatusMessage = nil
+        Task {
+            defer { isManagingPassword = false }
+            do {
+                try await onAuthorizePassword()
+                passwordIsSaved = true
+                passwordStatusMessage = "已授权使用已存密码；本次 App 运行中会复用授权。"
+                passwordErrorMessage = nil
+            } catch {
+                passwordErrorMessage = error.localizedDescription
+            }
         }
     }
 
     private func removePassword() {
-        do {
-            try onRemovePassword()
-            password = ""
-            passwordIsSaved = false
-            passwordStatusMessage = "已移除密码；现有 SSH 连接不会被中断。"
-            passwordErrorMessage = nil
-        } catch {
-            passwordErrorMessage = error.localizedDescription
+        guard !isManagingPassword else { return }
+        isManagingPassword = true
+        passwordStatusMessage = nil
+        Task {
+            defer { isManagingPassword = false }
+            do {
+                try await onRemovePassword()
+                password = ""
+                passwordIsSaved = false
+                passwordStatusMessage = "已移除密码；现有 SSH 连接不会被中断。"
+                passwordErrorMessage = nil
+            } catch {
+                passwordErrorMessage = error.localizedDescription
+            }
         }
     }
 }
 
 struct LocalTerminalLandingView: View {
+    @ObservedObject var terminals: TerminalTabsModel
     let onOpenShell: () -> Void
     let onNewTmux: () -> Void
     let onBrowseSessions: () -> Void
@@ -388,7 +449,10 @@ struct LocalTerminalLandingView: View {
                     .buttonStyle(.bordered)
             }
             .controlSize(.large)
+            TmuxConfigurationCard(target: .local, terminals: terminals)
+                .frame(maxWidth: 720)
         }
+        .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }

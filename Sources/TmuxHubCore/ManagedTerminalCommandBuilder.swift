@@ -15,21 +15,32 @@ public struct ManagedTerminalCommandBuilder: Sendable {
 
     public func swiftTermCommand(
         target: TerminalTarget,
-        sessionName: String
+        sessionName: String,
+        launchMode: TmuxSessionLaunchMode = .createOrAttach
     ) throws -> CommandSpec {
-        try managedRemoteCommand(target: target, sessionName: sessionName)
+        try managedRemoteCommand(
+            target: target,
+            sessionName: sessionName,
+            launchMode: launchMode
+        )
     }
 
     public func externalTerminalCommand(
         target: TerminalTarget,
-        sessionName: String
+        sessionName: String,
+        launchMode: TmuxSessionLaunchMode = .createOrAttach
     ) throws -> CommandSpec {
-        try managedRemoteCommand(target: target, sessionName: sessionName)
+        try managedRemoteCommand(
+            target: target,
+            sessionName: sessionName,
+            launchMode: launchMode
+        )
     }
 
     private func managedRemoteCommand(
         target: TerminalTarget,
-        sessionName: String
+        sessionName: String,
+        launchMode: TmuxSessionLaunchMode
     ) throws -> CommandSpec {
         let command: CommandSpec
         let alias: String
@@ -40,7 +51,8 @@ public struct ManagedTerminalCommandBuilder: Sendable {
             alias = destination
             command = try TmuxCommands.remoteTerminal(
                 destination: destination,
-                sessionName: sessionName
+                sessionName: sessionName,
+                launchMode: launchMode
             )
         }
         return try sshMasterPool.managedCommand(command, alias: alias)

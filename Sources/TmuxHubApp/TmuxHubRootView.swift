@@ -5,6 +5,7 @@ import SwiftUI
 struct TmuxHubRootView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var terminals: TerminalTabsModel
+    @ObservedObject var hpc2: HPC2PlatformModel
     @State private var sessionBrowserTarget: TerminalTarget?
     @State private var herdrBrowserTarget: TerminalTarget?
 
@@ -37,9 +38,13 @@ struct TmuxHubRootView: View {
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
-                    model.refresh()
+                    if model.selection == .platform("hkust-hpc2") {
+                        Task { await hpc2.refresh(force: true) }
+                    } else {
+                        model.refresh()
+                    }
                 } label: {
-                    Label("重新读取 SSH 配置", systemImage: "arrow.clockwise")
+                    Label("刷新", systemImage: "arrow.clockwise")
                 }
                 .keyboardShortcut("r", modifiers: [.command])
             }
@@ -88,15 +93,39 @@ struct TmuxHubRootView: View {
             }
         case .local:
             LocalTerminalLandingView(
+                terminals: terminals,
                 onOpenShell: terminals.openLocalShell,
                 onNewTmux: { terminals.openLocalTmux() },
                 onBrowseSessions: { sessionBrowserTarget = .local },
                 onBrowseHerdr: { browseHerdr(.local) }
             )
+        case let .platform(platformID):
+            if platformID == "hkust-hpc2" {
+                HPC2PlatformView(
+                    model: hpc2,
+                    onConnect: { receipt in
+                        terminals.openAttachOnlyRemoteTmux(
+                            destination: receipt.loginDestination,
+                            sessionName: receipt.tmuxSessionName,
+                            title: "HPC2 · \(receipt.jobName)"
+                        )
+                    },
+                    onOpenLoginShell: {
+                        terminals.openOrResumeSSH(hpc2.profile.loginDestination)
+                    }
+                )
+            } else {
+                ContentUnavailableView(
+                    "平台不可用",
+                    systemImage: "cpu",
+                    description: Text("没有找到这个计算平台。")
+                )
+            }
         case let .host(destination):
             if let host = model.host(destination: destination) {
                 SSHHostDetailView(
                     host: host,
+                    terminals: terminals,
                     onConnect: { terminals.openOrResumeSSH(destination) },
                     onNewSession: { terminals.openSSH(destination) },
                     onBrowseSessions: {
@@ -106,15 +135,19 @@ struct TmuxHubRootView: View {
                         browseHerdr(.ssh(destination: destination))
                     },
                     hasSavedPassword: {
-                        try terminals.hasSavedPassword(for: destination)
+                        try await terminals.hasSavedPassword(for: destination)
                     },
                     onSavePassword: {
-                        try terminals.savePassword($0, for: destination)
+                        try await terminals.savePassword($0, for: destination)
+                    },
+                    onAuthorizePassword: {
+                        try await terminals.authorizeSavedPassword(for: destination)
                     },
                     onRemovePassword: {
-                        try terminals.removePassword(for: destination)
+                        try await terminals.removePassword(for: destination)
                     }
                 )
+                .id(destination)
             } else {
                 ContentUnavailableView(
                     "SSH 目标已移除",

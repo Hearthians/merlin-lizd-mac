@@ -4,6 +4,7 @@ import TmuxHubCore
 enum SidebarSelection: Hashable {
     case overview
     case local
+    case platform(String)
     case host(String)
 }
 
