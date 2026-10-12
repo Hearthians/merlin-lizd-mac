@@ -4,6 +4,8 @@ import Foundation
 enum SSHMasterCommandError: Error, Equatable, Sendable {
     case invalidDestination
     case invalidSSHCommand
+    case invalidForwardHost
+    case invalidForwardPort
     case socketPathTooLong
 }
 
@@ -65,6 +67,36 @@ struct SSHMasterCommands: Sendable {
 
     func stop(alias: String) throws -> CommandSpec {
         try operation("stop", alias: alias)
+    }
+
+    func openLocalForward(
+        alias: String,
+        localPort: Int,
+        remoteHost: String,
+        remotePort: Int
+    ) throws -> CommandSpec {
+        try localForwardOperation(
+            "forward",
+            alias: alias,
+            localPort: localPort,
+            remoteHost: remoteHost,
+            remotePort: remotePort
+        )
+    }
+
+    func cancelLocalForward(
+        alias: String,
+        localPort: Int,
+        remoteHost: String,
+        remotePort: Int
+    ) throws -> CommandSpec {
+        try localForwardOperation(
+            "cancel",
+            alias: alias,
+            localPort: localPort,
+            remoteHost: remoteHost,
+            remotePort: remotePort
+        )
     }
 
     func sftp(batchFile: URL, alias: String) throws -> CommandSpec {
@@ -215,8 +247,45 @@ struct SSHMasterCommands: Sendable {
         return CommandSpec(
             executable: "/usr/bin/ssh",
             arguments: [
-                "-O", operation, "-o", "BatchMode=yes",
-                "-o", "ControlPath=\(path)", alias,
+                "-F", "/dev/null", "-S", path,
+                "-O", operation, "-o", "BatchMode=yes", alias,
+            ]
+        )
+    }
+
+    private func localForwardOperation(
+        _ operation: String,
+        alias: String,
+        localPort: Int,
+        remoteHost: String,
+        remotePort: Int
+    ) throws -> CommandSpec {
+        let path = try socketPath(alias: alias)
+        guard (1...65_535).contains(localPort),
+            (1...65_535).contains(remotePort)
+        else {
+            throw SSHMasterCommandError.invalidForwardPort
+        }
+
+        let formattedRemoteHost: String
+        switch remoteHost {
+        case "localhost", "127.0.0.1":
+            formattedRemoteHost = remoteHost
+        case "::1":
+            formattedRemoteHost = "[::1]"
+        default:
+            throw SSHMasterCommandError.invalidForwardHost
+        }
+
+        return CommandSpec(
+            executable: "/usr/bin/ssh",
+            arguments: [
+                "-F", "/dev/null", "-S", path,
+                "-O", operation,
+                "-o", "BatchMode=yes",
+                "-o", "ExitOnForwardFailure=yes",
+                "-L", "127.0.0.1:\(localPort):\(formattedRemoteHost):\(remotePort)",
+                alias,
             ]
         )
     }

@@ -12,6 +12,7 @@ enum PasswordAuthenticationSetupError: LocalizedError {
 @MainActor
 final class HubRuntime {
     let sshMasterPool: SSHMasterPool
+    let sshLocalForwardingService: SSHLocalForwardingService
     let tmuxDiscovery: TmuxSessionDiscovery
     let tmuxController: TmuxSessionController
     let attachmentService: AttachmentTransferService
@@ -38,6 +39,9 @@ final class HubRuntime {
             }
         )
         sshMasterPool = pool
+        sshLocalForwardingService = SSHLocalForwardingService(
+            sshMasterPool: pool
+        )
         let herdr = HerdrService(sshMasterPool: pool)
         herdrService = herdr
         slurmService = SlurmService(sshMasterPool: pool)
@@ -109,6 +113,7 @@ final class HubRuntime {
     func shutdown() async {
         guard !isShuttingDown else { return }
         isShuttingDown = true
+        await sshLocalForwardingService.shutdown()
         await sshMasterPool.shutdown()
     }
 

@@ -54,6 +54,15 @@ Interactive terminals use `ssh -tt` plus the same control socket and run:
 exec tmux new-session -A -s <validated-name>
 ```
 
+When a user opens an explicit-port HTTP(S) loopback URL from an SSH terminal,
+TmuxHub adds an App-owned local forwarding request to that terminal's existing
+control master, rewrites the browser URL to the actual local loopback port, and
+opens it only after the forwarding request succeeds. Local listeners bind to
+`127.0.0.1`; conflicts fall back to another available port. Routes are shared
+by matching remote endpoints and removed when their terminal owners or the App
+shut down. This reaches the configured SSH host's network namespace, not an
+implicit nested SSH host, Slurm node, or container.
+
 Quick connect first selects an existing tab for the destination. When none
 exists, it derives one deterministic, bounded tmux session name from the exact
 SSH destination. Explicit "new session" actions continue to create a unique

@@ -27,6 +27,8 @@ final class TerminalSession: ObservableObject, Identifiable,
     private var command: CommandSpec?
     private var currentDirectory: String?
     private let attachmentService: AttachmentTransferService
+    private let portForwardingService: SSHLocalForwardingService
+    private let portForwardingOwner = UUID()
     private var linkTask: Task<Void, Never>?
     private var savePanel: NSSavePanel?
 
@@ -39,12 +41,14 @@ final class TerminalSession: ObservableObject, Identifiable,
         command: CommandSpec,
         attachmentModel: TerminalAttachmentModel,
         service: AttachmentTransferService,
+        portForwardingService: SSHLocalForwardingService,
         currentDirectory: String? = nil
     ) {
         self.id = id
         self.command = command
         self.attachmentModel = attachmentModel
         attachmentService = service
+        self.portForwardingService = portForwardingService
         self.currentDirectory = currentDirectory
         terminalView = AttachmentTerminalView(frame: .zero)
         terminalView.processDelegate = self
@@ -111,6 +115,7 @@ final class TerminalSession: ObservableObject, Identifiable,
             TerminalProcessReaper.reap(processID: processID)
         }
         terminalView.processDelegate = nil
+        releasePortForwards()
     }
 
     func dismissLinkTransferMessage() {
@@ -124,6 +129,15 @@ final class TerminalSession: ObservableObject, Identifiable,
         if let url = URL(string: link), let scheme = url.scheme,
             scheme.lowercased() != "file"
         {
+            if let destination = attachmentModel.target.sshDestination,
+                let endpoint = LoopbackURL(link)
+            {
+                openForwarded(
+                    endpoint,
+                    destination: destination
+                )
+                return
+            }
             NSWorkspace.shared.open(url)
             return
         }
@@ -158,12 +172,55 @@ final class TerminalSession: ObservableObject, Identifiable,
             } catch is CancellationError {
                 linkTask = nil
                 isLinkTransferActive = false
+                linkTransferMessage = nil
             } catch {
                 linkTask = nil
                 isLinkTransferActive = false
                 linkTransferMessage = error.localizedDescription
             }
         }
+    }
+
+    private func openForwarded(
+        _ endpoint: LoopbackURL,
+        destination: String
+    ) {
+        linkTransferMessage = "正在转发远端端口 \(endpoint.remotePort)…"
+        isLinkTransferActive = true
+        linkTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let localURL = try await portForwardingService.acquire(
+                    owner: portForwardingOwner,
+                    destination: destination,
+                    endpoint: endpoint
+                )
+                try Task.checkCancellation()
+                guard state == .running else {
+                    throw CancellationError()
+                }
+                linkTask = nil
+                isLinkTransferActive = false
+                linkTransferMessage = nil
+                if !NSWorkspace.shared.open(localURL) {
+                    linkTransferMessage = "端口转发已建立，但系统浏览器无法打开链接。"
+                }
+            } catch is CancellationError {
+                linkTask = nil
+                isLinkTransferActive = false
+                linkTransferMessage = nil
+            } catch {
+                linkTask = nil
+                isLinkTransferActive = false
+                linkTransferMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func releasePortForwards() {
+        let service = portForwardingService
+        let owner = portForwardingOwner
+        Task { await service.release(owner: owner) }
     }
 
     private func presentSavePanel(for remotePath: String, context: AttachmentContext) {
@@ -280,6 +337,7 @@ final class TerminalSession: ObservableObject, Identifiable,
             }
             self.didReportExit = true
             self.state = .exited(exitCode)
+            self.releasePortForwards()
         }
     }
 }

@@ -336,6 +336,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
                 command: try command(for: tab),
                 attachmentModel: attachmentModel,
                 service: runtime.attachmentService,
+                portForwardingService: runtime.sshLocalForwardingService,
                 currentDirectory: tab.target == .local
                     ? FileManager.default.homeDirectoryForCurrentUser.path
                     : nil

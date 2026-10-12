@@ -40,14 +40,18 @@ private struct SSHPreparationResult: Sendable {
 }
 
 private func sshCommandFailure(_ output: InventoryProcessOutput) -> SSHMasterPoolError {
-    let filtered = String(String.UnicodeScalarView(output.stderr.unicodeScalars.filter {
-        !CharacterSet.controlCharacters.contains($0) || $0 == "\n"
-    }))
-    let message = String(filtered.trimmingCharacters(in: .whitespacesAndNewlines).prefix(4_096))
+    let message = sanitizedSSHDiagnostic(output.stderr)
     guard !message.isEmpty else {
         return .commandFailed(exitCode: output.exitCode)
     }
     return .connectionFailed(exitCode: output.exitCode, message: message)
+}
+
+private func sanitizedSSHDiagnostic(_ stderr: String) -> String {
+    let filtered = String(String.UnicodeScalarView(stderr.unicodeScalars.filter {
+        !CharacterSet.controlCharacters.contains($0) || $0 == "\n"
+    }))
+    return String(filtered.trimmingCharacters(in: .whitespacesAndNewlines).prefix(4_096))
 }
 
 public final class SSHMasterPool: @unchecked Sendable {
@@ -230,6 +234,91 @@ public final class SSHMasterPool: @unchecked Sendable {
         }
         // Never replay a file transfer automatically.
         return try await runAdmitted(commands.sftp(batchFile: batchFile, alias: alias))
+    }
+
+    /// Adds a forwarding request to the already prepared control master. A
+    /// failed request is never replayed because OpenSSH may have accepted it
+    /// before the client lost its response.
+    func openLocalForward(
+        alias: String,
+        localPort: Int,
+        remoteHost: String,
+        remotePort: Int
+    ) async throws {
+        let command = try commands.openLocalForward(
+            alias: alias,
+            localPort: localPort,
+            remoteHost: remoteHost,
+            remotePort: remotePort
+        )
+        if await state.shuttingDown() {
+            throw SSHMasterPoolError.shuttingDown
+        }
+
+        let preparation = await state.prepare(alias: alias, priority: .foreground)
+        guard preparation.linkState == .ready else {
+            if await state.shuttingDown() {
+                throw SSHMasterPoolError.shuttingDown
+            }
+            throw preparation.failure ?? SSHMasterPoolError.commandFailed(exitCode: 255)
+        }
+        if await state.shuttingDown() {
+            throw SSHMasterPoolError.shuttingDown
+        }
+
+        let output = try await runAdmitted(command)
+        if output.exitCode == 255 {
+            await state.invalidate(alias: alias)
+        }
+        guard output.exitCode == 0 else {
+            let diagnostic = sanitizedSSHDiagnostic(output.stderr).lowercased()
+            let muxBindFailure = "mux_client_forward: forwarding request failed: port forwarding failed"
+            if diagnostic.contains("address already in use")
+                || diagnostic.contains("cannot listen to port")
+                || diagnostic.split(separator: "\n").contains(where: {
+                    let line = $0.trimmingCharacters(in: .whitespaces)
+                    return line == muxBindFailure || line == "\(muxBindFailure)."
+                })
+            {
+                throw SSHLocalForwardingError.localPortUnavailable(localPort)
+            }
+            throw sshCommandFailure(output)
+        }
+    }
+
+    /// Removes only the exact forwarding tuple owned by the caller. Cleanup is
+    /// best effort and deliberately does not establish a missing master.
+    func cancelLocalForward(
+        alias: String,
+        localPort: Int,
+        remoteHost: String,
+        remotePort: Int
+    ) async {
+        guard let command = try? commands.cancelLocalForward(
+            alias: alias,
+            localPort: localPort,
+            remoteHost: remoteHost,
+            remotePort: remotePort
+        ), !Task.isCancelled, !(await state.shuttingDown()) else { return }
+
+        guard let output = try? await runAdmitted(command) else { return }
+        if output.exitCode == 255 {
+            await state.invalidate(alias: alias)
+        }
+    }
+
+    /// Checks the exact control socket without starting a new connection.
+    func isMasterRunning(alias: String) async -> Bool {
+        guard let command = try? commands.check(alias: alias),
+            !Task.isCancelled,
+            !(await state.shuttingDown()),
+            let output = try? await runAdmitted(command)
+        else { return false }
+
+        if output.exitCode == 255 {
+            await state.invalidate(alias: alias)
+        }
+        return output.exitCode == 0
     }
 
     public func shutdown() async {
