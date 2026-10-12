@@ -4,8 +4,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
-/usr/bin/swift build --target SwiftTerm
-BIN_DIR="$(/usr/bin/swift build --show-bin-path)"
+BUILD_ARGS=()
+if [[ -n "${TMUXHUB_SCRATCH_PATH:-}" ]]; then
+    BUILD_ARGS+=(--scratch-path "$TMUXHUB_SCRATCH_PATH")
+fi
+/usr/bin/swift build "${BUILD_ARGS[@]}" --target SwiftTerm
+BIN_DIR="$(/usr/bin/swift build "${BUILD_ARGS[@]}" --show-bin-path)"
 
 /usr/bin/python3 - "$PROJECT_ROOT" "$BIN_DIR" <<'PY'
 import json

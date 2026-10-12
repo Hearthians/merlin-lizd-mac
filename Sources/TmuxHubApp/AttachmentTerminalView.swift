@@ -7,7 +7,14 @@ final class AttachmentTerminalView: LocalProcessTerminalView {
     var hoverChanged: ((Bool) -> Void)?
     var inputChanged: (() -> Void)?
     var openLink: ((String, [String: String]) -> Void)?
-    private var pendingFileClick: (link: String, location: NSPoint)?
+    private struct FileClickTarget: Equatable {
+        let link: String
+        let params: [String: String]
+        // The source is part of the gesture: clearing/changing a selection
+        // must not switch the pending action to the link under the pointer.
+        let selection: String?
+    }
+    private var pendingFileClick: (target: FileClickTarget, location: NSPoint)?
     private var fileClickWasDragged = false
 
     override init(frame: NSRect) {
@@ -50,10 +57,10 @@ final class AttachmentTerminalView: LocalProcessTerminalView {
         pendingFileClick = nil
         fileClickWasDragged = false
         if event.modifierFlags.contains(.command),
-            let match = link(at: event), Self.isFileLink(match.link)
+            let target = fileClickTarget(at: event)
         {
             window?.makeFirstResponder(self)
-            pendingFileClick = (match.link, event.locationInWindow)
+            pendingFileClick = (target, event.locationInWindow)
             return
         }
         super.rightMouseDown(with: event)
@@ -77,9 +84,26 @@ final class AttachmentTerminalView: LocalProcessTerminalView {
         self.pendingFileClick = nil
         guard !fileClickWasDragged, event.modifierFlags.contains(.command),
             distance(from: pendingFileClick.location, to: event.locationInWindow) <= 4,
-            let match = link(at: event), match.link == pendingFileClick.link
+            let target = fileClickTarget(at: event), target == pendingFileClick.target,
+            !target.link.isEmpty, Self.isFileLink(target.link)
         else { return }
-        requestOpenLink(source: self, link: match.link, params: match.params)
+        requestOpenLink(source: self, link: target.link, params: target.params)
+    }
+
+    private func fileClickTarget(at event: NSEvent) -> FileClickTarget? {
+        if selectionActive {
+            guard let selection = getSelection() else { return nil }
+            // A selection explicitly identifies one path, including paths that
+            // a TUI has split across hard rows. Keep spaces inside each part.
+            let path = selection.components(separatedBy: .newlines)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .joined()
+            // Even an invalid selection owns the gesture: consume both mouse
+            // events without falling back to another file or forwarding them.
+            return FileClickTarget(link: path, params: [:], selection: selection)
+        }
+        guard let match = link(at: event), Self.isFileLink(match.link) else { return nil }
+        return FileClickTarget(link: match.link, params: match.params, selection: nil)
     }
 
     private static func isFileLink(_ link: String) -> Bool {

@@ -6,14 +6,32 @@ struct TmuxHubRootView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var terminals: TerminalTabsModel
     @ObservedObject var hpc2: HPC2PlatformModel
+    var propertiesReader = SSHHostPropertiesReader()
     @State private var sessionBrowserTarget: TerminalTarget?
     @State private var herdrBrowserTarget: TerminalTarget?
+    @State private var showsAddSSHHost = false
+    @State private var propertiesTarget: PropertiesTarget?
+
+    private enum PropertiesTarget: Identifiable {
+        case host(SSHHost)
+        case platform
+
+        var id: String {
+            switch self {
+            case let .host(host): "ssh:\(host.destination)"
+            case .platform: "platform:hkust-hpc2"
+            }
+        }
+    }
 
     var body: some View {
         NavigationSplitView {
             SidebarView(
                 model: model,
                 terminals: terminals,
+                platformName: hpc2.profile.name,
+                onAddHost: { showsAddSSHHost = true },
+                onShowProperties: showProperties,
                 onBrowseSessions: browseSessions,
                 onBrowseHerdr: browseHerdr
             )
@@ -38,6 +56,11 @@ struct TmuxHubRootView: View {
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
+                    showsAddSSHHost = true
+                } label: {
+                    Label("添加 SSH 主机", systemImage: "plus")
+                }
+                Button {
                     if model.selection == .platform("hkust-hpc2") {
                         Task { await hpc2.refresh(force: true) }
                     } else {
@@ -48,6 +71,29 @@ struct TmuxHubRootView: View {
                 }
                 .keyboardShortcut("r", modifiers: [.command])
             }
+        }
+        .focusedSceneValue(\.addSSHHost, { showsAddSSHHost = true })
+        .sheet(item: $propertiesTarget) { target in
+            switch target {
+            case let .host(host):
+                SSHHostPropertiesSheet(host: host, reader: propertiesReader) { settings in
+                    _ = try await model.updateConnection(settings)
+                }
+            case .platform:
+                HPC2PropertiesSheet(model: hpc2)
+            }
+        }
+        .sheet(isPresented: $showsAddSSHHost) {
+            AddSSHHostSheet(
+                onAddConfiguration: { configuration in
+                    _ = try await model.add(configuration: configuration)
+                    terminals.selectedTabID = nil
+                },
+                onAddDestination: { destination in
+                    _ = try model.add(destination: destination)
+                    terminals.selectedTabID = nil
+                }
+            )
         }
         .sheet(
             isPresented: Binding(
@@ -88,7 +134,11 @@ struct TmuxHubRootView: View {
     private var selectedContent: some View {
         switch model.selection {
         case .overview:
-            HostOverviewView(model: model) { destination in
+            HostOverviewView(
+                model: model,
+                onAddHost: { showsAddSSHHost = true },
+                onShowProperties: { showProperties(.host($0)) }
+            ) { destination in
                 model.selection = .host(destination)
             }
         case .local:
@@ -160,6 +210,19 @@ struct TmuxHubRootView: View {
 
     private func browseSessions(_ target: TerminalTarget) {
         sessionBrowserTarget = target
+    }
+
+    private func showProperties(_ selection: SidebarSelection) {
+        switch selection {
+        case let .host(destination):
+            if let host = model.host(destination: destination) {
+                propertiesTarget = .host(host)
+            }
+        case .platform("hkust-hpc2"):
+            propertiesTarget = .platform
+        default:
+            break
+        }
     }
 
     private func browseHerdr(_ target: TerminalTarget) {

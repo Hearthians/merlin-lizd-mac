@@ -1,25 +1,33 @@
 import SwiftUI
 import TmuxHubCore
 
+enum HPC2ConfigurationSheetMode {
+    case start
+    case properties
+}
+
 struct HPC2StartSheet: View {
     let initialProfile: SlurmPlatformProfile
     let initialPreset: SlurmInteractivePreset
+    let mode: HPC2ConfigurationSheetMode
+    let submissionFailureMessage: @MainActor () -> String?
     let onSubmit: @MainActor (
         SlurmPlatformProfile,
         SlurmInteractivePreset
-    ) async -> Bool
+    ) async throws -> Bool
 
     @Environment(\.dismiss) private var dismiss
+    @State private var platformName: String
     @State private var loginDestination: String
     @State private var owner: String
     @State private var environmentName: String
     @State private var partition: String
     @State private var cpusPerTask: Int
-    @State private var memoryGiB: Int
+    @State private var memoryMiB: Int
     @State private var wallTime: String
     @State private var requestsGPU: Bool
     @State private var gpuCount: Int
-    @State private var gpuType: GPUTypeChoice
+    @State private var gpuType: String
     @State private var workingDirectory: String
     @State private var initializationScript: String
     @State private var showsAdvanced = false
@@ -29,24 +37,32 @@ struct HPC2StartSheet: View {
     init(
         initialProfile: SlurmPlatformProfile,
         initialPreset: SlurmInteractivePreset,
+        mode: HPC2ConfigurationSheetMode = .start,
+        submissionFailureMessage: @escaping @MainActor () -> String? = { nil },
         onSubmit: @escaping @MainActor (
             SlurmPlatformProfile,
             SlurmInteractivePreset
-        ) async -> Bool
+        ) async throws -> Bool
     ) {
         self.initialProfile = initialProfile
         self.initialPreset = initialPreset
+        self.mode = mode
+        self.submissionFailureMessage = submissionFailureMessage
         self.onSubmit = onSubmit
+        _platformName = State(initialValue: initialProfile.name)
         _loginDestination = State(initialValue: initialProfile.loginDestination)
         _owner = State(initialValue: initialProfile.owner)
         _environmentName = State(initialValue: initialPreset.name)
         _partition = State(initialValue: initialPreset.partition)
         _cpusPerTask = State(initialValue: initialPreset.cpusPerTask)
-        _memoryGiB = State(initialValue: max(1, initialPreset.memoryMiB / 1_024))
-        _wallTime = State(initialValue: initialPreset.wallTime.schedulerValue)
+        _memoryMiB = State(initialValue: initialPreset.memoryMiB)
+        let seconds = initialPreset.wallTime.seconds
+        _wallTime = State(initialValue: String(
+            format: "%02d:%02d:%02d", seconds / 3_600, (seconds % 3_600) / 60, seconds % 60
+        ))
         _requestsGPU = State(initialValue: initialPreset.gpu != nil)
         _gpuCount = State(initialValue: initialPreset.gpu?.count ?? 1)
-        _gpuType = State(initialValue: GPUTypeChoice(type: initialPreset.gpu?.type))
+        _gpuType = State(initialValue: initialPreset.gpu?.type ?? "")
         _workingDirectory = State(initialValue: initialPreset.workingDirectory ?? "$HOME")
         _initializationScript = State(initialValue: initialPreset.initializationScript ?? "")
     }
@@ -55,9 +71,11 @@ struct HPC2StartSheet: View {
         VStack(spacing: 0) {
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("启动交互环境")
+                    Text(mode == .properties ? "计算平台属性" : "启动交互环境")
                         .font(.title2.bold())
-                    Text("任务会在登录节点的 tmux 中排队和运行。")
+                    Text(mode == .properties
+                        ? "管理平台连接和默认资源配置。"
+                        : "任务会在登录节点的 tmux 中排队和运行。")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
@@ -71,7 +89,11 @@ struct HPC2StartSheet: View {
 
             Form {
                 Section("平台") {
-                    TextField("SSH 主机别名", text: $loginDestination)
+                    if mode == .properties {
+                        TextField("显示名称", text: $platformName)
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    TextField("SSH 登录目标", text: $loginDestination)
                         .textFieldStyle(.roundedBorder)
                     TextField("集群用户名", text: $owner)
                         .textFieldStyle(.roundedBorder)
@@ -88,20 +110,23 @@ struct HPC2StartSheet: View {
                 }
 
                 Section("资源") {
-                    Stepper(value: $cpusPerTask, in: 1...256) {
+                    Stepper(value: $cpusPerTask, in: 1...4_096) {
                         LabeledContent("CPU", value: "\(cpusPerTask) 核")
                     }
-                    Stepper(value: $memoryGiB, in: 1...1_024) {
-                        LabeledContent("内存", value: "\(memoryGiB) GiB")
+                    Stepper(value: $memoryMiB, in: 1...1_073_741_824, step: 1_024) {
+                        LabeledContent("内存", value: "\((Double(memoryMiB) / 1_024).formatted()) GiB")
                     }
                     Toggle("GPU", isOn: $requestsGPU)
                     if requestsGPU {
-                        Stepper(value: $gpuCount, in: 1...16) {
+                        Stepper(value: $gpuCount, in: 1...1_024) {
                             LabeledContent("GPU 数量", value: "\(gpuCount)")
                         }
                         Picker("GPU 型号", selection: $gpuType) {
                             ForEach(GPUTypeChoice.allCases) { choice in
-                                Text(choice.title).tag(choice)
+                                Text(choice.title).tag(choice.rawValue)
+                            }
+                            if GPUTypeChoice(rawValue: gpuType) == nil {
+                                Text(gpuType).tag(gpuType)
                             }
                         }
                     }
@@ -133,7 +158,7 @@ struct HPC2StartSheet: View {
                     .padding(.top, 8)
                 }
 
-                Section("等价命令") {
+                Section(mode == .properties ? "默认启动命令预览" : "等价命令") {
                     ScrollView(.horizontal, showsIndicators: false) {
                         Text(commandPreview)
                             .font(.caption.monospaced())
@@ -143,26 +168,34 @@ struct HPC2StartSheet: View {
                     .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
                 }
 
-                if let validationMessage {
-                    MessageBanner(text: validationMessage, kind: .warning)
-                }
-                if let submissionError {
-                    MessageBanner(text: submissionError, kind: .error)
-                }
             }
             .formStyle(.grouped)
+            .disabled(isSubmitting)
+
+            if let validationMessage {
+                MessageBanner(text: validationMessage, kind: .warning)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 10)
+            }
+            if let submissionError {
+                MessageBanner(text: submissionError, kind: .error)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 10)
+            }
 
             Divider()
 
             HStack {
-                Text("启动后，关闭终端只会断开显示，不会取消 Slurm 任务。")
+                Text(mode == .properties
+                    ? "保存后，下次启动交互环境时使用这些默认资源。"
+                    : "启动后，关闭终端只会断开显示，不会取消 Slurm 任务。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
                 if isSubmitting {
                     ProgressView().controlSize(.small)
                 }
-                Button("启动") { submit() }
+                Button(mode == .properties ? "保存" : "启动") { submit() }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
                     .disabled(validationMessage != nil || isSubmitting)
@@ -174,12 +207,15 @@ struct HPC2StartSheet: View {
     }
 
     private var validationMessage: String? {
+        guard !platformName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return "平台显示名称不能为空。"
+        }
         let destination = loginDestination.trimmingCharacters(in: .whitespacesAndNewlines)
         let username = owner.trimmingCharacters(in: .whitespacesAndNewlines)
         let name = environmentName.trimmingCharacters(in: .whitespacesAndNewlines)
         let queue = partition.trimmingCharacters(in: .whitespacesAndNewlines)
         guard IdentifierValidator.isSSHDestination(destination) else {
-            return "请输入有效的 SSH 主机别名。"
+            return "请输入有效的 SSH 登录目标。"
         }
         guard isSafeIdentifier(username) else {
             return "集群用户名包含不支持的字符。"
@@ -189,6 +225,13 @@ struct HPC2StartSheet: View {
         }
         guard isSafeIdentifier(queue) else {
             return "分区名称包含不支持的字符。"
+        }
+        guard (1...4_096).contains(cpusPerTask),
+            (1...1_073_741_824).contains(memoryMiB),
+            !requestsGPU || ((1...1_024).contains(gpuCount)
+                && (gpuType.isEmpty || isSafeIdentifier(gpuType)))
+        else {
+            return "CPU、内存或 GPU 资源参数无效。"
         }
         guard Self.parseWallTime(wallTime) != nil else {
             return "时限格式应为 HH:MM:SS，且必须大于 0。"
@@ -214,11 +257,11 @@ struct HPC2StartSheet: View {
             "--partition", partitionOrPlaceholder,
             "--ntasks", "1",
             "--cpus-per-task", String(cpusPerTask),
-            "--mem", "\(memoryGiB * 1_024)M",
+            "--mem", "\(memoryMiB)M",
             "--time", wallTime,
         ]
         if requestsGPU {
-            let resource = ["gpu", gpuType.rawValue, String(gpuCount)]
+            let resource = ["gpu", gpuType, String(gpuCount)]
                 .filter { !$0.isEmpty }
                 .joined(separator: ":")
             arguments += ["--gres", resource]
@@ -243,7 +286,7 @@ struct HPC2StartSheet: View {
 
         let profile = SlurmPlatformProfile(
             id: initialProfile.id,
-            name: initialProfile.name,
+            name: platformName.trimmingCharacters(in: .whitespacesAndNewlines),
             loginDestination: loginDestination.trimmingCharacters(in: .whitespacesAndNewlines),
             owner: owner.trimmingCharacters(in: .whitespacesAndNewlines)
         )
@@ -255,10 +298,10 @@ struct HPC2StartSheet: View {
             partition: partition.trimmingCharacters(in: .whitespacesAndNewlines),
             tasks: 1,
             cpusPerTask: cpusPerTask,
-            memoryMiB: memoryGiB * 1_024,
+            memoryMiB: memoryMiB,
             wallTime: SlurmWallTime(seconds: wallTimeSeconds),
             gpu: requestsGPU
-                ? SlurmGPURequest(type: gpuType.value, count: gpuCount)
+                ? SlurmGPURequest(type: gpuType.isEmpty ? nil : gpuType, count: gpuCount)
                 : nil,
             workingDirectory: directory.isEmpty || directory == "$HOME" ? nil : directory,
             initializationScript: script.isEmpty ? nil : script
@@ -267,12 +310,16 @@ struct HPC2StartSheet: View {
         isSubmitting = true
         submissionError = nil
         Task {
-            let accepted = await onSubmit(profile, preset)
-            isSubmitting = false
-            if accepted {
-                dismiss()
-            } else {
-                submissionError = "启动失败。请检查页面上的错误信息后重试。"
+            defer { isSubmitting = false }
+            do {
+                if try await onSubmit(profile, preset) {
+                    dismiss()
+                } else {
+                    submissionError = submissionFailureMessage()
+                        ?? (mode == .properties ? "保存失败，请检查配置后重试。" : "启动失败，请重试。")
+                }
+            } catch {
+                submissionError = error.localizedDescription
             }
         }
     }
@@ -288,7 +335,7 @@ struct HPC2StartSheet: View {
     private static func parseWallTime(_ value: String) -> Int? {
         let components = value.split(separator: ":", omittingEmptySubsequences: false)
         guard components.count == 3,
-            let hours = Int(components[0]), hours >= 0,
+            let hours = Int(components[0]), (0...8_760).contains(hours),
             let minutes = Int(components[1]), (0..<60).contains(minutes),
             let seconds = Int(components[2]), (0..<60).contains(seconds)
         else { return nil }
@@ -307,7 +354,6 @@ private enum GPUTypeChoice: String, CaseIterable, Identifiable {
     case a800 = "a800"
 
     var id: String { rawValue }
-    var value: String? { rawValue.isEmpty ? nil : rawValue }
 
     var title: String {
         switch self {
@@ -315,9 +361,5 @@ private enum GPUTypeChoice: String, CaseIterable, Identifiable {
         case .a40: "A40"
         case .a800: "A800"
         }
-    }
-
-    init(type: String?) {
-        self = GPUTypeChoice(rawValue: type?.lowercased() ?? "") ?? .automatic
     }
 }

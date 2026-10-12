@@ -27,13 +27,14 @@ struct HPC2PlatformView: View {
             .frame(maxWidth: 1_080, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
-        .task(id: model.profile.id) {
+        .task(id: model.profile) {
             await model.refreshContinuously()
         }
         .sheet(isPresented: $showsStartSheet) {
             HPC2StartSheet(
                 initialProfile: model.profile,
-                initialPreset: model.defaultPreset
+                initialPreset: model.defaultPreset,
+                submissionFailureMessage: { model.notice }
             ) { profile, preset in
                 await model.start(profile: profile, preset: preset)
             }
@@ -61,7 +62,7 @@ struct HPC2PlatformView: View {
     private var header: some View {
         HStack(alignment: .top, spacing: 16) {
             VStack(alignment: .leading, spacing: 5) {
-                Text("HKUST HPC2")
+                Text(model.profile.name)
                     .font(.largeTitle.bold())
                 Text("通过 \(model.profile.loginDestination) 管理 Slurm 交互任务")
                     .foregroundStyle(.secondary)

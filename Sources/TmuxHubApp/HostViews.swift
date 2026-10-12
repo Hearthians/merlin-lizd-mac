@@ -4,6 +4,8 @@ import SwiftUI
 
 struct HostOverviewView: View {
     @ObservedObject var model: AppModel
+    let onAddHost: () -> Void
+    let onShowProperties: (String) -> Void
     let onSelect: (String) -> Void
     @State private var searchText = ""
     @State private var showsRawAddresses = false
@@ -35,11 +37,19 @@ struct HostOverviewView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("主机库")
-                        .font(.largeTitle.bold())
-                    Text("侧边栏只保留已固定和最近使用的主机；其余 SSH 配置按需搜索。")
-                        .foregroundStyle(.secondary)
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("主机库")
+                            .font(.largeTitle.bold())
+                        Text("侧边栏只保留已固定和最近使用的主机；其余 SSH 配置按需搜索。")
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("添加 SSH 主机", systemImage: "plus") {
+                        onAddHost()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
                 }
 
                 HStack(spacing: 12) {
@@ -80,7 +90,12 @@ struct HostOverviewView: View {
                     ContentUnavailableView {
                         Label("尚无 SSH 主机", systemImage: "server.rack")
                     } description: {
-                        Text("在 ~/.ssh/config 添加具体 Host，或用侧边栏的 + 手动添加。")
+                        Text("添加服务器地址和登录信息，即可开始连接。已有的 SSH 配置也会自动显示在这里。")
+                    } actions: {
+                        Button("添加 SSH 主机", systemImage: "plus") {
+                            onAddHost()
+                        }
+                        .buttonStyle(.borderedProminent)
                     }
                     .frame(maxWidth: .infinity, minHeight: 300)
                 } else {
@@ -143,6 +158,10 @@ struct HostOverviewView: View {
                         Button(model.isPinned(host.destination)
                             ? "取消固定" : "固定到侧边栏") {
                             togglePin(host)
+                        }
+                        Divider()
+                        Button("属性", systemImage: "slider.horizontal.3") {
+                            onShowProperties(host.destination)
                         }
                     }
                 }

@@ -26,6 +26,8 @@ struct TmuxConfigurationCard: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             status
+            Divider().padding(.vertical, 4)
+            vimPasteRepair
         }
     }
 
@@ -58,6 +60,77 @@ struct TmuxConfigurationCard: View {
         .disabled(state == .applying)
         .accessibilityIdentifier("apply-tmux-configuration")
         .help("为 \(target.sshDestination ?? "本机") 应用以上 tmux 设置")
+    }
+
+    private var vimPasteRepair: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .center, spacing: 16) {
+                    vimPasteDescription
+                    Spacer(minLength: 8)
+                    vimPasteRepairButton
+                }
+                VStack(alignment: .leading, spacing: 12) {
+                    vimPasteDescription
+                    vimPasteRepairButton
+                }
+            }
+            Text("只为此主机保存设置；已打开的 Vim 需保存文件后重新打开。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            switch terminals.vimPasteConfigurationStates[target] {
+            case .applying:
+                Text("正在为 \(target.sshDestination ?? "本机") 保存设置…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case let .applied(result):
+                Label("Vim 粘贴设置已保存，重新打开 Vim 后生效", systemImage: "checkmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+                Text("设置文件：\(result.configurationPath)")
+                    .font(.caption.monospaced())
+                    .textSelection(.enabled)
+                if let backup = result.backupPath {
+                    Text("原文件备份：\(backup)")
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                }
+            case let .failed(message):
+                Label(message, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+            case nil:
+                EmptyView()
+            }
+        }
+    }
+
+    private var vimPasteDescription: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("Vim 代码粘贴")
+                .font(.callout.weight(.medium))
+            Text("解决多行代码粘贴后缩进不断增加的问题。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var vimPasteRepairButton: some View {
+        Button {
+            let selectedTarget = target
+            Task { await terminals.repairVimPaste(on: selectedTarget) }
+        } label: {
+            HStack(spacing: 6) {
+                if terminals.vimPasteConfigurationStates[target] == .applying {
+                    ProgressView().controlSize(.small)
+                }
+                Text(terminals.vimPasteConfigurationStates[target] == .applying ? "正在修复…" : "修复 Vim 粘贴")
+            }
+        }
+        .disabled(terminals.vimPasteConfigurationStates[target] == .applying)
+        .accessibilityIdentifier("repair-vim-paste")
+        .help("为 \(target.sshDestination ?? "本机") 保存 Vim 粘贴兼容设置")
     }
 
     @ViewBuilder

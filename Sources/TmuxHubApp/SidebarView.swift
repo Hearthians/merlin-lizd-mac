@@ -5,13 +5,13 @@ import SwiftUI
 struct SidebarView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var terminals: TerminalTabsModel
+    let platformName: String
+    let onAddHost: () -> Void
+    let onShowProperties: (SidebarSelection) -> Void
     let onBrowseSessions: (TerminalTarget) -> Void
     let onBrowseHerdr: (TerminalTarget) -> Void
 
     @State private var searchText = ""
-    @State private var isAddingHost = false
-    @State private var newDestination = ""
-    @State private var errorMessage: String?
 
     private var quickSections: [SSHHostQuickAccessSection] {
         model.quickAccessSections()
@@ -54,11 +54,16 @@ struct SidebarView: View {
 
             Section("计算平台") {
                 sidebarRow(
-                    title: "HKUST HPC2",
+                    title: platformName,
                     symbol: "cpu",
                     tint: .purple,
                     selection: .platform("hkust-hpc2")
                 )
+                .contextMenu {
+                    Button("属性", systemImage: "slider.horizontal.3") {
+                        onShowProperties(.platform("hkust-hpc2"))
+                    }
+                }
             }
 
             if isSearching {
@@ -101,21 +106,6 @@ struct SidebarView: View {
         .listStyle(.sidebar)
         .navigationTitle("TmuxHub")
         .searchable(text: $searchText, placement: .sidebar, prompt: "搜索主机库")
-        .alert("添加 SSH 目标", isPresented: $isAddingHost) {
-            TextField("alias 或 user@host", text: $newDestination)
-            Button("添加") { addHost() }
-            Button("取消", role: .cancel) {}
-        } message: {
-            Text("添加后会固定到侧边栏；连接参数仍由 ~/.ssh/config 和 SSH Agent 管理。")
-        }
-        .alert("无法添加主机", isPresented: Binding(
-            get: { errorMessage != nil },
-            set: { if !$0 { errorMessage = nil } }
-        )) {
-            Button("好", role: .cancel) {}
-        } message: {
-            Text(errorMessage ?? "SSH 目标格式无效。")
-        }
     }
 
     private func sidebarRow(
@@ -213,6 +203,10 @@ struct SidebarView: View {
                     model.removeCustomHost(host.destination)
                 }
             }
+            Divider()
+            Button("属性", systemImage: "slider.horizontal.3") {
+                onShowProperties(.host(host.destination))
+            }
         }
     }
 
@@ -238,13 +232,13 @@ struct SidebarView: View {
             Spacer()
             if showsAddButton {
                 Button {
-                    newDestination = ""
-                    isAddingHost = true
+                    onAddHost()
                 } label: {
                     Image(systemName: "plus.circle")
                 }
                 .buttonStyle(.plain)
-                .help("添加 SSH 目标")
+                .help("添加 SSH 主机")
+                .accessibilityLabel("添加 SSH 主机")
             }
         }
     }
@@ -259,14 +253,6 @@ struct SidebarView: View {
     private func show(_ selection: SidebarSelection) {
         model.selection = selection
         terminals.selectedTabID = nil
-    }
-
-    private func addHost() {
-        do {
-            _ = try model.add(destination: newDestination)
-        } catch {
-            errorMessage = error.localizedDescription
-        }
     }
 
     private func hostRowSubtitle(_ host: SSHHost) -> String {

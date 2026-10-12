@@ -12,6 +12,7 @@ public actor TmuxSessionController {
     private let executionPolicy: BoundedAsyncOperationRunner?
     private let localTmuxPath: String?
     private var configuringTargets: Set<TerminalTarget> = []
+    private var configuringVimTargets: Set<TerminalTarget> = []
 
     public init(
         sshMasterPool: SSHMasterPool,
@@ -65,6 +66,22 @@ public actor TmuxSessionController {
             )
         }
         return try TmuxConfigurationResult.parse(output.stdout)
+    }
+
+    public func applyVimPasteConfiguration(target: TerminalTarget) async throws -> VimPasteConfigurationResult {
+        guard configuringVimTargets.insert(target).inserted else {
+            throw VimPasteConfigurationError.alreadyApplying
+        }
+        defer { configuringVimTargets.remove(target) }
+        let command = try VimPasteConfiguration.command(target: target)
+        let output = try await run(command, target: target)
+        guard output.exitCode == 0 else {
+            throw VimPasteConfigurationError.commandFailed(
+                exitCode: output.exitCode,
+                detail: String(output.stderr.suffix(2_000)).trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        }
+        return try VimPasteConfigurationResult.parse(output.stdout)
     }
 
     public func rename(

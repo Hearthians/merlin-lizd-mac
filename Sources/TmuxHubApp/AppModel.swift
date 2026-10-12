@@ -35,6 +35,7 @@ final class AppModel: ObservableObject {
 
     private let defaults: UserDefaults
     private let catalog: SSHConfigCatalog
+    private let configWriter: SSHConfigWriter
     private let customHostsKey = "custom-ssh-hosts-v1"
     private let lastUsedHostsKey = "ssh-host-last-used-v1"
     private let pinnedHostsKey = "pinned-ssh-hosts-v1"
@@ -44,10 +45,12 @@ final class AppModel: ObservableObject {
 
     init(
         defaults: UserDefaults = .standard,
-        catalog: SSHConfigCatalog = SSHConfigCatalog()
+        catalog: SSHConfigCatalog = SSHConfigCatalog(),
+        configWriter: SSHConfigWriter = SSHConfigWriter()
     ) {
         self.defaults = defaults
         self.catalog = catalog
+        self.configWriter = configWriter
         customDestinations = Set(
             defaults.stringArray(forKey: customHostsKey) ?? []
         )
@@ -117,6 +120,50 @@ final class AppModel: ObservableObject {
         selection = .host(destination)
         return hosts.first(where: { $0.destination == destination })
             ?? SSHHost(destination: destination, source: .custom)
+    }
+
+    @discardableResult
+    func add(configuration: SSHHostConfiguration) async throws -> SSHHost {
+        let writer = configWriter
+        let host = try await Task.detached(priority: .userInitiated) {
+            try writer.add(configuration)
+        }.value
+        if customDestinations.remove(host.destination) != nil {
+            persistCustomHosts()
+        }
+        pinnedDestinations.insert(host.destination)
+        persistPinnedHosts()
+        refresh()
+        selection = .host(host.destination)
+        return host
+    }
+
+    @discardableResult
+    func updateConnection(_ settings: SSHConnectionSettings) async throws -> SSHHost {
+        let writer = configWriter
+        let updatedHost = try await Task.detached(priority: .userInitiated) {
+            try writer.update(settings)
+        }.value
+        let original = settings.destination
+        let wasSelected = selection == .host(original)
+        let wasPinned = pinnedDestinations.remove(original) != nil
+        let previousUse = lastUsedAt.removeValue(forKey: original)
+        customDestinations.remove(original)
+        if updatedHost.source == .custom {
+            customDestinations.insert(updatedHost.destination)
+        }
+        if wasPinned { pinnedDestinations.insert(updatedHost.destination) }
+        if let previousUse {
+            lastUsedAt[updatedHost.destination] = max(
+                previousUse, lastUsedAt[updatedHost.destination] ?? .distantPast
+            )
+        }
+        persistCustomHosts()
+        persistPinnedHosts()
+        persistLastUsedHosts()
+        refresh()
+        if wasSelected { selection = .host(updatedHost.destination) }
+        return updatedHost
     }
 
     func removeCustomHost(_ destination: String) {

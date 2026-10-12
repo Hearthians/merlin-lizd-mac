@@ -6,6 +6,7 @@ import SwiftUI
 final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     @Published private(set) var tabs: [TerminalTabRecord]
     @Published private(set) var tmuxConfigurationStates: [TerminalTarget: TmuxConfigurationState] = [:]
+    @Published private(set) var vimPasteConfigurationStates: [TerminalTarget: VimPasteConfigurationState] = [:]
     @Published var selectedTabID: String? {
         didSet {
             if oldValue != selectedTabID {
@@ -68,6 +69,21 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     var selectedTab: TerminalTabRecord? {
         guard let selectedTabID else { return nil }
         return tabs.first { $0.id == selectedTabID }
+    }
+
+    func repairVimPaste(on target: TerminalTarget) async {
+        guard vimPasteConfigurationStates[target] != .applying else { return }
+        vimPasteConfigurationStates[target] = .applying
+        do {
+            let result = try await tmuxSessionController.applyVimPasteConfiguration(target: target)
+            vimPasteConfigurationStates[target] = .applied(result)
+        } catch let TmuxSessionMutationError.commandFailed(exitCode) {
+            vimPasteConfigurationStates[target] = .failed(
+                VimPasteConfigurationError.commandFailed(exitCode: exitCode, detail: "").localizedDescription
+            )
+        } catch {
+            vimPasteConfigurationStates[target] = .failed(error.localizedDescription)
+        }
     }
 
     func openLocalShell() {
@@ -646,6 +662,12 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
 enum TmuxConfigurationState: Equatable {
     case applying
     case applied(TmuxConfigurationResult)
+    case failed(String)
+}
+
+enum VimPasteConfigurationState: Equatable {
+    case applying
+    case applied(VimPasteConfigurationResult)
     case failed(String)
 }
 

@@ -8,6 +8,26 @@ enum HPC2ConnectionState: Equatable {
     case stale(Date?, String)
 }
 
+enum HPC2ConfigurationError: LocalizedError, Equatable {
+    case launchInProgress
+    case invalidProfile
+    case invalidPreset
+    case activeJobs
+
+    var errorDescription: String? {
+        switch self {
+        case .launchInProgress:
+            "正在启动交互环境，请等待提交完成后再保存配置。"
+        case .invalidProfile:
+            "平台配置无效，请检查显示名称、SSH 登录目标和集群用户名。"
+        case .invalidPreset:
+            "资源配置无效，请检查环境名称、分区和资源参数。"
+        case .activeJobs:
+            "当前仍有活动或待确认的 TmuxHub 任务，暂时不能更改 SSH 主机别名或集群用户名。请先结束任务并刷新状态，或恢复原配置。"
+        }
+    }
+}
+
 enum HPC2ManagedRunPhase: String, Codable, Hashable, Sendable {
     case submitting
     case awaitingScheduler
@@ -232,40 +252,59 @@ final class HPC2PlatformModel: ObservableObject {
         }
     }
 
-    /// Returns true once a launch was accepted locally. An uncertain SSH result
-    /// is also accepted because its durable receipt must be reconciled, not retried.
-    func start(
+    /// Saves only local preferences. Launching, refreshing, and cancelling jobs
+    /// remain separate actions; existing launch receipts are never rewritten.
+    func saveConfiguration(
         profile proposedProfile: SlurmPlatformProfile,
         preset proposedPreset: SlurmInteractivePreset
-    ) async -> Bool {
-        guard !isStarting,
-            let profile = Self.validProfile(proposedProfile),
-            let preset = Self.validPreset(proposedPreset)
-        else {
-            notice = "平台或资源配置无效。"
-            return false
+    ) throws {
+        guard !isStarting else { throw HPC2ConfigurationError.launchInProgress }
+        guard let profile = Self.validProfile(proposedProfile) else {
+            throw HPC2ConfigurationError.invalidProfile
         }
-
+        guard let preset = Self.validPreset(proposedPreset) else {
+            throw HPC2ConfigurationError.invalidPreset
+        }
         guard Self.canChangePlatformIdentity(
             from: self.profile,
             to: profile,
             managedRuns: managedRuns
         ) else {
-            notice = "当前仍有活动或待确认的 TmuxHub 任务，暂时不能更改 SSH 主机别名或集群用户名。请先结束任务并刷新状态，或恢复原配置。"
-            return false
+            throw HPC2ConfigurationError.activeJobs
         }
+
+        // Prepare both payloads before changing either the stored or live state.
+        let profileData = try JSONEncoder().encode(profile)
+        let presetData = try JSONEncoder().encode(preset)
+        defaults.set(profileData, forKey: profileKey)
+        defaults.set(presetData, forKey: presetKey)
 
         let identityChanged = self.profile.loginDestination != profile.loginDestination
             || self.profile.owner != profile.owner
         self.profile = profile
+        defaultPreset = preset
         if identityChanged {
             jobs = []
             lastSuccessfulRefresh = nil
             connectionDiagnostic = nil
             connectionState = .idle
         }
-        defaultPreset = preset
-        persistConfiguration()
+    }
+
+    /// Returns true once a launch was accepted locally. An uncertain SSH result
+    /// is also accepted because its durable receipt must be reconciled, not retried.
+    func start(
+        profile proposedProfile: SlurmPlatformProfile,
+        preset proposedPreset: SlurmInteractivePreset
+    ) async -> Bool {
+        do {
+            try saveConfiguration(profile: proposedProfile, preset: proposedPreset)
+        } catch {
+            notice = error.localizedDescription
+            return false
+        }
+        let profile = self.profile
+        let preset = defaultPreset
 
         let requestID = UUID()
         let requestedAt = now()
@@ -425,15 +464,6 @@ final class HPC2PlatformModel: ObservableObject {
         update(&managedRuns[index])
         managedRuns = Self.sortedRuns(managedRuns)
         persistRuns()
-    }
-
-    private func persistConfiguration() {
-        if let data = try? JSONEncoder().encode(profile) {
-            defaults.set(data, forKey: profileKey)
-        }
-        if let data = try? JSONEncoder().encode(defaultPreset) {
-            defaults.set(data, forKey: presetKey)
-        }
     }
 
     private func persistRuns() {

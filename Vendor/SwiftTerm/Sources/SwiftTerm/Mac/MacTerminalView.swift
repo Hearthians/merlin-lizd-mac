@@ -1318,10 +1318,26 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             return
         }
         
+        if sendLegacyModifiedKey(event) {
+            return
+        }
+
         // Handle Option-letter to send the ESC sequence plus the letter as expected by terminals
         if eventFlags.contains ([.option, .command]) {
             if event.charactersIgnoringModifiers == "o" {
                 optionAsMetaKey.toggle()
+            }
+        } else if eventFlags.contains(.control) {
+            if let characters = event.charactersIgnoringModifiers {
+                // Functional keys are handled above; do not emit AppKit's
+                // private-use key identifiers as text for unsupported keys.
+                guard !characters.unicodeScalars.contains(where: { (0xf700...0xf8ff).contains($0.value) }) else { return }
+                var bytes = applyControlToEventCharacters(characters)
+                if optionAsMetaKey && eventFlags.contains(.option) {
+                    bytes.insert(ControlCodes.ESC, at: 0)
+                }
+                send(bytes)
+                return
             }
         } else if optionAsMetaKey && eventFlags.contains (.option) {
             if let rawCharacter = event.charactersIgnoringModifiers {
@@ -1340,24 +1356,6 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
                 send (txt: rawCharacter)
             }
             return
-        } else if eventFlags.contains (.control) {
-            // Sends the control sequence
-            if let ch = event.charactersIgnoringModifiers {
-                if let fs = ch.unicodeScalars.first {
-                    switch Int (fs.value) {
-                    case NSLeftArrowFunctionKey:
-                        send (EscapeSequences.controlLeft)
-                        return
-                    case NSRightArrowFunctionKey:
-                        send (EscapeSequences.controlRight)
-                        return
-                    default:
-                        break
-                    }
-                }
-                send (applyControlToEventCharacters (ch))
-                return
-            }
         } else if eventFlags.contains (.function) {
             if let str = event.charactersIgnoringModifiers {
                 if let fs = str.unicodeScalars.first {
@@ -1410,6 +1408,56 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
         
         interpretKeyEvents([event])
+    }
+
+    /// Legacy xterm function-key sequences still carry Shift/Alt/Control even
+    /// when the application has not enabled an enhanced keyboard protocol.
+    private func sendLegacyModifiedKey(_ event: NSEvent) -> Bool {
+        guard !hasMarkedText(), !event.modifierFlags.contains(.command) else { return false }
+        let control = event.modifierFlags.contains(.control)
+        let shift = event.modifierFlags.contains(.shift)
+        let alt = optionAsMetaKey && event.modifierFlags.contains(.option)
+        guard control || shift || alt, let key = kittyFunctionalKey(from: event) else { return false }
+        if (key == .left || key == .right) && alt && !control {
+            // Retain Option-arrow word movement handled below.
+            return false
+        }
+        let modifier = 1 + (shift ? 1 : 0) + (alt ? 2 : 0) + (control ? 4 : 0)
+        let sequence: String
+        switch key {
+        case .up: sequence = "\u{1b}[1;\(modifier)A"
+        case .down: sequence = "\u{1b}[1;\(modifier)B"
+        case .right: sequence = "\u{1b}[1;\(modifier)C"
+        case .left: sequence = "\u{1b}[1;\(modifier)D"
+        case .home: sequence = "\u{1b}[1;\(modifier)H"
+        case .end: sequence = "\u{1b}[1;\(modifier)F"
+        case .insert: sequence = "\u{1b}[2;\(modifier)~"
+        case .delete: sequence = "\u{1b}[3;\(modifier)~"
+        case .pageUp, .pageDown:
+            // Keep unmodified/Shift paging available for local scrollback.
+            guard control || alt else { return false }
+            sequence = "\u{1b}[\(key == .pageUp ? 5 : 6);\(modifier)~"
+        case .f1: sequence = "\u{1b}[1;\(modifier)P"
+        case .f2: sequence = "\u{1b}[1;\(modifier)Q"
+        case .f3: sequence = "\u{1b}[1;\(modifier)R"
+        case .f4: sequence = "\u{1b}[1;\(modifier)S"
+        case .f5: sequence = "\u{1b}[15;\(modifier)~"
+        case .f6: sequence = "\u{1b}[17;\(modifier)~"
+        case .f7: sequence = "\u{1b}[18;\(modifier)~"
+        case .f8: sequence = "\u{1b}[19;\(modifier)~"
+        case .f9: sequence = "\u{1b}[20;\(modifier)~"
+        case .f10: sequence = "\u{1b}[21;\(modifier)~"
+        case .f11: sequence = "\u{1b}[23;\(modifier)~"
+        case .f12: sequence = "\u{1b}[24;\(modifier)~"
+        case .enter, .tab, .backspace, .escape:
+            var modifiers = kittyModifiers(from: event, includeOption: optionAsMetaKey)
+            modifiers.remove(.capsLock)
+            return sendKittyFunctionalKey(key, modifiers: modifiers)
+        default:
+            return false
+        }
+        send(txt: sequence)
+        return true
     }
 
     public override func keyUp(with event: NSEvent) {
@@ -1556,14 +1604,21 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         markedSelectedRange = NSRange(location: NSNotFound, length: 0)
         updateMarkedTextOverlay()
         if let str = string as? NSString {
-            if !terminal.keyboardEnhancementFlags.isEmpty {
-                if isPaste, terminal.bracketedPasteMode {
-                    pendingKittyKeyEvent = nil
-                    send(data: EscapeSequences.bracketedPasteStart[0...])
-                    send (txt: str as String)
-                    send(data: EscapeSequences.bracketedPasteEnd[0...])
-                    return
+            if isPaste {
+                // Pasted text is not a keyboard event. In Kitty report-all
+                // mode, encoding it as one key loses text or control characters.
+                pendingKittyKeyEvent = nil
+                kittyIsComposing = false
+                let bracketed = terminal.bracketedPasteMode
+                var bytes = bracketed ? EscapeSequences.bracketedPasteStart : []
+                bytes.append(contentsOf: (str as String).utf8)
+                if bracketed {
+                    bytes.append(contentsOf: EscapeSequences.bracketedPasteEnd)
                 }
+                send(data: bytes[...])
+                return
+            }
+            if !terminal.keyboardEnhancementFlags.isEmpty {
                 let pendingEvent = pendingKittyKeyEvent
                 pendingKittyKeyEvent = nil
                 kittyIsComposing = false
@@ -1601,13 +1656,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
                 _ = sendKittyEvent(kittyEvent)
                 return
             }
-            if isPaste, terminal.bracketedPasteMode {
-                send(data: EscapeSequences.bracketedPasteStart[0...])
-            }
             send (txt: str as String)
-            if isPaste, terminal.bracketedPasteMode {
-                send(data: EscapeSequences.bracketedPasteEnd[0...])
-            }
         }
         // TODO: I do not think we actually need this needsDisplay, the data fed should bubble this up
         // needsDisplay = true
@@ -1703,6 +1752,14 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 
     private func kittyFunctionalKey(from event: NSEvent) -> KittyFunctionalKey? {
         switch Int(event.keyCode) {
+        case kVK_Return:
+            return .enter
+        case kVK_Tab:
+            return .tab
+        case kVK_Delete:
+            return .backspace
+        case kVK_Escape:
+            return .escape
         case kVK_ANSI_Keypad0:
             return .keypad0
         case kVK_ANSI_Keypad1:
@@ -1997,8 +2054,23 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
               let scalar = chars.unicodeScalars.first else {
             return nil
         }
-        let baseScalar = String(scalar).lowercased().unicodeScalars.first ?? scalar
-        let shiftedScalar = event.modifierFlags.contains(.shift) ? event.characters?.unicodeScalars.first : nil
+        func printableScalar(_ value: String?) -> UnicodeScalar? {
+            guard let result = value?.unicodeScalars.first,
+                  result.value >= 0x20,
+                  !(0x7f...0x9f).contains(result.value) else { return nil }
+            return result
+        }
+        // charactersIgnoringModifiers retains Shift; lowercasing it does not
+        // turn '?' back into '/' or '@' back into '2'. Translate with the
+        // current layout while preserving event text as a fallback when the
+        // input source cannot provide layout data (for example, some IMEs).
+        let unshifted = printableScalar(event.characters(byApplyingModifiers: [])) ?? scalar
+        let baseScalar = String(unshifted).lowercased().unicodeScalars.first ?? unshifted
+        // Control can turn event.characters into a control byte. Alternate
+        // keys describe the shifted layout key, not the resulting input text.
+        let shiftedScalar = event.modifierFlags.contains(.shift)
+            ? (printableScalar(event.characters(byApplyingModifiers: .shift)) ?? printableScalar(chars))
+            : nil
         let baseLayout = kittyBaseLayoutKey(from: event)
         let baseLayoutKey = baseLayout == baseScalar ? nil : baseLayout
         let modifiers = kittyModifiers(from: event, includeOption: optionAsMetaKey)
@@ -2436,6 +2508,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     // to re-extend the selection as the auto-scroll timer advances the viewport
     // while the pointer is held still past the top or bottom edge.
     private var lastSelectionDragPoint: CGPoint?
+    // AppKit may coalesce motion before the first drag event. Keep the press
+    // position so that a quick drag does not drop the beginning of the text.
+    private var pendingSelectionAnchor: Position?
 
     private func startSelectionAutoScrollTimer() {
         if selectionAutoScrollTimer != nil {
@@ -2482,6 +2557,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
 
     open override func mouseDown(with event: NSEvent) {
+        pendingSelectionAnchor = nil
         if allowMouseReporting && !shiftBypassesMouseReporting(for: event) && terminal.mouseMode.sendButtonPress() {
             sharedMouseEvent(with: event)
             return
@@ -2491,12 +2567,11 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         
         switch event.clickCount {
         case 1:
-            if selection.active == true {
-                if event.modifierFlags.contains(.shift) {
-                    selection.shiftExtend(bufferPosition: Position(col: hit.col, row: hit.row))
-                } else {
-                    selection.active = false
-                }
+            if selection.active && event.modifierFlags.contains(.shift) {
+                selection.shiftExtend(bufferPosition: Position(col: hit.col, row: hit.row))
+            } else {
+                selection.active = false
+                pendingSelectionAnchor = hit
             }
         case 2:
             let displayBuffer = terminal.displayBuffer
@@ -2537,6 +2612,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     open override func mouseUp(with event: NSEvent) {
+        pendingSelectionAnchor = nil
         stopSelectionAutoScrollTimer()
         autoScrollDelta = 0
         lastSelectionDragPoint = nil
@@ -2577,9 +2653,11 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         if selection.active {
             selection.dragExtend(bufferPosition: Position(col: hit.col, row: hit.row))
         } else {
-            selection.setSoftStart(bufferPosition: Position(col: hit.col, row: hit.row))
+            selection.setSoftStart(bufferPosition: pendingSelectionAnchor ?? hit)
             selection.startSelection()
+            selection.dragExtend(bufferPosition: hit)
         }
+        pendingSelectionAnchor = nil
         didSelectionDrag = true
         lastSelectionDragPoint = convert(event.locationInWindow, from: nil)
         autoScrollDelta = 0

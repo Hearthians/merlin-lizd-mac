@@ -261,7 +261,6 @@ public final class Buffer {
         }
     }
     
-    private var curAttr: Attribute = Attribute.empty
     private var insertMode: Bool = false
     private var marginMode: Bool = false
     private var wraparound: Bool = false
@@ -1226,7 +1225,7 @@ public final class Buffer {
         // insert mode: move characters to right
         if insertMode {
             var empty = CharData.Null
-            empty.attribute = curAttr
+            empty.attribute = charData.attribute
             // right shift cells according to the width
             bufferRow.insertCells (pos: _x, n: chWidth, rightMargin: marginMode ? _marginRight : _cols-1, fillData: empty)
             // test last cell - since the last cell has only room for
@@ -1250,7 +1249,10 @@ public final class Buffer {
         // for graphemes bigger than fullwidth we can simply loop to zero
         // we already made sure above, that buffer.x + chWidth will not overflow right
         if chWidth > 1 {
-            let wideEmpty = CharData(attribute: curAttr, scalar: UnicodeScalar(0)!, size: 0)
+            // Partial repaints can expose this cell after replacing the wide
+            // character's leading cell. Keep its colors and style consistent
+            // with that character, rather than an inverted default background.
+            let wideEmpty = CharData(attribute: charData.attribute, scalar: UnicodeScalar(0)!, size: 0)
             chWidth -= 1
             while chWidth != 0 && _x < _cols {
                 bufferRow [_x] = wideEmpty

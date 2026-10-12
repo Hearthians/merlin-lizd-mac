@@ -1951,7 +1951,8 @@ extension TerminalView {
     
     ///
     /// This takes a string returned by events (NSEvent or UIKey) as the 'charactersIngoringModifiers'
-    /// and returns the control-version of that, and only applies to a handful of characters
+    /// and returns its legacy control byte. Keys without a control-byte mapping
+    /// retain their text, as they do in a traditional terminal.
     ///
     func applyControlToEventCharacters (_ ch: String) -> [UInt8]
     {
@@ -1964,24 +1965,26 @@ extension TerminalView {
                 value = (ch.asciiValue! - 0x40 /* - 'A' + 1 */)
             case "a"..."z":
                 value = (ch.asciiValue! - 0x60 /* - 'a' + 1 */)
-            case "\\":
+            case "\\", "4":
                 value = 0x1c
-            case "_":
+            case "_", "/", "7":
                 value = 0x1f
-            case "]":
+            case "]", "5":
                 value = 0x1d
-            case "[":
+            case "[", "3":
                 value = 0x1b
-            case "^", "6":
+            case "^", "6", "~":
                 value = 0x1e
-            case " ":
+            case " ", "@", "2":
                 value = 0
+            case "?", "8":
+                value = 0x7f
             default:
-                return []
+                return arr
             }
             return [value]
         }
-        return []
+        return arr
     }
     /**
      * Returns the thumb size in proportion to the visible content of the entire content, alternate buffers are not scrollable, so this returns 0
