@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -23,7 +24,7 @@ public sealed class TerminalLauncher
 
     public uint OpenShell(string destination)
     {
-        return Launch(new[]
+        return Launch(destination, new[]
         {
             "-tt",
             "-o", "ServerAliveInterval=10",
@@ -32,8 +33,9 @@ public sealed class TerminalLauncher
         });
     }
 
-    public uint Launch(IReadOnlyList<string> arguments)
+    public uint Launch(string destination, IReadOnlyList<string> arguments)
     {
+        destination = SshInvocation.RequireDestination(destination);
         ArgumentNullException.ThrowIfNull(arguments);
 
         var commandLine = new StringBuilder(QuoteWindowsArgument(_sshExecutable));
@@ -79,12 +81,46 @@ public sealed class TerminalLauncher
 
         try
         {
+            TryStartClipboardPasteBridge(processInformation.ProcessId, destination);
             return processInformation.ProcessId;
         }
         finally
         {
             CloseHandle(processInformation.ThreadHandle);
             CloseHandle(processInformation.ProcessHandle);
+        }
+    }
+
+    private static void TryStartClipboardPasteBridge(
+        uint consoleProcessId,
+        string destination)
+    {
+        var executable = Environment.ProcessPath;
+        if (string.IsNullOrWhiteSpace(executable)
+            || !File.Exists(executable)
+            || consoleProcessId == 0)
+        {
+            return;
+        }
+        try
+        {
+            var startInfo = new ProcessStartInfo(executable)
+            {
+                CreateNoWindow = true,
+                UseShellExecute = false,
+            };
+            startInfo.ArgumentList.Add(ConsoleClipboardPasteBridge.Argument);
+            startInfo.ArgumentList.Add(
+                consoleProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            startInfo.ArgumentList.Add(destination);
+            Process.Start(startInfo)?.Dispose();
+        }
+        catch (Exception error) when (error is Win32Exception
+            or FileNotFoundException
+            or InvalidOperationException)
+        {
+            // The SSH console remains usable with the terminal's native paste
+            // shortcut if the optional bridge cannot start.
         }
     }
 

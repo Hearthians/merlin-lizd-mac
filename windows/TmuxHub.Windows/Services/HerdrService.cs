@@ -176,6 +176,7 @@ namespace TmuxHub.Windows.Services
                 .Concat(["terminal", "attach", reference.TerminalId])
                 .ToArray();
             return terminalLauncher.Launch(
+                destination,
                 BuildSshArguments(destination, arguments, interactive: true));
         }
 

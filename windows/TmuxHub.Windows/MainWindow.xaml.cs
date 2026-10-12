@@ -22,8 +22,11 @@ public partial class MainWindow : Window
     private AppState state = new();
     private IReadOnlyList<SshHost> configuredHosts = [];
     private IReadOnlyList<HostDisplay> hostItems = [];
+    private SshProcessRunner? sshRunner;
     private TmuxService? tmuxService;
+    private TmuxConfigurationService? tmuxConfigurationService;
     private HerdrService? herdrService;
+    private SlurmService? slurmService;
     private TerminalLauncher? terminalLauncher;
     private Exception? remoteInitializationError;
     private CancellationTokenSource? inventoryCancellation;
@@ -49,9 +52,12 @@ public partial class MainWindow : Window
         {
             var sshExecutable = OpenSshLocator.Locate();
             var runner = new SshProcessRunner(sshExecutable);
+            sshRunner = runner;
             terminalLauncher = new TerminalLauncher(sshExecutable);
             tmuxService = new TmuxService(runner, terminalLauncher);
+            tmuxConfigurationService = new TmuxConfigurationService(runner);
             herdrService = new HerdrService(runner, terminalLauncher);
+            slurmService = new SlurmService(runner, terminalLauncher);
         }
         catch (Exception error)
         {
@@ -225,6 +231,7 @@ public partial class MainWindow : Window
         try
         {
             var processId = RequireTerminalLauncher().Launch(
+                destination,
             [
                 "-tt", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3",
                 destination,
@@ -284,6 +291,9 @@ public partial class MainWindow : Window
     private async void RefreshSessionsButton_OnClick(object sender, RoutedEventArgs e) =>
         await RefreshSessionsAsync();
 
+    private async void ConfigureTmuxButton_OnClick(object sender, RoutedEventArgs e) =>
+        await ConfigureTmuxAsync();
+
     private void SessionGrid_OnSelectionChanged(object sender, SelectionChangedEventArgs e) =>
         UpdateSessionControls();
 
@@ -321,6 +331,30 @@ public partial class MainWindow : Window
 
     private async void OpenHerdrButton_OnClick(object sender, RoutedEventArgs e) =>
         await OpenSelectedHerdrAsync();
+
+    private async void RefreshSlurmButton_OnClick(object sender, RoutedEventArgs e) =>
+        await RefreshSlurmAsync();
+
+    private async void StartSlurmButton_OnClick(object sender, RoutedEventArgs e) =>
+        await StartSlurmAsync();
+
+    private void SlurmGrid_OnSelectionChanged(object sender, SelectionChangedEventArgs e) =>
+        UpdateSlurmControls();
+
+    private void SlurmGrid_OnMouseDoubleClick(object sender, MouseButtonEventArgs e)
+    {
+        if (CanManageSlurmSelection(SelectedSlurmJob))
+        {
+            OpenSelectedSlurm();
+            e.Handled = true;
+        }
+    }
+
+    private void OpenSlurmButton_OnClick(object sender, RoutedEventArgs e) =>
+        OpenSelectedSlurm();
+
+    private async void CancelSlurmButton_OnClick(object sender, RoutedEventArgs e) =>
+        await CancelSelectedSlurmAsync();
 
     private void AddHost()
     {
@@ -490,12 +524,16 @@ public partial class MainWindow : Window
             CancelInventory();
             SessionGrid.ItemsSource = Array.Empty<TmuxSessionDisplay>();
             HerdrGrid.ItemsSource = Array.Empty<HerdrPaneDisplay>();
+            SlurmGrid.ItemsSource = Array.Empty<SlurmJobDisplay>();
             SessionHint.Text = "选择会话后可连接、改名或终止。";
             HerdrHint.Text = "选择终端后可通过独立 SSH 控制台连接。";
+            SlurmSummaryText.Text = "—";
+            LoadSlurmSettings(destination);
         }
         UpdateHostControls();
         UpdateSessionControls();
         UpdateHerdrControls();
+        UpdateSlurmControls();
         if (changed && destination is not null && !isExclusiveOperation)
         {
             _ = RefreshActiveWorkspaceAsync();
@@ -507,6 +545,10 @@ public partial class MainWindow : Window
         if (WorkspaceTabs.SelectedIndex == 1)
         {
             await RefreshHerdrAsync();
+        }
+        else if (WorkspaceTabs.SelectedIndex == 2)
+        {
+            await RefreshSlurmAsync();
         }
         else
         {
@@ -569,6 +611,43 @@ public partial class MainWindow : Window
         {
             FinishInventory(request);
         }
+    }
+
+    private async Task ConfigureTmuxAsync()
+    {
+        var destination = activeDestination;
+        if (destination is null)
+        {
+            SetStatus("请选择 SSH 主机。", StatusKind.Warning);
+            return;
+        }
+
+        TmuxConfigurationResult? result = null;
+        var succeeded = await RunExclusiveAsync(
+            $"正在配置 {destination} 的 tmux…",
+            "无法配置 tmux",
+            async cancellationToken =>
+            {
+                result = await RequireTmuxConfigurationService()
+                    .ApplyAsync(destination, cancellationToken);
+            },
+            "tmux 配置完成。");
+
+        if (!succeeded || result is null)
+        {
+            return;
+        }
+
+        var message = result.StatusMessage;
+        if (result.BackupPath is { Length: > 0 })
+        {
+            message += $" 备份：{result.BackupPath}";
+        }
+        SetStatus(
+            message,
+            result.Activation == TmuxConfigurationActivation.ReloadFailed
+                ? StatusKind.Warning
+                : StatusKind.Ready);
     }
 
     private async Task RefreshHerdrAsync()
@@ -638,6 +717,80 @@ public partial class MainWindow : Window
                 HerdrHint.Text = FriendlyError(error);
                 SetStatus(FriendlyError(error), StatusKind.Error);
                 UpdateHerdrControls();
+            }
+        }
+        finally
+        {
+            FinishInventory(request);
+        }
+    }
+
+    private async Task RefreshSlurmAsync()
+    {
+        var destination = activeDestination;
+        if (destination is null)
+        {
+            SetStatus("请选择 SSH 主机。", StatusKind.Warning);
+            return;
+        }
+        if (isExclusiveOperation)
+        {
+            SetStatus("请等待当前操作完成。", StatusKind.Warning);
+            return;
+        }
+
+        SlurmService service;
+        try
+        {
+            service = RequireSlurmService();
+        }
+        catch (Exception error)
+        {
+            ShowOperationError("无法刷新 Slurm", error);
+            return;
+        }
+
+        var request = BeginInventory();
+        SetStatus($"正在读取 {destination} 的 Slurm 任务…", StatusKind.Working);
+        try
+        {
+            var owner = await ResolveSlurmOwnerAsync(destination, request.Token);
+            var profile = BuildSlurmProfile(destination, owner);
+            var queue = await service.ListJobsWithDiagnosticsAsync(profile, request.Token);
+            var jobs = queue.Jobs;
+            request.Token.ThrowIfCancellationRequested();
+            if (!IsCurrentInventory(request, destination))
+            {
+                return;
+            }
+            SlurmOwnerBox.Text = owner;
+            try
+            {
+                SaveSlurmSettings(destination, showDialog: false);
+            }
+            catch (ArgumentException)
+            {
+                // Resource inputs are validated when starting a task; an
+                // invalid draft must not block read-only queue refresh.
+            }
+            BindSlurmJobs(destination, owner, jobs, queue.IgnoredRowCount);
+            SetStatus(
+                queue.IgnoredRowCount == 0
+                    ? $"Slurm · {jobs.Count} 个任务"
+                    : $"Slurm · {jobs.Count} 个任务 · 忽略 {queue.IgnoredRowCount} 条异常记录",
+                queue.IgnoredRowCount == 0 ? StatusKind.Ready : StatusKind.Warning);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception error)
+        {
+            if (IsCurrentInventory(request, destination))
+            {
+                SlurmGrid.ItemsSource = Array.Empty<SlurmJobDisplay>();
+                SlurmSummaryText.Text = "—";
+                SetStatus(FriendlyError(error), StatusKind.Error);
+                UpdateSlurmControls();
             }
         }
         finally
@@ -827,6 +980,242 @@ public partial class MainWindow : Window
             "Herdr 终端已打开。");
     }
 
+    private async Task StartSlurmAsync()
+    {
+        var destination = activeDestination;
+        if (destination is null)
+        {
+            SetStatus("请选择 SSH 主机。", StatusKind.Warning);
+            return;
+        }
+
+        SlurmPlatformProfile? submittedPlatform = null;
+        SlurmLaunchReceipt? submittedReceipt = null;
+        Exception? confirmationError = null;
+        var submitted = await RunExclusiveAsync(
+            $"正在启动 {destination} 的 Slurm 交互环境…",
+            "无法启动 Slurm 任务",
+            async cancellationToken =>
+            {
+                var service = RequireSlurmService();
+                var owner = await ResolveSlurmOwnerAsync(destination, cancellationToken);
+                SlurmOwnerBox.Text = owner;
+                var platform = BuildSlurmProfile(destination, owner);
+                var preset = BuildSlurmPreset();
+                if (!SaveSlurmSettings(destination, showDialog: false))
+                {
+                    throw new IOException("无法保存 Slurm 资源设置。");
+                }
+
+                var receipt = service.CreateLaunchReceipt(platform);
+                state.SlurmReceipts.Insert(0, receipt);
+                if (!TrySaveState("无法在提交前保存 Slurm 启动凭据。", showDialog: false))
+                {
+                    state.SlurmReceipts.Remove(receipt);
+                    throw new IOException("未保存启动凭据，因此没有提交 Slurm 任务。");
+                }
+
+                submittedPlatform = platform;
+                submittedReceipt = receipt;
+                try
+                {
+                    await service.StartInteractiveAsync(
+                        platform,
+                        preset,
+                        receipt,
+                        cancellationToken);
+                }
+                catch (SlurmSubmissionOutcomeUnknownException)
+                {
+                    submittedReceipt = SetSlurmPhase(
+                        receipt.RequestId,
+                        SlurmLaunchPhase.LaunchOutcomeUnknown);
+                    throw;
+                }
+                catch
+                {
+                    submittedReceipt = SetSlurmPhase(
+                        receipt.RequestId,
+                        SlurmLaunchPhase.LaunchFailed);
+                    throw;
+                }
+
+                submittedReceipt = SetSlurmPhase(
+                    receipt.RequestId,
+                    SlurmLaunchPhase.AwaitingScheduler);
+                RecordUse(destination);
+
+                for (var attempt = 0; attempt < 5; attempt++)
+                {
+                    try
+                    {
+                        var reconciliation = await service.ReconcileAsync(
+                            submittedReceipt,
+                            platform,
+                            cancellationToken);
+                        if (reconciliation is SlurmReconciliation.Found)
+                        {
+                            submittedReceipt = SetSlurmPhase(
+                                receipt.RequestId,
+                                SlurmLaunchPhase.Active);
+                            break;
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception error)
+                    {
+                        confirmationError = error;
+                        break;
+                    }
+                    if (attempt < 4)
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+                    }
+                }
+            },
+            "启动请求已发出。");
+
+        if (submittedPlatform is null || submittedReceipt is null)
+        {
+            return;
+        }
+        await RefreshSlurmAsync();
+        submittedReceipt = FindSlurmReceipt(submittedReceipt.RequestId) ?? submittedReceipt;
+        if (!submitted)
+        {
+            return;
+        }
+        if (submittedReceipt.Phase != SlurmLaunchPhase.Active)
+        {
+            SetStatus(
+                confirmationError is null
+                    ? "请求已发出，等待 Slurm 确认；请勿重复提交。"
+                    : "请求已发出，暂时无法确认；请刷新，勿重复提交。",
+                StatusKind.Warning);
+            return;
+        }
+
+        // Submission and local terminal launch are separate outcomes. Once the
+        // remote command succeeds, a local launch error must never imply that
+        // submitting the allocation again is safe.
+        try
+        {
+            var processId = RequireSlurmService().OpenInteractive(
+                submittedPlatform,
+                submittedReceipt);
+            SetStatus($"Slurm 终端已打开（PID {processId}）。", StatusKind.Ready);
+        }
+        catch (Exception error)
+        {
+            ShowOperationError("Slurm 已确认，但无法打开终端", error);
+        }
+    }
+
+    private void OpenSelectedSlurm()
+    {
+        var destination = activeDestination;
+        var selected = SelectedSlurmJob;
+        if (destination is null
+            || selected?.Record is null
+            || selected.Receipt is not { } displayedReceipt
+            || isExclusiveOperation)
+        {
+            return;
+        }
+        var receipt = FindSlurmReceipt(displayedReceipt.RequestId);
+        if (receipt?.Phase != SlurmLaunchPhase.Active)
+        {
+            UpdateSlurmControls();
+            return;
+        }
+        try
+        {
+            var platform = PlatformForReceipt(receipt);
+            var processId = RequireSlurmService().OpenInteractive(platform, receipt);
+            RecordUse(destination);
+            SetStatus($"Slurm 终端已打开（PID {processId}）。", StatusKind.Ready);
+        }
+        catch (Exception error)
+        {
+            ShowOperationError("无法连接 Slurm 任务", error);
+        }
+    }
+
+    private async Task CancelSelectedSlurmAsync()
+    {
+        var destination = activeDestination;
+        var selected = SelectedSlurmJob;
+        if (destination is null
+            || selected?.Record is not { } record
+            || selected.Receipt is not { } displayedReceipt)
+        {
+            return;
+        }
+        var receipt = FindSlurmReceipt(displayedReceipt.RequestId);
+        if (receipt?.Phase != SlurmLaunchPhase.Active)
+        {
+            UpdateSlurmControls();
+            return;
+        }
+        var confirmation = MessageBox.Show(
+            $"取消作业 {record.JobId.Value} 并释放资源？",
+            "TmuxHub",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Warning,
+            MessageBoxResult.No);
+        if (confirmation != MessageBoxResult.Yes)
+        {
+            return;
+        }
+
+        receipt = FindSlurmReceipt(receipt.RequestId);
+        if (receipt?.Phase != SlurmLaunchPhase.Active)
+        {
+            await RefreshSlurmAsync();
+            SetStatus("任务状态已变化，请重新选择。", StatusKind.Warning);
+            return;
+        }
+        var phaseBeforeCancellation = receipt.Phase;
+        var managed = new SlurmManagedJob(receipt, record);
+        await RunExclusiveAsync(
+            $"正在取消作业 {record.JobId.Value}…",
+            "无法取消 Slurm 任务",
+            async cancellationToken =>
+            {
+                SetSlurmPhase(
+                    receipt.RequestId,
+                    SlurmLaunchPhase.CancellationOutcomeUnknown,
+                    requireSaved: true);
+                try
+                {
+                    await RequireSlurmService().CancelVerifiedAsync(
+                        managed,
+                        PlatformForReceipt(receipt),
+                        cancellationToken);
+                }
+                catch (SlurmCancellationOutcomeUnknownException)
+                {
+                    SetSlurmPhase(
+                        receipt.RequestId,
+                        SlurmLaunchPhase.CancellationOutcomeUnknown);
+                    throw;
+                }
+                catch
+                {
+                    SetSlurmPhase(receipt.RequestId, phaseBeforeCancellation);
+                    throw;
+                }
+                SetSlurmPhase(
+                    receipt.RequestId,
+                    SlurmLaunchPhase.CancellationRequested);
+            },
+            "取消请求已发出。");
+        await RefreshSlurmAsync();
+    }
+
     private async Task<bool> RunExclusiveAsync(
         string progressMessage,
         string errorTitle,
@@ -886,6 +1275,369 @@ public partial class MainWindow : Window
         }
     }
 
+    private void BindSlurmJobs(
+        string destination,
+        string owner,
+        IReadOnlyList<SlurmJobSnapshot> jobs,
+        int ignoredRowCount)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var stateChanged = false;
+        for (var index = 0; index < state.SlurmReceipts.Count; index++)
+        {
+            var receipt = state.SlurmReceipts[index];
+            if (receipt.LoginDestination != destination || receipt.Owner != owner)
+            {
+                continue;
+            }
+            // A partial queue can prove that a visible row exists, but it
+            // cannot prove uniqueness or absence. Freeze all persisted phases
+            // until a complete refresh is available.
+            if (ignoredRowCount > 0)
+            {
+                continue;
+            }
+
+            var matchingJobs = jobs.Where(job => ReceiptMatchesJob(receipt, job)).ToArray();
+            var phase = receipt.Phase;
+            if (matchingJobs.Length > 1)
+            {
+                phase = SlurmLaunchPhase.Ambiguous;
+            }
+            else if (matchingJobs.Length == 1)
+            {
+                var matchedJob = matchingJobs[0];
+                if (matchedJob.State.IsTerminal)
+                {
+                    phase = SlurmLaunchPhase.LeftQueue;
+                }
+                else if (phase is not SlurmLaunchPhase.CancellationRequested
+                    and not SlurmLaunchPhase.CancellationOutcomeUnknown)
+                {
+                    phase = SlurmLaunchPhase.Active;
+                }
+            }
+            else
+            {
+                phase = phase switch
+                {
+                    SlurmLaunchPhase.Active
+                        or SlurmLaunchPhase.Ambiguous
+                        or SlurmLaunchPhase.CancellationRequested
+                        or SlurmLaunchPhase.CancellationOutcomeUnknown
+                        => SlurmLaunchPhase.LeftQueue,
+                    SlurmLaunchPhase.Submitting
+                        or SlurmLaunchPhase.AwaitingScheduler
+                        when now - receipt.RequestedAt >= TimeSpan.FromMinutes(2)
+                        => SlurmLaunchPhase.NotFound,
+                    _ => phase,
+                };
+            }
+
+            if (phase != receipt.Phase)
+            {
+                state.SlurmReceipts[index] = receipt with
+                {
+                    Phase = phase,
+                    PhaseUpdatedAt = now,
+                };
+                stateChanged = true;
+            }
+        }
+        if (stateChanged)
+        {
+            TrySaveState("Slurm 状态已刷新，但无法保存。", showDialog: false);
+        }
+
+        var activeRows = jobs
+            .OrderBy(static job => job.State.Kind switch
+            {
+                SlurmJobStateKind.Running => 0,
+                SlurmJobStateKind.Pending => 1,
+                SlurmJobStateKind.Completing => 2,
+                _ => 3,
+            })
+            .ThenByDescending(static job => job.JobId.Value, StringComparer.Ordinal)
+            .Select(job => new SlurmJobDisplay(
+                job,
+                ignoredRowCount == 0
+                    ? FindUniqueSlurmReceipt(destination, job, jobs)
+                    : null))
+            .ToArray();
+        var matched = activeRows
+            .Where(static row => row.Receipt is not null)
+            .Select(static row => row.Receipt!.RequestId)
+            .ToHashSet();
+        var historyRows = state.SlurmReceipts
+            .Where(receipt =>
+                receipt.LoginDestination == destination
+                && receipt.Owner == owner
+                && !matched.Contains(receipt.RequestId))
+            .OrderByDescending(static receipt => receipt.RequestedAt)
+            .Select(static receipt => new SlurmJobDisplay(receipt));
+        SlurmGrid.ItemsSource = activeRows.Concat(historyRows).ToArray();
+
+        var running = jobs.Count(static job => job.State.Kind == SlurmJobStateKind.Running);
+        var pending = jobs.Count(static job => job.State.Kind == SlurmJobStateKind.Pending);
+        var awaiting = state.SlurmReceipts.Count(receipt =>
+            receipt.LoginDestination == destination
+            && receipt.Owner == owner
+            && receipt.Phase is SlurmLaunchPhase.Submitting
+                or SlurmLaunchPhase.AwaitingScheduler);
+        var uncertain = state.SlurmReceipts.Count(receipt =>
+            receipt.LoginDestination == destination
+            && receipt.Owner == owner
+            && receipt.Phase == SlurmLaunchPhase.LaunchOutcomeUnknown);
+        var ambiguous = state.SlurmReceipts.Count(receipt =>
+            receipt.LoginDestination == destination
+            && receipt.Owner == owner
+            && receipt.Phase == SlurmLaunchPhase.Ambiguous);
+        var summary = new List<string> { $"运行 {running}", $"排队 {pending}" };
+        if (awaiting > 0)
+        {
+            summary.Add($"待确认 {awaiting}");
+        }
+        if (uncertain > 0)
+        {
+            summary.Add($"未知 {uncertain}");
+        }
+        if (ambiguous > 0)
+        {
+            summary.Add($"冲突 {ambiguous}");
+        }
+        if (ignoredRowCount > 0)
+        {
+            summary.Add($"异常 {ignoredRowCount}");
+        }
+        SlurmSummaryText.Text = string.Join(" · ", summary);
+        UpdateSlurmControls();
+    }
+
+    private void LoadSlurmSettings(string? destination)
+    {
+        var settings = destination is not null
+            && state.SlurmSettings.TryGetValue(destination, out var saved)
+                ? saved
+                : null;
+        var at = destination?.IndexOf('@') ?? -1;
+        SlurmOwnerBox.Text = settings?.Owner
+            ?? (at > 0 ? destination![..at] : string.Empty);
+        SlurmPartitionBox.Text = settings?.Partition ?? "debug";
+        SlurmCpuBox.Text = (settings?.CpusPerTask ?? 4)
+            .ToString(CultureInfo.InvariantCulture);
+        SlurmMemoryBox.Text = (settings?.MemoryMiB ?? 16 * 1024)
+            .ToString(CultureInfo.InvariantCulture);
+        SlurmMinutesBox.Text = (settings?.WallTimeMinutes ?? 30)
+            .ToString(CultureInfo.InvariantCulture);
+        SlurmGpuBox.Text = (settings?.GpuCount ?? 1)
+            .ToString(CultureInfo.InvariantCulture);
+    }
+
+    private bool SaveSlurmSettings(string destination, bool showDialog)
+    {
+        var settings = ReadSlurmSettings();
+        var hadPrevious = state.SlurmSettings.TryGetValue(destination, out var previous);
+        state.SlurmSettings[destination] = settings;
+        if (TrySaveState("无法保存 Slurm 资源设置。", showDialog))
+        {
+            return true;
+        }
+        if (hadPrevious)
+        {
+            state.SlurmSettings[destination] = previous!;
+        }
+        else
+        {
+            state.SlurmSettings.Remove(destination);
+        }
+        return false;
+    }
+
+    private SlurmHostSettings ReadSlurmSettings()
+    {
+        var owner = SlurmOwnerBox.Text.Trim();
+        var partition = SlurmPartitionBox.Text.Trim();
+        var cpus = ParseResourceField(SlurmCpuBox.Text, "CPU", 1, 4_096);
+        var memory = ParseResourceField(
+            SlurmMemoryBox.Text,
+            "内存",
+            1,
+            1_073_741_824);
+        var minutes = ParseResourceField(SlurmMinutesBox.Text, "时限", 1, 525_600);
+        var gpu = ParseResourceField(SlurmGpuBox.Text, "GPU", 0, 1_024);
+        return new SlurmHostSettings(owner, partition, cpus, memory, minutes, gpu);
+    }
+
+    private async Task<string> ResolveSlurmOwnerAsync(
+        string destination,
+        CancellationToken cancellationToken)
+    {
+        var lockedOwner = LockedSlurmOwner(destination);
+        if (lockedOwner is not null)
+        {
+            SlurmOwnerBox.Text = lockedOwner;
+            return lockedOwner;
+        }
+
+        var owner = SlurmOwnerBox.Text.Trim();
+        if (owner.Length > 0)
+        {
+            return owner;
+        }
+
+        var runner = sshRunner ?? throw RemoteUnavailable();
+        var result = await runner.RunAsync(
+            ["-G", SshInvocation.RequireDestination(destination)],
+            TimeSpan.FromSeconds(5),
+            cancellationToken);
+        if (result.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                SshConnectionDiagnostics.FromResult(result).DisplayMessage);
+        }
+        foreach (var line in result.StandardOutput
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Split('\n'))
+        {
+            if (line.StartsWith("user ", StringComparison.OrdinalIgnoreCase))
+            {
+                owner = line[5..].Trim();
+                if (owner.Length > 0)
+                {
+                    return owner;
+                }
+            }
+        }
+        throw new ArgumentException("请填写集群用户名。");
+    }
+
+    private string? LockedSlurmOwner(string destination) =>
+        state.SlurmReceipts
+            .Where(receipt =>
+                receipt.LoginDestination == destination
+                && LocksSlurmOwner(receipt.Phase))
+            .OrderByDescending(static receipt => receipt.RequestedAt)
+            .Select(static receipt => receipt.Owner)
+            .FirstOrDefault();
+
+    private static bool LocksSlurmOwner(SlurmLaunchPhase phase) =>
+        phase is SlurmLaunchPhase.Submitting
+            or SlurmLaunchPhase.AwaitingScheduler
+            or SlurmLaunchPhase.Active
+            or SlurmLaunchPhase.LaunchOutcomeUnknown
+            or SlurmLaunchPhase.Ambiguous
+            or SlurmLaunchPhase.CancellationRequested
+            or SlurmLaunchPhase.CancellationOutcomeUnknown;
+
+    private SlurmPlatformProfile BuildSlurmProfile(string destination, string owner)
+    {
+        var stable = IdentifierValidator.StableTmuxSessionName(destination)
+            ?? throw new ArgumentException("SSH 目标格式无效。");
+        var platform = new SlurmPlatformProfile(
+            "slurm-" + stable,
+            destination,
+            destination,
+            owner);
+        SlurmCommands.ValidatePlatform(platform);
+        return platform;
+    }
+
+    private SlurmInteractivePreset BuildSlurmPreset()
+    {
+        var settings = ReadSlurmSettings();
+        var seconds = checked(settings.WallTimeMinutes * 60);
+        var preset = new SlurmInteractivePreset(
+            "windows-default",
+            "交互环境",
+            settings.Partition,
+            1,
+            settings.CpusPerTask,
+            settings.MemoryMiB,
+            new SlurmWallTime(seconds),
+            settings.GpuCount == 0 ? null : new SlurmGpuRequest(null, settings.GpuCount));
+        SlurmCommands.ValidatePreset(preset);
+        return preset;
+    }
+
+    private static SlurmPlatformProfile PlatformForReceipt(SlurmLaunchReceipt receipt) =>
+        new(
+            receipt.PlatformId,
+            receipt.LoginDestination,
+            receipt.LoginDestination,
+            receipt.Owner);
+
+    private SlurmLaunchReceipt? FindUniqueSlurmReceipt(
+        string destination,
+        SlurmJobSnapshot job,
+        IReadOnlyList<SlurmJobSnapshot> jobs) =>
+        state.SlurmReceipts
+            .Where(receipt =>
+                receipt.LoginDestination == destination
+                && ReceiptMatchesJob(receipt, job)
+                && SlurmService.MatchCount(receipt, jobs) == 1)
+            .OrderByDescending(static receipt => receipt.RequestedAt)
+            .FirstOrDefault();
+
+    private SlurmLaunchReceipt? FindSlurmReceipt(Guid requestId) =>
+        state.SlurmReceipts.FirstOrDefault(receipt => receipt.RequestId == requestId);
+
+    private SlurmLaunchReceipt SetSlurmPhase(
+        Guid requestId,
+        SlurmLaunchPhase phase,
+        bool requireSaved = false)
+    {
+        var index = state.SlurmReceipts.FindIndex(
+            receipt => receipt.RequestId == requestId);
+        if (index < 0)
+        {
+            throw new InvalidOperationException("Slurm 启动凭据不存在。");
+        }
+        var current = state.SlurmReceipts[index];
+        if (current.Phase == phase)
+        {
+            return current;
+        }
+        var updated = current with
+        {
+            Phase = phase,
+            PhaseUpdatedAt = DateTimeOffset.UtcNow,
+        };
+        state.SlurmReceipts[index] = updated;
+        if (!TrySaveState("Slurm 状态已更新，但无法保存。", showDialog: false)
+            && requireSaved)
+        {
+            state.SlurmReceipts[index] = current;
+            throw new IOException("未保存取消状态，因此没有发送取消请求。");
+        }
+        return updated;
+    }
+
+    private static bool ReceiptMatchesJob(
+        SlurmLaunchReceipt receipt,
+        SlurmJobSnapshot job) =>
+        receipt.Owner == job.Owner
+        && receipt.JobName == job.Name
+        && receipt.Comment == job.Comment;
+
+    private static int ParseResourceField(
+        string value,
+        string label,
+        int minimum,
+        int maximum)
+    {
+        if (!int.TryParse(
+                value.Trim(),
+                NumberStyles.None,
+                CultureInfo.InvariantCulture,
+                out var parsed)
+            || parsed < minimum
+            || parsed > maximum)
+        {
+            throw new ArgumentException($"{label}必须是 {minimum}–{maximum} 的整数。");
+        }
+        return parsed;
+    }
+
     private void BindSessions(
         IReadOnlyList<TmuxSessionRecord> sessions,
         TmuxSessionIdentity? preferredIdentity = null)
@@ -908,8 +1660,12 @@ public partial class MainWindow : Window
         UpdateHostControls();
         UpdateSessionControls();
         UpdateHerdrControls();
+        UpdateSlurmControls();
         SearchBox.IsEnabled = !isExclusiveOperation;
         AddHostBox.IsEnabled = !isExclusiveOperation;
+        AddHostButton.IsEnabled = !isExclusiveOperation;
+        RefreshHostsButton.IsEnabled = !isExclusiveOperation;
+        EditSshConfigButton.IsEnabled = !isExclusiveOperation;
         SessionNameBox.IsEnabled = !isExclusiveOperation;
         WorkspaceTabs.IsEnabled = !isExclusiveOperation;
         HostsList.IsEnabled = !isExclusiveOperation;
@@ -928,7 +1684,11 @@ public partial class MainWindow : Window
             SelectedHostTitle.Text = host.Destination;
             SelectedHostSubtitle.Text = host.Detail;
         }
-        PinButton.Content = host?.IsPinned == true ? "取消固定" : "固定";
+        PinButton.Content = host?.IsPinned == true ? "★" : "☆";
+        PinButton.ToolTip = host?.IsPinned == true ? "取消固定" : "固定主机";
+        System.Windows.Automation.AutomationProperties.SetName(
+            PinButton,
+            host?.IsPinned == true ? "取消固定主机" : "固定主机");
         PinButton.IsEnabled = host is not null && !isExclusiveOperation;
         RemoveHostButton.IsEnabled = host?.IsCustom == true && !isExclusiveOperation;
         OpenShellButton.IsEnabled = host is not null
@@ -945,6 +1705,9 @@ public partial class MainWindow : Window
         OpenSessionButton.IsEnabled = canOpen;
         RenameSessionButton.IsEnabled = canMutate;
         TerminateSessionButton.IsEnabled = canMutate;
+        ConfigureTmuxButton.IsEnabled = activeDestination is not null
+            && tmuxConfigurationService is not null
+            && !isExclusiveOperation;
         if (selected is null)
         {
             return;
@@ -965,6 +1728,41 @@ public partial class MainWindow : Window
         {
             HerdrHint.Text = $"将重新确认终端 {selected.Record.Reference.TerminalId} 后再打开。";
         }
+    }
+
+    private void UpdateSlurmControls()
+    {
+        var hasHost = activeDestination is not null;
+        var selected = SelectedSlurmJob;
+        var canManage = CanManageSlurmSelection(selected)
+            && slurmService is not null
+            && !isExclusiveOperation;
+        StartSlurmButton.IsEnabled = hasHost
+            && slurmService is not null
+            && !isExclusiveOperation;
+        OpenSlurmButton.IsEnabled = canManage;
+        CancelSlurmButton.IsEnabled = canManage;
+        SlurmOwnerBox.IsEnabled = hasHost
+            && activeDestination is { } destination
+            && LockedSlurmOwner(destination) is null
+            && !isExclusiveOperation;
+        SlurmPartitionBox.IsEnabled = hasHost && !isExclusiveOperation;
+        SlurmCpuBox.IsEnabled = hasHost && !isExclusiveOperation;
+        SlurmMemoryBox.IsEnabled = hasHost && !isExclusiveOperation;
+        SlurmMinutesBox.IsEnabled = hasHost && !isExclusiveOperation;
+        SlurmGpuBox.IsEnabled = hasHost && !isExclusiveOperation;
+    }
+
+    private bool CanManageSlurmSelection(SlurmJobDisplay? selected)
+    {
+        if (selected?.Record is not { } record
+            || record.State.IsTerminal
+            || selected.Receipt is not { } displayedReceipt)
+        {
+            return false;
+        }
+        return FindSlurmReceipt(displayedReceipt.RequestId)?.Phase
+            == SlurmLaunchPhase.Active;
     }
 
     private CancellationTokenSource BeginInventory()
@@ -1015,7 +1813,13 @@ public partial class MainWindow : Window
     private TmuxService RequireTmuxService() => tmuxService
         ?? throw RemoteUnavailable();
 
+    private TmuxConfigurationService RequireTmuxConfigurationService() =>
+        tmuxConfigurationService ?? throw RemoteUnavailable();
+
     private HerdrService RequireHerdrService() => herdrService
+        ?? throw RemoteUnavailable();
+
+    private SlurmService RequireSlurmService() => slurmService
         ?? throw RemoteUnavailable();
 
     private TerminalLauncher RequireTerminalLauncher() => terminalLauncher
@@ -1091,8 +1895,18 @@ public partial class MainWindow : Window
         var message = error switch
         {
             TmuxSessionChangedException => "远端会话已变化或已消失；为避免操作错误目标，已取消本次操作。请刷新后重试。",
-            FileNotFoundException => "未找到 Windows OpenSSH Client。请在 Windows 可选功能中启用 OpenSSH 客户端。",
-            TimeoutException => "SSH 操作超时，请检查网络、主机配置与认证方式。",
+            TmuxConfigurationException
+                or SlurmCommandException
+                or SlurmConnectionException
+                or SlurmSubmissionOutcomeUnknownException
+                or SlurmCancellationOutcomeUnknownException
+                or SlurmAmbiguousLaunchException
+                or SlurmJobUnavailableException
+                or SlurmIdentityMismatchException
+                or SlurmValidationException => error.Message,
+            FileNotFoundException
+                or TimeoutException
+                or TmuxServiceException => SshConnectionDiagnostics.Describe(error),
             OperationCanceledException => "操作已取消。",
             _ => error.Message,
         };
@@ -1115,6 +1929,9 @@ public partial class MainWindow : Window
 
     private HerdrPaneDisplay? SelectedHerdrPane =>
         HerdrGrid.SelectedItem as HerdrPaneDisplay;
+
+    private SlurmJobDisplay? SelectedSlurmJob =>
+        SlurmGrid.SelectedItem as SlurmJobDisplay;
 
     private enum StatusKind
     {
@@ -1221,5 +2038,63 @@ public partial class MainWindow : Window
         public string Label { get; }
         public string AgentDisplay { get; }
         public string WorkingDirectoryDisplay { get; }
+    }
+
+    private sealed class SlurmJobDisplay
+    {
+        public SlurmJobDisplay(
+            SlurmJobSnapshot record,
+            SlurmLaunchReceipt? receipt)
+        {
+            Record = record;
+            Receipt = receipt;
+        }
+
+        public SlurmJobDisplay(SlurmLaunchReceipt receipt)
+        {
+            Receipt = receipt;
+        }
+
+        public SlurmJobSnapshot? Record { get; }
+        public SlurmLaunchReceipt? Receipt { get; }
+        public string Name => Record?.Name ?? Receipt?.JobName ?? "—";
+        public string JobId => Record?.JobId.Value ?? "—";
+        public string State => Record is null ? Receipt?.Phase switch
+        {
+            SlurmLaunchPhase.Submitting => "准备中",
+            SlurmLaunchPhase.AwaitingScheduler => "待确认",
+            SlurmLaunchPhase.LaunchOutcomeUnknown => "结果未知",
+            SlurmLaunchPhase.Ambiguous => "匹配冲突",
+            SlurmLaunchPhase.LaunchFailed => "启动失败",
+            SlurmLaunchPhase.NotFound => "未找到",
+            SlurmLaunchPhase.CancellationRequested => "取消中",
+            SlurmLaunchPhase.CancellationOutcomeUnknown => "取消未知",
+            SlurmLaunchPhase.LeftQueue => "已离队",
+            _ => "—",
+        } : Receipt?.Phase is SlurmLaunchPhase.CancellationRequested
+            or SlurmLaunchPhase.CancellationOutcomeUnknown
+            ? "取消中"
+            : Record.State.Kind switch
+        {
+            SlurmJobStateKind.Pending => "排队",
+            SlurmJobStateKind.Running => "运行",
+            SlurmJobStateKind.Completing => "结束中",
+            SlurmJobStateKind.Completed => "完成",
+            SlurmJobStateKind.Cancelled => "取消",
+            SlurmJobStateKind.Failed => "失败",
+            SlurmJobStateKind.Timeout => "超时",
+            SlurmJobStateKind.NodeFailure => "节点故障",
+            SlurmJobStateKind.OutOfMemory => "内存不足",
+            SlurmJobStateKind.Preempted => "抢占",
+            SlurmJobStateKind.Suspended => "暂停",
+            _ => Record.State.SchedulerValue,
+        };
+        public string Partition => Record?.Partition ?? "—";
+        public string Time => Record is null ? "—" : $"{Record.Elapsed} / {Record.TimeLimit}";
+        public string Nodes => Record is null
+            ? "—"
+            : Record.NodeList
+                ?? (Record.ReasonOrNodeList.Length == 0 ? "—" : Record.ReasonOrNodeList);
+        public string Source => Receipt is null ? "只读" : "TmuxHub";
     }
 }

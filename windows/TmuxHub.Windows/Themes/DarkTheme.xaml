@@ -155,6 +155,25 @@
     <Setter Property="Foreground" Value="{StaticResource DangerBrush}" />
   </Style>
 
+  <Style x:Key="IconButton" TargetType="Button" BasedOn="{StaticResource BaseButton}">
+    <Setter Property="Width" Value="40" />
+    <Setter Property="MinWidth" Value="40" />
+    <Setter Property="Padding" Value="0" />
+    <Setter Property="FontSize" Value="17" />
+    <Setter Property="FontWeight" Value="SemiBold" />
+  </Style>
+
+  <Style x:Key="PrimaryIconButton" TargetType="Button" BasedOn="{StaticResource PrimaryButton}">
+    <Setter Property="Width" Value="40" />
+    <Setter Property="MinWidth" Value="40" />
+    <Setter Property="Padding" Value="0" />
+    <Setter Property="FontSize" Value="17" />
+  </Style>
+
+  <Style x:Key="DangerIconButton" TargetType="Button" BasedOn="{StaticResource IconButton}">
+    <Setter Property="Foreground" Value="{StaticResource DangerBrush}" />
+  </Style>
+
   <Style x:Key="GhostButton" TargetType="Button" BasedOn="{StaticResource BaseButton}">
     <Setter Property="Background" Value="Transparent" />
     <Setter Property="BorderBrush" Value="Transparent" />

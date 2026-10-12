@@ -6,7 +6,7 @@
         WindowStartupLocation="CenterScreen">
   <Grid Background="{StaticResource WindowBrush}">
     <Grid.ColumnDefinitions>
-      <ColumnDefinition Width="326" />
+      <ColumnDefinition Width="286" />
       <ColumnDefinition Width="*" />
     </Grid.ColumnDefinitions>
 
@@ -29,24 +29,22 @@
             <Image Source="/TmuxHub.Windows;component/Assets/TmuxHub.Windows.png"
                    Width="29" Height="29" Stretch="Uniform" />
           </Border>
-          <StackPanel Grid.Column="1" VerticalAlignment="Center">
-            <TextBlock Text="TmuxHub" FontSize="18" FontWeight="SemiBold" />
-            <TextBlock Text="Windows · 远程版" Style="{StaticResource CaptionText}" />
-          </StackPanel>
+          <TextBlock Grid.Column="1" Text="TmuxHub" FontSize="18"
+                     FontWeight="SemiBold" VerticalAlignment="Center" />
         </Grid>
 
-        <TextBox x:Name="SearchBox" Grid.Row="1" Margin="0,0,0,10"
-                 ToolTip="搜索完整 SSH 主机库" TextChanged="SearchBox_OnTextChanged" />
+        <StackPanel Grid.Row="1" Margin="0,0,0,10">
+          <TextBlock Text="主机" FontWeight="SemiBold" Margin="2,0,0,7" />
+          <TextBox x:Name="SearchBox" ToolTip="搜索完整 SSH 主机库"
+                   AutomationProperties.Name="搜索主机"
+                   TextChanged="SearchBox_OnTextChanged" />
+        </StackPanel>
 
         <ListBox x:Name="HostsList" Grid.Row="2"
                  SelectionChanged="HostsList_OnSelectionChanged">
           <ListBox.ItemTemplate>
             <DataTemplate>
               <Grid>
-                <Grid.RowDefinitions>
-                  <RowDefinition Height="Auto" />
-                  <RowDefinition Height="Auto" />
-                </Grid.RowDefinitions>
                 <Grid.ColumnDefinitions>
                   <ColumnDefinition Width="*" />
                   <ColumnDefinition Width="Auto" />
@@ -58,10 +56,6 @@
                   <TextBlock Text="{Binding Badge}" FontSize="10"
                              Foreground="{StaticResource SecondaryTextBrush}" />
                 </Border>
-                <TextBlock Grid.Row="1" Grid.ColumnSpan="2" Text="{Binding Detail}"
-                           Margin="0,4,0,0" FontSize="11"
-                           Foreground="{StaticResource MutedTextBrush}"
-                           TextTrimming="CharacterEllipsis" />
               </Grid>
             </DataTemplate>
           </ListBox.ItemTemplate>
@@ -73,28 +67,33 @@
               <ColumnDefinition Width="*" />
               <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
-            <TextBox x:Name="AddHostBox" ToolTip="例如 prod 或 user@example.com"
-                     KeyDown="AddHostBox_OnKeyDown" />
-            <Button Grid.Column="1" Content="添加" Style="{StaticResource PrimaryButton}"
-                    Margin="8,0,0,0" Click="AddHostButton_OnClick" />
+            <StackPanel>
+              <TextBlock Text="地址" Style="{StaticResource CaptionText}" Margin="2,0,0,5" />
+              <TextBox x:Name="AddHostBox" ToolTip="例如 prod 或 user@example.com"
+                       AutomationProperties.Name="添加 SSH 地址"
+                       KeyDown="AddHostBox_OnKeyDown" />
+            </StackPanel>
+            <Button x:Name="AddHostButton" Grid.Column="1" Content="＋"
+                    Style="{StaticResource PrimaryIconButton}" VerticalAlignment="Bottom"
+                    Margin="8,0,0,0" ToolTip="添加主机"
+                    AutomationProperties.Name="添加主机" Click="AddHostButton_OnClick" />
           </Grid>
-          <Grid>
-            <Grid.ColumnDefinitions>
-              <ColumnDefinition Width="*" />
-              <ColumnDefinition Width="*" />
-            </Grid.ColumnDefinitions>
-            <Button Content="刷新主机库" Style="{StaticResource BaseButton}"
-                    Margin="0,0,4,0" Click="RefreshHostsButton_OnClick" />
-            <Button Grid.Column="1" Content="编辑 SSH 配置" Style="{StaticResource BaseButton}"
-                    Margin="4,0,0,0" Click="EditSshConfigButton_OnClick" />
-          </Grid>
+          <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button x:Name="RefreshHostsButton" Content="↻"
+                    Style="{StaticResource IconButton}" ToolTip="刷新主机"
+                    AutomationProperties.Name="刷新主机"
+                    Margin="0,0,8,0" Click="RefreshHostsButton_OnClick" />
+            <Button x:Name="EditSshConfigButton" Content="⚙"
+                    Style="{StaticResource IconButton}" ToolTip="编辑 SSH 配置"
+                    AutomationProperties.Name="编辑 SSH 配置"
+                    Click="EditSshConfigButton_OnClick" />
+          </StackPanel>
         </StackPanel>
       </Grid>
     </Border>
 
     <Grid Grid.Column="1" Margin="28,24,28,18">
       <Grid.RowDefinitions>
-        <RowDefinition Height="Auto" />
         <RowDefinition Height="Auto" />
         <RowDefinition Height="*" />
         <RowDefinition Height="Auto" />
@@ -106,33 +105,32 @@
           <ColumnDefinition Width="Auto" />
         </Grid.ColumnDefinitions>
         <StackPanel>
-          <TextBlock x:Name="SelectedHostTitle" Text="选择一台 SSH 主机"
+          <TextBlock x:Name="SelectedHostTitle" Text="SSH"
                      Style="{StaticResource TitleText}" />
-          <TextBlock x:Name="SelectedHostSubtitle"
-                     Text="从左侧主机库选择目标，或手动添加一个 OpenSSH 地址。"
-                     Margin="0,5,0,0" Style="{StaticResource CaptionText}" />
+          <TextBlock x:Name="SelectedHostSubtitle" Visibility="Collapsed" />
         </StackPanel>
         <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-          <Button x:Name="PinButton" Content="固定" Style="{StaticResource BaseButton}"
+          <Button x:Name="PinButton" Content="☆" Style="{StaticResource IconButton}"
+                  ToolTip="固定主机" AutomationProperties.Name="固定主机"
                   Margin="0,0,8,0" IsEnabled="False" Click="PinButton_OnClick" />
-          <Button x:Name="RemoveHostButton" Content="移除" Style="{StaticResource DangerButton}"
+          <Button x:Name="RemoveHostButton" Content="−" Style="{StaticResource DangerIconButton}"
+                  ToolTip="移除主机"
+                  AutomationProperties.Name="移除主机"
                   Margin="0,0,8,0" IsEnabled="False" Click="RemoveHostButton_OnClick" />
-          <Button x:Name="OpenShellButton" Content="SSH Shell" Style="{StaticResource BaseButton}"
-                  Margin="0,0,8,0" IsEnabled="False" Click="OpenShellButton_OnClick" />
-          <Button x:Name="QuickConnectButton" Content="快速连接" Style="{StaticResource PrimaryButton}"
+          <Button x:Name="OpenShellButton" Content="&gt;_" Style="{StaticResource IconButton}"
+                  ToolTip="打开 SSH Shell" AutomationProperties.Name="打开 SSH Shell"
+                  Margin="0,0,8,0"
+                  IsEnabled="False" Click="OpenShellButton_OnClick" />
+          <Button x:Name="QuickConnectButton" Content="▶" Style="{StaticResource PrimaryIconButton}"
+                  ToolTip="快速连接" AutomationProperties.Name="快速连接"
                   IsEnabled="False" Click="QuickConnectButton_OnClick" />
         </StackPanel>
       </Grid>
 
-      <Border Grid.Row="1" Margin="0,18,0,16" Padding="13,10" CornerRadius="10"
-              Background="{StaticResource AccentSoftBrush}" BorderBrush="#6658A6FF" BorderThickness="1">
-        <TextBlock Text="Windows 端只连接远程 tmux / Herdr：使用系统 OpenSSH，不安装本机 tmux，也不需要 WSL。"
-                   Foreground="{StaticResource AccentHoverBrush}" TextWrapping="Wrap" />
-      </Border>
-
-      <TabControl x:Name="WorkspaceTabs" Grid.Row="2" Background="Transparent" BorderThickness="0"
+      <TabControl x:Name="WorkspaceTabs" Grid.Row="1" Margin="0,16,0,0"
+                  Background="Transparent" BorderThickness="0"
                   SelectionChanged="WorkspaceTabs_OnSelectionChanged">
-        <TabItem Header="tmux 会话">
+        <TabItem Header="tmux">
           <Grid Margin="0,14,0,0">
             <Grid.RowDefinitions>
               <RowDefinition Height="Auto" />
@@ -145,19 +143,26 @@
                   <ColumnDefinition Width="*" />
                   <ColumnDefinition Width="Auto" />
                   <ColumnDefinition Width="Auto" />
+                  <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
                 <StackPanel>
-                  <TextBlock Text="新建或接入会话" FontWeight="SemiBold" />
-                  <TextBlock Text="会话名只允许字母、数字、点、短横线和下划线。"
-                             Margin="0,3,0,8" Style="{StaticResource CaptionText}" />
-                  <TextBox x:Name="SessionNameBox" ToolTip="例如 main" KeyDown="SessionNameBox_OnKeyDown" />
+                  <TextBlock Text="会话" FontWeight="SemiBold" />
+                  <TextBox x:Name="SessionNameBox" Margin="0,8,0,0"
+                           ToolTip="会话名，例如 main" KeyDown="SessionNameBox_OnKeyDown" />
                 </StackPanel>
-                <Button Grid.Column="1" Content="新建 / 连接" Style="{StaticResource PrimaryButton}"
+                <Button Grid.Column="1" Content="＋" Style="{StaticResource PrimaryIconButton}"
+                        ToolTip="新建或连接" AutomationProperties.Name="新建或连接 tmux 会话"
                         Margin="12,24,0,0" VerticalAlignment="Center"
                         Click="ConnectNamedSessionButton_OnClick" />
-                <Button Grid.Column="2" Content="刷新" Style="{StaticResource BaseButton}"
+                <Button Grid.Column="2" Content="↻" Style="{StaticResource IconButton}"
+                        ToolTip="刷新会话" AutomationProperties.Name="刷新 tmux 会话"
                         Margin="8,24,0,0" VerticalAlignment="Center"
                         Click="RefreshSessionsButton_OnClick" />
+                <Button x:Name="ConfigureTmuxButton" Grid.Column="3" Content="⚙"
+                        Style="{StaticResource IconButton}" ToolTip="一键配置 tmux"
+                        AutomationProperties.Name="一键配置 tmux"
+                        Margin="8,24,0,0" VerticalAlignment="Center"
+                        Click="ConfigureTmuxButton_OnClick" />
               </Grid>
             </Border>
 
@@ -180,13 +185,15 @@
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="Auto" />
               </Grid.ColumnDefinitions>
-              <TextBlock x:Name="SessionHint" Text="选择会话后可连接、改名或终止。"
-                         VerticalAlignment="Center" Style="{StaticResource CaptionText}" />
-              <Button x:Name="OpenSessionButton" Grid.Column="1" Content="打开会话"
-                      Style="{StaticResource PrimaryButton}" IsEnabled="False"
+              <TextBlock x:Name="SessionHint" Visibility="Collapsed" />
+              <Button x:Name="OpenSessionButton" Grid.Column="1" Content="▶"
+                      Style="{StaticResource PrimaryIconButton}" ToolTip="打开会话"
+                      AutomationProperties.Name="打开 tmux 会话" IsEnabled="False"
                       Click="OpenSessionButton_OnClick" />
-              <Button x:Name="RenameSessionButton" Grid.Column="2" Content="重命名"
-                      Style="{StaticResource BaseButton}" IsEnabled="False" Margin="8,0,0,0"
+              <Button x:Name="RenameSessionButton" Grid.Column="2" Content="✎"
+                      Style="{StaticResource IconButton}" ToolTip="重命名"
+                      AutomationProperties.Name="重命名 tmux 会话"
+                      IsEnabled="False" Margin="8,0,0,0"
                       Click="RenameSessionButton_OnClick" />
               <Button x:Name="TerminateSessionButton" Grid.Column="3" Content="终止会话"
                       Style="{StaticResource DangerButton}" IsEnabled="False" Margin="8,0,0,0"
@@ -195,7 +202,7 @@
           </Grid>
         </TabItem>
 
-        <TabItem Header="Herdr 工作区">
+        <TabItem Header="Herdr">
           <Grid Margin="0,14,0,0">
             <Grid.RowDefinitions>
               <RowDefinition Height="Auto" />
@@ -208,12 +215,9 @@
                   <ColumnDefinition Width="*" />
                   <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
-                <StackPanel>
-                  <TextBlock Text="现有 Herdr 终端" FontWeight="SemiBold" />
-                  <TextBlock Text="只读取并连接已有工作区，不会创建、接管或停止 Herdr。"
-                             Margin="0,3,0,0" Style="{StaticResource CaptionText}" />
-                </StackPanel>
-                <Button Grid.Column="1" Content="刷新 Herdr" Style="{StaticResource BaseButton}"
+                <TextBlock Text="工作区" FontWeight="SemiBold" VerticalAlignment="Center" />
+                <Button Grid.Column="1" Content="↻" Style="{StaticResource IconButton}"
+                        ToolTip="刷新 Herdr" AutomationProperties.Name="刷新 Herdr"
                         Click="RefreshHerdrButton_OnClick" />
               </Grid>
             </Border>
@@ -237,29 +241,118 @@
                 <ColumnDefinition Width="*" />
                 <ColumnDefinition Width="Auto" />
               </Grid.ColumnDefinitions>
-              <TextBlock x:Name="HerdrHint" Text="选择终端后可通过独立 SSH 控制台连接。"
-                         VerticalAlignment="Center" Style="{StaticResource CaptionText}" />
-              <Button x:Name="OpenHerdrButton" Grid.Column="1" Content="打开终端"
-                      Style="{StaticResource PrimaryButton}" IsEnabled="False"
+              <TextBlock x:Name="HerdrHint" Visibility="Collapsed" />
+              <Button x:Name="OpenHerdrButton" Grid.Column="1" Content="▶"
+                      Style="{StaticResource PrimaryIconButton}" ToolTip="打开终端"
+                      AutomationProperties.Name="打开 Herdr 终端" IsEnabled="False"
                       Click="OpenHerdrButton_OnClick" />
+            </Grid>
+          </Grid>
+        </TabItem>
+
+        <TabItem Header="Slurm">
+          <Grid Margin="0,14,0,0">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto" />
+              <RowDefinition Height="*" />
+              <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <Border Style="{StaticResource Card}" Margin="0,0,0,12">
+              <StackPanel>
+                <Grid>
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                  </Grid.ColumnDefinitions>
+                  <TextBlock Text="资源" FontWeight="SemiBold" VerticalAlignment="Center" />
+                  <Button Grid.Column="1" Content="↻" Style="{StaticResource IconButton}"
+                          ToolTip="刷新任务" AutomationProperties.Name="刷新 Slurm 任务"
+                          Margin="0,0,8,0"
+                          Click="RefreshSlurmButton_OnClick" />
+                  <Button x:Name="StartSlurmButton" Grid.Column="2" Content="＋"
+                          Style="{StaticResource PrimaryIconButton}"
+                          ToolTip="启动交互环境" AutomationProperties.Name="启动 Slurm 交互环境"
+                          Click="StartSlurmButton_OnClick" />
+                </Grid>
+
+                <UniformGrid Columns="6" Margin="0,12,0,0">
+                  <StackPanel Margin="0,0,8,0">
+                    <TextBlock Text="用户" Style="{StaticResource CaptionText}" />
+                    <TextBox x:Name="SlurmOwnerBox" Margin="0,5,0,0" ToolTip="集群用户名" />
+                  </StackPanel>
+                  <StackPanel Margin="0,0,8,0">
+                    <TextBlock Text="分区" Style="{StaticResource CaptionText}" />
+                    <TextBox x:Name="SlurmPartitionBox" Margin="0,5,0,0" Text="debug" />
+                  </StackPanel>
+                  <StackPanel Margin="0,0,8,0">
+                    <TextBlock Text="CPU" Style="{StaticResource CaptionText}" />
+                    <TextBox x:Name="SlurmCpuBox" Margin="0,5,0,0" Text="4" />
+                  </StackPanel>
+                  <StackPanel Margin="0,0,8,0">
+                    <TextBlock Text="内存 MiB" Style="{StaticResource CaptionText}" />
+                    <TextBox x:Name="SlurmMemoryBox" Margin="0,5,0,0" Text="16384" />
+                  </StackPanel>
+                  <StackPanel Margin="0,0,8,0">
+                    <TextBlock Text="时限 min" Style="{StaticResource CaptionText}" />
+                    <TextBox x:Name="SlurmMinutesBox" Margin="0,5,0,0" Text="30" />
+                  </StackPanel>
+                  <StackPanel>
+                    <TextBlock Text="GPU" Style="{StaticResource CaptionText}" />
+                    <TextBox x:Name="SlurmGpuBox" Margin="0,5,0,0" Text="1"
+                             ToolTip="0 表示不申请 GPU" />
+                  </StackPanel>
+                </UniformGrid>
+              </StackPanel>
+            </Border>
+
+            <Border Grid.Row="1" Style="{StaticResource Card}" Padding="0">
+              <DataGrid x:Name="SlurmGrid" AutoGenerateColumns="False"
+                        SelectionChanged="SlurmGrid_OnSelectionChanged"
+                        MouseDoubleClick="SlurmGrid_OnMouseDoubleClick">
+                <DataGrid.Columns>
+                  <DataGridTextColumn Header="任务" Binding="{Binding Name}" Width="*" />
+                  <DataGridTextColumn Header="Job" Binding="{Binding JobId}" Width="90" />
+                  <DataGridTextColumn Header="状态" Binding="{Binding State}" Width="90" />
+                  <DataGridTextColumn Header="分区" Binding="{Binding Partition}" Width="100" />
+                  <DataGridTextColumn Header="运行" Binding="{Binding Time}" Width="120" />
+                  <DataGridTextColumn Header="节点" Binding="{Binding Nodes}" Width="130" />
+                  <DataGridTextColumn Header="来源" Binding="{Binding Source}" Width="80" />
+                </DataGrid.Columns>
+              </DataGrid>
+            </Border>
+
+            <Grid Grid.Row="2" Margin="0,12,0,0">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+              </Grid.ColumnDefinitions>
+              <TextBlock x:Name="SlurmSummaryText" Text="—"
+                         VerticalAlignment="Center" Style="{StaticResource CaptionText}" />
+              <Button x:Name="OpenSlurmButton" Grid.Column="1" Content="▶"
+                      Style="{StaticResource PrimaryIconButton}" ToolTip="连接任务"
+                      AutomationProperties.Name="连接 Slurm 任务"
+                      IsEnabled="False" Click="OpenSlurmButton_OnClick" />
+              <Button x:Name="CancelSlurmButton" Grid.Column="2" Content="取消任务"
+                      Style="{StaticResource DangerButton}" IsEnabled="False"
+                      Margin="8,0,0,0" Click="CancelSlurmButton_OnClick" />
             </Grid>
           </Grid>
         </TabItem>
       </TabControl>
 
-      <Grid Grid.Row="3" Margin="0,16,0,0">
+      <Grid Grid.Row="2" Margin="0,16,0,0">
         <Grid.ColumnDefinitions>
           <ColumnDefinition Width="Auto" />
           <ColumnDefinition Width="*" />
-          <ColumnDefinition Width="Auto" />
         </Grid.ColumnDefinitions>
         <Ellipse x:Name="StatusDot" Width="8" Height="8" Fill="{StaticResource SuccessBrush}"
                  VerticalAlignment="Center" />
         <TextBlock x:Name="StatusText" Grid.Column="1" Text="就绪"
                    Margin="8,0,0,0" Style="{StaticResource CaptionText}"
                    VerticalAlignment="Center" />
-        <TextBlock Grid.Column="2" Text="OpenSSH · 远端 only"
-                   Foreground="{StaticResource MutedTextBrush}" FontSize="11" />
       </Grid>
     </Grid>
   </Grid>

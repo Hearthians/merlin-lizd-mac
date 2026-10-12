@@ -160,6 +160,7 @@ namespace TmuxHub.Windows.Services
                 "new-session", "-A", "-s", normalizedName
             );
             return _terminalLauncher.Launch(
+                destination,
                 SshInvocation.InteractiveArguments(destination, remoteCommand)
             );
         }

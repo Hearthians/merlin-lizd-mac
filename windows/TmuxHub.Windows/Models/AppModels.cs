@@ -30,7 +30,7 @@ public sealed record TmuxSessionRecord(
 
 public sealed class AppState
 {
-    public const int CurrentVersion = 1;
+    public const int CurrentVersion = 3;
 
     public int Version { get; set; } = CurrentVersion;
 
@@ -42,4 +42,17 @@ public sealed class AppState
 
     public Dictionary<string, DateTimeOffset> LastUsedAt { get; set; } =
         new(StringComparer.Ordinal);
+
+    public Dictionary<string, SlurmHostSettings> SlurmSettings { get; set; } =
+        new(StringComparer.Ordinal);
+
+    public List<SlurmLaunchReceipt> SlurmReceipts { get; set; } = [];
 }
+
+public sealed record SlurmHostSettings(
+    string Owner,
+    string Partition,
+    int CpusPerTask,
+    int MemoryMiB,
+    int WallTimeMinutes,
+    int GpuCount);

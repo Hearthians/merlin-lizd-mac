@@ -111,6 +111,38 @@ public sealed class AppStateStore
             }
         }
 
+        foreach (var entry in persisted.SlurmSettings
+            ?? new Dictionary<string, SlurmHostSettings>(StringComparer.Ordinal))
+        {
+            if (IsValidSlurmSettings(entry.Key, entry.Value))
+            {
+                state.SlurmSettings[entry.Key] = entry.Value;
+            }
+        }
+
+        var receipts = (persisted.SlurmReceipts ?? [])
+            .Where(static value => value is not null)
+            .Where(IsValidReceipt)
+            .GroupBy(static receipt => receipt.RequestId)
+            .Select(static group => group
+                .OrderByDescending(StatusTimestamp)
+                .First())
+            .Select(static receipt => receipt.Phase == SlurmLaunchPhase.Submitting
+                ? receipt with
+                {
+                    Phase = SlurmLaunchPhase.LaunchOutcomeUnknown,
+                    PhaseUpdatedAt = DateTimeOffset.UtcNow,
+                }
+                : receipt)
+            .ToArray();
+        state.SlurmReceipts.AddRange(receipts
+            .Where(static receipt => !IsTerminalHistory(receipt.Phase))
+            .Concat(receipts
+                .Where(static receipt => IsTerminalHistory(receipt.Phase))
+                .OrderByDescending(StatusTimestamp)
+                .Take(100))
+            .OrderByDescending(StatusTimestamp));
+
         return state;
     }
 
@@ -136,14 +168,115 @@ public sealed class AppStateStore
             }
         }
 
+        var slurmSettings = new SortedDictionary<string, SlurmHostSettings>(
+            StringComparer.Ordinal);
+        foreach (var entry in state.SlurmSettings)
+        {
+            if (IsValidSlurmSettings(entry.Key, entry.Value))
+            {
+                slurmSettings[entry.Key] = entry.Value;
+            }
+        }
+        var validReceipts = state.SlurmReceipts
+            .Where(IsValidReceipt)
+            .GroupBy(static receipt => receipt.RequestId)
+            .Select(static group => group
+                .OrderByDescending(StatusTimestamp)
+                .First())
+            .ToArray();
+        var receipts = validReceipts
+            .Where(static receipt => !IsTerminalHistory(receipt.Phase))
+            .Concat(validReceipts
+                .Where(static receipt => IsTerminalHistory(receipt.Phase))
+                .OrderByDescending(StatusTimestamp)
+                .Take(100))
+            .OrderByDescending(StatusTimestamp)
+            .ToArray();
+
         return new PersistedAppState
         {
             Version = AppState.CurrentVersion,
             CustomDestinations = custom,
             PinnedDestinations = pinned,
             LastUsedAt = recent,
+            SlurmSettings = slurmSettings,
+            SlurmReceipts = receipts,
         };
     }
+
+    private static bool IsValidSlurmSettings(
+        string destination,
+        SlurmHostSettings? settings)
+    {
+        if (!IdentifierValidator.IsSshDestination(destination)
+            || settings is null
+            || settings.GpuCount is < 0 or > 1_024
+            || settings.WallTimeMinutes is < 1 or > 525_600)
+        {
+            return false;
+        }
+        try
+        {
+            SlurmCommands.ValidatePlatform(new SlurmPlatformProfile(
+                "windows-slurm",
+                destination,
+                destination,
+                settings.Owner));
+            SlurmCommands.ValidatePreset(new SlurmInteractivePreset(
+                "windows-default",
+                "交互环境",
+                settings.Partition,
+                1,
+                settings.CpusPerTask,
+                settings.MemoryMiB,
+                new SlurmWallTime(checked(settings.WallTimeMinutes * 60)),
+                settings.GpuCount == 0 ? null : new SlurmGpuRequest(null, settings.GpuCount)));
+            return true;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+        catch (OverflowException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsValidReceipt(SlurmLaunchReceipt? receipt)
+    {
+        if (receipt is null
+            || receipt.RequestedAt <= DateTimeOffset.UnixEpoch
+            || !Enum.IsDefined(receipt.Phase)
+            || receipt.PhaseUpdatedAt is { } updatedAt
+                && updatedAt <= DateTimeOffset.UnixEpoch)
+        {
+            return false;
+        }
+        try
+        {
+            var platform = new SlurmPlatformProfile(
+                receipt.PlatformId,
+                receipt.LoginDestination,
+                receipt.LoginDestination,
+                receipt.Owner);
+            SlurmCommands.ValidatePlatform(platform);
+            SlurmCommands.ValidateReceipt(receipt, platform);
+            return true;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsTerminalHistory(SlurmLaunchPhase phase) =>
+        phase is SlurmLaunchPhase.LaunchFailed
+            or SlurmLaunchPhase.NotFound
+            or SlurmLaunchPhase.LeftQueue;
+
+    private static DateTimeOffset StatusTimestamp(SlurmLaunchReceipt receipt) =>
+        receipt.PhaseUpdatedAt ?? receipt.RequestedAt;
 
     private static string DefaultStateFilePath()
     {
@@ -169,5 +302,9 @@ public sealed class AppStateStore
         public string[]? PinnedDestinations { get; set; }
 
         public IDictionary<string, DateTimeOffset>? LastUsedAt { get; set; }
+
+        public IDictionary<string, SlurmHostSettings>? SlurmSettings { get; set; }
+
+        public SlurmLaunchReceipt[]? SlurmReceipts { get; set; }
     }
 }
