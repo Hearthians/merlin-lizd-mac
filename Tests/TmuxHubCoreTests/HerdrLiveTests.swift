@@ -145,8 +145,16 @@ struct HerdrLiveTests {
                 + missingRelativePath + "\""
             let fallback = try await run(makeFallback)
             try #require(fallback.exitCode == 0, "\(fallback.stderr)")
-            await #expect(throws: AttachmentError.downloadFailed) {
-                try await attachments.resolveDownloadPath(missingRelativePath, context: updatedContext)
+            do {
+                _ = try await attachments.resolveDownloadPath(
+                    missingRelativePath,
+                    context: updatedContext
+                )
+                Issue.record("Expected the missing bound-workspace file to fail")
+            } catch let AttachmentError.fileNotFound(path) {
+                #expect(path == movedDirectory + "/" + missingRelativePath)
+            } catch {
+                Issue.record("Expected a missing-file diagnostic, got \(error)")
             }
 
             let closed = try await run(named + " workspace close " + quote(workspaceA.id))

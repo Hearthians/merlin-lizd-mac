@@ -80,12 +80,28 @@ actor BoundedAsyncOperationRunner {
     func run<Value: Sendable>(
         _ operation: @escaping @Sendable () async throws -> Value
     ) async throws -> Value {
+        try await run(timeout: timeout, operation)
+    }
+
+    func runWithoutTimeout<Value: Sendable>(
+        _ operation: @escaping @Sendable () async throws -> Value
+    ) async throws -> Value {
+        try await run(timeout: nil, operation)
+    }
+
+    private func run<Value: Sendable>(
+        timeout: Duration?,
+        _ operation: @escaping @Sendable () async throws -> Value
+    ) async throws -> Value {
         try await acquireSlot()
         defer { releaseSlot() }
         try Task.checkCancellation()
+        guard let timeout else {
+            return try await operation()
+        }
         return try await withThrowingTaskGroup(of: Value.self) { group in
             group.addTask { try await operation() }
-            group.addTask { [timeout] in
+            group.addTask {
                 try await Task.sleep(for: timeout)
                 throw InventoryProcessTimeoutError.timedOut
             }

@@ -51,6 +51,7 @@ struct SSHMasterCommands: Sendable {
             : authenticationOptions(authentication))
         arguments.append(contentsOf: [
             "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
             "-o", "ControlMaster=yes", "-o", "ControlPath=\(path)",
             "-o", "ControlPersist=600", alias,
         ])
@@ -106,6 +107,7 @@ struct SSHMasterCommands: Sendable {
         return CommandSpec(executable: "/usr/bin/sftp", arguments: [
             "-q", "-b", batchFile.path,
             "-o", "BatchMode=yes", "-o", "ControlMaster=no",
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
             "-o", "ControlPath=\(path)",
             "-o", "ProxyCommand=/usr/bin/false",
             AttachmentPaths.sftpDestination(alias),

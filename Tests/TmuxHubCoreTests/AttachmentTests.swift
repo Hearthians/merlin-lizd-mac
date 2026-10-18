@@ -55,11 +55,16 @@ struct AttachmentTests {
     @Test("SFTP shares the prepared socket and cannot silently start another connection")
     func sharedMaster() throws {
         let commands = SSHMasterCommands(directory: URL(fileURLWithPath: "/tmp/th-transfer"))
+        let master = try commands.prepare(alias: "lizd@gfyh.fun")
+        #expect(master.arguments.contains("ServerAliveInterval=15"))
+        #expect(master.arguments.contains("ServerAliveCountMax=3"))
         let command = try commands.sftp(batchFile: URL(fileURLWithPath: "/tmp/batch"), alias: "lizd@gfyh.fun")
         #expect(command.executable == "/usr/bin/sftp")
         #expect(command.arguments.contains("ControlPath=\(try commands.socketPath(alias: "lizd@gfyh.fun"))"))
         #expect(command.arguments.contains("ProxyCommand=/usr/bin/false"))
         #expect(command.arguments.contains("BatchMode=yes"))
+        #expect(command.arguments.contains("ServerAliveInterval=15"))
+        #expect(command.arguments.contains("ServerAliveCountMax=3"))
         #expect(command.environment.isEmpty)
         #expect(AttachmentPaths.sftpDestination("user@2001:db8::1") == "user@[2001:db8::1]")
         #expect(AttachmentPaths.sftpDestination("[::1]") == "[::1]")
@@ -129,6 +134,10 @@ struct AttachmentTests {
             workingDirectory: "/home/user/project"
         ) == "/home/user/project/temp_output/r256/model/38.ply")
         #expect(try AttachmentPaths.resolvedRemotePath(
+            "TRELLIS.2/log/run/results/glb_epoch0950.zip",
+            workingDirectory: "/home/user/project"
+        ) == "/home/user/project/TRELLIS.2/log/run/results/glb_epoch0950.zip")
+        #expect(try AttachmentPaths.resolvedRemotePath(
             "../shared/mesh.ply",
             workingDirectory: "/home/user/project"
         ) == "/home/user/shared/mesh.ply")
@@ -146,6 +155,10 @@ struct AttachmentTests {
         ) == "temp_output/r256/model/38.ply")
         #expect(try AttachmentPaths.searchableRelativePath("../shared/mesh.ply") == nil)
         #expect(try AttachmentPaths.searchableRelativePath("/tmp/mesh.ply") == nil)
+
+        let missing = AttachmentError.fileNotFound("/remote/result.zip").localizedDescription
+        #expect(missing.contains("/remote/result.zip"))
+        #expect(missing.contains("容器或计算节点"))
     }
 
     @Test("real SFTP downloads an exact remote path into a local partial file")
@@ -271,5 +284,32 @@ struct AttachmentTests {
         let cleaned = try await pool.run(command(cleanup), alias: host, replay: .never)
         #expect(cleaned.exitCode == 0)
         await pool.shutdown()
+    }
+
+    @Test("operation runner supports transfers without a fixed wall-clock timeout")
+    func operationRunnerWithoutTimeout() async throws {
+        let policy = BoundedAsyncOperationRunner(
+            maxConcurrentOperations: 1,
+            timeout: .seconds(300)
+        )
+        let value = try await policy.runWithoutTimeout {
+            try await Task.sleep(for: .milliseconds(25))
+            return 42
+        }
+        #expect(value == 42)
+    }
+
+    @Test("operation runner still enforces configured timeouts")
+    func operationRunnerTimeout() async {
+        let policy = BoundedAsyncOperationRunner(
+            maxConcurrentOperations: 1,
+            timeout: .milliseconds(10)
+        )
+        await #expect(throws: InventoryProcessTimeoutError.timedOut) {
+            try await policy.run {
+                try await Task.sleep(for: .seconds(60))
+                return 0
+            }
+        }
     }
 }

@@ -16,24 +16,46 @@ public enum LocalProcessDirectory {
     }
 }
 
-public enum AttachmentError: LocalizedError, Sendable {
+public enum AttachmentError: LocalizedError, Equatable, Sendable {
     case invalidPath
     case regularFileRequired
     case tooLarge
     case contextUnavailable
     case connectionFailed
     case transferFailed
+    case fileNotFound(String)
+    case ambiguousRemotePath(String)
+    case remotePathLookupFailed
+    case sftpDownloadFailed(String)
+    case localSaveFailed(String)
     case downloadFailed
 
     public var errorDescription: String? {
         switch self {
-        case .invalidPath: "路径无效：请使用绝对路径，且不能包含控制字符。"
-        case .regularFileRequired: "只支持普通文件；文件夹、软件包和符号链接请先打包。"
-        case .tooLarge: "单个附件不能超过 100 MB。"
-        case .contextUnavailable: "无法确定终端当前目录。请确认会话已连接，再重试。"
-        case .connectionFailed: "SSH 连接不可用；请先完成认证，再重试上传。"
-        case .transferFailed: "附件传输失败；请检查 SFTP 支持、目录权限和可用空间。"
-        case .downloadFailed: "文件下载失败；请检查远端路径、SFTP 支持和本地目录权限。"
+        case .invalidPath:
+            "路径无效：请使用绝对路径，且不能包含控制字符。"
+        case .regularFileRequired:
+            "只支持普通文件；文件夹、软件包和符号链接请先打包。"
+        case .tooLarge:
+            "单个附件不能超过 100 MB。"
+        case .contextUnavailable:
+            "无法确定终端当前目录。请确认会话已连接，再重试。"
+        case .connectionFailed:
+            "SSH 连接不可用；请先完成认证，再重试文件传输。"
+        case .transferFailed:
+            "附件传输失败；请检查 SFTP 支持、目录权限和可用空间。"
+        case let .fileNotFound(path):
+            "找不到文件：\(path)。如果文件位于容器或计算节点，请先复制到 SSH 登录主机可见的目录。"
+        case let .ambiguousRemotePath(path):
+            "找到多个匹配文件，无法确定要下载哪一个：\(path)。请使用绝对路径。"
+        case .remotePathLookupFailed:
+            "无法在远端确认文件位置；请检查 SSH 连接后重试。"
+        case let .sftpDownloadFailed(path):
+            "已定位文件，但 SFTP 无法读取：\(path)。请检查远端权限，并确认文件对 SSH 登录主机可见。"
+        case let .localSaveFailed(path):
+            "无法写入本地位置：\(path)。请检查目录权限和可用空间。"
+        case .downloadFailed:
+            "文件下载失败；请检查远端路径、SFTP 支持和本地目录权限。"
         }
     }
 }
@@ -344,11 +366,15 @@ public actor AttachmentTransferService {
         )
         let staging = FileManager.default.temporaryDirectory
             .appendingPathComponent("tmuxhub-sftp-download-\(token)")
-        try FileManager.default.createDirectory(
-            at: staging,
-            withIntermediateDirectories: false,
-            attributes: [.posixPermissions: 0o700]
-        )
+        do {
+            try FileManager.default.createDirectory(
+                at: staging,
+                withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
+            )
+        } catch {
+            throw AttachmentError.localSaveFailed(destination.path)
+        }
         defer {
             try? FileManager.default.removeItem(at: staging)
             try? FileManager.default.removeItem(at: partial)
@@ -358,25 +384,45 @@ public actor AttachmentTransferService {
             remotePath: resolved,
             localPath: partial.path
         )
-        try Data(batch.utf8).write(to: batchURL)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o600],
-            ofItemAtPath: batchURL.path
-        )
+        do {
+            try Data(batch.utf8).write(to: batchURL)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: batchURL.path
+            )
+        } catch {
+            throw AttachmentError.localSaveFailed(destination.path)
+        }
 
         let pool = pool
+        let output: InventoryProcessOutput
         do {
-            let output = try await limit.run {
+            output = try await limit.runWithoutTimeout {
                 try await pool.transfer(batchFile: batchURL, alias: alias)
             }
-            guard output.exitCode == 0 else { throw AttachmentError.downloadFailed }
-            try Task.checkCancellation()
-            let info = try partial.resourceValues(forKeys: [
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw AttachmentError.sftpDownloadFailed(resolved)
+        }
+        guard output.exitCode == 0 else {
+            throw AttachmentError.sftpDownloadFailed(resolved)
+        }
+        try Task.checkCancellation()
+
+        let info: URLResourceValues
+        do {
+            info = try partial.resourceValues(forKeys: [
                 .isRegularFileKey, .isSymbolicLinkKey,
             ])
-            guard info.isRegularFile == true, info.isSymbolicLink != true else {
-                throw AttachmentError.downloadFailed
-            }
+        } catch {
+            throw AttachmentError.sftpDownloadFailed(resolved)
+        }
+        guard info.isRegularFile == true, info.isSymbolicLink != true else {
+            throw AttachmentError.sftpDownloadFailed(resolved)
+        }
+
+        do {
             try FileManager.default.setAttributes(
                 [.posixPermissions: 0o600],
                 ofItemAtPath: partial.path
@@ -391,12 +437,8 @@ public actor AttachmentTransferService {
             } else {
                 try FileManager.default.moveItem(at: partial, to: destination)
             }
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch let error as AttachmentError {
-            throw error
         } catch {
-            throw AttachmentError.downloadFailed
+            throw AttachmentError.localSaveFailed(destination.path)
         }
     }
 
@@ -417,7 +459,7 @@ public actor AttachmentTransferService {
         switch context.target {
         case .local:
             guard FileManager.default.fileExists(atPath: resolved) else {
-                throw AttachmentError.downloadFailed
+                throw AttachmentError.fileNotFound(resolved)
             }
             return resolved
         case let .ssh(alias):
@@ -438,7 +480,7 @@ public actor AttachmentTransferService {
                     + "[ -f \"$candidate\" ] && printf '%s\\n' \"$candidate\"; "
                     + "done; exit 0"
             } else {
-                script += "; exit 1"
+                script += "; exit 0"
             }
             let command = CommandSpec(executable: "/usr/bin/ssh", arguments: [
                 "-nT", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
@@ -450,9 +492,11 @@ public actor AttachmentTransferService {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                throw AttachmentError.downloadFailed
+                throw AttachmentError.remotePathLookupFailed
             }
-            guard output.exitCode == 0 else { throw AttachmentError.downloadFailed }
+            guard output.exitCode == 0 else {
+                throw AttachmentError.remotePathLookupFailed
+            }
             let suffix = relative.map { "/" + $0 }
             var matches: [String] = []
             var seen: Set<String> = []
@@ -465,8 +509,11 @@ public actor AttachmentTransferService {
                 else { continue }
                 if seen.insert(standardized).inserted { matches.append(standardized) }
             }
+            guard !matches.isEmpty else {
+                throw AttachmentError.fileNotFound(resolved)
+            }
             guard matches.count == 1, let match = matches.first else {
-                throw AttachmentError.downloadFailed
+                throw AttachmentError.ambiguousRemotePath(relative ?? remotePath)
             }
             return match
         }
