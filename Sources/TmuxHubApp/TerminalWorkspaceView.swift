@@ -253,6 +253,7 @@ struct TerminalTabBar: View {
             .buttonStyle(.plain)
             .accessibilityLabel(tab.title)
             .accessibilityAddTraits(selected ? .isSelected : [])
+            .help(tab.herdrReference.map { "Herdr: \($0.terminalID)" } ?? tab.sessionName.map { "tmux: \($0)" } ?? "本机登录 shell")
 
             if terminatingSessionID == tab.id {
                 ProgressView()
@@ -313,7 +314,6 @@ struct TerminalTabBar: View {
             Divider()
             Button("关闭标签") { terminals.close(tab.id) }
         }
-        .help(tab.herdrReference.map { "Herdr: \($0.terminalID)" } ?? tab.sessionName.map { "tmux: \($0)" } ?? "本机登录 shell")
     }
 
     private var addTerminalMenu: some View {
