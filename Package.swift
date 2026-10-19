@@ -82,6 +82,7 @@ let package = Package(
                 "HubRuntime.swift",
                 "TmuxHubApplication.swift",
                 "TmuxHubRootView.swift",
+                "WindowChrome.swift",
                 "SidebarView.swift",
                 "TerminalSession.swift",
                 "TerminalSessionHost.swift",

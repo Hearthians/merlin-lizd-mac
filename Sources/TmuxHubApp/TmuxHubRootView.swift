@@ -10,6 +10,7 @@ struct TmuxHubRootView: View {
     @State private var sessionBrowserTarget: TerminalTarget?
     @State private var herdrBrowserTarget: TerminalTarget?
     @State private var showsAddSSHHost = false
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var propertiesTarget: PropertiesTarget?
 
     private enum PropertiesTarget: Identifiable {
@@ -25,24 +26,39 @@ struct TmuxHubRootView: View {
     }
 
     var body: some View {
-        NavigationSplitView {
-            SidebarView(
-                model: model,
-                terminals: terminals,
-                platformName: hpc2.profile.name,
-                onAddHost: { showsAddSSHHost = true },
-                onShowProperties: showProperties,
-                onBrowseSessions: browseSessions,
-                onBrowseHerdr: browseHerdr
-            )
+        NavigationSplitView(columnVisibility: $columnVisibility) {
+            VStack(spacing: 0) {
+                sidebarHeader
+                SidebarView(
+                    model: model,
+                    terminals: terminals,
+                    platformName: hpc2.profile.name,
+                    onAddHost: { showsAddSSHHost = true },
+                    onShowProperties: showProperties,
+                    onBrowseSessions: browseSessions,
+                    onBrowseHerdr: browseHerdr
+                )
+            }
             .navigationSplitViewColumnWidth(min: 230, ideal: 275, max: 360)
+            .ignoresSafeArea(.container, edges: .top)
         } detail: {
             VStack(spacing: 0) {
                 if !terminals.tabs.isEmpty {
-                    TerminalTabBar(
-                        terminals: terminals,
-                        hosts: model.quickAccessHosts
-                    )
+                    HStack(spacing: 0) {
+                        if isSidebarHidden {
+                            showSidebarControl
+                        }
+                        TerminalTabBar(
+                            terminals: terminals,
+                            hosts: model.quickAccessHosts
+                        )
+                    }
+                } else if isSidebarHidden {
+                    HStack(spacing: 0) {
+                        showSidebarControl
+                        Spacer(minLength: 0)
+                    }
+                    .background(WindowHeaderDragArea())
                 }
                 if terminals.selectedTabID != nil {
                     TerminalWorkspaceView(terminals: terminals)
@@ -52,27 +68,13 @@ struct TmuxHubRootView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color(nsColor: .windowBackgroundColor))
+            .ignoresSafeArea(.container, edges: .top)
         }
-        .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
-                Button {
-                    showsAddSSHHost = true
-                } label: {
-                    Label("添加 SSH 主机", systemImage: "plus")
-                }
-                Button {
-                    if model.selection == .platform("hkust-hpc2") {
-                        Task { await hpc2.refresh(force: true) }
-                    } else {
-                        model.refresh()
-                    }
-                } label: {
-                    Label("刷新", systemImage: "arrow.clockwise")
-                }
-                .keyboardShortcut("r", modifiers: [.command])
-            }
-        }
+        .toolbar(removing: .sidebarToggle)
+        .ignoresSafeArea(.container, edges: .top)
         .focusedSceneValue(\.addSSHHost, { showsAddSSHHost = true })
+        .focusedSceneValue(\.refreshHub, refresh)
+        .focusedSceneValue(\.toggleHubSidebar, toggleSidebar)
         .sheet(item: $propertiesTarget) { target in
             switch target {
             case let .host(host):
@@ -127,6 +129,73 @@ struct TmuxHubRootView: View {
                     self.herdrBrowserTarget = nil
                 }
             }
+        }
+    }
+
+    private var isSidebarHidden: Bool {
+        columnVisibility == .detailOnly
+    }
+
+    private var sidebarHeader: some View {
+        HStack(spacing: 4) {
+            Button(action: toggleSidebar) {
+                Image(systemName: "sidebar.left")
+                    .frame(width: 20, height: 24)
+            }
+            .help("隐藏侧边栏")
+            .accessibilityLabel("隐藏侧边栏")
+
+            Text("TmuxHub")
+                .font(.system(size: 12, weight: .semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.9)
+
+            Spacer(minLength: 4)
+
+            Button {
+                showsAddSSHHost = true
+            } label: {
+                Image(systemName: "plus")
+                    .frame(width: 20, height: 24)
+            }
+            .help("添加 SSH 主机")
+            .accessibilityLabel("添加 SSH 主机")
+
+            Button(action: refresh) {
+                Image(systemName: "arrow.clockwise")
+                    .frame(width: 20, height: 24)
+            }
+            .help("刷新（⌘R）")
+            .accessibilityLabel("刷新")
+        }
+        .buttonStyle(.plain)
+        .padding(.leading, 78)
+        .padding(.trailing, 6)
+        .frame(height: 38)
+        .background(WindowHeaderDragArea())
+    }
+
+    private var showSidebarControl: some View {
+        Button(action: toggleSidebar) {
+            Image(systemName: "sidebar.left")
+                .frame(width: 28, height: 38)
+        }
+        .buttonStyle(.plain)
+        .help("显示侧边栏")
+        .accessibilityLabel("显示侧边栏")
+        .padding(.leading, 78)
+        .background(WindowHeaderDragArea())
+    }
+
+    private func toggleSidebar() {
+        columnVisibility = isSidebarHidden ? .all : .detailOnly
+    }
+
+    private func refresh() {
+        if model.selection == .platform("hkust-hpc2") {
+            Task { await hpc2.refresh(force: true) }
+        } else {
+            model.refresh()
         }
     }
 

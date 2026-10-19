@@ -35,9 +35,11 @@ struct TmuxHubApplication: App {
                 .frame(minWidth: 900, minHeight: 600)
         }
         .defaultSize(width: 1160, height: 760)
+        .windowStyle(.hiddenTitleBar)
         .windowToolbarStyle(.unifiedCompact)
         .commands {
             AddSSHHostCommands()
+            WindowChromeCommands()
             CommandGroup(after: .newItem) {
                 Button("新建本机终端") {
                     terminals.openLocalShell()

@@ -104,7 +104,6 @@ struct SidebarView: View {
             }
         }
         .listStyle(.sidebar)
-        .navigationTitle("TmuxHub")
         .searchable(text: $searchText, placement: .sidebar, prompt: "搜索主机库")
     }
 
