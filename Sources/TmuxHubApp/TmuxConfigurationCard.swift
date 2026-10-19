@@ -10,7 +10,9 @@ struct TmuxConfigurationCard: View {
     }
 
     var body: some View {
-        SurfaceCard("tmux 快捷配置") {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("终端设置")
+                .font(.callout.weight(.semibold))
             ViewThatFits(in: .horizontal) {
                 HStack(alignment: .center, spacing: 16) {
                     description
@@ -22,20 +24,30 @@ struct TmuxConfigurationCard: View {
                     applyButton
                 }
             }
-            Text("自动备份原配置并保留其他设置；重复应用会更新同一配置段。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
             status
-            Divider().padding(.vertical, 4)
+            Divider()
             vimPasteRepair
+            DisclosureGroup("配置说明") {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("tmux：黑底白字状态栏、绿/红面板边框、从 1 编号、256 色。")
+                    Text("自动备份原配置并保留其他设置；重复应用会更新同一配置段。")
+                    Text("Vim 设置只保存在此主机；已打开的 Vim 需保存文件后重新打开。")
+                }
+                .font(.caption)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 6)
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var description: some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text("Ctrl+A 前缀 · 鼠标选择与滚动")
+            Text("tmux 快捷配置")
                 .font(.callout.weight(.medium))
-            Text("黑底白字状态栏 · 绿/红面板边框 · 从 1 编号 · 256 色")
+            Text("Ctrl+A 前缀 · 鼠标选择与滚动")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -55,8 +67,8 @@ struct TmuxConfigurationCard: View {
                 Text(state == .applying ? "正在配置…" : "一键配置 tmux")
             }
         }
-        .buttonStyle(.borderedProminent)
-        .controlSize(.large)
+        .buttonStyle(.bordered)
+        .controlSize(.regular)
         .disabled(state == .applying)
         .accessibilityIdentifier("apply-tmux-configuration")
         .help("为 \(target.sshDestination ?? "本机") 应用以上 tmux 设置")
@@ -75,9 +87,6 @@ struct TmuxConfigurationCard: View {
                     vimPasteRepairButton
                 }
             }
-            Text("只为此主机保存设置；已打开的 Vim 需保存文件后重新打开。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
             switch terminals.vimPasteConfigurationStates[target] {
             case .applying:
                 Text("正在为 \(target.sshDestination ?? "本机") 保存设置…")
@@ -128,6 +137,8 @@ struct TmuxConfigurationCard: View {
                 Text(terminals.vimPasteConfigurationStates[target] == .applying ? "正在修复…" : "修复 Vim 粘贴")
             }
         }
+        .buttonStyle(.bordered)
+        .controlSize(.regular)
         .disabled(terminals.vimPasteConfigurationStates[target] == .applying)
         .accessibilityIdentifier("repair-vim-paste")
         .help("为 \(target.sshDestination ?? "本机") 保存 Vim 粘贴兼容设置")

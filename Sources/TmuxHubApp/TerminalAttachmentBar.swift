@@ -12,7 +12,8 @@ struct TerminalAttachmentBar: View {
                     LazyVStack(spacing: 6) {
                         ForEach(model.items) { item in row(item) }
                     }
-                    .padding(8)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
                 }
                 .frame(maxHeight: min(CGFloat(model.items.count) * 48 + 16, 160))
             }
@@ -24,14 +25,15 @@ struct TerminalAttachmentBar: View {
                         .buttonStyle(.plain)
                 }.padding(.horizontal, 10).padding(.vertical, 5)
             }
-            HStack(spacing: 12) {
+            HStack(spacing: 14) {
                 Button("添加文件", systemImage: "paperclip") { model.chooseFiles() }
+                    .help("选择或拖入文件；传输后插入路径，不自动发送")
                 Button("粘贴截图", systemImage: "photo.on.rectangle") { model.pasteImage() }
+                    .help("粘贴剪贴板截图（⌘V）；传输后插入路径，不自动发送")
                 Spacer()
-                Text("拖入文件 / ⌘V 截图 · 不自动发送")
-                    .font(.caption2).foregroundStyle(.secondary)
                 Button { showDirectory = true } label: { Image(systemName: "folder.badge.gearshape") }
                     .help("附件目录")
+                    .accessibilityLabel("附件目录")
                     .popover(isPresented: $showDirectory) {
                         VStack(alignment: .leading, spacing: 12) {
                             Text("附件目录").font(.headline)
@@ -48,9 +50,16 @@ struct TerminalAttachmentBar: View {
                     }
             }
             .buttonStyle(.borderless)
-            .padding(.horizontal, 10).padding(.vertical, 8)
+            .font(.system(size: 11))
+            .foregroundStyle(.secondary)
+            .controlSize(.small)
+            .padding(.horizontal, 10)
+            .frame(height: 28)
         }
-        .background(.bar)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .overlay(alignment: .top) {
+            Rectangle().fill(.separator.opacity(0.35)).frame(height: 0.5)
+        }
     }
 
     private func row(_ item: TerminalAttachment) -> some View {

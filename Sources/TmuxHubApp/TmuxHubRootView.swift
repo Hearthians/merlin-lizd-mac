@@ -35,7 +35,7 @@ struct TmuxHubRootView: View {
                 onBrowseSessions: browseSessions,
                 onBrowseHerdr: browseHerdr
             )
-            .navigationSplitViewColumnWidth(min: 230, ideal: 275, max: 360)
+            .navigationSplitViewColumnWidth(min: 200, ideal: 230, max: 320)
         } detail: {
             VStack(spacing: 0) {
                 if !terminals.tabs.isEmpty {
@@ -51,8 +51,9 @@ struct TmuxHubRootView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color(nsColor: .windowBackgroundColor))
+            .background(Color(nsColor: .controlBackgroundColor))
         }
+        .toolbarBackground(.hidden, for: .windowToolbar)
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {

@@ -9,9 +9,9 @@ struct StatusPill: View {
         Label(label, systemImage: symbol)
             .font(.caption.weight(.medium))
             .foregroundStyle(color)
-            .padding(.horizontal, 9)
-            .padding(.vertical, 5)
-            .background(color.opacity(0.12), in: Capsule())
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(color.opacity(0.07), in: Capsule())
     }
 }
 
@@ -25,8 +25,8 @@ struct MetricPill: View {
             .font(.caption.monospacedDigit())
             .foregroundStyle(tint)
             .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(.quaternary.opacity(0.7), in: RoundedRectangle(cornerRadius: 7))
+            .padding(.vertical, 3)
+            .background(.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 5))
     }
 }
 
@@ -40,7 +40,7 @@ struct SurfaceCard<Content: View>: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             if let title {
                 Text(title)
                     .font(.headline)
@@ -48,12 +48,8 @@ struct SurfaceCard<Content: View>: View {
             content
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(16)
-        .background(.background.secondary, in: RoundedRectangle(cornerRadius: 12))
-        .overlay {
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(.separator.opacity(0.65), lineWidth: 0.5)
-        }
+        .padding(12)
+        .background(.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 8))
     }
 }
 
