@@ -125,7 +125,7 @@ struct TerminalTabBar: View {
     @ObservedObject var terminals: TerminalTabsModel
     let hosts: [SSHHost]
 
-    @State private var pendingCloseID: String?
+    @State private var pendingTerminationID: String?
     @State private var renameID: String?
     @State private var renameText = ""
     @State private var renameSessionID: String?
@@ -156,23 +156,26 @@ struct TerminalTabBar: View {
             Rectangle().fill(.separator.opacity(0.35)).frame(height: 0.5)
         }
         .confirmationDialog(
-            "关闭终端标签？",
+            "终止 tmux 会话？",
             isPresented: Binding(
-                get: { pendingCloseID != nil },
-                set: { if !$0 { pendingCloseID = nil } }
+                get: { pendingTerminationID != nil },
+                set: { if !$0 { pendingTerminationID = nil } }
             ),
             titleVisibility: .visible
         ) {
-            Button(pendingCloseTab?.sessionName == nil ? "关闭标签" : "仅关闭标签") {
-                if let pendingCloseID { terminals.close(pendingCloseID) }
-                pendingCloseID = nil
-            }
-            if pendingCloseTab?.sessionName != nil,
-                pendingCloseTab.map(terminals.allowsTmuxLifecycleMutation) == true
+            if pendingTerminationTab?.sessionName != nil,
+                pendingTerminationTab.map(terminals.allowsTmuxLifecycleMutation) == true
             {
-                Button("关闭标签并终止 tmux", role: .destructive) {
-                    guard let id = pendingCloseID else { return }
-                    pendingCloseID = nil
+                Button("终止会话并关闭标签", role: .destructive) {
+                    guard let tab = pendingTerminationTab,
+                        tab.sessionName != nil,
+                        terminals.allowsTmuxLifecycleMutation(tab)
+                    else {
+                        pendingTerminationID = nil
+                        return
+                    }
+                    let id = tab.id
+                    pendingTerminationID = nil
                     terminatingSessionID = id
                     Task {
                         do {
@@ -184,17 +187,9 @@ struct TerminalTabBar: View {
                     }
                 }
             }
-            Button("取消", role: .cancel) { pendingCloseID = nil }
+            Button("取消", role: .cancel) { pendingTerminationID = nil }
         } message: {
-            if pendingCloseTab?.herdrReference != nil {
-                Text("仅断开当前终端连接；Herdr 工作区和 Agent 会继续运行。")
-            } else if pendingCloseTab?.tmuxLaunchMode == .attachOnly {
-                Text("仅断开当前终端；如需释放计算资源，请在 HPC 平台页取消对应任务。")
-            } else if pendingCloseTab?.sessionName != nil {
-                Text("默认仅断开当前标签；远程 tmux 和任务会继续运行。")
-            } else {
-                Text("将结束本机登录 shell。")
-            }
+            Text("将终止 tmux 会话“\(pendingTerminationTab?.sessionName ?? "")”及其中运行的进程，并关闭当前标签。")
         }
         .alert("重命名标签", isPresented: Binding(
             get: { renameID != nil },
@@ -266,7 +261,7 @@ struct TerminalTabBar: View {
                     .padding(.trailing, 6)
             } else {
                 Button {
-                    pendingCloseID = tab.id
+                    closeTab(tab)
                 } label: {
                     Image(systemName: "xmark")
                         .font(.system(size: 8, weight: .medium))
@@ -278,6 +273,7 @@ struct TerminalTabBar: View {
                 .opacity(selected ? 0.9 : 0.5)
                 .padding(.trailing, 6)
                 .accessibilityLabel("关闭 \(tab.title)")
+                .help(closeTabHelp(tab))
             }
         }
         .frame(height: 28)
@@ -315,7 +311,7 @@ struct TerminalTabBar: View {
                 }
             }
             Divider()
-            Button("关闭…", role: .destructive) { pendingCloseID = tab.id }
+            Button("关闭标签") { terminals.close(tab.id) }
         }
         .help(tab.herdrReference.map { "Herdr: \($0.terminalID)" } ?? tab.sessionName.map { "tmux: \($0)" } ?? "本机登录 shell")
     }
@@ -345,9 +341,33 @@ struct TerminalTabBar: View {
         .accessibilityLabel("新建终端")
     }
 
-    private var pendingCloseTab: TerminalTabRecord? {
-        guard let pendingCloseID else { return nil }
-        return terminals.tabs.first { $0.id == pendingCloseID }
+    private func closeTab(_ tab: TerminalTabRecord) {
+        let event = NSApp.currentEvent
+        let isLeftClick = event?.type == .leftMouseDown || event?.type == .leftMouseUp
+        let isOptionClick = isLeftClick && event?.modifierFlags.contains(.option) == true
+        if isOptionClick,
+            tab.sessionName != nil,
+            terminals.allowsTmuxLifecycleMutation(tab)
+        {
+            pendingTerminationID = tab.id
+        } else {
+            terminals.close(tab.id)
+        }
+    }
+
+    private func closeTabHelp(_ tab: TerminalTabRecord) -> String {
+        if tab.sessionName != nil, terminals.allowsTmuxLifecycleMutation(tab) {
+            return "关闭标签并断开连接；按住 Option 点击 × 可终止 tmux 会话"
+        }
+        if tab.sessionName != nil || tab.herdrReference != nil {
+            return "关闭标签并断开连接；会话和任务会继续运行"
+        }
+        return tab.target == .local ? "关闭标签并结束本机 shell" : "关闭标签并断开连接"
+    }
+
+    private var pendingTerminationTab: TerminalTabRecord? {
+        guard let pendingTerminationID else { return nil }
+        return terminals.tabs.first { $0.id == pendingTerminationID }
     }
 
     private func operationErrorText(_ error: Error) -> String {
