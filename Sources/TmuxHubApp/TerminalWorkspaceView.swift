@@ -136,25 +136,24 @@ struct TerminalTabBar: View {
     var body: some View {
         HStack(spacing: 0) {
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 0) {
+                HStack(spacing: 4) {
                     ForEach(terminals.tabs) { tab in
                         tabItem(tab)
                     }
                 }
-                .padding(.horizontal, 4)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
             }
 
-            Divider().frame(height: 14).opacity(0.45)
+            Divider().frame(height: 22)
             addTerminalMenu
                 .menuStyle(.borderlessButton)
-                .frame(width: 32)
-                .padding(.horizontal, 2)
+                .frame(width: 34)
+                .padding(.horizontal, 4)
         }
-        .frame(height: 28)
-        .background(Color(nsColor: .windowBackgroundColor))
-        .overlay(alignment: .bottom) {
-            Rectangle().fill(.separator.opacity(0.35)).frame(height: 0.5)
-        }
+        .frame(height: 38)
+        .background(.bar)
+        .overlay(alignment: .bottom) { Divider() }
         .confirmationDialog(
             "终止 tmux 会话？",
             isPresented: Binding(
@@ -233,22 +232,20 @@ struct TerminalTabBar: View {
 
     private func tabItem(_ tab: TerminalTabRecord) -> some View {
         let selected = terminals.selectedTabID == tab.id
-        return HStack(spacing: 2) {
+        return HStack(spacing: 4) {
             Button {
                 terminals.select(tab.id)
             } label: {
-                HStack(spacing: 5) {
+                HStack(spacing: 6) {
                     Image(systemName: tab.herdrReference != nil ? "square.stack.3d.up" : (tab.target == .local ? "macbook" : "server.rack"))
-                        .font(.system(size: 10))
                     Text(tab.title)
                         .lineLimit(1)
-                        .frame(maxWidth: 190)
+                        .frame(maxWidth: 210)
                 }
-                .font(.system(size: 11))
+                .font(.caption)
                 .foregroundStyle(selected ? .primary : .secondary)
-                .padding(.leading, 9)
-                .frame(height: 28)
-                .contentShape(Rectangle())
+                .padding(.leading, 8)
+                .padding(.vertical, 5)
             }
             .buttonStyle(.plain)
             .accessibilityLabel(tab.title)
@@ -259,31 +256,27 @@ struct TerminalTabBar: View {
                 ProgressView()
                     .controlSize(.mini)
                     .frame(width: 18, height: 18)
-                    .padding(.trailing, 6)
+                    .padding(.trailing, 4)
             } else {
                 Button {
                     closeTab(tab)
                 } label: {
                     Image(systemName: "xmark")
-                        .font(.system(size: 8, weight: .medium))
+                        .font(.system(size: 9, weight: .semibold))
                         .frame(width: 18, height: 18)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
-                .opacity(selected ? 0.9 : 0.5)
-                .padding(.trailing, 6)
+                .padding(.trailing, 4)
                 .accessibilityLabel("关闭 \(tab.title)")
                 .help(closeTabHelp(tab))
             }
         }
-        .frame(height: 28)
-        .background(selected ? Color.primary.opacity(0.045) : Color.clear)
-        .overlay(alignment: .bottom) {
-            if selected {
-                Rectangle().fill(Color.accentColor.opacity(0.75)).frame(height: 1.5)
-            }
-        }
+        .background(
+            selected ? Color.accentColor.opacity(0.14) : Color.clear,
+            in: RoundedRectangle(cornerRadius: 7)
+        )
         .contextMenu {
             Button("重命名标签") {
                 renameText = tab.title
@@ -334,11 +327,9 @@ struct TerminalTabBar: View {
             }
         } label: {
             Image(systemName: "plus")
-                .font(.system(size: 11))
-                .frame(width: 22, height: 24)
+                .frame(width: 24, height: 24)
         }
         .help("新建终端")
-        .accessibilityLabel("新建终端")
     }
 
     private func closeTab(_ tab: TerminalTabRecord) {

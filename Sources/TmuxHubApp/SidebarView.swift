@@ -104,9 +104,7 @@ struct SidebarView: View {
             }
         }
         .listStyle(.sidebar)
-        .environment(\.defaultMinListRowHeight, 30)
-        .scrollContentBackground(.hidden)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.55))
+        .navigationTitle("TmuxHub")
         .searchable(text: $searchText, placement: .sidebar, prompt: "搜索主机库")
     }
 
@@ -116,18 +114,18 @@ struct SidebarView: View {
         tint: Color,
         selection: SidebarSelection
     ) -> some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 9) {
             Image(systemName: symbol)
-                .font(.system(size: 13, weight: .regular))
-                .foregroundStyle(model.selection == selection ? tint : .secondary)
-                .frame(width: 18, height: 22)
+                .foregroundStyle(tint)
+                .frame(width: 26, height: 26)
+                .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
             Text(title)
                 .font(.callout.weight(
-                    model.selection == selection ? .medium : .regular
+                    model.selection == selection ? .semibold : .medium
                 ))
             Spacer()
         }
-        .padding(.vertical, 1)
+        .padding(.vertical, 3)
         .contentShape(Rectangle())
         .tag(selection)
         .onTapGesture { show(selection) }
@@ -135,31 +133,38 @@ struct SidebarView: View {
 
     private func hostRow(_ host: SSHHost) -> some View {
         let selection = SidebarSelection.host(host.destination)
-        return HStack(spacing: 8) {
+        return HStack(spacing: 9) {
             Image(systemName: "server.rack")
-                .font(.system(size: 13, weight: .regular))
-                .foregroundStyle(.secondary)
-                .frame(width: 18, height: 22)
-            Text(host.destination)
-                .font(.callout.weight(
-                    model.selection == selection ? .medium : .regular
-                ))
-                .lineLimit(1)
-                .help(host.destination + " · " + hostRowSubtitle(host))
+                .foregroundStyle(.green)
+                .frame(width: 26, height: 26)
+                .background(
+                    Color.green.opacity(0.12),
+                    in: RoundedRectangle(cornerRadius: 7)
+                )
+            VStack(alignment: .leading, spacing: 2) {
+                Text(host.destination)
+                    .font(.callout.weight(
+                        model.selection == selection ? .semibold : .medium
+                    ))
+                    .lineLimit(1)
+                Text(hostRowSubtitle(host))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
             Spacer(minLength: 4)
             Button {
                 terminals.openOrResumeSSH(host.destination)
             } label: {
                 Image(systemName: "terminal")
                     .foregroundStyle(.secondary)
-                    .frame(width: 20, height: 24)
+                    .frame(width: 24, height: 26)
             }
             .buttonStyle(.borderless)
             .help("连接或继续")
             .accessibilityLabel("连接或继续 \(host.destination)")
             herdrButton(for: .ssh(destination: host.destination))
         }
-        .padding(.vertical, 1)
+        .padding(.vertical, 3)
         .contentShape(Rectangle())
         .tag(selection)
         .onTapGesture { show(selection) }
@@ -211,7 +216,7 @@ struct SidebarView: View {
         } label: {
             Image(systemName: "square.stack.3d.up")
                 .foregroundStyle(.secondary)
-                .frame(width: 20, height: 24)
+                .frame(width: 24, height: 26)
         }
         .buttonStyle(.borderless)
         .help("浏览 Herdr 工作区")
