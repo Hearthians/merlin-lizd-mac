@@ -68,6 +68,11 @@ final class HPC2PlatformModel: ObservableObject {
     @Published private(set) var profile: SlurmPlatformProfile
     @Published private(set) var defaultPreset: SlurmInteractivePreset
     @Published private(set) var jobs: [SlurmJobSnapshot] = []
+    @Published private(set) var queueSnapshots: [SlurmQueueSnapshot] = []
+    @Published private(set) var queueMonitoringError: String?
+    @Published private(set) var queueMonitoringUpdatedAt: Date?
+    @Published private(set) var jobUtilization: [SlurmJobID: SlurmJobUtilizationSnapshot] = [:]
+    @Published private(set) var isRefreshingMonitoring = false
     @Published private(set) var managedRuns: [HPC2ManagedRunRecord]
     @Published private(set) var connectionState: HPC2ConnectionState = .idle
     @Published private(set) var connectionDiagnostic: String?
@@ -85,6 +90,11 @@ final class HPC2PlatformModel: ObservableObject {
     private let freshnessInterval: TimeInterval = 30
     private let unresolvedLaunchInterval: TimeInterval = 120
     private var lastSuccessfulRefresh: Date?
+    private var lastQueueMonitoringAttempt: Date?
+    private var lastUtilizationAttempt: Date?
+    private var monitoringRefreshID: UUID?
+    private let queueMonitoringInterval: TimeInterval = 60
+    private let utilizationInterval: TimeInterval = 30
 
     init(
         service: SlurmService,
@@ -211,11 +221,13 @@ final class HPC2PlatformModel: ObservableObject {
         if lastSuccessfulRefresh == nil { connectionState = .loading }
         defer { isRefreshing = false }
         let requestedProfile = profile
+        var jobsAreFresh = false
 
         do {
             let refreshedJobs = try await service.listJobs(on: requestedProfile)
             guard !Task.isCancelled, profile == requestedProfile else { return }
             jobs = refreshedJobs.sorted(by: Self.jobOrdering)
+            jobsAreFresh = true
             reconcileRuns(with: refreshedJobs, at: refreshDate)
             lastSuccessfulRefresh = refreshDate
             connectionDiagnostic = nil
@@ -238,6 +250,103 @@ final class HPC2PlatformModel: ObservableObject {
                 connectionState = .stale(lastSuccessfulRefresh, error.localizedDescription)
             }
         }
+        await refreshMonitoring(force: force, on: requestedProfile, jobsAreFresh: jobsAreFresh)
+    }
+
+    private func refreshMonitoring(
+        force: Bool,
+        on requestedProfile: SlurmPlatformProfile,
+        jobsAreFresh: Bool
+    ) async {
+        guard !Task.isCancelled, profile == requestedProfile, !isRefreshingMonitoring else { return }
+        let date = now()
+        let refreshQueues = force || lastQueueMonitoringAttempt.map {
+            date.timeIntervalSince($0) >= queueMonitoringInterval
+        } ?? true
+        let refreshUtilization = force || lastUtilizationAttempt.map {
+            date.timeIntervalSince($0) >= utilizationInterval
+        } ?? true
+        guard refreshQueues || refreshUtilization else { return }
+
+        let refreshID = UUID()
+        monitoringRefreshID = refreshID
+        isRefreshingMonitoring = true
+        defer {
+            if monitoringRefreshID == refreshID {
+                isRefreshingMonitoring = false
+                monitoringRefreshID = nil
+            }
+        }
+        if refreshQueues { lastQueueMonitoringAttempt = date }
+        if refreshUtilization { lastUtilizationAttempt = date }
+        let requestedJobs = activeJobs
+        async let queues: Void = refreshQueueResources(
+            enabled: refreshQueues, on: requestedProfile, refreshID: refreshID
+        )
+        async let utilization: Void = refreshJobUtilization(
+            enabled: refreshUtilization, on: requestedProfile, jobs: requestedJobs,
+            jobsAreFresh: jobsAreFresh, refreshID: refreshID
+        )
+        _ = await (queues, utilization)
+    }
+
+    private func refreshQueueResources(
+        enabled: Bool,
+        on requestedProfile: SlurmPlatformProfile,
+        refreshID: UUID
+    ) async {
+        guard enabled else { return }
+        do {
+            let snapshots = try await service.queueResources(on: requestedProfile)
+            guard !Task.isCancelled, profile == requestedProfile,
+                monitoringRefreshID == refreshID else { return }
+            queueSnapshots = snapshots
+            queueMonitoringUpdatedAt = now()
+            queueMonitoringError = nil
+        } catch is CancellationError {
+            return
+        } catch {
+            guard !Task.isCancelled, profile == requestedProfile,
+                monitoringRefreshID == refreshID else { return }
+            queueMonitoringError = error.localizedDescription
+        }
+    }
+
+    private func refreshJobUtilization(
+        enabled: Bool,
+        on requestedProfile: SlurmPlatformProfile,
+        jobs requestedJobs: [SlurmJobSnapshot],
+        jobsAreFresh: Bool,
+        refreshID: UUID
+    ) async {
+        guard enabled else { return }
+        do {
+            guard jobsAreFresh else {
+                markUtilizationUnavailable(for: requestedJobs, reason: "任务列表刷新失败，利用率未知。")
+                return
+            }
+            let snapshots = requestedJobs.isEmpty ? [:]
+                : try await service.jobUtilization(on: requestedProfile, jobs: requestedJobs)
+            guard !Task.isCancelled, profile == requestedProfile,
+                monitoringRefreshID == refreshID else { return }
+            jobUtilization = snapshots
+        } catch is CancellationError {
+            return
+        } catch {
+            guard !Task.isCancelled, profile == requestedProfile,
+                monitoringRefreshID == refreshID else { return }
+            markUtilizationUnavailable(for: requestedJobs, reason: error.localizedDescription)
+        }
+    }
+
+    private func markUtilizationUnavailable(for jobs: [SlurmJobSnapshot], reason: String) {
+        let sampledAt = now()
+        jobUtilization = Dictionary(uniqueKeysWithValues: jobs.map { job in
+            (job.jobID, SlurmJobUtilizationSnapshot(
+                jobID: job.jobID, allocation: nil, statistics: nil, gpus: nil,
+                sampledAt: sampledAt, unavailableReason: reason
+            ))
+        })
     }
 
     func refreshContinuously() async {
@@ -285,6 +394,14 @@ final class HPC2PlatformModel: ObservableObject {
         defaultPreset = preset
         if identityChanged {
             jobs = []
+            queueSnapshots = []
+            queueMonitoringError = nil
+            queueMonitoringUpdatedAt = nil
+            jobUtilization = [:]
+            lastQueueMonitoringAttempt = nil
+            lastUtilizationAttempt = nil
+            monitoringRefreshID = nil
+            isRefreshingMonitoring = false
             lastSuccessfulRefresh = nil
             connectionDiagnostic = nil
             connectionState = .idle

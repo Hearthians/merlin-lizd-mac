@@ -48,6 +48,151 @@ public enum SlurmCommands {
         )
     }
 
+
+    // These markers form a private transport envelope; parser inputs remain the
+    // unmodified output of the three scheduler tools.
+    static let monitoringNodesMarker = "@@TMUXHUB_NODES@@"
+    static let monitoringPartitionsMarker = "@@TMUXHUB_PARTITIONS@@"
+    static let monitoringQueueMarker = "@@TMUXHUB_QUEUE@@"
+    static let monitoringAllocationsMarker = "@@TMUXHUB_ALLOCATIONS@@"
+    static let monitoringStatisticsMarker = "@@TMUXHUB_STATISTICS@@"
+    static let monitoringEndMarker = "@@TMUXHUB_END@@"
+    static let monitoringUnavailableMarker = "@@TMUXHUB_UNAVAILABLE@@"
+    static let statisticsFormat =
+        "JobID,NTasks,AveCPU,AveRSS,MaxRSS,TRESUsageInAve,TRESUsageInMax,TRESUsageInTot"
+
+    /// One bounded, read-only request. Counts describe allocation, not activity.
+    public static func queueResources(
+        platform: SlurmPlatformProfile
+    ) throws -> CommandSpec {
+        let script = """
+            printf '%s\\n' \(shellQuote(monitoringNodesMarker))
+            scontrol show nodes --oneliner || exit 74
+            printf '%s\\n' \(shellQuote(monitoringPartitionsMarker))
+            scontrol show partitions --oneliner || exit 74
+            printf '%s\\n' \(shellQuote(monitoringQueueMarker))
+            if ! squeue --noheader --array --format '%P|%T'; then
+                printf '%s\\n' \(shellQuote(monitoringUnavailableMarker))
+            fi
+            printf '%s\\n' \(shellQuote(monitoringEndMarker))
+            """
+        return try boundedMonitoringQuery(platform: platform, script: script, seconds: 12)
+    }
+
+    /// Allocation and accounting are read-only; no monitoring step is created.
+    public static func jobStatistics(
+        platform: SlurmPlatformProfile,
+        jobIDs: [SlurmJobID]
+    ) throws -> CommandSpec {
+        try validate(platform)
+        guard !jobIDs.isEmpty, jobIDs.count <= 64,
+            Set(jobIDs).count == jobIDs.count,
+            jobIDs.allSatisfy(isNumericMonitoringJobID)
+        else { throw SlurmCommandError.invalidJobIdentity }
+        let identifiers = jobIDs.map(\.rawValue)
+        let statistics = shellJoin([
+            "sstat", "--allsteps", "--noheader", "--parsable2",
+            "--jobs", identifiers.joined(separator: ","),
+            "--format", statisticsFormat,
+        ])
+        let script = """
+            printf '%s\\n' \(shellQuote(monitoringAllocationsMarker))
+            for tmuxhub_job in \(shellJoin(identifiers)); do
+                scontrol show job "$tmuxhub_job" --oneliner || :
+            done
+            printf '%s\\n' \(shellQuote(monitoringStatisticsMarker))
+            if ! \(statistics); then
+                printf '%s\\n' \(shellQuote(monitoringUnavailableMarker))
+            fi
+            printf '%s\\n' \(shellQuote(monitoringEndMarker))
+            """
+        return try boundedMonitoringQuery(platform: platform, script: script, seconds: 12)
+    }
+
+    /// This creates only a short step inside a freshly verified existing own
+    /// allocation. Callers must use SSHReplayPolicy.never for this command.
+    public static func jobGPUUtilization(
+        platform: SlurmPlatformProfile,
+        jobID: SlurmJobID
+    ) throws -> CommandSpec {
+        try validate(platform)
+        guard isNumericMonitoringJobID(jobID) else {
+            throw SlurmCommandError.invalidJobIdentity
+        }
+        let verification = shellJoin([
+            "squeue", "--noheader", "--array", "--jobs", jobID.rawValue,
+            "--format", "%i %u %T %D",
+        ])
+        let gpuScript = #"""
+            set -ef
+            tmuxhub_ids=${SLURM_STEP_GPUS:-}
+            [ -n "$tmuxhub_ids" ] || exit 78
+            [ "${#tmuxhub_ids}" -le 16384 ] || exit 78
+            [[ "$tmuxhub_ids" =~ ^[0-9]{1,4}(-[0-9]{1,4})?(,[0-9]{1,4}(-[0-9]{1,4})?)*$ ]] || exit 78
+            IFS=',' read -r -a tmuxhub_parts <<< "$tmuxhub_ids"
+            tmuxhub_expanded=
+            tmuxhub_count=0
+            for tmuxhub_part in "${tmuxhub_parts[@]}"; do
+                [[ "$tmuxhub_part" =~ ^[0-9]{1,4}(-[0-9]{1,4})?$ ]] || exit 78
+                tmuxhub_first=${tmuxhub_part%%-*}
+                tmuxhub_last=${tmuxhub_part##*-}
+                tmuxhub_first=$((10#$tmuxhub_first))
+                tmuxhub_last=$((10#$tmuxhub_last))
+                (( tmuxhub_first <= tmuxhub_last && tmuxhub_last <= 1023 )) || exit 78
+                for ((tmuxhub_gpu=tmuxhub_first; tmuxhub_gpu<=tmuxhub_last; tmuxhub_gpu++)); do
+                    case ",$tmuxhub_expanded," in *",$tmuxhub_gpu,"*) exit 78 ;; esac
+                    tmuxhub_expanded="${tmuxhub_expanded:+$tmuxhub_expanded,}$tmuxhub_gpu"
+                    tmuxhub_count=$((tmuxhub_count + 1))
+                    [ "$tmuxhub_count" -le 1024 ] || exit 78
+                done
+            done
+            [ -n "$tmuxhub_expanded" ] || exit 78
+            exec nvidia-smi --id="$tmuxhub_expanded" --query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits
+            """#
+        let step = shellJoin([
+            "srun", "--jobid", jobID.rawValue, "--overlap", "--immediate=3",
+            "--nodes=1", "--ntasks=1", "--cpus-per-task=1", "--cpu-bind=none",
+            "--job-name=tmuxhub-monitor", "--chdir=/tmp",
+            "/bin/bash", "-c", gpuScript,
+        ])
+        let script = """
+            set -f
+            tmuxhub_identity=$(\(verification)) || exit 74
+            set -- $tmuxhub_identity
+            [ "$#" -eq 4 ] || exit 74
+            [ "$1" = \(shellQuote(jobID.rawValue)) ] || exit 74
+            [ "$2" = \(shellQuote(platform.owner)) ] || exit 74
+            [ "$3" = RUNNING ] || exit 74
+            [ "$4" = 1 ] || exit 75
+            exec \(step)
+            """
+        return try boundedMonitoringQuery(platform: platform, script: script, seconds: 15)
+    }
+
+    // Slurm exposes array/heterogeneous IDs differently in squeue, scontrol and
+    // sstat. Until those identities are reconciled, exclude them from sampling
+    // so one unsupported ID cannot invalidate accounting for normal jobs.
+    static func isNumericMonitoringJobID(_ jobID: SlurmJobID) -> Bool {
+        !jobID.rawValue.isEmpty && jobID.rawValue.utf8.allSatisfy { (48...57).contains($0) }
+    }
+
+    private static func boundedMonitoringQuery(
+        platform: SlurmPlatformProfile,
+        script: String,
+        seconds: Int
+    ) throws -> CommandSpec {
+        try remoteShell(
+            platform: platform,
+            script: "exec " + shellJoin([
+                "timeout", "--signal=TERM", "--kill-after=2s", "\(seconds)s",
+                "/bin/bash", "-c", script,
+            ]),
+            interactive: false
+        )
+    }
+
+
+
     public static func launchReceipt(
         platform: SlurmPlatformProfile,
         requestID: UUID = UUID(),

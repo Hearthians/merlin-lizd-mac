@@ -9,6 +9,7 @@ public enum SlurmServiceError: Error, Equatable, LocalizedError, Sendable {
     case ambiguousLaunch(SlurmLaunchReceipt)
     case jobUnavailable(SlurmJobID)
     case identityMismatch
+    case invalidMonitoringResponse
 
     public var errorDescription: String? {
         switch self {
@@ -26,6 +27,7 @@ public enum SlurmServiceError: Error, Equatable, LocalizedError, Sendable {
         case .ambiguousLaunch: "发现多个匹配同一启动凭据的作业，已停止自动操作。"
         case let .jobUnavailable(jobID): "作业 \(jobID.rawValue) 已不在活动队列中。"
         case .identityMismatch: "作业身份已经变化，已拒绝取消。"
+        case .invalidMonitoringResponse: "Slurm 返回的监控数据不完整。"
         }
     }
 
@@ -72,6 +74,179 @@ public actor SlurmService {
         let command = try SlurmCommands.listJobs(platform: platform)
         let output = try await query(command, on: platform)
         return try SlurmParser.queue(output.stdout)
+    }
+
+
+    public func queueResources(
+        on platform: SlurmPlatformProfile
+    ) async throws -> [SlurmQueueSnapshot] {
+        let output = try await query(
+            SlurmCommands.queueResources(platform: platform), on: platform
+        )
+        let sections = try monitoringSections(output.stdout, markers: [
+            SlurmCommands.monitoringNodesMarker,
+            SlurmCommands.monitoringPartitionsMarker,
+            SlurmCommands.monitoringQueueMarker,
+            SlurmCommands.monitoringEndMarker,
+        ])
+        let queue = sections[2].contains(SlurmCommands.monitoringUnavailableMarker)
+            ? nil : sections[2]
+        return try SlurmMonitoringParser.queues(
+            nodes: sections[0], partitions: sections[1], queue: queue, sampledAt: Date()
+        )
+    }
+
+    /// Samples only the supplied user's active jobs. Accounting is read-only;
+    /// at most three jobs get an overlapping GPU monitoring step per refresh.
+    public func jobUtilization(
+        on platform: SlurmPlatformProfile,
+        jobs: [SlurmJobSnapshot]
+    ) async throws -> [SlurmJobID: SlurmJobUtilizationSnapshot] {
+        try SlurmCommands.validate(platform)
+        let sampledAt = Date()
+        var unique: [SlurmJobID: SlurmJobSnapshot] = [:]
+        for job in jobs { unique[job.jobID] = job }
+        let running = unique.values
+            .filter {
+                $0.owner == platform.owner && $0.state == .running
+                    && SlurmCommands.isNumericMonitoringJobID($0.jobID)
+            }
+            .sorted { $0.jobID.rawValue < $1.jobID.rawValue }
+        let sampledJobs = Array(running.prefix(64))
+        var allocations: [SlurmJobID: SlurmJobAllocation] = [:]
+        var statistics: [SlurmJobID: SlurmJobStatistics] = [:]
+        if !sampledJobs.isEmpty {
+            let command = try SlurmCommands.jobStatistics(
+                platform: platform, jobIDs: sampledJobs.map(\.jobID)
+            )
+            let output = try await query(command, on: platform)
+            let sections = try monitoringSections(output.stdout, markers: [
+                SlurmCommands.monitoringAllocationsMarker,
+                SlurmCommands.monitoringStatisticsMarker,
+                SlurmCommands.monitoringEndMarker,
+            ])
+            allocations = try SlurmMonitoringParser.allocations(sections[0]).filter {
+                unique[$0.key]?.owner == platform.owner && $0.value.owner == platform.owner
+            }
+            if !sections[1].contains(SlurmCommands.monitoringUnavailableMarker) {
+                statistics = try SlurmMonitoringParser.statistics(
+                    sections[1], allocations: allocations
+                )
+            }
+        }
+
+        var result: [SlurmJobID: SlurmJobUtilizationSnapshot] = [:]
+        var gpuJobs: [SlurmJobID] = []
+        for job in unique.values.sorted(by: { $0.jobID.rawValue < $1.jobID.rawValue }) {
+            let allocation = allocations[job.jobID]
+            let reason: String?
+            var gpus: [SlurmGPUUtilization]?
+            if job.owner != platform.owner {
+                reason = "仅采集你本人任务的利用情况。"
+            } else if !SlurmCommands.isNumericMonitoringJobID(job.jobID) {
+                reason = "数组和异构任务暂不支持利用情况采样。"
+            } else if job.state != .running {
+                reason = "任务运行后可查看利用情况。"
+            } else if let allocation, allocation.state == .running {
+                if allocation.allocatedGPU == 0 {
+                    gpus = []
+                    reason = statistics[job.jobID] == nil
+                        ? "暂时无法读取 CPU 和内存统计。" : nil
+                } else if job.nodeCount != 1 {
+                    reason = "GPU 实时采样暂时仅支持单节点任务。"
+                } else if allocation.allocatedGPU == nil {
+                    reason = "暂时无法读取已分配的 GPU 数量。"
+                } else if gpuJobs.count >= 3 {
+                    reason = "每次刷新最多采样 3 个任务的 GPU。"
+                } else {
+                    gpuJobs.append(job.jobID)
+                    reason = nil
+                }
+            } else {
+                reason = "暂时无法读取任务当前分配的资源。"
+            }
+            result[job.jobID] = SlurmJobUtilizationSnapshot(
+                jobID: job.jobID, allocation: allocation,
+                statistics: statistics[job.jobID], gpus: gpus,
+                sampledAt: sampledAt, unavailableReason: reason
+            )
+        }
+        let gpuResults = await withTaskGroup(
+            of: (SlurmJobID, [SlurmGPUUtilization]?, String?).self,
+            returning: [(SlurmJobID, [SlurmGPUUtilization]?, String?)].self
+        ) { group in
+            for jobID in gpuJobs {
+                group.addTask {
+                    let sample = await self.sampleGPU(jobID: jobID, on: platform)
+                    return (jobID, sample.gpus, sample.reason)
+                }
+            }
+            var samples: [(SlurmJobID, [SlurmGPUUtilization]?, String?)] = []
+            for await sample in group { samples.append(sample) }
+            return samples
+        }
+        try Task.checkCancellation()
+        for (jobID, gpus, reason) in gpuResults {
+            result[jobID] = SlurmJobUtilizationSnapshot(
+                jobID: jobID, allocation: allocations[jobID],
+                statistics: statistics[jobID], gpus: gpus,
+                sampledAt: Date(), unavailableReason: reason
+            )
+        }
+        return result
+    }
+
+    private func sampleGPU(
+        jobID: SlurmJobID,
+        on platform: SlurmPlatformProfile
+    ) async -> (gpus: [SlurmGPUUtilization]?, reason: String?) {
+        do {
+            let command = try SlurmCommands.jobGPUUtilization(
+                platform: platform, jobID: jobID
+            )
+            let output = try await query(command, on: platform, replay: .never)
+            let gpus = try SlurmMonitoringParser.gpuUsage(output.stdout)
+            guard !gpus.isEmpty else {
+                return (nil, "未能读取任务已分配 GPU 的采样数据。")
+            }
+            return (gpus, nil)
+        } catch is CancellationError {
+            return (nil, "采样已取消。")
+        } catch let SlurmServiceError.commandFailed(exitCode, _) {
+            switch exitCode {
+            case 74: return (nil, "任务已结束或当前任务归属发生变化。")
+            case 75: return (nil, "GPU 实时采样暂时仅支持单节点任务。")
+            case 78: return (nil, "Slurm 未提供有效的已分配 GPU 编号。")
+            case 124, 137: return (nil, "GPU 采样超时，训练任务继续运行。")
+            default: return (nil, "暂时无法在任务内启动 GPU 采样。")
+            }
+        } catch {
+            return (nil, "GPU 监控连接暂时不可用。")
+        }
+    }
+
+    private func monitoringSections(
+        _ output: String,
+        markers: [String]
+    ) throws -> [String] {
+        var sections = Array(repeating: "", count: markers.count - 1)
+        var section = -1
+        for line in output.components(separatedBy: "\n") {
+            if section + 1 < markers.count, line == markers[section + 1] {
+                section += 1
+            } else if markers.contains(line)
+                || (section < 0 && !line.isEmpty)
+                || (section == sections.count && !line.isEmpty)
+            {
+                throw SlurmServiceError.invalidMonitoringResponse
+            } else if section >= 0 && section < sections.count {
+                sections[section] += line + "\n"
+            }
+        }
+        guard section == sections.count else {
+            throw SlurmServiceError.invalidMonitoringResponse
+        }
+        return sections
     }
 
     /// Performs exactly one non-replayed mutation. If the SSH result is
@@ -170,14 +345,15 @@ public actor SlurmService {
 
     private func query(
         _ command: CommandSpec,
-        on platform: SlurmPlatformProfile
+        on platform: SlurmPlatformProfile,
+        replay: SSHReplayPolicy = .readOnly
     ) async throws -> InventoryProcessOutput {
         let output: InventoryProcessOutput
         do {
             output = try await remoteRunner.run(
                 command,
                 alias: platform.loginDestination,
-                replay: .readOnly
+                replay: replay
             )
         } catch is CancellationError {
             throw CancellationError()

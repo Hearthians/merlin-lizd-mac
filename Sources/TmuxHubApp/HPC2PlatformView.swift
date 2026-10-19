@@ -15,6 +15,13 @@ struct HPC2PlatformView: View {
             VStack(alignment: .leading, spacing: 20) {
                 header
                 connectionBanner
+                HPC2QueueMonitoringView(
+                    queues: model.queueSnapshots,
+                    error: model.queueMonitoringError,
+                    updatedAt: model.queueMonitoringUpdatedAt,
+                    isRefreshing: model.isRefreshingMonitoring,
+                    preferredPartition: model.defaultPreset.partition
+                )
                 metrics
                 listPicker
                 if selectedList == .current {
@@ -79,7 +86,7 @@ struct HPC2PlatformView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.large)
-            .disabled(model.isRefreshing)
+            .disabled(model.isRefreshing || model.isRefreshingMonitoring)
             Button("启动交互环境", systemImage: "play.fill") {
                 showsStartSheet = true
             }
@@ -271,6 +278,11 @@ struct HPC2PlatformView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+                    HPC2JobUtilizationView(
+                        job: job,
+                        snapshot: model.jobUtilization[job.jobID],
+                        isRefreshing: model.isRefreshingMonitoring
+                    )
                 }
                 Spacer(minLength: 12)
                 if let run {
