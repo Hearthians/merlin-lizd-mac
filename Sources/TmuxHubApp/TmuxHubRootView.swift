@@ -50,7 +50,8 @@ struct TmuxHubRootView: View {
                         }
                         TerminalTabBar(
                             terminals: terminals,
-                            hosts: model.quickAccessHosts
+                            hosts: model.quickAccessHosts,
+                            onRefresh: refresh
                         )
                     }
                 } else if isSidebarHidden {
@@ -161,15 +162,17 @@ struct TmuxHubRootView: View {
             .help("添加 SSH 主机")
             .accessibilityLabel("添加 SSH 主机")
 
-            Button(action: refresh) {
-                Image(systemName: "arrow.clockwise")
-                    .frame(width: 20, height: 24)
+            if terminals.tabs.isEmpty {
+                Button(action: refresh) {
+                    Image(systemName: "arrow.clockwise")
+                        .frame(width: 20, height: 24)
+                }
+                .help("刷新（⌘R）")
+                .accessibilityLabel("刷新")
             }
-            .help("刷新（⌘R）")
-            .accessibilityLabel("刷新")
         }
         .buttonStyle(.plain)
-        .padding(.leading, 78)
+        .padding(.leading, WindowHeaderDragArea.leadingControlsInset)
         .padding(.trailing, 6)
         .frame(height: 38)
         .background(WindowHeaderDragArea())
@@ -183,7 +186,7 @@ struct TmuxHubRootView: View {
         .buttonStyle(.plain)
         .help("显示侧边栏")
         .accessibilityLabel("显示侧边栏")
-        .padding(.leading, 78)
+        .padding(.leading, WindowHeaderDragArea.leadingControlsInset)
         .background(WindowHeaderDragArea())
     }
 

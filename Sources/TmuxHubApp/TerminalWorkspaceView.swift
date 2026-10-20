@@ -124,6 +124,7 @@ private struct AttachmentDropOverlay: View {
 struct TerminalTabBar: View {
     @ObservedObject var terminals: TerminalTabsModel
     let hosts: [SSHHost]
+    let onRefresh: () -> Void
 
     @State private var pendingTerminationID: String?
     @State private var renameID: String?
@@ -135,17 +136,27 @@ struct TerminalTabBar: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 4) {
-                    ForEach(terminals.tabs) { tab in
-                        tabItem(tab)
+            GeometryReader { geometry in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 4) {
+                        ForEach(terminals.tabs) { tab in
+                            tabItem(tab)
+                        }
                     }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .frame(minWidth: geometry.size.width, minHeight: 38, alignment: .leading)
+                    .background(WindowHeaderDragArea())
                 }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 6)
             }
 
-            Divider().frame(height: 22)
+            Button(action: onRefresh) {
+                Image(systemName: "arrow.clockwise")
+                    .frame(width: 28, height: 28)
+            }
+            .buttonStyle(.plain)
+            .help("刷新（⌘R）")
+            .accessibilityLabel("刷新")
             addTerminalMenu
                 .menuStyle(.borderlessButton)
                 .frame(width: 34)
@@ -153,7 +164,12 @@ struct TerminalTabBar: View {
         }
         .frame(height: 38)
         .background(.bar)
-        .overlay(alignment: .bottom) { Divider() }
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Color(nsColor: .separatorColor))
+                .frame(height: 1)
+                .allowsHitTesting(false)
+        }
         .confirmationDialog(
             "终止 tmux 会话？",
             isPresented: Binding(
