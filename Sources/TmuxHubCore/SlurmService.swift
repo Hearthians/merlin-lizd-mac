@@ -164,8 +164,8 @@ public actor SlurmService {
                     gpus = []
                     reason = statistics[job.jobID] == nil
                         ? "暂时无法读取 CPU 和内存统计。" : nil
-                } else if job.nodeCount != 1 {
-                    reason = "GPU 实时采样暂时仅支持单节点任务。"
+                } else if !(1...1024).contains(job.nodeCount) {
+                    reason = "无法确认任务的有效节点数量。"
                 } else if allocation.allocatedGPU == nil {
                     reason = "暂时无法读取已分配的 GPU 数量。"
                 } else if gpuJobs.count >= 3 {
@@ -204,10 +204,21 @@ public actor SlurmService {
             var sampleReason = reason
             if let gpus, let expected = allocation?.allocatedGPU, gpus.count != expected {
                 if gpus.count < expected {
-                    sampleReason = "仅读取到 \(gpus.count) / \(expected) 张 GPU；其余采样暂不可用，不代表未分配。"
+                    let coverage = "仅读取到 \(gpus.count) / \(expected) 张 GPU；其余采样暂不可用，不代表未分配。"
+                    sampleReason = [sampleReason, coverage].compactMap { $0 }.joined(separator: " ")
                 } else {
                     sampledGPUs = nil
                     sampleReason = "GPU 采样数量与任务分配不一致，已忽略本次结果；下次刷新后重试。"
+                }
+            }
+            if let gpus = sampledGPUs, let expectedNodes = unique[jobID]?.nodeCount, expectedNodes > 1 {
+                let nodes = Set(gpus.compactMap(\.nodeName))
+                if gpus.contains(where: { $0.nodeName == nil }) || nodes.count > expectedNodes {
+                    sampledGPUs = nil
+                    sampleReason = "GPU 采样缺少有效的节点归属，已忽略本次结果；下次刷新后重试。"
+                } else if nodes.count < expectedNodes {
+                    let coverage = "GPU 采样覆盖 \(nodes.count) / \(expectedNodes) 个节点。"
+                    sampleReason = [sampleReason, coverage].compactMap { $0 }.joined(separator: " ")
                 }
             }
             result[jobID] = SlurmJobUtilizationSnapshot(
@@ -227,18 +238,27 @@ public actor SlurmService {
             let command = try SlurmCommands.jobGPUUtilization(
                 platform: platform, jobID: jobID
             )
-            let output = try await query(command, on: platform, replay: .never)
+            // srun can return a failure after other nodes already produced valid
+            // samples. Keep those readings and expose the incomplete refresh.
+            let output = try await remoteRunner.run(
+                command, alias: platform.loginDestination, replay: .never
+            )
+            if output.exitCode != 0, output.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                throw commandError(output)
+            }
             let gpus = try SlurmMonitoringParser.gpuUsage(output.stdout)
             guard !gpus.isEmpty else {
                 return (nil, "未能读取任务已分配 GPU 的采样数据。")
             }
-            return (gpus, nil)
+            let reason: String? = output.exitCode == 0 ? nil
+                : "部分节点采样失败或超时，保留已读取的 GPU 数据；训练任务继续运行。"
+            return (gpus, reason)
         } catch is CancellationError {
             return (nil, "采样已取消。")
         } catch let SlurmServiceError.commandFailed(exitCode, _) {
             switch exitCode {
             case 74: return (nil, "任务已结束或当前任务归属发生变化。")
-            case 75: return (nil, "GPU 实时采样暂时仅支持单节点任务。")
+            case 75: return (nil, "无法确认任务的节点信息。")
             case 78: return (nil, "Slurm 未提供有效的已分配 GPU 编号。")
             case 124, 137: return (nil, "GPU 采样超时，训练任务继续运行。")
             default: return (nil, "暂时无法在任务内启动 GPU 采样。")

@@ -209,19 +209,6 @@ struct HPC2JobUtilizationView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
-                HStack(alignment: .top, spacing: 24) {
-                    statistic("CPU 平均（估算）", value: HPC2MonitoringFormat.percent(snapshot?.statistics?.averageCPUPercent))
-                    statistic("单 task 内存峰值", value: HPC2MonitoringFormat.memory(snapshot?.statistics?.peakTaskMemoryMiB))
-                }
-                .help("CPU 按当前活动 step 的累计 CPU 时间、作业运行时长和已分配核数估算；已结束的 step 可能未计入。内存是 Slurm 记录的单个 task 的 RSS 峰值，不代表整个作业的当前内存。一个 task 可能包含多个子进程。")
-                if snapshot != nil,
-                    snapshot?.statistics?.averageCPUPercent == nil
-                        || snapshot?.statistics?.peakTaskMemoryMiB == nil {
-                    Text("Slurm 尚未提供完整的 CPU / 内存采样，缺失指标显示 —。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
                 if let gpus = snapshot?.gpus {
                     if gpus.isEmpty {
                         Text("未分配 GPU")
@@ -249,6 +236,19 @@ struct HPC2JobUtilizationView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+
+                HStack(alignment: .top, spacing: 24) {
+                    statistic("CPU 平均（估算）", value: HPC2MonitoringFormat.percent(snapshot?.statistics?.averageCPUPercent))
+                    statistic("单 task 内存峰值", value: HPC2MonitoringFormat.memory(snapshot?.statistics?.peakTaskMemoryMiB))
+                }
+                .help("CPU 按当前活动 step 的累计 CPU 时间、作业运行时长和已分配核数估算；已结束的 step 可能未计入。内存是 Slurm 记录的单个 task 的 RSS 峰值，不代表整个作业的当前内存。一个 task 可能包含多个子进程。")
+                if snapshot != nil,
+                    snapshot?.statistics?.averageCPUPercent == nil
+                        || snapshot?.statistics?.peakTaskMemoryMiB == nil {
+                    Text("Slurm 尚未提供完整的 CPU / 内存采样，缺失指标显示 —。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -257,7 +257,7 @@ struct HPC2JobUtilizationView: View {
     private func statistic(_ title: String, value: String) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(title).font(.caption).foregroundStyle(.secondary)
-            Text(value).font(.callout.weight(.semibold).monospacedDigit())
+            Text(value).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
         }
     }
 }
@@ -265,12 +265,26 @@ struct HPC2JobUtilizationView: View {
 private struct HPC2GPUUtilizationCard: View {
     let gpu: SlurmGPUUtilization
 
+    private var memoryPercent: Double? {
+        guard let used = gpu.memoryUsedMiB, let total = gpu.memoryTotalMiB,
+            used.isFinite, total.isFinite, used >= 0, total > 0
+        else { return nil }
+        return min(100, max(0, used / total * 100))
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
+            if let node = gpu.nodeName, !node.isEmpty {
+                Text(node)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .help(node)
+            }
             HStack {
                 Text("GPU \(gpu.index)")
                     .font(.caption.bold())
-                    .help("任务内可见的 GPU 编号；可能与节点上的物理编号不同。")
+                    .help("此节点上任务内可见的 GPU 编号；可能与节点上的物理编号不同。")
                 Spacer(minLength: 8)
                 Text("利用率 \(HPC2MonitoringFormat.percent(gpu.utilizationPercent))")
                     .font(.callout.weight(.semibold).monospacedDigit())
@@ -283,10 +297,27 @@ private struct HPC2GPUUtilizationCard: View {
                 ProgressView(value: min(100, max(0, percent)), total: 100)
                     .tint(.green)
             }
-            Text("显存 \(HPC2MonitoringFormat.memory(gpu.memoryUsedMiB)) / \(HPC2MonitoringFormat.memory(gpu.memoryTotalMiB))")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .monospacedDigit()
+            HStack {
+                Text("显存")
+                Spacer(minLength: 4)
+                Text(HPC2MonitoringFormat.percent(memoryPercent))
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .monospacedDigit()
+            Text("\(HPC2MonitoringFormat.memory(gpu.memoryUsedMiB)) / \(HPC2MonitoringFormat.memory(gpu.memoryTotalMiB))")
+                .font(.caption.monospacedDigit())
+            if let percent = memoryPercent {
+                ProgressView(value: percent, total: 100)
+                    .tint(.blue)
+            }
+            HStack {
+                Text("功耗").foregroundStyle(.secondary)
+                Spacer(minLength: 4)
+                Text("\(HPC2MonitoringFormat.power(gpu.powerDrawWatts)) / \(HPC2MonitoringFormat.power(gpu.powerLimitWatts))")
+            }
+            .font(.caption.monospacedDigit())
+            .help("当前功耗 / 功率上限；GPU 或驱动未提供的读数显示 —。")
         }
         .padding(10)
         .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
@@ -320,6 +351,11 @@ private enum HPC2MonitoringFormat {
     static func percent(_ value: Double?) -> String {
         guard let value, value.isFinite else { return "—" }
         return "\(value.formatted(.number.precision(.fractionLength(0...1))))%"
+    }
+
+    static func power(_ value: Double?) -> String {
+        guard let value, value.isFinite, value >= 0 else { return "—" }
+        return "\(value.formatted(.number.precision(.fractionLength(0...1)))) W"
     }
 
     static func time(_ date: Date) -> String {

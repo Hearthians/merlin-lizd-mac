@@ -189,6 +189,89 @@ struct SlurmMonitoringTests {
         #expect(devices[3].utilizationPercent == nil)
         #expect(devices[3].memoryUsedMiB == nil)
         #expect(devices[3].memoryTotalMiB == nil)
+        #expect(devices.allSatisfy { $0.nodeName == nil && $0.powerDrawWatts == nil && $0.powerLimitWatts == nil })
+        #expect(devices[0].id == devices[0].uuid)
+    }
+
+    @Test("Multi-node GPU metrics retain node identity when local GPU indexes or UUIDs repeat")
+    func nodeScopedGPUMetrics() throws {
+        let devices = try SlurmMonitoringParser.gpuUsage("""
+        gpu01, 0, GPU-aaaa, NVIDIA A800, 95, 58000, 81920, 275.5, 400
+        gpu02, 0, GPU-aaaa, NVIDIA A800, 92, 53000, 81920, 240, 400
+        gpu02, 1, GPU-bbbb, NVIDIA A800, 89, 50000, 81920, 235, 400
+        """)
+        #expect(devices.map(\.nodeName) == ["gpu01", "gpu02", "gpu02"])
+        #expect(devices.map(\.index) == [0, 0, 1])
+        #expect(Set(devices.map(\.id)).count == 3)
+        #expect(devices[0].id == "gpu01:GPU-aaaa")
+        #expect(devices[1].id == "gpu02:GPU-aaaa")
+        #expect(devices[0].memoryUsedMiB == 58_000)
+        #expect(devices[0].powerDrawWatts == 275.5)
+        #expect(devices[0].powerLimitWatts == 400)
+        #expect(throws: SlurmMonitoringParserError.duplicateIdentifier("gpu01:GPU-aaaa")) {
+            try SlurmMonitoringParser.gpuUsage("""
+            gpu01, 0, GPU-aaaa, NVIDIA A800, 95, 58000, 81920, 275.5, 400
+            gpu01, 1, GPU-aaaa, NVIDIA A800, 92, 53000, 81920, 240, 400
+            """)
+        }
+    }
+
+    @Test("GPU power metrics preserve observed zero and keep unsupported or invalid values unknown")
+    func gpuPowerMetrics() throws {
+        let devices = try SlurmMonitoringParser.gpuUsage("""
+        gpu01, 0, GPU-aaaa, NVIDIA A800, 0, 0, 81920, 0, 0
+        gpu01, 1, GPU-bbbb, NVIDIA A800, [N/A], N/A, UNKNOWN, [N/A], N/A
+        gpu01, 2, GPU-cccc, NVIDIA A800, 87, 40960.5, 81920, 215.25, 400
+        gpu01, 3, GPU-dddd, NVIDIA A800, 87, 40960.5, 81920, -1, inf
+        gpu01, 4, GPU-eeee, NVIDIA A800, 87, 40960.5, 81920, NaN, -20
+        """)
+        #expect(devices[0].powerDrawWatts == 0)
+        #expect(devices[0].powerLimitWatts == 0)
+        #expect(devices[1].utilizationPercent == nil)
+        #expect(devices[1].memoryUsedMiB == nil)
+        #expect(devices[1].memoryTotalMiB == nil)
+        #expect(devices[1].powerDrawWatts == nil)
+        #expect(devices[1].powerLimitWatts == nil)
+        #expect(devices[2].powerDrawWatts == 215.25)
+        #expect(devices[2].powerLimitWatts == 400)
+        #expect(devices[3].powerDrawWatts == nil)
+        #expect(devices[3].powerLimitWatts == nil)
+        #expect(devices[4].powerDrawWatts == nil)
+        #expect(devices[4].powerLimitWatts == nil)
+    }
+
+    @Test("Legacy GPU snapshots decode without node or power metrics")
+    func legacyGPUDecoding() throws {
+        let data = Data(#"""
+        {"index":0,"uuid":"GPU-aaaa","name":"NVIDIA A800","utilizationPercent":80,"memoryUsedMiB":1024,"memoryTotalMiB":81920}
+        """#.utf8)
+        let device = try JSONDecoder().decode(SlurmGPUUtilization.self, from: data)
+        #expect(device.id == "GPU-aaaa")
+        #expect(device.nodeName == nil)
+        #expect(device.powerDrawWatts == nil)
+        #expect(device.powerLimitWatts == nil)
+        #expect(device.memoryUsedMiB == 1024)
+    }
+
+    @Test("Node-tagged GPU rows reject unsafe nodes and malformed CSV")
+    func malformedNodeGPUMetrics() throws {
+        for row in [
+            ",0,GPU-aaaa,A800,80,1024,81920,200,400",
+            "gpu 01,0,GPU-aaaa,A800,80,1024,81920,200,400",
+            "gpu/01,0,GPU-aaaa,A800,80,1024,81920,200,400",
+            "gpu[01-02],0,GPU-aaaa,A800,80,1024,81920,200,400",
+            "gpu;whoami,0,GPU-aaaa,A800,80,1024,81920,200,400",
+            "-gpu01,0,GPU-aaaa,A800,80,1024,81920,200,400",
+            "gpu01,-1,GPU-aaaa,A800,80,1024,81920,200,400",
+            "gpu01,N/A,GPU-aaaa,A800,80,1024,81920,200,400",
+            "gpu01,0,GPU-aaaa,A800,80,1024,81920,200",
+            "gpu01,0,GPU-aaaa,A800,80,1024,81920,200,400,extra",
+            "\(String(repeating: "g", count: 256)),0,GPU-aaaa,A800,80,1024,81920,200,400",
+        ] {
+            #expect(throws: SlurmMonitoringParserError.malformedRow(section: "gpu", line: 1)) {
+                try SlurmMonitoringParser.gpuUsage(row)
+            }
+        }
     }
 
     @Test("monitoring rejects ambiguous rows, duplicate identities, and schema changes")

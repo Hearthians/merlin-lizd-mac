@@ -143,6 +143,9 @@ public enum SlurmCommands {
         ])
         let gpuScript = #"""
             set -ef
+            export LC_ALL=C
+            tmuxhub_node=${SLURMD_NODENAME:-}
+            [[ "$tmuxhub_node" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,254}$ ]] || exit 75
             tmuxhub_ids=${SLURM_STEP_GPUS:-}
             [ -n "$tmuxhub_ids" ] || exit 78
             [ "${#tmuxhub_ids}" -le 16384 ] || exit 78
@@ -184,13 +187,18 @@ public enum SlurmCommands {
                 case ",$tmuxhub_selection," in *",$tmuxhub_device,"*) exit 78 ;; esac
                 tmuxhub_selection="${tmuxhub_selection:+$tmuxhub_selection,}$tmuxhub_device"
             done
-            exec nvidia-smi --id="$tmuxhub_selection" --query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits
+            tmuxhub_sample=$(nvidia-smi --id="$tmuxhub_selection" --query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total,power.draw,power.limit --format=csv,noheader,nounits) || exit $?
+            [ -n "$tmuxhub_sample" ] || exit 78
+            while IFS= read -r tmuxhub_row; do
+                printf '%s, %s\n' "$tmuxhub_node" "$tmuxhub_row"
+            done <<< "$tmuxhub_sample"
             """#
         let step = shellJoin([
             "srun", "--jobid", jobID.rawValue, "--overlap", "--immediate=3",
-            "--nodes=1", "--ntasks=1", "--cpus-per-task=1", "--cpu-bind=none",
+            "--ntasks-per-node=1", "--cpus-per-task=1", "--cpu-bind=none",
+            "--gpu-bind=none", "--kill-on-bad-exit=0", "--mpi=none",
+            "--distribution=block", "--export=ALL", "--input=/dev/null",
             "--job-name=tmuxhub-monitor", "--chdir=/tmp",
-            "/bin/bash", "-c", gpuScript,
         ])
         let script = """
             set -f
@@ -200,8 +208,16 @@ public enum SlurmCommands {
             [ "$1" = \(shellQuote(jobID.rawValue)) ] || exit 74
             [ "$2" = \(shellQuote(platform.owner)) ] || exit 74
             [ "$3" = RUNNING ] || exit 74
-            [ "$4" = 1 ] || exit 75
-            exec \(step)
+            [[ "$4" =~ ^[1-9][0-9]{0,3}$ ]] && [ "$4" -le 1024 ] || exit 75
+            # Reuse the allocation, without inheriting another step's GPU request
+            # or output routing. Slurm supplies the per-node device lists anew.
+            unset SLURM_GPUS SLURM_GPUS_PER_NODE SLURM_GPUS_PER_SOCKET SLURM_GPUS_PER_TASK
+            unset SLURM_NTASKS_PER_GPU SLURM_CPUS_PER_GPU SLURM_MEM_PER_GPU
+            unset SLURM_GPU_FREQ SLURM_CPU_FREQ_REQ
+            unset SLURM_GRES SLURM_STEP_GRES SLURM_TRES_PER_TASK SLURM_HOSTFILE SLURM_LABELIO
+            unset SRUN_OUTPUT SRUN_ERROR SRUN_INPUT
+            export CUDA_DEVICE_ORDER=PCI_BUS_ID
+            exec \(step) --nodes="$4" --ntasks="$4" \(shellJoin(["/bin/bash", "-c", gpuScript]))
             """
         return try boundedMonitoringQuery(platform: platform, script: script, seconds: 15)
     }

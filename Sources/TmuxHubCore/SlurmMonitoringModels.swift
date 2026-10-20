@@ -54,13 +54,32 @@ public struct SlurmJobAllocation: Codable, Hashable, Sendable {
 }
 
 public struct SlurmGPUUtilization: Codable, Hashable, Identifiable, Sendable {
-    public var id: String { uuid }
+    public var id: String { nodeName.map { "\($0):\(uuid)" } ?? uuid }
     public let index: Int
     public let uuid: String
     public let name: String
     public let utilizationPercent: Double?
     public let memoryUsedMiB: Double?
     public let memoryTotalMiB: Double?
+    public let nodeName: String?
+    public let powerDrawWatts: Double?
+    public let powerLimitWatts: Double?
+
+    public init(
+        index: Int, uuid: String, name: String, utilizationPercent: Double?,
+        memoryUsedMiB: Double?, memoryTotalMiB: Double?, nodeName: String? = nil,
+        powerDrawWatts: Double? = nil, powerLimitWatts: Double? = nil
+    ) {
+        self.index = index
+        self.uuid = uuid
+        self.name = name
+        self.utilizationPercent = utilizationPercent
+        self.memoryUsedMiB = memoryUsedMiB
+        self.memoryTotalMiB = memoryTotalMiB
+        self.nodeName = nodeName
+        self.powerDrawWatts = powerDrawWatts
+        self.powerLimitWatts = powerLimitWatts
+    }
 }
 
 public struct SlurmJobStatistics: Codable, Hashable, Sendable {

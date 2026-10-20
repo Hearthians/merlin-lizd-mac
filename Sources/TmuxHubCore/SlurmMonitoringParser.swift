@@ -151,19 +151,35 @@ public enum SlurmMonitoringParser {
         return try lines(output).enumerated().map { index, line in
             let fields = line.split(separator: ",", omittingEmptySubsequences: false)
                 .map { String($0).trimmingCharacters(in: .whitespaces) }
-            guard fields.count == 6, fields.allSatisfy(safeField),
-                let gpuIndex = integer(fields[0]), fields[1].hasPrefix("GPU-"),
-                fields[1].utf8.count <= 128, !fields[2].isEmpty
-            else { throw SlurmMonitoringParserError.malformedRow(section: "gpu", line: index + 1) }
-            guard seen.insert(fields[1]).inserted else {
-                throw SlurmMonitoringParserError.duplicateIdentifier(fields[1])
+            guard [6, 9].contains(fields.count), fields.allSatisfy(safeField) else {
+                throw SlurmMonitoringParserError.malformedRow(section: "gpu", line: index + 1)
             }
-            let percent = number(fields[3]).flatMap { $0 <= 100 ? $0 : nil }
-            return SlurmGPUUtilization(
-                index: gpuIndex, uuid: fields[1], name: fields[2], utilizationPercent: percent,
-                memoryUsedMiB: number(fields[4]), memoryTotalMiB: number(fields[5])
+            let offset = fields.count == 9 ? 1 : 0
+            let nodeName = offset == 1 ? fields[0] : nil
+            guard nodeName.map(validGPUNodeName) ?? true,
+                let gpuIndex = integer(fields[offset]), fields[offset + 1].hasPrefix("GPU-"),
+                fields[offset + 1].utf8.count <= 128, !fields[offset + 2].isEmpty
+            else { throw SlurmMonitoringParserError.malformedRow(section: "gpu", line: index + 1) }
+            let percent = number(fields[offset + 3]).flatMap { $0 <= 100 ? $0 : nil }
+            let device = SlurmGPUUtilization(
+                index: gpuIndex, uuid: fields[offset + 1], name: fields[offset + 2],
+                utilizationPercent: percent, memoryUsedMiB: number(fields[offset + 4]),
+                memoryTotalMiB: number(fields[offset + 5]), nodeName: nodeName,
+                powerDrawWatts: offset == 1 ? number(fields[7]) : nil,
+                powerLimitWatts: offset == 1 ? number(fields[8]) : nil
             )
+            guard seen.insert(device.id).inserted else {
+                throw SlurmMonitoringParserError.duplicateIdentifier(device.id)
+            }
+            return device
+        }.sorted {
+            if $0.nodeName != $1.nodeName { return ($0.nodeName ?? "") < ($1.nodeName ?? "") }
+            return $0.index < $1.index
         }
+    }
+
+    private static func validGPUNodeName(_ value: String) -> Bool {
+        value.range(of: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$"#, options: .regularExpression) != nil
     }
 
     private static func nodeSnapshots(_ output: String) throws -> [SlurmNodeSnapshot] {

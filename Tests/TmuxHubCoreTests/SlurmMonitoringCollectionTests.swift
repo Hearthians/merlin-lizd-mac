@@ -60,20 +60,25 @@ struct SlurmMonitoringCollectionTests {
         #expect(!accounting.contains("'6'"))
     }
 
-    @Test("multi-node allocations keep accounting without a GPU monitor step")
+    @Test("multi-node allocations collect node-scoped GPUs and preserve accounting")
     func multiNodeAccounting() async throws {
         let snapshot = try job("7", nodes: "2")
         let runner = MonitoringFixtureRunner(
-            allocations: allocation("7"),
-            statistics: "7.batch|1|00:00:20|100M|256M||||\n"
+            allocations: allocation("7", gpuCount: 2),
+            statistics: "7.batch|1|00:00:20|100M|256M||||\n",
+            gpuOutput: """
+                gpu01, 0, GPU-first, NVIDIA A800, 95, 58000, 81920, 215, 400
+                gpu02, 0, GPU-second, NVIDIA A800, 93, 55000, 81920, 205, 400
+
+                """
         )
         let result = try await SlurmService(remoteRunner: runner).jobUtilization(
             on: platform, jobs: [snapshot]
         )
-        #expect(await runner.policies() == ["readOnly"])
+        #expect(await runner.policies() == ["readOnly", "never"])
         #expect(result[snapshot.jobID]?.statistics?.peakTaskMemoryMiB == 256)
-        #expect(result[snapshot.jobID]?.gpus == nil)
-        #expect(result[snapshot.jobID]?.unavailableReason?.contains("单节点") == true)
+        #expect(result[snapshot.jobID]?.gpus?.map(\.nodeName) == ["gpu01", "gpu02"])
+        #expect(result[snapshot.jobID]?.unavailableReason == nil)
     }
 
 
@@ -125,9 +130,11 @@ struct SlurmMonitoringCollectionTests {
             #expect(output.exitCode == 74)
             #expect(!fixture.exists("srun-called"))
         }
-        try fixture.write("identity", contents: "42 zli760 RUNNING 2")
-        #expect(try await fixture.run(command).exitCode == 75)
-        #expect(!fixture.exists("srun-called"))
+        for nodeCount in ["0", "-1", "01", "1025", "1.5", "unknown"] {
+            try fixture.write("identity", contents: "42 zli760 RUNNING \(nodeCount)")
+            #expect(try await fixture.run(command).exitCode == 75)
+            #expect(!fixture.exists("srun-called"))
+        }
     }
 
     @Test("GPU identifiers expand numeric ranges and fail closed for invalid allocations")
@@ -267,6 +274,146 @@ struct SlurmMonitoringCollectionTests {
         #expect(warning.contains("4"))
     }
 
+    @Test("Multi-node monitor launches one task per verified node and collects every assigned GPU")
+    func multiNodeMonitorSteps() async throws {
+        let command = try SlurmCommands.jobGPUUtilization(
+            platform: platform, jobID: #require(SlurmJobID(rawValue: "42"))
+        )
+        for (nodeCount, gpusPerNode, globalIDs, visibleIDs) in [
+            (4, 1, "7", "0"),
+            (2, 2, "3,7", "0,1"),
+        ] {
+            let fixture = try MonitoringShellFixture()
+            defer { fixture.remove() }
+            let nodeNames = (1...nodeCount).map { "gpu0\($0)" }
+            try fixture.write("identity", contents: "42 zli760 RUNNING \(nodeCount)")
+            try fixture.write("node-names", contents: nodeNames.joined(separator: "\n") + "\n")
+            try fixture.write("step-gpus", contents: globalIDs)
+            try fixture.write("cuda-gpus", contents: visibleIDs)
+            let output = try await fixture.run(command)
+            #expect(output.exitCode == 0, "\(output.stderr)")
+            let devices = try SlurmMonitoringParser.gpuUsage(output.stdout)
+            #expect(devices.count == nodeCount * gpusPerNode)
+            #expect(Set(devices.map(\.id)).count == nodeCount * gpusPerNode)
+            #expect(Set(devices.compactMap(\.nodeName)) == Set(nodeNames))
+            for nodeName in nodeNames {
+                #expect(devices.filter { $0.nodeName == nodeName }.map(\.index) == Array(0..<gpusPerNode))
+            }
+            #expect(devices.allSatisfy {
+                $0.memoryUsedMiB == 1024 && $0.memoryTotalMiB == 81920 &&
+                    $0.powerDrawWatts == 215 && $0.powerLimitWatts == 400
+            })
+            let arguments = try String(
+                contentsOf: fixture.directory.appendingPathComponent("srun-arguments"), encoding: .utf8
+            ).split(separator: "\n").map(String.init)
+            #expect(arguments.filter { $0.hasPrefix("--nodes=") } == ["--nodes=\(nodeCount)"])
+            #expect(arguments.filter { $0.hasPrefix("--ntasks=") } == ["--ntasks=\(nodeCount)"])
+            #expect(arguments.filter { $0.hasPrefix("--ntasks-per-node=") } == ["--ntasks-per-node=1"])
+            #expect(arguments.contains("--gpu-bind=none"))
+            #expect(arguments.contains("--kill-on-bad-exit=0"))
+            let nvidiaArguments = try String(
+                contentsOf: fixture.directory.appendingPathComponent("nvidia-arguments"), encoding: .utf8
+            )
+            #expect(nvidiaArguments.contains("--query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total,power.draw,power.limit\n"))
+        }
+    }
+
+    @Test("One failed node does not suppress samples from other monitor steps")
+    func partialNodeMonitorFailure() async throws {
+        let fixture = try MonitoringShellFixture()
+        defer { fixture.remove() }
+        let command = try SlurmCommands.jobGPUUtilization(
+            platform: platform, jobID: #require(SlurmJobID(rawValue: "42"))
+        )
+        try fixture.write("identity", contents: "42 zli760 RUNNING 4")
+        try fixture.write("node-names", contents: "gpu01\ngpu02\ngpu03\ngpu04\n")
+        try fixture.write("step-gpus", contents: "7")
+        try fixture.write("cuda-gpus", contents: "0")
+        try fixture.write("failed-node", contents: "gpu02")
+        let output = try await fixture.run(command)
+        #expect(output.exitCode == 1)
+        let devices = try SlurmMonitoringParser.gpuUsage(output.stdout)
+        #expect(devices.map(\.nodeName) == ["gpu01", "gpu03", "gpu04"])
+        #expect(Set(devices.map(\.id)).count == 3)
+    }
+
+    @Test("Missing or unsafe node names fail before querying any GPU")
+    func invalidMonitorNodeNames() async throws {
+        let command = try SlurmCommands.jobGPUUtilization(
+            platform: platform, jobID: #require(SlurmJobID(rawValue: "42"))
+        )
+        for nodeName in ["", "gpu 01", "gpu/01", "gpu;echo", "-gpu01", String(repeating: "g", count: 256)] {
+            let fixture = try MonitoringShellFixture()
+            defer { fixture.remove() }
+            try fixture.write("identity", contents: "42 zli760 RUNNING 1")
+            try fixture.write("node-names", contents: nodeName + "\n")
+            try fixture.write("step-gpus", contents: "7")
+            try fixture.write("cuda-gpus", contents: "0")
+            let output = try await fixture.run(command)
+            #expect(output.exitCode == 75)
+            #expect(!fixture.exists("nvidia-arguments"))
+        }
+    }
+
+    @Test("Partial multi-node failures retain valid GPU metrics and report incomplete sampling")
+    func partialNodeFailureTelemetry() async throws {
+        let snapshot = try job("42", nodes: "4")
+        let runner = MonitoringFixtureRunner(
+            allocations: allocation("42", gpuCount: 4),
+            gpuOutput: """
+                gpu01, 0, GPU-first, NVIDIA A800, 95, 58000, 81920, 215, 400
+                gpu03, 0, GPU-third, NVIDIA A800, 94, 52000, 81920, 205, 400
+                gpu04, 0, GPU-fourth, NVIDIA A800, 92, 51000, 81920, 195, 400
+
+                """,
+            gpuExitCode: 1
+        )
+        let result = try await SlurmService(remoteRunner: runner).jobUtilization(
+            on: platform, jobs: [snapshot]
+        )
+        let sample = try #require(result[snapshot.jobID])
+        #expect(sample.gpus?.map(\.nodeName) == ["gpu01", "gpu03", "gpu04"])
+        #expect(sample.gpus?.first?.powerDrawWatts == 215)
+        let warning = try #require(sample.unavailableReason)
+        #expect(warning.contains("3"))
+        #expect(warning.contains("4"))
+    }
+
+    @Test("A failed multi-node monitor with no readings remains unavailable")
+    func allNodesFailTelemetry() async throws {
+        let snapshot = try job("42", nodes: "4")
+        let runner = MonitoringFixtureRunner(
+            allocations: allocation("42", gpuCount: 4), gpuOutput: "", gpuExitCode: 1
+        )
+        let result = try await SlurmService(remoteRunner: runner).jobUtilization(
+            on: platform, jobs: [snapshot]
+        )
+        let sample = try #require(result[snapshot.jobID])
+        #expect(sample.gpus == nil)
+        #expect(sample.allocation?.allocatedGPU == 4)
+        #expect(sample.unavailableReason?.isEmpty == false)
+    }
+
+    @Test("GPU samples larger than the allocation are discarded")
+    func excessiveGPUCountTelemetry() async throws {
+        let snapshot = try job("42", nodes: "2")
+        let runner = MonitoringFixtureRunner(
+            allocations: allocation("42", gpuCount: 2),
+            gpuOutput: """
+                gpu01, 0, GPU-first, NVIDIA A800, 95, 58000, 81920, 215, 400
+                gpu02, 0, GPU-second, NVIDIA A800, 93, 55000, 81920, 205, 400
+                gpu02, 1, GPU-third, NVIDIA A800, 94, 52000, 81920, 195, 400
+
+                """
+        )
+        let result = try await SlurmService(remoteRunner: runner).jobUtilization(
+            on: platform, jobs: [snapshot]
+        )
+        let sample = try #require(result[snapshot.jobID])
+        #expect(sample.gpus == nil)
+        #expect(sample.unavailableReason?.contains("不一致") == true)
+    }
+
     private func job(
         _ id: String, owner: String = "zli760", state: String = "RUNNING",
         nodes: String = "1"
@@ -287,16 +434,19 @@ private actor MonitoringFixtureRunner: SlurmRemoteCommandRunning {
     let allocations: String
     let statistics: String
     let gpuOutput: String
+    let gpuExitCode: Int32
     private var history: [(command: String, policy: String)] = []
 
     init(
         queue: String = "", allocations: String = "", statistics: String = "",
-        gpuOutput: String = "0, GPU-own, NVIDIA A800, 80, 1024, 81920\n"
+        gpuOutput: String = "gpu01, 0, GPU-own, NVIDIA A800, 80, 1024, 81920, 215, 400\n",
+        gpuExitCode: Int32 = 0
     ) {
         self.queue = queue
         self.allocations = allocations
         self.statistics = statistics
         self.gpuOutput = gpuOutput
+        self.gpuExitCode = gpuExitCode
     }
 
     func run(
@@ -324,7 +474,10 @@ private actor MonitoringFixtureRunner: SlurmRemoteCommandRunning {
         } else {
             stdout = queue
         }
-        return InventoryProcessOutput(stdout: stdout, stderr: "", exitCode: 0)
+        return InventoryProcessOutput(
+            stdout: stdout, stderr: "",
+            exitCode: remote.contains("SLURM_STEP_GPUS") ? gpuExitCode : 0
+        )
     }
 
     func policies() -> [String] { history.map(\.policy) }
@@ -343,23 +496,32 @@ private struct MonitoringShellFixture {
         try write(".bash_profile", contents: """
             export PATH="$TMUXHUB_FIXTURE_ROOT/bin:/usr/bin:/bin"
             """)
+        try write("node-names", contents: "gpu01\n")
         try executable("timeout", script: "shift 3\nexec \"$@\"")
         try executable("squeue", script: "cat \"$TMUXHUB_FIXTURE_ROOT/identity\"")
         try executable("srun", script: """
             touch "$TMUXHUB_FIXTURE_ROOT/srun-called"
+            printf '%s\\n' "$@" > "$TMUXHUB_FIXTURE_ROOT/srun-arguments"
             export SLURM_STEP_GPUS=$(cat "$TMUXHUB_FIXTURE_ROOT/step-gpus")
             unset CUDA_VISIBLE_DEVICES
             if [ -f "$TMUXHUB_FIXTURE_ROOT/cuda-gpus" ]; then
                 export CUDA_VISIBLE_DEVICES=$(cat "$TMUXHUB_FIXTURE_ROOT/cuda-gpus")
             fi
-            while [ "$#" -gt 0 ]; do
-                if [ "$1" = /bin/bash ]; then exec "$@"; fi
-                shift
-            done
-            exit 97
+            while [ "$#" -gt 0 ] && [ "$1" != /bin/bash ]; do shift; done
+            [ "$#" -gt 0 ] || exit 97
+            status=0
+            while IFS= read -r node || [ -n "$node" ]; do
+                export SLURMD_NODENAME="$node"
+                "$@" || status=$?
+            done < "$TMUXHUB_FIXTURE_ROOT/node-names"
+            exit "$status"
             """)
         try executable("nvidia-smi", script: """
             printf '%s\\n' "$@" > "$TMUXHUB_FIXTURE_ROOT/nvidia-arguments"
+            if [ -f "$TMUXHUB_FIXTURE_ROOT/failed-node" ] &&
+                [ "$(cat "$TMUXHUB_FIXTURE_ROOT/failed-node")" = "$SLURMD_NODENAME" ]; then
+                exit 1
+            fi
             ids=
             for argument in "$@"; do
                 case "$argument" in --id=*) ids=${argument#--id=} ;; esac
@@ -372,7 +534,7 @@ private struct MonitoringShellFixture {
                     GPU-*) index=$local_index; uuid=$id ;;
                     *) index=$id; uuid="GPU-fixture-$id" ;;
                 esac
-                printf '%s\\n' "$index, $uuid, NVIDIA A800, 80, 1024, 81920"
+                printf '%s\\n' "$index, $uuid, NVIDIA A800, 80, 1024, 81920, 215, 400"
                 local_index=$((local_index + 1))
             done
             """)
