@@ -322,6 +322,9 @@ struct TerminalTabBar: View {
             }
             Divider()
             Button("关闭标签") { terminals.close(tab.id) }
+            Button("关闭其他标签页") { terminals.closeOtherTabs(keeping: tab.id) }
+                .disabled(terminals.tabs.count <= 1)
+            Button("关闭所有标签页") { terminals.closeAllTabs() }
         }
     }
 

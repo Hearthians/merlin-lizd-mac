@@ -370,6 +370,20 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         persist()
     }
 
+    /// Bulk closing only disconnects tabs; it never terminates remote sessions.
+    func closeOtherTabs(keeping id: String) {
+        guard tabs.contains(where: { $0.id == id }) else { return }
+        let ids = tabs.filter { $0.id != id }.map(\.id)
+        selectedTabID = id
+        ids.forEach(close)
+    }
+
+    func closeAllTabs() {
+        let ids = tabs.map(\.id)
+        selectedTabID = nil
+        ids.forEach(close)
+    }
+
     func renameTab(_ id: String, to proposedTitle: String) {
         let title = String(
             proposedTitle.trimmingCharacters(in: .whitespacesAndNewlines)
