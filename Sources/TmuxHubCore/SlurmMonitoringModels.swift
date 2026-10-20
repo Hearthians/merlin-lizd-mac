@@ -51,6 +51,8 @@ public struct SlurmJobAllocation: Codable, Hashable, Sendable {
     public let allocatedCPU: Int?
     public let allocatedMemoryMiB: Int64?
     public let elapsedSeconds: TimeInterval?
+    /// Original TRES allocation, retained to distinguish full GPUs from MIG slices.
+    public var allocatedResources: String? = nil
 }
 
 public struct SlurmGPUUtilization: Codable, Hashable, Identifiable, Sendable {

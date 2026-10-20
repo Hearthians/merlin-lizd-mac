@@ -8,6 +8,7 @@ struct HPC2PlatformView: View {
 
     @State private var selectedList: JobList = .current
     @State private var showsStartSheet = false
+    @State private var showsCostRatesSheet = false
     @State private var pendingCancellation: SlurmManagedJob?
 
     var body: some View {
@@ -23,7 +24,14 @@ struct HPC2PlatformView: View {
                     preferredPartition: model.defaultPreset.partition
                 )
                 metrics
-                listPicker
+                HStack {
+                    listPicker
+                    Spacer()
+                    Button("计费标准", systemImage: "yensign.circle") {
+                        showsCostRatesSheet = true
+                    }
+                    .buttonStyle(.borderless)
+                }
                 if selectedList == .current {
                     currentJobs
                 } else {
@@ -49,6 +57,11 @@ struct HPC2PlatformView: View {
                 submissionFailureMessage: { model.notice }
             ) { profile, preset in
                 await model.start(profile: profile, preset: preset)
+            }
+        }
+        .sheet(isPresented: $showsCostRatesSheet) {
+            HPC2CostRatesSheet(configuration: model.costConfiguration) { configuration in
+                try model.saveCostConfiguration(configuration)
             }
         }
         .alert(
@@ -202,6 +215,14 @@ struct HPC2PlatformView: View {
         let jobs = model.activeJobs
         let unresolved = model.unresolvedRuns
         LazyVStack(spacing: 10) {
+            if model.hasLoadedJobs, !jobs.isEmpty || !unresolved.isEmpty {
+                HPC2CostSummaryView(
+                    estimates: jobs.compactMap { model.costEstimate(for: $0) },
+                    jobCount: jobs.count + unresolved.count,
+                    isHistory: false
+                )
+                .padding(.bottom, 6)
+            }
             if !model.hasLoadedJobs {
                 if case .stale = model.connectionState {
                     ContentUnavailableView(
@@ -280,6 +301,11 @@ struct HPC2PlatformView: View {
                     .frame(maxWidth: .infinity, minHeight: 240)
                 }
             } else {
+                HPC2CostSummaryView(
+                    estimates: model.visibleAccountingHistory.compactMap { model.costEstimate(for: $0) },
+                    jobCount: model.visibleAccountingHistory.count + model.localOnlyHistoryRuns.count,
+                    isHistory: true
+                )
                 LazyVStack(spacing: 10) {
                     ForEach(model.visibleAccountingHistory) { record in
                         accountingHistoryRow(record)
@@ -335,6 +361,10 @@ struct HPC2PlatformView: View {
                         job: job,
                         snapshot: model.jobUtilization[job.jobID],
                         isRefreshing: model.isRefreshingMonitoring
+                    )
+                    HPC2JobCostView(
+                        estimate: model.costEstimate(for: job), showsHourlyRate: true,
+                        isPending: job.state == .pending
                     )
                 }
                 Spacer(minLength: 12)
@@ -412,6 +442,7 @@ struct HPC2PlatformView: View {
                         .font(.caption.monospaced())
                         .foregroundStyle(.secondary)
                 }
+                HPC2JobCostView(estimate: model.costEstimate(for: record))
                 if let endTime = record.endTime {
                     Text("结束于 \(endTime.replacingOccurrences(of: "T", with: " ")) · 集群时间")
                         .font(.caption)
@@ -438,6 +469,9 @@ struct HPC2PlatformView: View {
                         .font(.caption.monospaced())
                         .foregroundStyle(.secondary)
                     Text(run.updatedAt.formatted(date: .abbreviated, time: .shortened))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("计算费用估计 — · 本机记录缺少 Slurm 计费资源或完整时长")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

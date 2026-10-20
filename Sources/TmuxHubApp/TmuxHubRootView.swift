@@ -61,11 +61,17 @@ struct TmuxHubRootView: View {
                     }
                     .background(WindowHeaderDragArea())
                 }
-                if terminals.selectedTabID != nil {
-                    TerminalWorkspaceView(terminals: terminals)
-                } else {
-                    selectedContent
+                Group {
+                    if terminals.selectedTabID != nil {
+                        TerminalWorkspaceView(terminals: terminals)
+                    } else {
+                        selectedContent
+                    }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                // Scroll views must stop at the tab bar, even when the window
+                // content extends into the native title-bar area.
+                .clipped()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color(nsColor: .windowBackgroundColor))

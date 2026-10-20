@@ -12,6 +12,7 @@ enum HPC2ConfigurationError: LocalizedError, Equatable {
     case launchInProgress
     case invalidProfile
     case invalidPreset
+    case invalidCostRates
     case activeJobs
 
     var errorDescription: String? {
@@ -22,6 +23,8 @@ enum HPC2ConfigurationError: LocalizedError, Equatable {
             "平台配置无效，请检查显示名称、SSH 登录目标和集群用户名。"
         case .invalidPreset:
             "资源配置无效，请检查环境名称、分区和资源参数。"
+        case .invalidCostRates:
+            "费用单价必须是有效的非负数。"
         case .activeJobs:
             "当前仍有活动或待确认的 TmuxHub 任务，暂时不能更改 SSH 主机别名或集群用户名。请先结束任务并刷新状态，或恢复原配置。"
         }
@@ -67,6 +70,7 @@ struct HPC2ManagedRunRecord: Codable, Hashable, Identifiable, Sendable {
 final class HPC2PlatformModel: ObservableObject {
     @Published private(set) var profile: SlurmPlatformProfile
     @Published private(set) var defaultPreset: SlurmInteractivePreset
+    @Published private(set) var costConfiguration: SlurmCostConfiguration
     @Published private(set) var jobs: [SlurmJobSnapshot] = []
     @Published var historyRange: SlurmHistoryRange = .month
     @Published private(set) var accountingHistory: [SlurmJobHistoryRecord] = []
@@ -91,6 +95,7 @@ final class HPC2PlatformModel: ObservableObject {
     private let now: @Sendable () -> Date
     private let profileKey = "hpc2-platform-profile-v1"
     private let presetKey = "hpc2-interactive-preset-v1"
+    private let costConfigurationKey = "hpc2-cost-configuration-v1"
     private let managedRunsKey = "hpc2-managed-runs-v1"
     private let freshnessInterval: TimeInterval = 30
     private let unresolvedLaunchInterval: TimeInterval = 120
@@ -131,6 +136,12 @@ final class HPC2PlatformModel: ObservableObject {
         defaultPreset = decodedPreset.flatMap(Self.validPreset)
             ?? Self.makeDefaultPreset()
 
+        let decodedCosts = Self.decode(
+            SlurmCostConfiguration.self,
+            from: defaults.data(forKey: costConfigurationKey)
+        )
+        costConfiguration = decodedCosts.flatMap { $0.isValid ? $0 : nil } ?? .hkustHPC2
+
         let decodedRuns: [HPC2ManagedRunRecord] = Self.decode(
             [HPC2ManagedRunRecord].self,
             from: defaults.data(forKey: managedRunsKey)
@@ -145,6 +156,29 @@ final class HPC2PlatformModel: ObservableObject {
         {
             defaults.set(data, forKey: managedRunsKey)
         }
+    }
+
+    func saveCostConfiguration(_ configuration: SlurmCostConfiguration) throws {
+        guard configuration.isValid else { throw HPC2ConfigurationError.invalidCostRates }
+        let data = try JSONEncoder().encode(configuration)
+        defaults.set(data, forKey: costConfigurationKey)
+        costConfiguration = configuration
+    }
+
+    func costEstimate(for job: SlurmJobSnapshot) -> SlurmCostEstimate? {
+        guard let allocation = jobUtilization[job.jobID]?.allocation else { return nil }
+        return SlurmCostEstimator.estimate(
+            partition: job.partition,
+            allocatedCPU: allocation.allocatedCPU,
+            allocatedGPU: allocation.allocatedGPU,
+            elapsedSeconds: allocation.elapsedSeconds,
+            configuration: costConfiguration,
+            allocatedResources: allocation.allocatedResources
+        )
+    }
+
+    func costEstimate(for record: SlurmJobHistoryRecord) -> SlurmCostEstimate? {
+        SlurmCostEstimator.estimate(history: record, configuration: costConfiguration)
     }
 
     var activeJobs: [SlurmJobSnapshot] {

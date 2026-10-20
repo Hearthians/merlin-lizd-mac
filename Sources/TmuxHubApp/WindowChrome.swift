@@ -15,8 +15,18 @@ struct WindowHeaderDragArea: NSViewRepresentable {
 }
 
 private final class WindowHeaderDragView: NSView {
+    private var toolbarObservation: NSKeyValueObservation?
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        // NavigationSplitView can install a new toolbar after navigation or a
+        // sidebar change. Remove that replacement too, without hiding the
+        // native title bar (which would also hide the traffic-light controls).
+        toolbarObservation = window?.observe(\.toolbar, options: [.new]) { [weak self] _, _ in
+            DispatchQueue.main.async { [weak self] in
+                self?.configureWindow()
+            }
+        }
         DispatchQueue.main.async { [weak self] in
             self?.configureWindow()
         }

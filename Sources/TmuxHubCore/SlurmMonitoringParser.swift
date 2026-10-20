@@ -77,7 +77,8 @@ public enum SlurmMonitoringParser {
                 allocatedGPU: tres.flatMap { $0.isEmpty ? 0 : gpuCount($0) },
                 allocatedCPU: integer(tres?["cpu"]) ?? (hasAllocation ? integer(fields["NumCPUs"]) : nil),
                 allocatedMemoryMiB: memoryMiB(tres?["mem"]),
-                elapsedSeconds: duration(fields["RunTime"])
+                elapsedSeconds: duration(fields["RunTime"]),
+                allocatedResources: hasAllocation ? fields["AllocTRES"] : nil
             )
         }
         return result
@@ -238,7 +239,7 @@ public enum SlurmMonitoringParser {
     }
 
     private static func records(_ output: String, section: String) throws -> [[String: String]] {
-        let pattern = try NSRegularExpression(pattern: #"(?:^|\s)([A-Za-z][A-Za-z0-9_]*)="#)
+        let pattern = try NSRegularExpression(pattern: #"(?:^|\s)([A-Za-z][A-Za-z0-9_:/]*)="#)
         return try lines(output).enumerated().map { index, line in
             let string = line as NSString
             let matches = pattern.matches(in: line, range: NSRange(location: 0, length: string.length))
