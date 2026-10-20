@@ -6,7 +6,7 @@ import AppKit
 @main
 struct LinkSmoke {
     @MainActor
-    static func main() throws {
+    static func main() async throws {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 820, height: 440),
@@ -24,6 +24,8 @@ struct LinkSmoke {
             + "\u{1b}]8;id=fixture;file:///tmp/result.png\u{1b}\\open file\u{1b}]8;;\u{1b}\\")
         var opened: [(String, [String: String])] = []
         view.openLink = { opened.append(($0, $1)) }
+        var browsed: [(String, [String: String])] = []
+        view.browseFile = { browsed.append(($0, $1)) }
 
         func event(_ type: NSEvent.EventType, row: Int = 0, col: Int = 3,
                    flags: NSEvent.ModifierFlags = [], clickCount: Int = 1) -> NSEvent {
@@ -42,6 +44,7 @@ struct LinkSmoke {
             terminal.resetToInitialState()
             terminal.feed(text: text)
             opened.removeAll()
+            browsed.removeAll()
             recorder.sent.removeAll()
         }
 
@@ -52,6 +55,7 @@ struct LinkSmoke {
             view.mouseUp(with: event(.leftMouseUp, row: toRow, col: toCol, flags: flags))
             precondition(view.selectionActive, "The fixture must create an actual mouse selection")
             precondition(opened.isEmpty, "Selecting text must not activate it")
+            precondition(browsed.isEmpty, "Selecting text must not browse a file")
         }
 
         func commandRightClick(row: Int = 3, col: Int = 3) {
@@ -59,12 +63,62 @@ struct LinkSmoke {
             view.rightMouseUp(with: event(.rightMouseUp, row: row, col: col, flags: .command))
         }
 
+        func waitForSingleClick() async throws {
+            try await Task.sleep(nanoseconds: UInt64((NSEvent.doubleClickInterval + 0.05) * 1_000_000_000))
+        }
+
         precondition(view.link(at: event(.rightMouseDown))?.link == "outputs/result.png")
         for flags: NSEvent.ModifierFlags in [[], .command] {
             view.mouseDown(with: event(.leftMouseDown, flags: flags))
             view.mouseUp(with: event(.leftMouseUp, flags: flags))
-            precondition(opened.isEmpty, "Left-click must not activate a file, even with Command")
+            precondition(opened.isEmpty, "Left-click must not download a file")
+            precondition(browsed.isEmpty, "Browsing must wait until the double-click interval ends")
+            try await waitForSingleClick()
+            precondition(browsed.map(\.0) == (flags.isEmpty ? ["outputs/result.png"] : []),
+                         "Only a plain left-click must browse the file")
+            browsed.removeAll()
         }
+
+        view.mouseDown(with: event(.leftMouseDown))
+        precondition(browsed.isEmpty, "Browsing must wait for mouse-up")
+        view.mouseUp(with: event(.leftMouseUp, row: 2))
+        precondition(browsed.isEmpty, "Releasing on a different file must cancel browsing")
+        view.mouseDown(with: event(.leftMouseDown))
+        view.mouseDragged(with: event(.leftMouseDragged, col: 10))
+        view.mouseDragged(with: event(.leftMouseDragged))
+        view.mouseUp(with: event(.leftMouseUp))
+        precondition(browsed.isEmpty, "Dragging away and back must not browse")
+        view.selectNone()
+        view.mouseDown(with: event(.leftMouseDown))
+        view.mouseUp(with: event(.leftMouseUp, flags: .shift))
+        precondition(browsed.isEmpty, "Adding a modifier must cancel browsing")
+        view.mouseDown(with: event(.leftMouseDown, col: 40))
+        view.mouseUp(with: event(.leftMouseUp))
+        precondition(browsed.isEmpty, "A file click must start on the file")
+        for clickTotal in [2, 3] {
+            view.selectNone()
+            for count in 1...clickTotal {
+                view.mouseDown(with: event(.leftMouseDown, clickCount: count))
+                view.mouseUp(with: event(.leftMouseUp, clickCount: count))
+                if count < clickTotal {
+                    try await Task.sleep(nanoseconds: UInt64(NSEvent.doubleClickInterval * 250_000_000))
+                }
+            }
+            try await waitForSingleClick()
+            precondition(browsed.isEmpty, "Real double/triple-click sequences must cancel browsing")
+            precondition(view.selectionActive && !(view.getSelection() ?? "").isEmpty,
+                         "Double/triple-clicking must retain text selection")
+        }
+        view.selectNone()
+        view.mouseDown(with: event(.leftMouseDown))
+        view.mouseUp(with: event(.leftMouseUp))
+        view.mouseDown(with: event(.leftMouseDown, col: 1))
+        view.mouseDragged(with: event(.leftMouseDragged, col: 8))
+        view.mouseUp(with: event(.leftMouseUp, col: 8))
+        try await waitForSingleClick()
+        precondition(browsed.isEmpty && view.selectionActive,
+                     "Starting a selection after the first click must cancel scheduled browsing")
+        view.selectNone()
         for flags: NSEvent.ModifierFlags in [[], .option, .control] {
             view.rightMouseDown(with: event(.rightMouseDown, flags: flags))
             view.rightMouseUp(with: event(.rightMouseUp, flags: flags))
@@ -111,7 +165,11 @@ struct LinkSmoke {
 
         view.mouseDown(with: event(.leftMouseDown, row: 2))
         view.mouseUp(with: event(.leftMouseUp, row: 2))
-        precondition(opened.isEmpty, "OSC 8 file links also require the file gesture")
+        precondition(opened.isEmpty, "OSC 8 left-click must browse without downloading")
+        try await waitForSingleClick()
+        precondition(browsed.first?.0 == "file:///tmp/result.png")
+        precondition(browsed.first?.1["id"] == "fixture", "Browsing must retain OSC 8 metadata")
+        browsed.removeAll()
         view.rightMouseDown(with: event(.rightMouseDown, row: 2, flags: .command))
         view.rightMouseUp(with: event(.rightMouseUp, row: 2, flags: .command))
         precondition(opened.first?.0 == "file:///tmp/result.png")
@@ -123,8 +181,27 @@ struct LinkSmoke {
         view.mouseDown(with: event(.leftMouseDown))
         view.mouseUp(with: event(.leftMouseUp))
         precondition(opened.isEmpty)
+        try await waitForSingleClick()
+        precondition(browsed.map(\.0) == ["outputs/result.png"] && recorder.sent.isEmpty,
+                     "A file click must browse without leaking a mouse event to tmux")
+        browsed.removeAll()
+        view.mouseDown(with: event(.leftMouseDown))
+        _ = view.resignFirstResponder()
+        view.mouseUp(with: event(.leftMouseUp))
+        precondition(browsed.isEmpty && recorder.sent.isEmpty,
+                     "Losing focus during a file click must cancel it without an unmatched mouse release")
+        _ = view.becomeFirstResponder()
+        view.mouseDown(with: event(.leftMouseDown))
+        view.mouseUp(with: event(.leftMouseUp))
+        _ = view.resignFirstResponder()
+        try await waitForSingleClick()
+        precondition(browsed.isEmpty && recorder.sent.isEmpty,
+                     "Losing focus during the double-click interval must cancel scheduled browsing")
+        _ = view.becomeFirstResponder()
+        view.mouseDown(with: event(.leftMouseDown, col: 40))
+        view.mouseUp(with: event(.leftMouseUp, col: 40))
         precondition(recorder.sent.count == 2 && recorder.sent[0].hasSuffix("M") && recorder.sent[1].hasSuffix("m"),
-                     "Declining a link must preserve the terminal's mouse press/release pair")
+                     "Clicks outside file links must preserve the terminal's mouse press/release pair")
         recorder.sent.removeAll()
         view.rightMouseDown(with: event(.rightMouseDown, flags: .command))
         view.rightMouseUp(with: event(.rightMouseUp, flags: .command))
@@ -295,7 +372,7 @@ struct LinkSmoke {
         view.mouseUp(with: event(.leftMouseUp, row: 3, col: 1, flags: .shift))
         precondition(view.getSelection() == json && recorder.sent.isEmpty,
                      "Shift bypass must retain the complete local selection without reporting mouse events")
-        print("Link UI smoke passed: selection-first file gestures, wrapped paths, URLs, OSC 8, tmux mouse reporting, and full-prefix text selection.")
+        print("Link UI smoke passed: left-click browsing, selection-first downloads, wrapped paths, URLs, OSC 8, and tmux mouse reporting.")
     }
 }
 

@@ -3,8 +3,9 @@
 ## Scope
 
 The app manages local and arbitrary OpenSSH targets. A remote terminal always
-attaches to a tmux session. Platform-specific inventories, nested login
-commands, metrics dashboards and agent integrations are out of scope.
+attaches to a tmux or Herdr session. The host mesh adds explicit membership,
+directed connectivity checks, onboarding, and two independent throughput tests.
+Nested login commands and agent integrations are out of scope.
 
 ## Target model
 
@@ -67,6 +68,42 @@ Quick connect first selects an existing tab for the destination. When none
 exists, it derives one deterministic, bounded tmux session name from the exact
 SSH destination. Explicit "new session" actions continue to create a unique
 session name.
+
+## Host mesh
+
+SSH catalog entries and the local host are candidates, not enrolled members.
+A physical host groups endpoints; each endpoint belongs to an explicit runtime,
+account and platform. Windows and WSL have separate SSH identities. Users select
+the mesh membership, while all registered hosts retain independent online status.
+
+The persisted reconciliation journal tracks desired membership, runtime public
+keys, authenticated host keys, and pending add/revoke tasks. New members receive
+bidirectional authorization with existing members. Removal revokes only tagged
+TmuxHub mesh keys and managed configuration on both sides, retrying offline sides
+later. Management access remains available for health and cleanup. User keys and
+existing sessions remain intact.
+
+The Mac's management key is separate from each runtime's mesh key. Private keys
+never leave their originating environment. First authentication and trust are
+interactive; host keys for other peers come from authenticated management
+connections. Managed direct connections use the mesh key, a dedicated known-hosts
+file, strict host-key checking, and no implicit proxy. A changed fingerprint or
+authentication failure blocks the operation. Campus-to-ZeroTier fallback applies
+only to management or direct network failures, not trust/authentication failures.
+
+Endpoint health runs approximately every 30 seconds. Full directed member checks
+run independently about every five minutes, without overlapping runs. Sleep,
+network changes, missed polling intervals, and restart invalidate current state;
+old measurements remain timestamped history. A timeout means unreachable from the
+observer, not proof that the machine is powered off.
+
+Every mesh edge executes from its actual source runtime and binds the selected
+source IP. The Mac-to-source control channel is excluded from transfer timing.
+SSH throughput uses a complete 32 MiB encrypted stream; iperf3 uses a separate
+short receiver-measured run. Mbps uses decimal bits per second. Results retain
+source/target endpoint snapshots, and partial or unverified measurements do not
+become successful metrics. Bandwidth tests require reachable test ports and tools
+on both ends. Temporary test listeners are owned and bounded by the test lifecycle.
 
 ## Session discovery and identity
 

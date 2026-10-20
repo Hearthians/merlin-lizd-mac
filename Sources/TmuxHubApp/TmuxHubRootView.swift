@@ -6,10 +6,12 @@ struct TmuxHubRootView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var terminals: TerminalTabsModel
     @ObservedObject var hpc2: HPC2PlatformModel
+    @ObservedObject var mesh: NetworkMeshModel
     var propertiesReader = SSHHostPropertiesReader()
     @State private var sessionBrowserTarget: TerminalTarget?
     @State private var herdrBrowserTarget: TerminalTarget?
     @State private var showsAddSSHHost = false
+    @State private var fileBrowserDestination: String?
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var propertiesTarget: PropertiesTarget?
 
@@ -79,6 +81,15 @@ struct TmuxHubRootView: View {
         }
         .toolbar(removing: .sidebarToggle)
         .ignoresSafeArea(.container, edges: .top)
+        .sheet(isPresented: Binding(
+            get: { fileBrowserDestination != nil },
+            set: { if !$0 { fileBrowserDestination = nil } }
+        )) {
+            if let destination = fileBrowserDestination {
+                RemoteFileBrowser(alias: destination, service: terminals.remoteFileService)
+            }
+        }
+        .task { await mesh.startMonitoring(sshHosts: model.hosts) }
         .focusedSceneValue(\.addSSHHost, { showsAddSSHHost = true })
         .focusedSceneValue(\.refreshHub, refresh)
         .focusedSceneValue(\.toggleHubSidebar, toggleSidebar)
@@ -156,8 +167,24 @@ struct TmuxHubRootView: View {
                 .font(.system(size: 12, weight: .semibold))
                 .lineLimit(1)
                 .minimumScaleFactor(0.9)
+                .layoutPriority(-1)
 
             Spacer(minLength: 4)
+
+            Menu {
+                ForEach(model.hosts, id: \.destination) { host in
+                    Button(host.destination) { fileBrowserDestination = host.destination }
+                }
+            } label: {
+                Image(systemName: "folder")
+                    .frame(width: 20, height: 24)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("选择 SSH 主机，浏览和下载文件")
+            .accessibilityLabel("远程文件")
+            .disabled(model.hosts.isEmpty)
 
             Button {
                 showsAddSSHHost = true
@@ -201,7 +228,9 @@ struct TmuxHubRootView: View {
     }
 
     private func refresh() {
-        if model.selection == .platform("hkust-hpc2") {
+        if model.selection == .mesh {
+            Task { await mesh.refresh(sshHosts: model.hosts) }
+        } else if model.selection == .platform("hkust-hpc2") {
             Task { await hpc2.refresh(force: true) }
         } else {
             model.refresh()
@@ -219,6 +248,13 @@ struct TmuxHubRootView: View {
             ) { destination in
                 model.selection = .host(destination)
             }
+        case .mesh:
+            NetworkMeshView(
+                model: mesh,
+                sshHosts: model.hosts,
+                onConnect: terminals.openOrResumeSSH,
+                onHostsChanged: model.refresh
+            )
         case .local:
             LocalTerminalLandingView(
                 terminals: terminals,

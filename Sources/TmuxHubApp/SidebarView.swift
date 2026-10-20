@@ -34,6 +34,12 @@ struct SidebarView: View {
                     tint: .blue,
                     selection: .overview
                 )
+                sidebarRow(
+                    title: "主机互联",
+                    symbol: "point.3.connected.trianglepath.dotted",
+                    tint: .orange,
+                    selection: .mesh
+                )
                 HStack {
                     sidebarRow(
                         title: "本机",

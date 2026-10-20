@@ -207,6 +207,62 @@ public enum AttachmentPaths {
         return normalized
     }
 
+    /// Agent dashboards can start from HOME while the workspace lives below it.
+    /// Prefer the exact context path, then accept only a unique full-suffix
+    /// match in the existing one- and two-directory workspace layouts.
+    static func lookupScript(
+        resolved: String,
+        relative: String?,
+        includingDirectories: Bool
+    ) throws -> String {
+        try validate(resolved)
+        let candidate = try shellQuote(resolved)
+        let exists = includingDirectories
+            ? "[ -f \"$candidate\" ] || [ -d \"$candidate\" ]"
+            : "[ -f \"$candidate\" ]"
+        var script = "candidate=\(candidate); "
+            + "if \(exists); then "
+            + "printf '%s\\n' \"$candidate\"; exit 0; fi"
+        if let relative {
+            script += "; relative=" + (try shellQuote(relative))
+                + "; for root in \"$HOME\" \"$HOME\"/* \"$HOME\"/*/*; do "
+                + "[ -d \"$root\" ] || continue; "
+                + "candidate=\"$root/$relative\"; "
+                + "if \(exists); then printf '%s\\n' \"$candidate\"; fi; "
+                + "done; exit 0"
+        } else {
+            script += "; exit 0"
+        }
+        return script
+    }
+
+    static func lookupResult(
+        _ output: String,
+        resolved: String,
+        relative: String?,
+        remotePath: String
+    ) throws -> String {
+        let suffix = relative.map { "/" + $0 }
+        var matches: [String] = []
+        var seen: Set<String> = []
+        for line in output.split(separator: "\n", omittingEmptySubsequences: true) {
+            let path = String(line)
+            guard (try? validate(path)) != nil else { continue }
+            let standardized = (path as NSString).standardizingPath
+            guard standardized == resolved
+                || suffix.map({ standardized.hasSuffix($0) }) == true
+            else { continue }
+            if seen.insert(standardized).inserted { matches.append(standardized) }
+        }
+        guard !matches.isEmpty else {
+            throw AttachmentError.fileNotFound(resolved)
+        }
+        guard matches.count == 1, let match = matches.first else {
+            throw AttachmentError.ambiguousRemotePath(relative ?? remotePath)
+        }
+        return match
+    }
+
     private static func linkPath(_ link: String) throws -> String {
         guard !link.isEmpty,
             !link.unicodeScalars.contains(where: {
@@ -442,15 +498,28 @@ public actor AttachmentTransferService {
         }
     }
 
-    /// Resolve a terminal link before showing the Save panel. Agent dashboards
-    /// can run from `$HOME` while their active workspace lives deeper below it,
-    /// making tmux's `pane_current_path` an incomplete base for relative output.
-    /// Prefer the exact pane-relative path; if it is absent, inspect the common
-    /// one- and two-directory workspace layouts below `$HOME`, accepting only a
-    /// unique file with the same full relative suffix.
+    /// Resolve a terminal file link before showing the Save panel. The remote
+    /// lookup accepts regular files only, preserving download behavior.
     public func resolveDownloadPath(
         _ remotePath: String,
         context: AttachmentContext
+    ) async throws -> String {
+        try await resolvePath(remotePath, context: context, includingDirectories: false)
+    }
+
+    /// Resolve a file or directory link for browsing in SFTP Downloader. The
+    /// captured terminal context remains the first and authoritative location.
+    public func resolveBrowsePath(
+        _ remotePath: String,
+        context: AttachmentContext
+    ) async throws -> String {
+        try await resolvePath(remotePath, context: context, includingDirectories: true)
+    }
+
+    private func resolvePath(
+        _ remotePath: String,
+        context: AttachmentContext,
+        includingDirectories: Bool
     ) async throws -> String {
         let resolved = try AttachmentPaths.resolvedRemotePath(
             remotePath,
@@ -464,24 +533,14 @@ public actor AttachmentTransferService {
             return resolved
         case let .ssh(alias):
             // A Herdr reference already identifies the exact project. A missing
-            // file must not silently resolve to another workspace under HOME.
+            // path must not silently resolve to another workspace under HOME.
             let relative = context.herdrReference == nil
                 ? try AttachmentPaths.searchableRelativePath(remotePath) : nil
-            let candidate = try AttachmentPaths.shellQuote(resolved)
-            var script = "candidate=\(candidate); "
-                + "if [ -f \"$candidate\" ]; then "
-                + "printf '%s\\n' \"$candidate\"; exit 0; fi"
-            if let relative {
-                script += "; relative="
-                    + (try AttachmentPaths.shellQuote(relative))
-                    + "; for root in \"$HOME\" \"$HOME\"/* \"$HOME\"/*/*; do "
-                    + "[ -d \"$root\" ] || continue; "
-                    + "candidate=\"$root/$relative\"; "
-                    + "[ -f \"$candidate\" ] && printf '%s\\n' \"$candidate\"; "
-                    + "done; exit 0"
-            } else {
-                script += "; exit 0"
-            }
+            let script = try AttachmentPaths.lookupScript(
+                resolved: resolved,
+                relative: relative,
+                includingDirectories: includingDirectories
+            )
             let command = CommandSpec(executable: "/usr/bin/ssh", arguments: [
                 "-nT", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                 alias, script,
@@ -497,25 +556,12 @@ public actor AttachmentTransferService {
             guard output.exitCode == 0 else {
                 throw AttachmentError.remotePathLookupFailed
             }
-            let suffix = relative.map { "/" + $0 }
-            var matches: [String] = []
-            var seen: Set<String> = []
-            for line in output.stdout.split(separator: "\n", omittingEmptySubsequences: true) {
-                let path = String(line)
-                guard (try? AttachmentPaths.validate(path)) != nil else { continue }
-                let standardized = (path as NSString).standardizingPath
-                guard standardized == resolved
-                    || suffix.map({ standardized.hasSuffix($0) }) == true
-                else { continue }
-                if seen.insert(standardized).inserted { matches.append(standardized) }
-            }
-            guard !matches.isEmpty else {
-                throw AttachmentError.fileNotFound(resolved)
-            }
-            guard matches.count == 1, let match = matches.first else {
-                throw AttachmentError.ambiguousRemotePath(relative ?? remotePath)
-            }
-            return match
+            return try AttachmentPaths.lookupResult(
+                output.stdout,
+                resolved: resolved,
+                relative: relative,
+                remotePath: remotePath
+            )
         }
     }
 }

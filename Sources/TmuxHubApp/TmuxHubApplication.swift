@@ -9,6 +9,7 @@ struct TmuxHubApplication: App {
     @StateObject private var model: AppModel
     @StateObject private var terminals: TerminalTabsModel
     @StateObject private var hpc2: HPC2PlatformModel
+    @StateObject private var mesh: NetworkMeshModel
     private let runtime: HubRuntime
 
     init() {
@@ -16,6 +17,7 @@ struct TmuxHubApplication: App {
         let model = AppModel()
         self.runtime = runtime
         _model = StateObject(wrappedValue: model)
+        _mesh = StateObject(wrappedValue: NetworkMeshModel())
         let terminals = TerminalTabsModel(
                 runtime: runtime,
                 onRemoteHostUsed: { [weak model] destination, date in
@@ -31,7 +33,7 @@ struct TmuxHubApplication: App {
 
     var body: some Scene {
         WindowGroup("TmuxHub") {
-            TmuxHubRootView(model: model, terminals: terminals, hpc2: hpc2)
+            TmuxHubRootView(model: model, terminals: terminals, hpc2: hpc2, mesh: mesh)
                 .frame(minWidth: 900, minHeight: 600)
         }
         .defaultSize(width: 1160, height: 760)

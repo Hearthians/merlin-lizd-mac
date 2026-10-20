@@ -58,6 +58,7 @@ final class TerminalSession: ObservableObject, Identifiable,
         terminalView.hoverChanged = { [weak attachmentModel] in attachmentModel?.isDropTargeted = $0 }
         terminalView.inputChanged = { [weak attachmentModel] in attachmentModel?.noteInteraction() }
         terminalView.openLink = { [weak self] link, _ in self?.open(link: link) }
+        terminalView.browseFile = { [weak self] link, _ in self?.open(link: link, browseInSFTP: true) }
         attachmentModel.bind(
             canInsert: { [weak self] in
                 guard let self else { return false }
@@ -123,7 +124,7 @@ final class TerminalSession: ObservableObject, Identifiable,
         linkTransferMessage = nil
     }
 
-    private func open(link: String) {
+    private func open(link: String, browseInSFTP: Bool = false) {
         guard state == .running, isSelected, linkTask == nil,
             savePanel == nil else { return }
         if let url = URL(string: link), let scheme = url.scheme,
@@ -152,18 +153,40 @@ final class TerminalSession: ObservableObject, Identifiable,
                     localDirectory: localWorkingDirectory(),
                     herdrReference: attachmentModel.herdrReference
                 )
-                let resolvedPath = try await attachmentService.resolveDownloadPath(
-                    link,
-                    context: context
-                )
+                let resolvedPath: String
+                if browseInSFTP {
+                    resolvedPath = try await attachmentService.resolveBrowsePath(link, context: context)
+                } else {
+                    resolvedPath = try await attachmentService.resolveDownloadPath(link, context: context)
+                }
                 try Task.checkCancellation()
+                guard state == .running, isSelected else { throw CancellationError() }
                 switch context.target {
                 case .local:
                     linkTask = nil
                     isLinkTransferActive = false
                     linkTransferMessage = nil
                     NSWorkspace.shared.open(URL(fileURLWithPath: resolvedPath))
-                case .ssh:
+                case let .ssh(alias):
+                    if browseInSFTP {
+                        let url = try SFTPDownloaderLink.url(host: alias, path: resolvedPath)
+                        guard let application = NSWorkspace.shared.urlForApplication(
+                            withBundleIdentifier: "local.sftp-downloader"
+                        ) else {
+                            throw NSError(domain: "TmuxHub.SFTPDownloader", code: 1, userInfo: [
+                                NSLocalizedDescriptionKey: "未找到 SFTP Downloader，请先安装支持文件位置联动的版本。"
+                            ])
+                        }
+                        let configuration = NSWorkspace.OpenConfiguration()
+                        configuration.activates = true
+                        _ = try await NSWorkspace.shared.open(
+                            [url], withApplicationAt: application, configuration: configuration
+                        )
+                        linkTask = nil
+                        isLinkTransferActive = false
+                        linkTransferMessage = nil
+                        return
+                    }
                     linkTask = nil
                     isLinkTransferActive = false
                     linkTransferMessage = nil

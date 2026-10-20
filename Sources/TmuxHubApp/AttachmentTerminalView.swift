@@ -7,6 +7,7 @@ final class AttachmentTerminalView: LocalProcessTerminalView {
     var hoverChanged: ((Bool) -> Void)?
     var inputChanged: (() -> Void)?
     var openLink: ((String, [String: String]) -> Void)?
+    var browseFile: ((String, [String: String]) -> Void)?
     private struct FileClickTarget: Equatable {
         let link: String
         let params: [String: String]
@@ -16,6 +17,15 @@ final class AttachmentTerminalView: LocalProcessTerminalView {
     }
     private var pendingFileClick: (target: FileClickTarget, location: NSPoint)?
     private var fileClickWasDragged = false
+    private var pendingBrowseClick: (target: FileClickTarget, location: NSPoint)?
+    private var browseClickWasDragged = false
+    private var suppressLinkActivation = false
+    private var browseTask: Task<Void, Never>?
+
+    private func cancelScheduledBrowse() {
+        browseTask?.cancel()
+        browseTask = nil
+    }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -30,30 +40,92 @@ final class AttachmentTerminalView: LocalProcessTerminalView {
     }
 
     override func paste(_ sender: Any) {
+        cancelScheduledBrowse()
         inputChanged?()
         if receiveAttachments?(NSPasteboard.general, false) == true { return }
         super.paste(sender)
     }
 
     override func keyDown(with event: NSEvent) {
+        cancelScheduledBrowse()
         inputChanged?()
         super.keyDown(with: event)
     }
 
     override func mouseDown(with event: NSEvent) {
+        cancelScheduledBrowse()
         pendingFileClick = nil
+        pendingBrowseClick = nil
+        browseClickWasDragged = false
         inputChanged?()
+        if event.clickCount == 1, event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
+            let match = link(at: event), Self.isFileLink(match.link)
+        {
+            pendingBrowseClick = (FileClickTarget(link: match.link, params: match.params, selection: nil),
+                                  event.locationInWindow)
+            // Seed normal text selection without leaking a half-click to tmux.
+            let reporting = allowMouseReporting
+            allowMouseReporting = false
+            super.mouseDown(with: event)
+            allowMouseReporting = reporting
+            return
+        }
         super.mouseDown(with: event)
     }
 
+    override func mouseDragged(with event: NSEvent) {
+        cancelScheduledBrowse()
+        guard pendingBrowseClick != nil else {
+            super.mouseDragged(with: event)
+            return
+        }
+        browseClickWasDragged = true
+        let reporting = allowMouseReporting
+        allowMouseReporting = false
+        super.mouseDragged(with: event)
+        allowMouseReporting = reporting
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard let pendingBrowseClick else {
+            super.mouseUp(with: event)
+            return
+        }
+        self.pendingBrowseClick = nil
+        // Finish selection cleanup even if the pointer moved to a different URL.
+        let reporting = allowMouseReporting
+        allowMouseReporting = false
+        suppressLinkActivation = true
+        super.mouseUp(with: event)
+        suppressLinkActivation = false
+        allowMouseReporting = reporting
+        guard !browseClickWasDragged, !selectionActive, event.clickCount == 1,
+            event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
+            distance(from: pendingBrowseClick.location, to: event.locationInWindow) <= 4,
+            let match = link(at: event), match.link == pendingBrowseClick.target.link,
+            match.params == pendingBrowseClick.target.params
+        else { return }
+        // A double-click starts with this same first down/up pair. Give the
+        // system click sequence time to finish before opening another app.
+        let delay = UInt64(NSEvent.doubleClickInterval * 1_000_000_000)
+        browseTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: delay) }
+            catch { return }
+            guard let self, !Task.isCancelled, !selectionActive else { return }
+            browseTask = nil
+            browseFile?(match.link, match.params)
+        }
+    }
+
     override func shouldActivateLink(_ link: String, with event: NSEvent) -> Bool {
-        // File links are handled only by the complete Cmd + right-click gesture.
-        // Let SwiftTerm finish normal selection and mouse reporting on left-up.
-        !Self.isFileLink(link) && super.shouldActivateLink(link, with: event)
+        !suppressLinkActivation && !Self.isFileLink(link)
+            && super.shouldActivateLink(link, with: event)
     }
 
     override func rightMouseDown(with event: NSEvent) {
+        cancelScheduledBrowse()
         inputChanged?()
+        if pendingBrowseClick != nil { browseClickWasDragged = true }
         pendingFileClick = nil
         fileClickWasDragged = false
         if event.modifierFlags.contains(.command),
@@ -118,7 +190,11 @@ final class AttachmentTerminalView: LocalProcessTerminalView {
     override func resignFirstResponder() -> Bool {
         let resigned = super.resignFirstResponder()
         if resigned {
+            cancelScheduledBrowse()
             pendingFileClick = nil
+            // The press was not sent to tmux; consume its release even after
+            // focus changes, while preventing the pending browse action.
+            browseClickWasDragged = true
             inputChanged?()
         }
         return resigned

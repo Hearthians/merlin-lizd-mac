@@ -12,6 +12,32 @@ struct AttachmentTests {
         return directory
     }
 
+    /// Exercise the exact shell command used over SSH against a synthetic HOME.
+    /// No test opens a network connection or inspects a real remote workspace.
+    private func lookup(
+        resolved: String,
+        relative: String?,
+        home: URL,
+        includingDirectories: Bool
+    ) async throws -> String {
+        let script = try AttachmentPaths.lookupScript(
+            resolved: resolved,
+            relative: relative,
+            includingDirectories: includingDirectories
+        )
+        let output = try await FoundationInventoryProcessRunner().run(CommandSpec(
+            executable: "/usr/bin/env",
+            arguments: ["HOME=\(home.path)", "/bin/sh", "-c", script]
+        ))
+        try #require(output.exitCode == 0, "\(output.stderr)")
+        return try AttachmentPaths.lookupResult(
+            output.stdout,
+            resolved: resolved,
+            relative: relative,
+            remotePath: relative ?? resolved
+        )
+    }
+
     @Test("insertion preserves shell metacharacters and never sends Enter")
     func insertionQuoting() async throws {
         let path = "/tmp/中文 screenshot ' \" $(false); [x]*?.png"
@@ -159,6 +185,128 @@ struct AttachmentTests {
         let missing = AttachmentError.fileNotFound("/remote/result.zip").localizedDescription
         #expect(missing.contains("/remote/result.zip"))
         #expect(missing.contains("容器或计算节点"))
+    }
+
+    @Test("SFTP browsing prefers the exact terminal directory over workspace matches")
+    func browseExactDirectory() async throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let relative = "output/模型 + #?%& ' $(false)"
+        let exact = home.appendingPathComponent("terminal").appendingPathComponent(relative)
+        let fallback = home.appendingPathComponent("workspace").appendingPathComponent(relative)
+        try FileManager.default.createDirectory(at: exact, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: fallback, withIntermediateDirectories: true)
+        #expect(try await lookup(
+            resolved: exact.path, relative: relative, home: home,
+            includingDirectories: true
+        ) == exact.path)
+        await #expect(throws: AttachmentError.fileNotFound(exact.path)) {
+            try await lookup(
+                resolved: exact.path, relative: nil, home: home,
+                includingDirectories: false
+            )
+        }
+    }
+
+    @Test("public browse resolution uses the captured context for files and directories")
+    func browseCapturedContext() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let folder = directory.appendingPathComponent("output")
+        let file = folder.appendingPathComponent("mesh.ply")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        try Data("mesh".utf8).write(to: file)
+        let context = AttachmentContext(
+            target: .local, sessionName: nil, paneID: nil, processName: nil,
+            workingDirectory: directory.path
+        )
+        let service = AttachmentTransferService(sshMasterPool: SSHMasterPool())
+        #expect(try await service.resolveBrowsePath("output", context: context) == folder.path)
+        #expect(try await service.resolveBrowsePath("output/mesh.ply", context: context) == file.path)
+        await #expect(throws: AttachmentError.fileNotFound(folder.appendingPathComponent("missing").path)) {
+            try await service.resolveBrowsePath("output/missing", context: context)
+        }
+        await #expect(throws: AttachmentError.invalidPath) {
+            try await service.resolveBrowsePath("output/bad\npath", context: context)
+        }
+    }
+
+    @Test("SFTP browsing accepts one workspace directory while downloads remain file-only")
+    func browseUniqueWorkspaceDirectory() async throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let relative = "output/r256/model"
+        let exact = home.appendingPathComponent(relative).path
+        let fallback = home.appendingPathComponent("projects/current").appendingPathComponent(relative)
+        try FileManager.default.createDirectory(at: fallback, withIntermediateDirectories: true)
+        #expect(try await lookup(
+            resolved: exact, relative: relative, home: home,
+            includingDirectories: true
+        ) == fallback.path)
+        await #expect(throws: AttachmentError.fileNotFound(exact)) {
+            try await lookup(
+                resolved: exact, relative: relative, home: home,
+                includingDirectories: false
+            )
+        }
+        // Exact project contexts, such as Herdr, supply no workspace fallback.
+        await #expect(throws: AttachmentError.fileNotFound(exact)) {
+            try await lookup(
+                resolved: exact, relative: nil, home: home,
+                includingDirectories: true
+            )
+        }
+    }
+
+    @Test("SFTP browsing rejects ambiguous and missing workspace locations")
+    func browseAmbiguousOrMissing() async throws {
+        let home = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let relative = "output/result"
+        let exact = home.appendingPathComponent(relative).path
+        await #expect(throws: AttachmentError.fileNotFound(exact)) {
+            try await lookup(
+                resolved: exact, relative: relative, home: home,
+                includingDirectories: true
+            )
+        }
+        let directory = home.appendingPathComponent("first").appendingPathComponent(relative)
+        let file = home.appendingPathComponent("second").appendingPathComponent(relative)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("mesh".utf8).write(to: file)
+        await #expect(throws: AttachmentError.ambiguousRemotePath(relative)) {
+            try await lookup(
+                resolved: exact, relative: relative, home: home,
+                includingDirectories: true
+            )
+        }
+        #expect(try await lookup(
+            resolved: exact, relative: relative, home: home,
+            includingDirectories: false
+        ) == file.path)
+        #expect(try await lookup(
+            resolved: file.path, relative: nil, home: home,
+            includingDirectories: false
+        ) == file.path)
+    }
+
+    @Test("SFTP path lookup filters unrelated output, duplicates and control characters")
+    func browseLookupOutputSafety() throws {
+        let relative = "output/result"
+        let found = "/home/user/project/output/result"
+        let output = "/unrelated/result\n\(found)\n\(found)\n/home/bad\t/output/result\n"
+        #expect(try AttachmentPaths.lookupResult(
+            output, resolved: "/terminal/output/result", relative: relative,
+            remotePath: relative
+        ) == found)
+        for path in ["relative", "/tmp/a\nother", "/tmp/a\t", "/tmp/a\u{1b}"] {
+            #expect(throws: AttachmentError.invalidPath) {
+                try AttachmentPaths.lookupScript(
+                    resolved: path, relative: nil, includingDirectories: true
+                )
+            }
+        }
     }
 
     @Test("real SFTP downloads an exact remote path into a local partial file")

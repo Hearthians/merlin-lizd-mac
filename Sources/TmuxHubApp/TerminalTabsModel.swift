@@ -25,6 +25,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     private let runtime: HubRuntime
     let tmuxSessionDiscovery: TmuxSessionDiscovery
     var herdrService: HerdrService { runtime.herdrService }
+    var remoteFileService: RemoteFileService { RemoteFileService(pool: runtime.sshMasterPool) }
     private let tmuxSessionController: TmuxSessionController
     private let externalTerminalLauncher = ExternalTerminalLauncher()
     private let persistenceKey = "terminal-state-v2"
