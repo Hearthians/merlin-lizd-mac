@@ -34,6 +34,24 @@ public enum SlurmCommands {
         )
     }
 
+    /// Accounting is read-only and scoped to this user and an explicit recent window.
+    public static func jobHistory(
+        platform: SlurmPlatformProfile,
+        range: SlurmHistoryRange
+    ) throws -> CommandSpec {
+        let arguments = [
+            "env", "SLURM_TIME_FORMAT=standard", "sacct",
+            "--allocations", "--array", "--duplicates", "--noheader", "--parsable2",
+            "--user", platform.owner,
+            "--starttime", "now-\(range.rawValue)days", "--endtime", "now",
+            "--delimiter", fieldDelimiter,
+            "--format", "JobID,JobName,User,State,Partition,AllocNodes,Elapsed,Timelimit,Submit,Start,End,NodeList,ExitCode,AllocTRES,Comment",
+        ]
+        return try boundedMonitoringQuery(
+            platform: platform, script: "exec " + shellJoin(arguments), seconds: 20
+        )
+    }
+
     public static func inspectJob(
         platform: SlurmPlatformProfile,
         jobID: SlurmJobID
@@ -147,7 +165,26 @@ public enum SlurmCommands {
                 done
             done
             [ -n "$tmuxhub_expanded" ] || exit 78
-            exec nvidia-smi --id="$tmuxhub_expanded" --query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits
+            # Slurm's global GRES IDs are not NVML indices inside a device cgroup.
+            # Use the visibility list assigned to this step, never an unfiltered query.
+            tmuxhub_visible=${CUDA_VISIBLE_DEVICES:-}
+            [ -n "$tmuxhub_visible" ] && [ "${#tmuxhub_visible}" -le 16384 ] || exit 78
+            [[ "$tmuxhub_visible" != *$'\n'* && "$tmuxhub_visible" != *$'\r'* ]] || exit 78
+            case "$tmuxhub_visible" in ,*|*,|*,,*) exit 78 ;; esac
+            IFS=',' read -r -a tmuxhub_visible_parts <<< "$tmuxhub_visible"
+            [ "${#tmuxhub_visible_parts[@]}" -eq "$tmuxhub_count" ] || exit 78
+            tmuxhub_selection=
+            for tmuxhub_device in "${tmuxhub_visible_parts[@]}"; do
+                if [[ "$tmuxhub_device" =~ ^[0-9]{1,4}$ ]]; then
+                    tmuxhub_device=$((10#$tmuxhub_device))
+                    [ "$tmuxhub_device" -le 1023 ] || exit 78
+                elif [[ ! "$tmuxhub_device" =~ ^GPU-[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
+                    exit 78
+                fi
+                case ",$tmuxhub_selection," in *",$tmuxhub_device,"*) exit 78 ;; esac
+                tmuxhub_selection="${tmuxhub_selection:+$tmuxhub_selection,}$tmuxhub_device"
+            done
+            exec nvidia-smi --id="$tmuxhub_selection" --query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits
             """#
         let step = shellJoin([
             "srun", "--jobid", jobID.rawValue, "--overlap", "--immediate=3",

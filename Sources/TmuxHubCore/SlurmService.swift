@@ -76,6 +76,18 @@ public actor SlurmService {
         return try SlurmParser.queue(output.stdout)
     }
 
+    public func jobHistory(
+        on platform: SlurmPlatformProfile,
+        range: SlurmHistoryRange = .month
+    ) async throws -> [SlurmJobHistoryRecord] {
+        let output = try await query(
+            SlurmCommands.jobHistory(platform: platform, range: range), on: platform
+        )
+        return try SlurmHistoryParser.parse(output.stdout).filter {
+            $0.snapshot.owner == platform.owner && $0.isFinished
+        }
+    }
+
 
     public func queueResources(
         on platform: SlurmPlatformProfile
@@ -187,10 +199,21 @@ public actor SlurmService {
         }
         try Task.checkCancellation()
         for (jobID, gpus, reason) in gpuResults {
+            let allocation = allocations[jobID]
+            var sampledGPUs = gpus
+            var sampleReason = reason
+            if let gpus, let expected = allocation?.allocatedGPU, gpus.count != expected {
+                if gpus.count < expected {
+                    sampleReason = "仅读取到 \(gpus.count) / \(expected) 张 GPU；其余采样暂不可用，不代表未分配。"
+                } else {
+                    sampledGPUs = nil
+                    sampleReason = "GPU 采样数量与任务分配不一致，已忽略本次结果；下次刷新后重试。"
+                }
+            }
             result[jobID] = SlurmJobUtilizationSnapshot(
-                jobID: jobID, allocation: allocations[jobID],
-                statistics: statistics[jobID], gpus: gpus,
-                sampledAt: Date(), unavailableReason: reason
+                jobID: jobID, allocation: allocation,
+                statistics: statistics[jobID], gpus: sampledGPUs,
+                sampledAt: Date(), unavailableReason: sampleReason
             )
         }
         return result

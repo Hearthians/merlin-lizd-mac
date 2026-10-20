@@ -68,6 +68,11 @@ final class HPC2PlatformModel: ObservableObject {
     @Published private(set) var profile: SlurmPlatformProfile
     @Published private(set) var defaultPreset: SlurmInteractivePreset
     @Published private(set) var jobs: [SlurmJobSnapshot] = []
+    @Published var historyRange: SlurmHistoryRange = .month
+    @Published private(set) var accountingHistory: [SlurmJobHistoryRecord] = []
+    @Published private(set) var historyError: String?
+    @Published private(set) var historyUpdatedAt: Date?
+    @Published private(set) var isRefreshingHistory = false
     @Published private(set) var queueSnapshots: [SlurmQueueSnapshot] = []
     @Published private(set) var queueMonitoringError: String?
     @Published private(set) var queueMonitoringUpdatedAt: Date?
@@ -89,6 +94,12 @@ final class HPC2PlatformModel: ObservableObject {
     private let managedRunsKey = "hpc2-managed-runs-v1"
     private let freshnessInterval: TimeInterval = 30
     private let unresolvedLaunchInterval: TimeInterval = 120
+    private var isHistoryVisible = false
+    private var loadedHistoryRange: SlurmHistoryRange?
+    private var lastHistoryAttempt: Date?
+    private var lastHistoryAttemptRange: SlurmHistoryRange?
+    private var historyRefreshID: UUID?
+    private var requestedHistoryRange: SlurmHistoryRange?
     private var lastSuccessfulRefresh: Date?
     private var lastQueueMonitoringAttempt: Date?
     private var lastUtilizationAttempt: Date?
@@ -181,6 +192,78 @@ final class HPC2PlatformModel: ObservableObject {
         }
     }
 
+    var visibleAccountingHistory: [SlurmJobHistoryRecord] {
+        guard loadedHistoryRange == historyRange else { return [] }
+        // Accounting already contains only finished allocations. An older
+        // squeue snapshot or a requeued job with the same numeric ID must not
+        // hide a completion confirmed by the accounting database.
+        return accountingHistory
+    }
+
+    var localOnlyHistoryRuns: [HPC2ManagedRunRecord] {
+        let records = visibleAccountingHistory
+        return historyRuns.filter { run in
+            guard run.receipt.platformID == profile.id,
+                run.receipt.owner == profile.owner,
+                run.receipt.loginDestination == profile.loginDestination
+            else { return false }
+            return !records.contains { record in
+                Self.matches(run.receipt, job: record.snapshot)
+            }
+        }
+    }
+
+    func setHistoryVisible(_ visible: Bool) {
+        isHistoryVisible = visible
+    }
+
+    func refreshHistory(force: Bool = false) async {
+        let range = historyRange
+        let requestedProfile = profile
+        let date = now()
+        if isRefreshingHistory, requestedHistoryRange == range { return }
+        if !force, lastHistoryAttemptRange == range, let lastHistoryAttempt,
+            date.timeIntervalSince(lastHistoryAttempt) < 60
+        { return }
+        let refreshID = UUID()
+        historyRefreshID = refreshID
+        requestedHistoryRange = range
+        isRefreshingHistory = true
+        if loadedHistoryRange != range {
+            accountingHistory = []
+            historyUpdatedAt = nil
+            loadedHistoryRange = nil
+            lastHistoryAttempt = nil
+            lastHistoryAttemptRange = nil
+        }
+        historyError = nil
+        defer {
+            if historyRefreshID == refreshID { isRefreshingHistory = false }
+        }
+        do {
+            let records = try await service.jobHistory(on: requestedProfile, range: range)
+            guard !Task.isCancelled, profile == requestedProfile,
+                historyRange == range, historyRefreshID == refreshID else { return }
+            accountingHistory = records
+            loadedHistoryRange = range
+            historyUpdatedAt = date
+            lastHistoryAttempt = date
+            lastHistoryAttemptRange = range
+        } catch is CancellationError {
+            return
+        } catch {
+            guard !Task.isCancelled, profile == requestedProfile,
+                historyRange == range, historyRefreshID == refreshID else { return }
+            lastHistoryAttempt = date
+            lastHistoryAttemptRange = range
+            if let parseError = error as? SlurmParserError, parseError == .responseTooLarge {
+                historyError = "历史记录过多，请缩短查询范围后重试。"
+            } else {
+                historyError = "无法读取 Slurm 历史：\(error.localizedDescription)"
+            }
+        }
+    }
+
     var historyRuns: [HPC2ManagedRunRecord] {
         let visibleJobIDs = Set(jobs.map(\.jobID))
         return managedRuns.filter { run in
@@ -251,6 +334,7 @@ final class HPC2PlatformModel: ObservableObject {
             }
         }
         await refreshMonitoring(force: force, on: requestedProfile, jobsAreFresh: jobsAreFresh)
+        if isHistoryVisible { await refreshHistory(force: force) }
     }
 
     private func refreshMonitoring(
@@ -394,6 +478,15 @@ final class HPC2PlatformModel: ObservableObject {
         defaultPreset = preset
         if identityChanged {
             jobs = []
+            accountingHistory = []
+            historyError = nil
+            historyUpdatedAt = nil
+            loadedHistoryRange = nil
+            lastHistoryAttempt = nil
+            lastHistoryAttemptRange = nil
+            historyRefreshID = nil
+            requestedHistoryRange = nil
+            isRefreshingHistory = false
             queueSnapshots = []
             queueMonitoringError = nil
             queueMonitoringUpdatedAt = nil

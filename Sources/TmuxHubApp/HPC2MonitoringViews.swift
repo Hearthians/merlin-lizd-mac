@@ -268,7 +268,9 @@ private struct HPC2GPUUtilizationCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack {
-                Text("GPU \(gpu.index)").font(.caption.bold())
+                Text("GPU \(gpu.index)")
+                    .font(.caption.bold())
+                    .help("任务内可见的 GPU 编号；可能与节点上的物理编号不同。")
                 Spacer(minLength: 8)
                 Text("利用率 \(HPC2MonitoringFormat.percent(gpu.utilizationPercent))")
                     .font(.callout.weight(.semibold).monospacedDigit())

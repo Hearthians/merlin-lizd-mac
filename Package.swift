@@ -38,6 +38,7 @@ let package = Package(
                 "SSHPasswordStore.swift",
                 "SlurmCommands.swift",
                 "SlurmModels.swift",
+                "SlurmHistory.swift",
                 "SlurmMonitoringModels.swift",
                 "SlurmMonitoringParser.swift",
                 "SlurmParser.swift",

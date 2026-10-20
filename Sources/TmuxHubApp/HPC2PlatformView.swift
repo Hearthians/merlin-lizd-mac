@@ -37,6 +37,11 @@ struct HPC2PlatformView: View {
         .task(id: model.profile) {
             await model.refreshContinuously()
         }
+        .task(id: selectedList) {
+            model.setHistoryVisible(selectedList == .history)
+            if selectedList == .history { await model.refreshHistory() }
+        }
+        .onDisappear { model.setHistoryVisible(false) }
         .sheet(isPresented: $showsStartSheet) {
             HPC2StartSheet(
                 initialProfile: model.profile,
@@ -230,20 +235,68 @@ struct HPC2PlatformView: View {
 
     @ViewBuilder
     private var history: some View {
-        if model.historyRuns.isEmpty {
-            ContentUnavailableView(
-                "还没有 TmuxHub 任务记录",
-                systemImage: "clock.arrow.circlepath",
-                description: Text("任务离开活动队列后会保留最近一次状态。")
-            )
-            .frame(maxWidth: .infinity, minHeight: 240)
-        } else {
-            LazyVStack(spacing: 10) {
-                ForEach(model.historyRuns) { run in
-                    historyRow(run)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Picker("Slurm 历史", selection: $model.historyRange) {
+                    ForEach(SlurmHistoryRange.allCases, id: \.self) { range in
+                        Text("最近 \(range.rawValue) 天").tag(range)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 330)
+                Spacer()
+                if model.isRefreshingHistory {
+                    ProgressView().controlSize(.small)
+                }
+                Button("刷新历史", systemImage: "arrow.clockwise") {
+                    Task { await model.refreshHistory(force: true) }
+                }
+                .disabled(model.isRefreshingHistory)
+            }
+            Text("包含当前集群用户从其他终端提交的任务；实际可查范围取决于集群的历史保留时间。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if let error = model.historyError {
+                Label(error, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                if let updatedAt = model.historyUpdatedAt {
+                    Text("显示上次成功读取的记录：\(updatedAt.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if model.visibleAccountingHistory.isEmpty, model.localOnlyHistoryRuns.isEmpty {
+                if model.isRefreshingHistory {
+                    Text("正在读取 Slurm 历史…")
+                        .frame(maxWidth: .infinity, minHeight: 180)
+                        .foregroundStyle(.secondary)
+                } else if model.historyError == nil {
+                    ContentUnavailableView(
+                        "最近 \(model.historyRange.rawValue) 天没有已结束的任务",
+                        systemImage: "clock.arrow.circlepath",
+                        description: Text("可切换更长的查询范围。")
+                    )
+                    .frame(maxWidth: .infinity, minHeight: 240)
+                }
+            } else {
+                LazyVStack(spacing: 10) {
+                    ForEach(model.visibleAccountingHistory) { record in
+                        accountingHistoryRow(record)
+                    }
+                    if !model.localOnlyHistoryRuns.isEmpty {
+                        Text("本机保留的 TmuxHub 记录")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        ForEach(model.localOnlyHistoryRuns) { run in
+                            historyRow(run)
+                        }
+                    }
                 }
             }
         }
+        .task(id: model.historyRange) { await model.refreshHistory() }
     }
 
     private func jobRow(_ job: SlurmJobSnapshot) -> some View {
@@ -329,6 +382,41 @@ struct HPC2PlatformView: View {
                     onConnect(run.receipt)
                 }
                 .buttonStyle(.borderedProminent)
+            }
+        }
+    }
+
+    private func accountingHistoryRow(_ record: SlurmJobHistoryRecord) -> some View {
+        let job = record.snapshot
+        let run = model.run(for: job)
+        return SurfaceCard {
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(spacing: 8) {
+                    Text(run?.preset.name ?? job.name).font(.headline)
+                    StatusPill(label: job.state.hpc2Title, color: job.state.hpc2Color,
+                               symbol: job.state.hpc2Symbol)
+                    if run == nil {
+                        StatusPill(label: "外部任务 · 只读", color: .secondary, symbol: "eye")
+                    }
+                }
+                Text("Job \(job.jobID.rawValue) · \(job.partition)")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    MetricPill(symbol: "clock", value: job.elapsed)
+                    MetricPill(symbol: "square.stack.3d.up", value: "\(job.nodeCount) 节点")
+                    if let nodeList = job.nodeList {
+                        MetricPill(symbol: "server.rack", value: nodeList)
+                    }
+                    Text("退出码 \(record.exitCode)")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+                if let endTime = record.endTime {
+                    Text("结束于 \(endTime.replacingOccurrences(of: "T", with: " ")) · 集群时间")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
     }

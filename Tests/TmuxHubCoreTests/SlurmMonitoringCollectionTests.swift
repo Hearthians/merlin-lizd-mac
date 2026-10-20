@@ -130,7 +130,7 @@ struct SlurmMonitoringCollectionTests {
         #expect(!fixture.exists("srun-called"))
     }
 
-    @Test("GPU identifiers expand numeric ranges and fail closed without a visibility fallback")
+    @Test("GPU identifiers expand numeric ranges and fail closed for invalid allocations")
     func scopedGPUIdentifiers() async throws {
         let fixture = try MonitoringShellFixture()
         defer { fixture.remove() }
@@ -138,6 +138,7 @@ struct SlurmMonitoringCollectionTests {
             platform: platform, jobID: #require(SlurmJobID(rawValue: "42"))
         )
         try fixture.write("identity", contents: " 42 zli760 RUNNING 1 ")
+        try fixture.write("cuda-gpus", contents: "0,1,4")
         for ids in ["", "0,", "0,,1", "0;1", "0-9999", "2-1", "0,0", "0-1,1", "0\n1"] {
             try fixture.write("step-gpus", contents: ids)
             let output = try await fixture.run(command)
@@ -152,8 +153,118 @@ struct SlurmMonitoringCollectionTests {
             encoding: .utf8
         )
         #expect(arguments.contains("--id=0,1,4\n"))
-        let remote = try #require(command.arguments.last)
-        #expect(!remote.contains("CUDA_VISIBLE_DEVICES"))
+        #expect(try SlurmMonitoringParser.gpuUsage(output.stdout).map(\.index) == [0, 1, 4])
+    }
+
+    @Test("GPU monitoring uses the step-local device IDs when Slurm remaps global IDs")
+    func remappedGPUIdentifiers() async throws {
+        let fixture = try MonitoringShellFixture()
+        defer { fixture.remove() }
+        let command = try SlurmCommands.jobGPUUtilization(
+            platform: platform, jobID: #require(SlurmJobID(rawValue: "42"))
+        )
+        try fixture.write("identity", contents: "42 zli760 RUNNING 1")
+        try fixture.write("step-gpus", contents: "1,2,3,7")
+        try fixture.write("cuda-gpus", contents: "0,1,2,3")
+        let output = try await fixture.run(command)
+        #expect(output.exitCode == 0, "\(output.stderr)")
+        let arguments = try String(
+            contentsOf: fixture.directory.appendingPathComponent("nvidia-arguments"),
+            encoding: .utf8
+        )
+        #expect(arguments.contains("--id=0,1,2,3\n"))
+        #expect(!arguments.contains("--id=1,2,3,7\n"))
+        #expect(try SlurmMonitoringParser.gpuUsage(output.stdout).map(\.index) == [0, 1, 2, 3])
+    }
+
+    @Test("GPU monitoring preserves device IDs when the step does not remap them")
+    func nonRemappedGPUIdentifiers() async throws {
+        let fixture = try MonitoringShellFixture()
+        defer { fixture.remove() }
+        let command = try SlurmCommands.jobGPUUtilization(
+            platform: platform, jobID: #require(SlurmJobID(rawValue: "42"))
+        )
+        try fixture.write("identity", contents: "42 zli760 RUNNING 1")
+        try fixture.write("step-gpus", contents: "1,2,3,7")
+        try fixture.write("cuda-gpus", contents: "1,2,3,7")
+        let output = try await fixture.run(command)
+        #expect(output.exitCode == 0, "\(output.stderr)")
+        let arguments = try String(
+            contentsOf: fixture.directory.appendingPathComponent("nvidia-arguments"),
+            encoding: .utf8
+        )
+        #expect(arguments.contains("--id=1,2,3,7\n"))
+        #expect(try SlurmMonitoringParser.gpuUsage(output.stdout).map(\.index) == [1, 2, 3, 7])
+    }
+
+    @Test("GPU monitoring accepts explicit step-local GPU UUIDs")
+    func visibleGPUUUIDs() async throws {
+        let fixture = try MonitoringShellFixture()
+        defer { fixture.remove() }
+        let command = try SlurmCommands.jobGPUUtilization(
+            platform: platform, jobID: #require(SlurmJobID(rawValue: "42"))
+        )
+        let uuids = [
+            "GPU-12345678-1234-1234-1234-123456789abc",
+            "GPU-87654321-4321-4321-4321-cba987654321",
+        ]
+        try fixture.write("identity", contents: "42 zli760 RUNNING 1")
+        try fixture.write("step-gpus", contents: "3,7")
+        try fixture.write("cuda-gpus", contents: uuids.joined(separator: ","))
+        let output = try await fixture.run(command)
+        #expect(output.exitCode == 0, "\(output.stderr)")
+        let arguments = try String(
+            contentsOf: fixture.directory.appendingPathComponent("nvidia-arguments"),
+            encoding: .utf8
+        )
+        #expect(arguments.contains("--id=\(uuids.joined(separator: ","))\n"))
+        #expect(try SlurmMonitoringParser.gpuUsage(output.stdout).map(\.uuid) == uuids)
+    }
+
+    @Test("Missing or invalid step-local visibility never triggers an unfiltered GPU query")
+    func invalidVisibleGPUIdentifiers() async throws {
+        let command = try SlurmCommands.jobGPUUtilization(
+            platform: platform, jobID: #require(SlurmJobID(rawValue: "42"))
+        )
+        let malformed: [String?] = [
+            nil, "", "0,1,2", "0,1,2,3,4", "0,1,2,2", "0,1,2,", "0,,2,3",
+            "0-3", "0;1;2;3", "0,1,2,3\n4", "0,1,2,3\r4", "-1,0,1,2",
+            "0,00,1,2", "0,1,2,1024",
+            "GPU-,GPU-,GPU-,GPU-", "GPU-not-a-uuid,0,1,2",
+        ]
+        for ids in malformed {
+            let fixture = try MonitoringShellFixture()
+            defer { fixture.remove() }
+            try fixture.write("identity", contents: "42 zli760 RUNNING 1")
+            try fixture.write("step-gpus", contents: "1,2,3,7")
+            if let ids { try fixture.write("cuda-gpus", contents: ids) }
+            let output = try await fixture.run(command)
+            #expect(output.exitCode == 78, "\(ids ?? "<missing>"): \(output.stderr)")
+            #expect(!fixture.exists("nvidia-arguments"))
+        }
+    }
+
+    @Test("An incomplete GPU sample keeps valid readings and explains the allocation mismatch")
+    func partialGPUSampleWarning() async throws {
+        let snapshot = try job("42")
+        let runner = MonitoringFixtureRunner(
+            allocations: allocation("42", gpuCount: 4),
+            gpuOutput: """
+                0, GPU-first, NVIDIA A800, 95, 58000, 81920
+                1, GPU-second, NVIDIA A800, 93, 55000, 81920
+                2, GPU-third, NVIDIA A800, 94, 52000, 81920
+
+                """
+        )
+        let result = try await SlurmService(remoteRunner: runner).jobUtilization(
+            on: platform, jobs: [snapshot]
+        )
+        let sample = try #require(result[snapshot.jobID])
+        #expect(sample.gpus?.count == 3)
+        #expect(sample.gpus?.map(\.index) == [0, 1, 2])
+        let warning = try #require(sample.unavailableReason)
+        #expect(warning.contains("3"))
+        #expect(warning.contains("4"))
     }
 
     private func job(
@@ -166,8 +277,8 @@ struct SlurmMonitoringCollectionTests {
         ].joined(separator: "\u{001F}")).first)
     }
 
-    private func allocation(_ id: String) -> String {
-        "JobId=\(id) UserId=zli760(123) JobState=RUNNING NodeList=gpu1 NumCPUs=4 RunTime=00:10:00 AllocTRES=cpu=4,mem=64G,gres/gpu=1"
+    private func allocation(_ id: String, gpuCount: Int = 1) -> String {
+        "JobId=\(id) UserId=zli760(123) JobState=RUNNING NodeList=gpu1 NumCPUs=4 RunTime=00:10:00 AllocTRES=cpu=4,mem=64G,gres/gpu=\(gpuCount)"
     }
 }
 
@@ -175,12 +286,17 @@ private actor MonitoringFixtureRunner: SlurmRemoteCommandRunning {
     let queue: String
     let allocations: String
     let statistics: String
+    let gpuOutput: String
     private var history: [(command: String, policy: String)] = []
 
-    init(queue: String = "", allocations: String = "", statistics: String = "") {
+    init(
+        queue: String = "", allocations: String = "", statistics: String = "",
+        gpuOutput: String = "0, GPU-own, NVIDIA A800, 80, 1024, 81920\n"
+    ) {
         self.queue = queue
         self.allocations = allocations
         self.statistics = statistics
+        self.gpuOutput = gpuOutput
     }
 
     func run(
@@ -195,7 +311,7 @@ private actor MonitoringFixtureRunner: SlurmRemoteCommandRunning {
         history.append((remote, policy))
         let stdout: String
         if remote.contains("SLURM_STEP_GPUS") {
-            stdout = "0, GPU-own, NVIDIA A800, 80, 1024, 81920\n"
+            stdout = gpuOutput
         } else if remote.contains(SlurmCommands.monitoringAllocationsMarker) {
             stdout = """
                 @@TMUXHUB_ALLOCATIONS@@
@@ -232,6 +348,10 @@ private struct MonitoringShellFixture {
         try executable("srun", script: """
             touch "$TMUXHUB_FIXTURE_ROOT/srun-called"
             export SLURM_STEP_GPUS=$(cat "$TMUXHUB_FIXTURE_ROOT/step-gpus")
+            unset CUDA_VISIBLE_DEVICES
+            if [ -f "$TMUXHUB_FIXTURE_ROOT/cuda-gpus" ]; then
+                export CUDA_VISIBLE_DEVICES=$(cat "$TMUXHUB_FIXTURE_ROOT/cuda-gpus")
+            fi
             while [ "$#" -gt 0 ]; do
                 if [ "$1" = /bin/bash ]; then exec "$@"; fi
                 shift
@@ -240,7 +360,21 @@ private struct MonitoringShellFixture {
             """)
         try executable("nvidia-smi", script: """
             printf '%s\\n' "$@" > "$TMUXHUB_FIXTURE_ROOT/nvidia-arguments"
-            printf '%s\\n' '0, GPU-own, NVIDIA A800, 80, 1024, 81920'
+            ids=
+            for argument in "$@"; do
+                case "$argument" in --id=*) ids=${argument#--id=} ;; esac
+            done
+            [ -n "$ids" ] || exit 96
+            IFS=,
+            local_index=0
+            for id in $ids; do
+                case "$id" in
+                    GPU-*) index=$local_index; uuid=$id ;;
+                    *) index=$id; uuid="GPU-fixture-$id" ;;
+                esac
+                printf '%s\\n' "$index, $uuid, NVIDIA A800, 80, 1024, 81920"
+                local_index=$((local_index + 1))
+            done
             """)
     }
 
