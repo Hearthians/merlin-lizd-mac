@@ -93,10 +93,11 @@ final class HPC2PlatformModel: ObservableObject {
     private let service: SlurmService
     private let defaults: UserDefaults
     private let now: @Sendable () -> Date
-    private let profileKey = "hpc2-platform-profile-v1"
-    private let presetKey = "hpc2-interactive-preset-v1"
-    private let costConfigurationKey = "hpc2-cost-configuration-v1"
-    private let managedRunsKey = "hpc2-managed-runs-v1"
+    let cluster: HKUSTSlurmCluster
+    private let profileKey: String
+    private let presetKey: String
+    private let costConfigurationKey: String
+    private let managedRunsKey: String
     private let freshnessInterval: TimeInterval = 30
     private let unresolvedLaunchInterval: TimeInterval = 120
     private var isHistoryVisible = false
@@ -114,19 +115,25 @@ final class HPC2PlatformModel: ObservableObject {
 
     init(
         service: SlurmService,
+        cluster: HKUSTSlurmCluster = .hpc2,
         defaults: UserDefaults = .standard,
         now: @escaping @Sendable () -> Date = Date.init
     ) {
         self.service = service
+        self.cluster = cluster
         self.defaults = defaults
         self.now = now
+        profileKey = "\(cluster.storagePrefix)-platform-profile-v1"
+        presetKey = "\(cluster.storagePrefix)-interactive-preset-v1"
+        costConfigurationKey = "\(cluster.storagePrefix)-cost-configuration-v1"
+        managedRunsKey = "\(cluster.storagePrefix)-managed-runs-v1"
 
         let decodedProfile: SlurmPlatformProfile? = Self.decode(
             SlurmPlatformProfile.self,
             from: defaults.data(forKey: profileKey)
         )
-        let restoredProfile = decodedProfile.flatMap(Self.validProfile)
-            ?? Self.makeDefaultProfile()
+        let restoredProfile = decodedProfile.flatMap { Self.validProfile($0, cluster: cluster) }
+            ?? cluster.defaultProfile()
         profile = restoredProfile
 
         let decodedPreset: SlurmInteractivePreset? = Self.decode(
@@ -134,13 +141,15 @@ final class HPC2PlatformModel: ObservableObject {
             from: defaults.data(forKey: presetKey)
         )
         defaultPreset = decodedPreset.flatMap(Self.validPreset)
-            ?? Self.makeDefaultPreset()
+            ?? cluster.defaultPreset
 
         let decodedCosts = Self.decode(
             SlurmCostConfiguration.self,
             from: defaults.data(forKey: costConfigurationKey)
         )
-        costConfiguration = decodedCosts.flatMap { $0.isValid ? $0 : nil } ?? .hkustHPC2
+        costConfiguration = decodedCosts.flatMap {
+            $0.isValid && $0.effectiveCluster == cluster ? $0 : nil
+        } ?? cluster.defaultCostConfiguration
 
         let decodedRuns: [HPC2ManagedRunRecord] = Self.decode(
             [HPC2ManagedRunRecord].self,
@@ -159,7 +168,9 @@ final class HPC2PlatformModel: ObservableObject {
     }
 
     func saveCostConfiguration(_ configuration: SlurmCostConfiguration) throws {
-        guard configuration.isValid else { throw HPC2ConfigurationError.invalidCostRates }
+        guard configuration.isValid, configuration.effectiveCluster == cluster else {
+            throw HPC2ConfigurationError.invalidCostRates
+        }
         let data = try JSONEncoder().encode(configuration)
         defaults.set(data, forKey: costConfigurationKey)
         costConfiguration = configuration
@@ -486,7 +497,7 @@ final class HPC2PlatformModel: ObservableObject {
         preset proposedPreset: SlurmInteractivePreset
     ) throws {
         guard !isStarting else { throw HPC2ConfigurationError.launchInProgress }
-        guard let profile = Self.validProfile(proposedProfile) else {
+        guard let profile = Self.validProfile(proposedProfile, cluster: cluster) else {
             throw HPC2ConfigurationError.invalidProfile
         }
         guard let preset = Self.validPreset(proposedPreset) else {
@@ -725,9 +736,10 @@ final class HPC2PlatformModel: ObservableObject {
     }
 
     private static func validProfile(
-        _ profile: SlurmPlatformProfile
+        _ profile: SlurmPlatformProfile,
+        cluster: HKUSTSlurmCluster
     ) -> SlurmPlatformProfile? {
-        guard profile.id == "hkust-hpc2",
+        guard profile.id == cluster.id,
             !profile.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
             IdentifierValidator.isSSHDestination(profile.loginDestination),
             isSafeIdentifier(profile.owner)
@@ -846,27 +858,4 @@ final class HPC2PlatformModel: ObservableObject {
         }
     }
 
-    private static func makeDefaultProfile() -> SlurmPlatformProfile {
-        SlurmPlatformProfile(
-            id: "hkust-hpc2",
-            name: "HKUST HPC2",
-            loginDestination: "hpc2",
-            owner: "zli760"
-        )
-    }
-
-    private static func makeDefaultPreset() -> SlurmInteractivePreset {
-        SlurmInteractivePreset(
-            id: "hpc2-default",
-            name: "交互环境",
-            partition: "debug",
-            tasks: 1,
-            cpusPerTask: 4,
-            memoryMiB: 16 * 1_024,
-            wallTime: SlurmWallTime(seconds: 30 * 60),
-            gpu: SlurmGPURequest(count: 1),
-            workingDirectory: nil,
-            initializationScript: nil
-        )
-    }
 }

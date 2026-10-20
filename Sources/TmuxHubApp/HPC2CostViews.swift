@@ -22,7 +22,7 @@ struct HPC2JobCostView: View {
                     .foregroundStyle(.secondary)
             }
             .font(.caption.monospacedDigit())
-            .help("按已分配的 GPU、CPU 和 Slurm 已运行时长估算，不按 GPU 利用率折扣；以平台账单为准。")
+            .help("按当前平台计费标准、已分配资源和 Slurm 已运行时长估算，不按 GPU 利用率折扣；以平台账单为准。")
         } else {
             Text(isPending
                  ? "排队中 · 暂未计入当前费用估计，已有运行记录可在历史中查看"
@@ -59,8 +59,8 @@ struct HPC2CostSummaryView: View {
                     .foregroundStyle(.secondary)
             }
             Text(isHistory
-                 ? "按所列任务的完整运行时长、当前单价回算 GPU + CPU 费用；不含存储，以平台账单为准。"
-                 : "按已分配资源和已采样的运行时长估算 GPU + CPU 费用；不含存储，以平台账单为准。")
+                 ? "按所列任务的完整运行时长、当前单价回算计算费用；不含存储，以平台账单为准。"
+                 : "按已分配资源和已采样的运行时长估算计算费用；不含存储，以平台账单为准。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -72,6 +72,7 @@ struct HPC2CostRatesSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var fields: [String]
     @State private var error: String?
+    private let cluster: HKUSTSlurmCluster
     let onSave: (SlurmCostConfiguration) throws -> Void
 
     init(
@@ -79,6 +80,7 @@ struct HPC2CostRatesSheet: View {
         onSave: @escaping (SlurmCostConfiguration) throws -> Void
     ) {
         _fields = State(initialValue: Self.fields(for: configuration))
+        cluster = configuration.effectiveCluster
         self.onSave = onSave
     }
 
@@ -89,13 +91,13 @@ struct HPC2CostRatesSheet: View {
         guard values.count == 9 else { return nil }
         func tier(_ start: Int) -> SlurmCostTierRates {
             SlurmCostTierRates(
-                cpuPerCoreHour: values[start],
-                a800PerGPUHour: values[start + 1],
+                cpuPerCoreHour: cluster == .hpc3 ? 0 : values[start],
+                a800PerGPUHour: cluster == .hpc3 ? 0 : values[start + 1],
                 otherPerGPUHour: values[start + 2]
             )
         }
         let configuration = SlurmCostConfiguration(
-            low: tier(0), medium: tier(3), high: tier(6)
+            low: tier(0), medium: tier(3), high: tier(6), cluster: cluster
         )
         return configuration.isValid ? configuration : nil
     }
@@ -103,15 +105,21 @@ struct HPC2CostRatesSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             Text("费用估计 · 计费标准").font(.title2.bold())
-            Text("人民币（CNY） · GPU 按卡时，CPU 按核时；不足一小时按秒折算。")
+            Text(cluster == .hpc3
+                 ? "人民币（CNY） · ACD GPU 按卡时；不足一小时按秒折算，不另加 CPU 费用。"
+                 : "人民币（CNY） · GPU 按卡时，CPU 按核时；不足一小时按秒折算。")
                 .font(.callout)
                 .foregroundStyle(.secondary)
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
                 GridRow {
                     Text("优先级")
-                    Text("CPU / 核时")
-                    Text("A800 / 卡时")
-                    Text("A30 / A40 / 昇腾 / 卡时")
+                    if cluster == .hpc3 {
+                        Text("ACD GPU / 卡时")
+                    } else {
+                        Text("CPU / 核时")
+                        Text("A800 / 卡时")
+                        Text("A30 / A40 / 昇腾 / 卡时")
+                    }
                 }
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.secondary)
@@ -120,12 +128,19 @@ struct HPC2CostRatesSheet: View {
                 rateRow("高", offset: 6)
             }
             .textFieldStyle(.roundedBorder)
-            Text("按已确认的 HPC2 队列匹配优先级；debug 计算免费。未知队列及 MIG 暂不估算。修改单价会重新计算当前和历史任务的估计金额，不会修改集群设置。")
+            Text(cluster == .hpc3
+                 ? "参考三期公开定价（2025-09-01 起生效），仅估算 ACD 低、中、高优先级队列；未列单独 CPU 加价。debug、未知队列及 MIG 暂不估算。修改单价会重新计算当前和历史任务，不会修改集群设置。"
+                 : "按已确认的 HPC2 队列匹配优先级；debug 计算免费。未知队列及 MIG 暂不估算。修改单价会重新计算当前和历史任务的估计金额，不会修改集群设置。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             HStack {
-                Link("价格速查 · 2026-10-13", destination: URL(string: "https://mcnj47nsbq2m.feishu.cn/wiki/Rhr9wjK8FiK15DkjA33cruc5nWg")!)
-                Link("官方队列说明", destination: URL(string: "https://docs.hpc.hkust-gz.edu.cn/docs/hpc12/slurm/queue/")!)
+                if cluster == .hpc3 {
+                    Link("三期官方定价 · 2025-09-01", destination: URL(string: "https://docs.hpc.hkust-gz.edu.cn/docs/charges/prices-phaseIII/")!)
+                    Link("官方队列说明", destination: URL(string: "https://docs.hpc.hkust-gz.edu.cn/docs/hpc3/slurm/queue/")!)
+                } else {
+                    Link("价格速查 · 2026-10-13", destination: URL(string: "https://mcnj47nsbq2m.feishu.cn/wiki/Rhr9wjK8FiK15DkjA33cruc5nWg")!)
+                    Link("官方队列说明", destination: URL(string: "https://docs.hpc.hkust-gz.edu.cn/docs/hpc12/slurm/queue/")!)
+                }
             }
             .font(.caption)
             if let error {
@@ -136,7 +151,7 @@ struct HPC2CostRatesSheet: View {
             }
             HStack {
                 Button("恢复参考单价") {
-                    fields = Self.fields(for: .hkustHPC2)
+                    fields = Self.fields(for: cluster.defaultCostConfiguration)
                     error = nil
                 }
                 Spacer()
@@ -161,12 +176,17 @@ struct HPC2CostRatesSheet: View {
     private func rateRow(_ title: String, offset: Int) -> some View {
         GridRow {
             Text(title)
-            TextField("CPU", text: $fields[offset])
-                .accessibilityLabel("\(title)优先级 CPU 每核小时单价")
-            TextField("A800", text: $fields[offset + 1])
-                .accessibilityLabel("\(title)优先级 A800 每卡小时单价")
-            TextField("A30 / A40 / 昇腾", text: $fields[offset + 2])
-                .accessibilityLabel("\(title)优先级 A30 A40 昇腾每卡小时单价")
+            if cluster == .hpc3 {
+                TextField("ACD GPU", text: $fields[offset + 2])
+                    .accessibilityLabel("\(title)优先级 ACD GPU 每卡小时单价")
+            } else {
+                TextField("CPU", text: $fields[offset])
+                    .accessibilityLabel("\(title)优先级 CPU 每核小时单价")
+                TextField("A800", text: $fields[offset + 1])
+                    .accessibilityLabel("\(title)优先级 A800 每卡小时单价")
+                TextField("A30 / A40 / 昇腾", text: $fields[offset + 2])
+                    .accessibilityLabel("\(title)优先级 A30 A40 昇腾每卡小时单价")
+            }
         }
     }
 

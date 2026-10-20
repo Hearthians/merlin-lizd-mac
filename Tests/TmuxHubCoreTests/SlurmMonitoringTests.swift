@@ -53,6 +53,86 @@ struct SlurmMonitoringTests {
         #expect(queue.schedulableFourGPUNodeCount == 0)
     }
 
+    @Test("HPC4 CPU and NPU resources remain distinct from GPUs")
+    func hpc4Resources() throws {
+        let snapshots = try queues("""
+        NodeName=cpu01 CPUTot=128 CPUAlloc=32 RealMemory=512000 AllocMem=64000 State=MIXED Partitions=a128m512u Gres=(null) CfgTRES=cpu=128,mem=512000M AllocTRES=cpu=32,mem=64000M
+        NodeName=npu01 CPUTot=640 CPUAlloc=160 RealMemory=2000000 AllocMem=500000 State=MIXED Partitions=a320m2tn910cu Gres=npu:16 CfgTRES=cpu=640,mem=2000000M,gres/npu=16,gres/npu:910c=16 AllocTRES=cpu=160,mem=500000M,gres/npu=4,gres/npu:910c=4
+        """, partitions: "PartitionName=a128m512u State=UP\nPartitionName=a320m2tn910cu State=UP")
+        let cpu = try #require(snapshots.first { $0.partition == "a128m512u" })
+        #expect(cpu.totalGPU == 0)
+        #expect(cpu.totalNPU == 0)
+        #expect(cpu.totalCPU == 128)
+        #expect(cpu.totalMemoryMiB == 512_000)
+        let npu = try #require(snapshots.first { $0.partition == "a320m2tn910cu" })
+        #expect(npu.totalGPU == 0)
+        #expect(npu.allocatedGPU == 0)
+        #expect(npu.totalNPU == 16)
+        #expect(npu.allocatedNPU == 4)
+        #expect(npu.unallocatedNPU == 12)
+        #expect(npu.nodes.first?.unallocatedNPU == 12)
+        #expect(npu.totalCPU == 640)
+        #expect(npu.totalMemoryMiB == 2_000_000)
+        #expect(npu.schedulableFourGPUNodeCount == 0)
+    }
+
+    @Test("NPU counts use typed TRES or configured Gres without inventing allocations")
+    func npuResourceFallbacks() throws {
+        let snapshot = try #require(try queues("""
+        NodeName=npu01 State=MIXED Partitions=npu Gres=npu:16(S:0-1) CfgTRES=cpu=640,mem=2000000M AllocTRES=cpu=160,gres/npu:910c=4
+        NodeName=npu02 State=IDLE Partitions=npu CfgTRES=cpu=640,gres/npu:910c=16
+        """, partitions: "PartitionName=npu State=UP").first)
+        #expect(snapshot.totalNPU == 32)
+        #expect(snapshot.nodes[0].allocatedNPU == 4)
+        #expect(snapshot.nodes[1].allocatedNPU == nil)
+        #expect(snapshot.allocatedNPU == nil)
+        #expect(snapshot.unallocatedNPU == nil)
+        let invalid = try #require(try queues("""
+        NodeName=npu01 State=IDLE Partitions=npu Gres=npu:16 CfgTRES=cpu=640,gres/npu=N/A AllocTRES=
+        """, partitions: "PartitionName=npu State=UP").first)
+        #expect(invalid.totalNPU == nil)
+        #expect(invalid.allocatedNPU == 0)
+    }
+
+    @Test("NPU job allocations preserve GPU zero and exclude pending requests")
+    func npuJobAllocations() throws {
+        let values = try SlurmMonitoringParser.allocations("""
+        JobId=42 UserId=zli760(10001) JobState=RUNNING NumCPUs=160 RunTime=00:01:00 AllocTRES=cpu=160,mem=500000M,gres/npu=4,gres/npu:910c=4
+        JobId=43 UserId=zli760(10001) JobState=PENDING NumCPUs=160 RunTime=00:00:00 ReqTRES=cpu=160,gres/npu=4 AllocTRES=cpu=160,gres/npu=4
+        JobId=44 UserId=zli760(10001) JobState=RUNNING NumCPUs=160 RunTime=00:01:00 AllocTRES=gres/npu:910c=2
+        """)
+        #expect(values[jobID("42")]?.allocatedGPU == 0)
+        #expect(values[jobID("42")]?.allocatedNPU == 4)
+        #expect(values[jobID("43")]?.allocatedNPU == nil)
+        #expect(values[jobID("44")]?.allocatedGPU == 0)
+        #expect(values[jobID("44")]?.allocatedNPU == 2)
+    }
+
+    @Test("Snapshots saved before NPU support still decode")
+    func legacyMonitoringDecoding() throws {
+        let queue = try #require(try queues(node("gpu01")).first)
+        var object = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(queue)) as? [String: Any])
+        for key in ["totalNPU", "allocatedNPU", "unallocatedNPU"] { object.removeValue(forKey: key) }
+        var nodes = try #require(object["nodes"] as? [[String: Any]])
+        for index in nodes.indices {
+            nodes[index].removeValue(forKey: "totalNPU")
+            nodes[index].removeValue(forKey: "allocatedNPU")
+        }
+        object["nodes"] = nodes
+        let decoded = try JSONDecoder().decode(SlurmQueueSnapshot.self, from: JSONSerialization.data(withJSONObject: object))
+        #expect(decoded.totalGPU == 8)
+        #expect(decoded.totalNPU == nil)
+        #expect(decoded.nodes.first?.totalNPU == nil)
+        let allocation = try #require(try SlurmMonitoringParser.allocations(
+            "JobId=42 UserId=zli760(1) JobState=RUNNING AllocTRES=cpu=8,gres/gpu=1"
+        )[jobID("42")])
+        var allocationObject = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(allocation)) as? [String: Any])
+        allocationObject.removeValue(forKey: "allocatedNPU")
+        let legacyAllocation = try JSONDecoder().decode(SlurmJobAllocation.self, from: JSONSerialization.data(withJSONObject: allocationObject))
+        #expect(legacyAllocation.allocatedGPU == 1)
+        #expect(legacyAllocation.allocatedNPU == nil)
+    }
+
     @Test("unpartitioned drained nodes do not invalidate healthy partition snapshots")
     func unpartitionedNodes() throws {
         let retired = """

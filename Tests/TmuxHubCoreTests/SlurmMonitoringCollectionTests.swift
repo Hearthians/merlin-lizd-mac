@@ -60,6 +60,27 @@ struct SlurmMonitoringCollectionTests {
         #expect(!accounting.contains("'6'"))
     }
 
+    @Test("NPU-only jobs retain accounting without launching NVIDIA telemetry")
+    func npuOnlyAccounting() async throws {
+        let snapshot = try job("42")
+        let runner = MonitoringFixtureRunner(
+            allocations: "JobId=42 UserId=zli760(10001) JobState=RUNNING NodeList=npu01 RunTime=00:01:00 AllocTRES=cpu=160,mem=500000M,gres/npu=4",
+            statistics: "42.batch|1|00:00:20|100M|256M||||\n"
+        )
+        let result = try await SlurmService(remoteRunner: runner).jobUtilization(
+            on: platform, jobs: [snapshot]
+        )
+        let sample = try #require(result[snapshot.jobID])
+        #expect(sample.allocation?.allocatedNPU == 4)
+        #expect(sample.allocation?.allocatedGPU == 0)
+        #expect(sample.statistics?.peakTaskMemoryMiB == 256)
+        #expect(sample.gpus == nil)
+        #expect(sample.unavailableReason?.contains("NPU") == true)
+        #expect(await runner.policies() == ["readOnly"])
+        let commands = await runner.commands()
+        #expect(commands.allSatisfy { !$0.contains("nvidia-smi") && !$0.contains("'srun'") })
+    }
+
     @Test("multi-node allocations collect node-scoped GPUs and preserve accounting")
     func multiNodeAccounting() async throws {
         let snapshot = try job("7", nodes: "2")

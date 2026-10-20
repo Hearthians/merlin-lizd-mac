@@ -67,6 +67,14 @@ struct HPC2StartSheet: View {
         _initializationScript = State(initialValue: initialPreset.initializationScript ?? "")
     }
 
+    private var acceleratorResource: SlurmAcceleratorResource {
+        initialProfile.id == HKUSTSlurmCluster.hpc4.id ? .npu : .gpu
+    }
+
+    private var acceleratorLabel: String {
+        acceleratorResource.rawValue.uppercased()
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack {
@@ -97,7 +105,7 @@ struct HPC2StartSheet: View {
                         .textFieldStyle(.roundedBorder)
                     TextField("集群用户名", text: $owner)
                         .textFieldStyle(.roundedBorder)
-                    Text("SSH 连接参数由 ~/.ssh/config 管理；默认别名为 hpc2。")
+                    Text("SSH 连接参数由 ~/.ssh/config 管理。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -116,18 +124,28 @@ struct HPC2StartSheet: View {
                     Stepper(value: $memoryMiB, in: 1...1_073_741_824, step: 1_024) {
                         LabeledContent("内存", value: "\((Double(memoryMiB) / 1_024).formatted()) GiB")
                     }
-                    Toggle("GPU", isOn: $requestsGPU)
+                    Toggle(acceleratorLabel, isOn: $requestsGPU)
                     if requestsGPU {
                         Stepper(value: $gpuCount, in: 1...1_024) {
-                            LabeledContent("GPU 数量", value: "\(gpuCount)")
+                            LabeledContent("\(acceleratorLabel) 数量", value: "\(gpuCount)")
                         }
-                        Picker("GPU 型号", selection: $gpuType) {
-                            ForEach(GPUTypeChoice.allCases) { choice in
-                                Text(choice.title).tag(choice.rawValue)
+                        if initialProfile.id == HKUSTSlurmCluster.hpc2.id {
+                            Picker("GPU 型号", selection: $gpuType) {
+                                ForEach(GPUTypeChoice.allCases) { choice in
+                                    Text(choice.title).tag(choice.rawValue)
+                                }
+                                if GPUTypeChoice(rawValue: gpuType) == nil {
+                                    Text(gpuType).tag(gpuType)
+                                }
                             }
-                            if GPUTypeChoice(rawValue: gpuType) == nil {
-                                Text(gpuType).tag(gpuType)
-                            }
+                        } else {
+                            TextField("\(acceleratorLabel) 类型（可选）", text: $gpuType)
+                                .textFieldStyle(.roundedBorder)
+                        }
+                        if acceleratorResource == .npu {
+                            Text("数量按 Slurm NPU 资源单位计，不等同于物理卡数。请选择提供 NPU 的分区。")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
                     }
                     TextField("时限（HH:MM:SS）", text: $wallTime)
@@ -231,7 +249,7 @@ struct HPC2StartSheet: View {
             !requestsGPU || ((1...1_024).contains(gpuCount)
                 && (gpuType.isEmpty || isSafeIdentifier(gpuType)))
         else {
-            return "CPU、内存或 GPU 资源参数无效。"
+            return "CPU、内存或加速器资源参数无效。"
         }
         guard Self.parseWallTime(wallTime) != nil else {
             return "时限格式应为 HH:MM:SS，且必须大于 0。"
@@ -261,10 +279,12 @@ struct HPC2StartSheet: View {
             "--time", wallTime,
         ]
         if requestsGPU {
-            let resource = ["gpu", gpuType, String(gpuCount)]
-                .filter { !$0.isEmpty }
-                .joined(separator: ":")
-            arguments += ["--gres", resource]
+            let resource = SlurmGPURequest(
+                type: gpuType.isEmpty ? nil : gpuType,
+                count: gpuCount,
+                resource: acceleratorResource
+            )
+            arguments += ["--gres", resource.gresValue]
         }
         let directory = workingDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
         if !directory.isEmpty, directory != "$HOME" {
@@ -301,7 +321,11 @@ struct HPC2StartSheet: View {
             memoryMiB: memoryMiB,
             wallTime: SlurmWallTime(seconds: wallTimeSeconds),
             gpu: requestsGPU
-                ? SlurmGPURequest(type: gpuType.isEmpty ? nil : gpuType, count: gpuCount)
+                ? SlurmGPURequest(
+                    type: gpuType.isEmpty ? nil : gpuType,
+                    count: gpuCount,
+                    resource: acceleratorResource
+                )
                 : nil,
             workingDirectory: directory.isEmpty || directory == "$HOME" ? nil : directory,
             initializationScript: script.isEmpty ? nil : script

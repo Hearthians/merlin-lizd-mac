@@ -29,6 +29,8 @@ public enum SlurmMonitoringParser {
             let members = nodes.filter { $0.partitions.contains(name) }.sorted { $0.name < $1.name }
             let totalGPU = sum(members.map(\.totalGPU))
             let allocatedGPU = sum(members.map(\.allocatedGPU))
+            let totalNPU = sum(members.map(\.totalNPU))
+            let allocatedNPU = sum(members.map(\.allocatedNPU))
             let partitionIsUp = state.uppercased() == "UP"
             let countsKnown = members.allSatisfy { $0.unallocatedGPU != nil }
             let four = countsKnown ? members.filter {
@@ -52,7 +54,9 @@ public enum SlurmMonitoringParser {
                 schedulableEightGPUNodeCount: eight,
                 runningJobCount: counts == nil ? nil : (count?.running ?? 0),
                 pendingJobCount: counts == nil ? nil : (count?.pending ?? 0),
-                nodes: members, sampledAt: sampledAt
+                nodes: members, sampledAt: sampledAt,
+                totalNPU: totalNPU, allocatedNPU: allocatedNPU,
+                unallocatedNPU: difference(totalNPU, allocatedNPU)
             )
         }.sorted { $0.partition < $1.partition }
     }
@@ -78,7 +82,8 @@ public enum SlurmMonitoringParser {
                 allocatedCPU: integer(tres?["cpu"]) ?? (hasAllocation ? integer(fields["NumCPUs"]) : nil),
                 allocatedMemoryMiB: memoryMiB(tres?["mem"]),
                 elapsedSeconds: duration(fields["RunTime"]),
-                allocatedResources: hasAllocation ? fields["AllocTRES"] : nil
+                allocatedResources: hasAllocation ? fields["AllocTRES"] : nil,
+                allocatedNPU: tres.flatMap { $0.isEmpty ? 0 : acceleratorCount($0, resource: "npu") }
             )
         }
         return result
@@ -203,7 +208,7 @@ public enum SlurmMonitoringParser {
             let upperState = state.uppercased()
             return SlurmNodeSnapshot(
                 name: name, partitions: partitions, state: state,
-                totalGPU: configured.flatMap(gpuCount),
+                totalGPU: nodeAcceleratorCount(configured, gres: fields["Gres"], resource: "gpu"),
                 // An explicit empty AllocTRES means no resources are allocated.
                 // A missing key remains unknown rather than an observed zero.
                 allocatedGPU: allocated.flatMap { $0.isEmpty ? 0 : gpuCount($0) },
@@ -211,7 +216,9 @@ public enum SlurmMonitoringParser {
                 allocatedCPU: integer(fields["CPUAlloc"]) ?? integer(allocated?["cpu"]),
                 totalMemoryMiB: integer64(fields["RealMemory"]) ?? memoryMiB(configured?["mem"]),
                 allocatedMemoryMiB: integer64(fields["AllocMem"]) ?? memoryMiB(allocated?["mem"]),
-                isSchedulable: !excludedStates.contains { upperState.contains($0) }
+                isSchedulable: !excludedStates.contains { upperState.contains($0) },
+                totalNPU: nodeAcceleratorCount(configured, gres: fields["Gres"], resource: "npu"),
+                allocatedNPU: allocated.flatMap { $0.isEmpty ? 0 : acceleratorCount($0, resource: "npu") }
             )
         }
     }
@@ -279,11 +286,47 @@ public enum SlurmMonitoringParser {
     }
 
     private static func gpuCount(_ tres: [String: String]) -> Int? {
-        if let generic = tres["gres/gpu"] { return integer(generic) }
-        let typed = tres.filter { $0.key.hasPrefix("gres/gpu:") }
+        acceleratorCount(tres, resource: "gpu")
+    }
+
+    private static func acceleratorCount(_ tres: [String: String], resource: String) -> Int? {
+        if let generic = tres["gres/\(resource)"] { return integer(generic) }
+        let typed = tres.filter { $0.key.hasPrefix("gres/\(resource):") }
         if !typed.isEmpty { return sum(typed.values.map(integer)) }
-        // A valid TRES list without any GPU entry describes a CPU-only allocation.
-        return tres["cpu"] != nil || tres["mem"] != nil ? 0 : nil
+        // A complete allocation without this resource reports an observed zero,
+        // including NPU-only jobs which must never be sampled as NVIDIA GPUs.
+        let knownResource = tres.keys.contains {
+            $0 == "gres/gpu" || $0.hasPrefix("gres/gpu:")
+                || $0 == "gres/npu" || $0.hasPrefix("gres/npu:")
+        }
+        return tres["cpu"] != nil || tres["mem"] != nil || knownResource ? 0 : nil
+    }
+
+    private static func nodeAcceleratorCount(
+        _ configured: [String: String]?, gres: String?, resource: String
+    ) -> Int? {
+        if let configured, configured.keys.contains(where: {
+            $0 == "gres/\(resource)" || $0.hasPrefix("gres/\(resource):")
+        }) {
+            return acceleratorCount(configured, resource: resource)
+        }
+        // Some clusters expose devices only through Gres rather than CfgTRES.
+        // Ignore socket affinity suffixes such as npu:16(S:0-1).
+        if let gres {
+            let entries = gres.split(separator: ",").map {
+                String($0.prefix { $0 != "(" }).trimmingCharacters(in: .whitespaces)
+            }.filter { $0 == resource || $0.hasPrefix(resource + ":") }
+            if !entries.isEmpty {
+                let parts = entries.map { $0.split(separator: ":", omittingEmptySubsequences: false) }
+                guard parts.allSatisfy({ (2...3).contains($0.count) }) else { return nil }
+                let generic = parts.filter { $0.count == 2 }
+                if generic.count == 1 { return integer(String(generic[0][1])) }
+                guard generic.isEmpty else { return nil }
+                return sum(parts.map { integer(String($0[2])) })
+            }
+        }
+        if let configured { return acceleratorCount(configured, resource: resource) }
+        return gres?.lowercased() == "(null)" ? 0 : nil
     }
 
     private static func integer(_ value: String?) -> Int? {

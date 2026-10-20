@@ -13,6 +13,14 @@ public struct SlurmNodeSnapshot: Codable, Hashable, Identifiable, Sendable {
     public let allocatedMemoryMiB: Int64?
     public let isSchedulable: Bool
 
+    public var totalNPU: Int? = nil
+    public var allocatedNPU: Int? = nil
+
+    public var unallocatedNPU: Int? {
+        guard let totalNPU, let allocatedNPU else { return nil }
+        return max(0, totalNPU - allocatedNPU)
+    }
+
     public var unallocatedGPU: Int? {
         guard let totalGPU, let allocatedGPU else { return nil }
         return max(0, totalGPU - allocatedGPU)
@@ -40,6 +48,9 @@ public struct SlurmQueueSnapshot: Codable, Hashable, Identifiable, Sendable {
     public let pendingJobCount: Int?
     public let nodes: [SlurmNodeSnapshot]
     public let sampledAt: Date
+    public var totalNPU: Int? = nil
+    public var allocatedNPU: Int? = nil
+    public var unallocatedNPU: Int? = nil
 }
 
 public struct SlurmJobAllocation: Codable, Hashable, Sendable {
@@ -53,6 +64,7 @@ public struct SlurmJobAllocation: Codable, Hashable, Sendable {
     public let elapsedSeconds: TimeInterval?
     /// Original TRES allocation, retained to distinguish full GPUs from MIG slices.
     public var allocatedResources: String? = nil
+    public var allocatedNPU: Int? = nil
 }
 
 public struct SlurmGPUUtilization: Codable, Hashable, Identifiable, Sendable {

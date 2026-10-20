@@ -7,12 +7,13 @@ struct HPC2QueueMonitoringView: View {
     let updatedAt: Date?
     let isRefreshing: Bool
     let preferredPartition: String
+    let platformPartitions: [String]
 
     @State private var showsAllQueues = false
 
     private var preferredPartitions: [String] {
         var result: [String] = []
-        for partition in [preferredPartition, "i64m1tga800u", "i64m1tga40u", "debug"] {
+        for partition in [preferredPartition] + platformPartitions {
             if !result.contains(partition) { result.append(partition) }
         }
         return result
@@ -20,7 +21,8 @@ struct HPC2QueueMonitoringView: View {
 
     private var displayedQueues: [SlurmQueueSnapshot] {
         let order = preferredPartitions
-        return queues.filter { showsAllQueues || order.contains($0.partition) }.sorted {
+        let hasPreferredQueue = queues.contains { order.contains($0.partition) }
+        return queues.filter { showsAllQueues || !hasPreferredQueue || order.contains($0.partition) }.sorted {
             let left = order.firstIndex(of: $0.partition) ?? Int.max
             let right = order.firstIndex(of: $1.partition) ?? Int.max
             return left == right ? $0.partition < $1.partition : left < right
@@ -69,7 +71,7 @@ struct HPC2QueueMonitoringView: View {
             }
 
             HStack(alignment: .top, spacing: 12) {
-                Text("未分配 GPU 是资源空位；4 / 8 卡空位按单台机器统计，能否启动仍取决于 CPU、内存、优先级和配额。队列可能共享节点，请勿相加。")
+                Text("未分配数量是资源空位；GPU 的 4 / 8 卡空位按单台机器统计，NPU 数量按 Slurm 资源单位显示。能否启动仍取决于 CPU、内存、优先级和配额。队列可能共享节点，请勿相加。")
                 Spacer(minLength: 0)
                 if let updatedAt {
                     Text("更新于 \(HPC2MonitoringFormat.time(updatedAt))")
@@ -84,6 +86,31 @@ struct HPC2QueueMonitoringView: View {
 
 private struct HPC2QueueResourceCard: View {
     let queue: SlurmQueueSnapshot
+
+    private var isNPUQueue: Bool { (queue.totalNPU ?? 0) > 0 }
+    private var isGPUQueue: Bool { !isNPUQueue && (queue.totalGPU ?? 0) > 0 }
+    private var isCPUOnlyQueue: Bool { queue.totalGPU == 0 && queue.totalNPU == 0 }
+    private var resourceName: String {
+        if isNPUQueue { return "NPU" }
+        if isCPUOnlyQueue { return "CPU 核" }
+        return isGPUQueue ? "GPU" : "加速器"
+    }
+    private var totalResource: Int? {
+        if isNPUQueue { return queue.totalNPU }
+        if isCPUOnlyQueue { return queue.totalCPU }
+        return isGPUQueue ? queue.totalGPU : nil
+    }
+    private var allocatedResource: Int? {
+        if isNPUQueue { return queue.allocatedNPU }
+        if isCPUOnlyQueue { return queue.allocatedCPU }
+        return isGPUQueue ? queue.allocatedGPU : nil
+    }
+    private var unallocatedResource: Int? {
+        if isNPUQueue { return queue.unallocatedNPU }
+        if isGPUQueue { return queue.unallocatedGPU }
+        guard isCPUOnlyQueue, let total = queue.totalCPU, let allocated = queue.allocatedCPU else { return nil }
+        return max(0, total - allocated)
+    }
 
     private var title: String {
         if queue.partition.localizedCaseInsensitiveContains("a800") { return "A800" }
@@ -108,26 +135,28 @@ private struct HPC2QueueResourceCard: View {
                     .textSelection(.enabled)
 
                 HStack(alignment: .firstTextBaseline, spacing: 5) {
-                    Text(HPC2MonitoringFormat.count(queue.unallocatedGPU))
+                    Text(HPC2MonitoringFormat.count(unallocatedResource))
                         .font(.system(size: 30, weight: .semibold, design: .rounded).monospacedDigit())
                         .foregroundStyle(.blue)
-                    Text("/ \(HPC2MonitoringFormat.count(queue.totalGPU)) GPU 未分配")
+                    Text("/ \(HPC2MonitoringFormat.count(totalResource)) \(resourceName) 未分配")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                     Spacer(minLength: 0)
                 }
-                if let total = queue.totalGPU, let allocated = queue.allocatedGPU, total > 0 {
+                if let total = totalResource, let allocated = allocatedResource, total > 0 {
                     ProgressView(value: Double(min(total, max(0, allocated))), total: Double(total))
                         .tint(.blue)
-                        .accessibilityLabel("GPU 已分配 \(allocated)，共 \(total)")
+                        .accessibilityLabel("\(resourceName) 已分配 \(allocated)，共 \(total)")
                 }
-                Text("GPU 已分配 \(HPC2MonitoringFormat.count(queue.allocatedGPU)) · 运行 \(HPC2MonitoringFormat.count(queue.runningJobCount)) · 排队 \(HPC2MonitoringFormat.count(queue.pendingJobCount))")
+                Text("\(resourceName) 已分配 \(HPC2MonitoringFormat.count(allocatedResource)) · 运行 \(HPC2MonitoringFormat.count(queue.runningJobCount)) · 排队 \(HPC2MonitoringFormat.count(queue.pendingJobCount))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                HStack(spacing: 12) {
-                    candidateCount("4 卡空位", count: queue.schedulableFourGPUNodeCount)
-                    candidateCount("8 卡空位", count: queue.schedulableEightGPUNodeCount)
+                if isGPUQueue {
+                    HStack(spacing: 12) {
+                        candidateCount("4 卡空位", count: queue.schedulableFourGPUNodeCount)
+                        candidateCount("8 卡空位", count: queue.schedulableEightGPUNodeCount)
+                    }
                 }
                 Divider()
                 VStack(alignment: .leading, spacing: 5) {
@@ -144,7 +173,7 @@ private struct HPC2QueueResourceCard: View {
                                     Spacer()
                                     Text(node.state).font(.caption.monospaced())
                                 }
-                                Text("GPU 空位 \(HPC2MonitoringFormat.count(node.unallocatedGPU)) / \(HPC2MonitoringFormat.count(node.totalGPU)) · CPU 已分配 \(HPC2MonitoringFormat.count(node.allocatedCPU)) / \(HPC2MonitoringFormat.count(node.totalCPU))")
+                                Text(nodeResourceDescription(node))
                                     .font(.caption)
                                 Text("内存已分配 \(HPC2MonitoringFormat.memory(node.allocatedMemoryMiB)) / \(HPC2MonitoringFormat.memory(node.totalMemoryMiB))\(node.isSchedulable ? "" : " · 节点暂不可调度")")
                                     .font(.caption)
@@ -160,6 +189,25 @@ private struct HPC2QueueResourceCard: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+
+    private func nodeResourceDescription(_ node: SlurmNodeSnapshot) -> String {
+        var resources: [String] = []
+        if (node.totalNPU ?? 0) > 0 {
+            resources.append("NPU 空位 \(HPC2MonitoringFormat.count(node.unallocatedNPU)) / \(HPC2MonitoringFormat.count(node.totalNPU)) 资源单位")
+        }
+        if (node.totalGPU ?? 0) > 0 {
+            resources.append("GPU 空位 \(HPC2MonitoringFormat.count(node.unallocatedGPU)) / \(HPC2MonitoringFormat.count(node.totalGPU))")
+        }
+        if node.totalNPU == nil && node.totalGPU == nil {
+            resources.append("加速器空位 — / —")
+        } else if node.totalNPU == nil {
+            resources.append("NPU 空位 — / —")
+        } else if node.totalGPU == nil {
+            resources.append("GPU 空位 — / —")
+        }
+        resources.append("CPU 已分配 \(HPC2MonitoringFormat.count(node.allocatedCPU)) / \(HPC2MonitoringFormat.count(node.totalCPU))")
+        return resources.joined(separator: " · ")
     }
 
     private func candidateCount(_ title: String, count: Int?) -> some View {
@@ -186,6 +234,15 @@ struct HPC2JobUtilizationView: View {
     let snapshot: SlurmJobUtilizationSnapshot?
     let isRefreshing: Bool
 
+    private var isNPUOnlyJob: Bool {
+        (snapshot?.allocation?.allocatedNPU ?? 0) > 0 && (snapshot?.allocation?.allocatedGPU ?? 0) == 0
+    }
+
+    private var npuUnavailableReason: String {
+        if let reason = snapshot?.unavailableReason, !reason.isEmpty { return reason }
+        return "NPU 已分配；暂不支持 NPU 利用率、显存和功率采样。"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Divider()
@@ -199,7 +256,7 @@ struct HPC2JobUtilizationView: View {
                 if isRefreshing { ProgressView().controlSize(.mini) }
             }
             if let allocation = snapshot?.allocation, job.state != .pending {
-                Text("已分配：GPU \(HPC2MonitoringFormat.count(allocation.allocatedGPU)) 张 · CPU \(HPC2MonitoringFormat.count(allocation.allocatedCPU)) 核 · 内存 \(HPC2MonitoringFormat.memory(allocation.allocatedMemoryMiB))")
+                Text(allocationDescription(allocation))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -209,7 +266,12 @@ struct HPC2JobUtilizationView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
-                if let gpus = snapshot?.gpus {
+                if isNPUOnlyJob {
+                    Text(npuUnavailableReason)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                } else if let gpus = snapshot?.gpus {
                     if gpus.isEmpty {
                         Text("未分配 GPU")
                             .font(.caption)
@@ -226,7 +288,7 @@ struct HPC2JobUtilizationView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                if let reason = snapshot?.unavailableReason, !reason.isEmpty {
+                if !isNPUOnlyJob, let reason = snapshot?.unavailableReason, !reason.isEmpty {
                     Text(reason)
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -252,6 +314,19 @@ struct HPC2JobUtilizationView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func allocationDescription(_ allocation: SlurmJobAllocation) -> String {
+        var resources: [String] = []
+        if (allocation.allocatedNPU ?? 0) > 0 {
+            resources.append("NPU \(HPC2MonitoringFormat.count(allocation.allocatedNPU)) 资源单位")
+        }
+        if (allocation.allocatedGPU ?? 0) > 0 {
+            resources.append("GPU \(HPC2MonitoringFormat.count(allocation.allocatedGPU)) 张")
+        }
+        resources.append("CPU \(HPC2MonitoringFormat.count(allocation.allocatedCPU)) 核")
+        resources.append("内存 \(HPC2MonitoringFormat.memory(allocation.allocatedMemoryMiB))")
+        return "已分配：" + resources.joined(separator: " · ")
     }
 
     private func statistic(_ title: String, value: String) -> some View {

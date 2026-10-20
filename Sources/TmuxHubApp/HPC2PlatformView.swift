@@ -21,7 +21,8 @@ struct HPC2PlatformView: View {
                     error: model.queueMonitoringError,
                     updatedAt: model.queueMonitoringUpdatedAt,
                     isRefreshing: model.isRefreshingMonitoring,
-                    preferredPartition: model.defaultPreset.partition
+                    preferredPartition: model.defaultPreset.partition,
+                    platformPartitions: model.cluster.preferredPartitions
                 )
                 metrics
                 HStack {
@@ -31,6 +32,14 @@ struct HPC2PlatformView: View {
                         showsCostRatesSheet = true
                     }
                     .buttonStyle(.borderless)
+                    .disabled(!model.costConfiguration.isPricingAvailable)
+                }
+                if model.cluster == .hpc3 {
+                    Text("HPC3 使用 2025-09-01 起公布的 ACD 卡时参考价；未另加 HPC2 的 CPU 费。可按当前账单调整单价。")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else if model.cluster == .hpc4 {
+                    Text("HPC4 计费标准尚未确认，费用暂不估算；缺失价格不按零费用处理。")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 if selectedList == .current {
                     currentJobs

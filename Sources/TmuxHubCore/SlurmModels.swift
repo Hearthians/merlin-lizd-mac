@@ -16,13 +16,71 @@ public struct SlurmPlatformProfile: Codable, Hashable, Identifiable, Sendable {
     }
 }
 
+/// Built-in cluster identities keep preferences, receipts and scheduler data isolated.
+public enum HKUSTSlurmCluster: String, Codable, CaseIterable, Identifiable, Sendable {
+    case hpc2, hpc3, hpc4
+
+    public var id: String { "hkust-\(rawValue)" }
+    public var displayName: String { "HKUST \(rawValue.uppercased())" }
+    public var sshDestination: String { rawValue }
+    public var storagePrefix: String { rawValue }
+    public var defaultCostConfiguration: SlurmCostConfiguration {
+        switch self {
+        case .hpc2: .hkustHPC2
+        case .hpc3: .hkustHPC3
+        case .hpc4: .hkustHPC4
+        }
+    }
+
+    public func defaultProfile(owner: String = "zli760") -> SlurmPlatformProfile {
+        SlurmPlatformProfile(
+            id: id, name: displayName, loginDestination: sshDestination, owner: owner
+        )
+    }
+
+    public var defaultPreset: SlurmInteractivePreset {
+        SlurmInteractivePreset(
+            id: "\(rawValue)-default", name: "交互环境", partition: "debug",
+            tasks: 1, cpusPerTask: 4, memoryMiB: 16 * 1_024,
+            wallTime: SlurmWallTime(seconds: 30 * 60),
+            gpu: self == .hpc4 ? nil : SlurmGPURequest(count: 1)
+        )
+    }
+
+    public var preferredPartitions: [String] {
+        switch self {
+        case .hpc2: ["i64m1tga800u", "i64m1tga40u", "debug"]
+        case .hpc3: ["acd_u", "acd_ue", "emergency_acd", "debug"]
+        case .hpc4: [
+            "a128m512u", "a128m512ue", "emergency", "debug",
+            "a320m2tn910cu", "a320m2tn910cue", "emergency_a320m2tn910c",
+        ]
+        }
+    }
+}
+
+public enum SlurmAcceleratorResource: String, Codable, CaseIterable, Hashable, Sendable {
+    case gpu, npu
+}
+
 public struct SlurmGPURequest: Codable, Hashable, Sendable {
     public let type: String?
     public let count: Int
+    /// Absent in older saved presets, where every accelerator request was a GPU.
+    public let resource: SlurmAcceleratorResource?
+    public var gresResource: SlurmAcceleratorResource { resource ?? .gpu }
+    public var gresValue: String {
+        [gresResource.rawValue, type, String(count)].compactMap { $0 }.joined(separator: ":")
+    }
 
-    public init(type: String? = nil, count: Int) {
+    public init(
+        type: String? = nil,
+        count: Int,
+        resource: SlurmAcceleratorResource = .gpu
+    ) {
         self.type = type
         self.count = count
+        self.resource = resource == .gpu ? nil : resource
     }
 }
 

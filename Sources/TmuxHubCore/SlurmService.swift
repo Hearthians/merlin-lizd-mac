@@ -160,7 +160,9 @@ public actor SlurmService {
             } else if job.state != .running {
                 reason = "任务运行后可查看利用情况。"
             } else if let allocation, allocation.state == .running {
-                if allocation.allocatedGPU == 0 {
+                if (allocation.allocatedNPU ?? 0) > 0, (allocation.allocatedGPU ?? 0) == 0 {
+                    reason = "NPU 已分配；暂不支持 NPU 利用率、显存和功率采样。"
+                } else if allocation.allocatedGPU == 0 {
                     gpus = []
                     reason = statistics[job.jobID] == nil
                         ? "暂时无法读取 CPU 和内存统计。" : nil

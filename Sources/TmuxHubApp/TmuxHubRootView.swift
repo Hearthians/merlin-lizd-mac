@@ -6,6 +6,8 @@ struct TmuxHubRootView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var terminals: TerminalTabsModel
     @ObservedObject var hpc2: HPC2PlatformModel
+    @ObservedObject var hpc3: HPC2PlatformModel
+    @ObservedObject var hpc4: HPC2PlatformModel
     @ObservedObject var mesh: NetworkMeshModel
     var propertiesReader = SSHHostPropertiesReader()
     @State private var sessionBrowserTarget: TerminalTarget?
@@ -17,12 +19,12 @@ struct TmuxHubRootView: View {
 
     private enum PropertiesTarget: Identifiable {
         case host(SSHHost)
-        case platform
+        case platform(String)
 
         var id: String {
             switch self {
             case let .host(host): "ssh:\(host.destination)"
-            case .platform: "platform:hkust-hpc2"
+            case let .platform(id): "platform:\(id)"
             }
         }
     }
@@ -34,7 +36,7 @@ struct TmuxHubRootView: View {
                 SidebarView(
                     model: model,
                     terminals: terminals,
-                    platformName: hpc2.profile.name,
+                    platforms: [hpc2.profile, hpc3.profile, hpc4.profile],
                     onAddHost: { showsAddSSHHost = true },
                     onShowProperties: showProperties,
                     onBrowseSessions: browseSessions,
@@ -99,8 +101,10 @@ struct TmuxHubRootView: View {
                 SSHHostPropertiesSheet(host: host, reader: propertiesReader) { settings in
                     _ = try await model.updateConnection(settings)
                 }
-            case .platform:
-                HPC2PropertiesSheet(model: hpc2)
+            case let .platform(id):
+                if let platform = platformModel(for: id) {
+                    HPC2PropertiesSheet(model: platform)
+                }
             }
         }
         .sheet(isPresented: $showsAddSSHHost) {
@@ -230,8 +234,9 @@ struct TmuxHubRootView: View {
     private func refresh() {
         if model.selection == .mesh {
             Task { await mesh.refresh(sshHosts: model.hosts) }
-        } else if model.selection == .platform("hkust-hpc2") {
-            Task { await hpc2.refresh(force: true) }
+        } else if case let .platform(id) = model.selection,
+            let platform = platformModel(for: id) {
+            Task { await platform.refresh(force: true) }
         } else {
             model.refresh()
         }
@@ -264,20 +269,21 @@ struct TmuxHubRootView: View {
                 onBrowseHerdr: { browseHerdr(.local) }
             )
         case let .platform(platformID):
-            if platformID == "hkust-hpc2" {
+            if let platform = platformModel(for: platformID) {
                 HPC2PlatformView(
-                    model: hpc2,
+                    model: platform,
                     onConnect: { receipt in
                         terminals.openAttachOnlyRemoteTmux(
                             destination: receipt.loginDestination,
                             sessionName: receipt.tmuxSessionName,
-                            title: "HPC2 · \(receipt.jobName)"
+                            title: "\(platform.profile.name) · \(receipt.jobName)"
                         )
                     },
                     onOpenLoginShell: {
-                        terminals.openOrResumeSSH(hpc2.profile.loginDestination)
+                        terminals.openOrResumeSSH(platform.profile.loginDestination)
                     }
                 )
+                .id(platformID)
             } else {
                 ContentUnavailableView(
                     "平台不可用",
@@ -322,6 +328,10 @@ struct TmuxHubRootView: View {
         }
     }
 
+    private func platformModel(for id: String) -> HPC2PlatformModel? {
+        [hpc2, hpc3, hpc4].first { $0.cluster.id == id }
+    }
+
     private func browseSessions(_ target: TerminalTarget) {
         sessionBrowserTarget = target
     }
@@ -332,8 +342,8 @@ struct TmuxHubRootView: View {
             if let host = model.host(destination: destination) {
                 propertiesTarget = .host(host)
             }
-        case .platform("hkust-hpc2"):
-            propertiesTarget = .platform
+        case let .platform(id):
+            if platformModel(for: id) != nil { propertiesTarget = .platform(id) }
         default:
             break
         }

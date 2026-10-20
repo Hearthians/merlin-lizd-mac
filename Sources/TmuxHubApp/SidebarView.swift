@@ -5,7 +5,7 @@ import SwiftUI
 struct SidebarView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var terminals: TerminalTabsModel
-    let platformName: String
+    let platforms: [SlurmPlatformProfile]
     let onAddHost: () -> Void
     let onShowProperties: (SidebarSelection) -> Void
     let onBrowseSessions: (TerminalTarget) -> Void
@@ -59,15 +59,17 @@ struct SidebarView: View {
             }
 
             Section("计算平台") {
-                sidebarRow(
-                    title: platformName,
-                    symbol: "cpu",
-                    tint: .purple,
-                    selection: .platform("hkust-hpc2")
-                )
-                .contextMenu {
-                    Button("属性", systemImage: "slider.horizontal.3") {
-                        onShowProperties(.platform("hkust-hpc2"))
+                ForEach(platforms) { platform in
+                    sidebarRow(
+                        title: platform.name,
+                        symbol: "cpu",
+                        tint: .purple,
+                        selection: .platform(platform.id)
+                    )
+                    .contextMenu {
+                        Button("属性", systemImage: "slider.horizontal.3") {
+                            onShowProperties(.platform(platform.id))
+                        }
                     }
                 }
             }

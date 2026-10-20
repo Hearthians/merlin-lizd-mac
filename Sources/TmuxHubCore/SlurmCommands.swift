@@ -290,10 +290,7 @@ public enum SlurmCommands {
             "--time", preset.wallTime.schedulerValue,
         ]
         if let gpu = preset.gpu {
-            let resource = ["gpu", gpu.type, String(gpu.count)]
-                .compactMap { $0 }
-                .joined(separator: ":")
-            srun += ["--gres", resource]
+            srun += ["--gres", gpu.gresValue]
         }
         if let workingDirectory = preset.workingDirectory {
             srun += ["--chdir", workingDirectory]
