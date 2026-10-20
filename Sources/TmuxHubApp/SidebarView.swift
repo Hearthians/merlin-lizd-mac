@@ -40,6 +40,12 @@ struct SidebarView: View {
                     tint: .orange,
                     selection: .mesh
                 )
+                sidebarRow(
+                    title: "端口转发",
+                    symbol: "arrow.left.arrow.right",
+                    tint: .teal,
+                    selection: .portForwarding
+                )
                 HStack {
                     sidebarRow(
                         title: "本机",

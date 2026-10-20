@@ -14,6 +14,7 @@ private let browserRestrictedPorts: Set<Int> = [
 
 public enum SSHLocalForwardingError: Error, Equatable, LocalizedError, Sendable {
     case localPortUnavailable(Int)
+    case invalidLocalPort(Int)
     case unableToAllocateLocalPort
     case unableToOpenForward
     case invalidLoopbackHost
@@ -24,6 +25,8 @@ public enum SSHLocalForwardingError: Error, Equatable, LocalizedError, Sendable 
         switch self {
         case let .localPortUnavailable(port):
             return "本机端口 \(port) 已被占用。"
+        case let .invalidLocalPort(port):
+            return "本机端口 \(port) 无效或被浏览器限制。"
         case .unableToAllocateLocalPort:
             return "无法为远端服务分配可用的本机端口。"
         case .unableToOpenForward:
@@ -71,11 +74,10 @@ protocol SSHLocalListenerProbing: Sendable {
 
 /// Owns local forwards opened through an SSH control master.
 ///
-/// Routes are shared by destination and remote endpoint. Each terminal session
+/// Routes are shared by destination and remote endpoint. Each saved link
 /// registers an owner, and the exact OpenSSH forwarding tuple is cancelled only
 /// after the final owner releases it. An in-flight creation also retains its
-/// owner set, so closing a terminal while OpenSSH is responding cannot leak a
-/// listener.
+/// owner set, so removing a link while OpenSSH is responding cannot leak a listener.
 public actor SSHLocalForwardingService {
     private struct RouteKey: Hashable, Sendable {
         let destination: String
@@ -87,6 +89,7 @@ public actor SSHLocalForwardingService {
         let id: UUID
         let key: RouteKey
         let localPort: Int
+        var isEstablished = true
     }
 
     private struct PendingRoute: Sendable {
@@ -133,21 +136,33 @@ public actor SSHLocalForwardingService {
         self.maximumOpenAttempts = maximumOpenAttempts
     }
 
+    /// A supplied local port is strict, so saved browser URLs survive restart.
+    /// Existing routes always repair on their assigned port; conflicts stay visible.
     public func acquire(
         owner: UUID,
         destination: String,
-        endpoint: LoopbackURL
+        endpoint: LoopbackURL,
+        localPort requestedLocalPort: Int? = nil
     ) async throws -> URL {
         guard !isShuttingDown else {
             throw SSHLocalForwardingError.shuttingDown
         }
 
+        if let requestedLocalPort,
+            !(1...65_535).contains(requestedLocalPort) || browserRestrictedPorts.contains(requestedLocalPort) {
+            throw SSHLocalForwardingError.invalidLocalPort(requestedLocalPort)
+        }
         let remoteHost = try canonicalRemoteHost(endpoint.remoteHost)
         let key = RouteKey(
             destination: destination,
             remoteHost: remoteHost,
             remotePort: endpoint.remotePort
         )
+        if let requestedLocalPort, let existing = routes[key],
+            requestedLocalPort != existing.localPort {
+            throw SSHLocalForwardingError.localPortUnavailable(requestedLocalPort)
+        }
+        let wasOwner = ownersByRoute[key]?.contains(owner) == true
         register(owner: owner, for: key)
 
         if let cancellation = inFlightCancellations[key] {
@@ -172,7 +187,9 @@ public actor SSHLocalForwardingService {
             pending = existing
         } else {
             let existingRoute = routes[key]
-            let task = makeRouteTask(key: key, existingRoute: existingRoute)
+            let task = makeRouteTask(
+                key: key, existingRoute: existingRoute, requestedLocalPort: requestedLocalPort
+            )
             let created = PendingRoute(
                 id: UUID(),
                 previousRouteID: existingRoute?.id,
@@ -182,14 +199,21 @@ public actor SSHLocalForwardingService {
             pending = created
         }
 
+        var establishedRoute = false
         do {
             let route = try await pending.task.value
+            establishedRoute = true
             try await settleSuccessfulRoute(
                 route,
                 pendingID: pending.id,
                 owner: owner,
                 key: key
             )
+            // A concurrent caller may have allocated this route before a saved
+            // link asked for its remembered port. Never silently rewrite that link.
+            if let requestedLocalPort, requestedLocalPort != route.localPort {
+                throw SSHLocalForwardingError.localPortUnavailable(requestedLocalPort)
+            }
             guard let url = endpoint.rewrittenURL(localPort: route.localPort) else {
                 remove(owner: owner, from: key)
                 await cancelIfUnowned(key: key)
@@ -199,9 +223,10 @@ public actor SSHLocalForwardingService {
         } catch {
             await settleFailedRoute(
                 pendingID: pending.id,
-                previousRouteID: pending.previousRouteID,
+                previousRouteID: establishedRoute ? nil : pending.previousRouteID,
                 owner: owner,
-                key: key
+                key: key,
+                preserveOwnership: wasOwner && !Task.isCancelled
             )
             throw error
         }
@@ -275,14 +300,15 @@ public actor SSHLocalForwardingService {
 
     private func makeRouteTask(
         key: RouteKey,
-        existingRoute: Route?
+        existingRoute: Route?,
+        requestedLocalPort: Int?
     ) -> Task<Route, any Error> {
         let transport = self.transport
         let portAllocator = self.portAllocator
         let listenerProbe = self.listenerProbe
         let maximumOpenAttempts = self.maximumOpenAttempts
         return Task.detached {
-            if let existingRoute {
+            if let existingRoute, existingRoute.isEstablished {
                 let masterIsRunning = await transport.isMasterRunning(
                     alias: key.destination
                 )
@@ -298,7 +324,8 @@ public actor SSHLocalForwardingService {
                 key: key,
                 transport: transport,
                 portAllocator: portAllocator,
-                maximumOpenAttempts: maximumOpenAttempts
+                maximumOpenAttempts: maximumOpenAttempts,
+                requestedLocalPort: existingRoute?.localPort ?? requestedLocalPort
             )
         }
     }
@@ -328,15 +355,18 @@ public actor SSHLocalForwardingService {
         pendingID: UUID,
         previousRouteID: UUID?,
         owner: UUID,
-        key: RouteKey
+        key: RouteKey,
+        preserveOwnership: Bool
     ) async {
         if pendingRoutes[key]?.id == pendingID {
             pendingRoutes.removeValue(forKey: key)
-            if routes[key]?.id == previousRouteID {
-                routes.removeValue(forKey: key)
+            if let previousRouteID, routes[key]?.id == previousRouteID {
+                // Keep the desired port for existing owners after failed repair.
+                // A listener at that port may belong to another process now.
+                routes[key]?.isEstablished = false
             }
         }
-        remove(owner: owner, from: key)
+        if !preserveOwnership { remove(owner: owner, from: key) }
         guard !isShuttingDown, pendingRoutes[key] == nil else { return }
         await cancelIfUnowned(key: key)
     }
@@ -383,13 +413,16 @@ public actor SSHLocalForwardingService {
         key: RouteKey,
         transport: any SSHLocalForwardingTransport,
         portAllocator: any SSHLocalPortAllocating,
-        maximumOpenAttempts: Int
+        maximumOpenAttempts: Int,
+        requestedLocalPort: Int?
     ) async throws -> Route {
         var attemptedPorts: Set<Int> = []
         for attempt in 0..<maximumOpenAttempts {
             let localPort: Int
             do {
-                localPort = try portAllocator.availablePort(
+                // Binding a remembered port must be atomic at SSH; a separate
+                // availability check could substitute a different browser URL.
+                localPort = try requestedLocalPort ?? portAllocator.availablePort(
                     preferredPort: attempt == 0
                         && !browserRestrictedPorts.contains(key.remotePort)
                         ? key.remotePort
@@ -412,6 +445,9 @@ public actor SSHLocalForwardingService {
                 )
                 return Route(id: UUID(), key: key, localPort: localPort)
             } catch SSHLocalForwardingError.localPortUnavailable {
+                if let requestedLocalPort {
+                    throw SSHLocalForwardingError.localPortUnavailable(requestedLocalPort)
+                }
                 continue
             } catch is CancellationError {
                 throw CancellationError()

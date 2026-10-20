@@ -37,7 +37,11 @@ struct TmuxHubApplication: App {
 
     var body: some Scene {
         WindowGroup("TmuxHub") {
-            TmuxHubRootView(model: model, terminals: terminals, hpc2: hpc2, hpc3: hpc3, hpc4: hpc4, mesh: mesh)
+            TmuxHubRootView(
+                model: model, terminals: terminals,
+                hpc2: hpc2, hpc3: hpc3, hpc4: hpc4,
+                mesh: mesh, forwardedLinks: runtime.forwardedLinks
+            )
                 .frame(minWidth: 900, minHeight: 600)
         }
         .defaultSize(width: 1160, height: 760)

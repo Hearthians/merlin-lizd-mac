@@ -9,6 +9,7 @@ struct TmuxHubRootView: View {
     @ObservedObject var hpc3: HPC2PlatformModel
     @ObservedObject var hpc4: HPC2PlatformModel
     @ObservedObject var mesh: NetworkMeshModel
+    @ObservedObject var forwardedLinks: ForwardedLinksModel
     var propertiesReader = SSHHostPropertiesReader()
     @State private var sessionBrowserTarget: TerminalTarget?
     @State private var herdrBrowserTarget: TerminalTarget?
@@ -234,6 +235,8 @@ struct TmuxHubRootView: View {
     private func refresh() {
         if model.selection == .mesh {
             Task { await mesh.refresh(sshHosts: model.hosts) }
+        } else if model.selection == .portForwarding {
+            Task { await forwardedLinks.refreshAll() }
         } else if case let .platform(id) = model.selection,
             let platform = platformModel(for: id) {
             Task { await platform.refresh(force: true) }
@@ -260,6 +263,8 @@ struct TmuxHubRootView: View {
                 onConnect: terminals.openOrResumeSSH,
                 onHostsChanged: model.refresh
             )
+        case .portForwarding:
+            ForwardedLinksView(model: forwardedLinks)
         case .local:
             LocalTerminalLandingView(
                 terminals: terminals,

@@ -100,6 +100,8 @@ let package = Package(
                 "HPC2StartSheet.swift",
                 "HPC2PropertiesSheet.swift",
                 "HubRuntime.swift",
+                "ForwardedLinksModel.swift",
+                "ForwardedLinksView.swift",
                 "TmuxHubApplication.swift",
                 "TmuxHubRootView.swift",
                 "WindowChrome.swift",

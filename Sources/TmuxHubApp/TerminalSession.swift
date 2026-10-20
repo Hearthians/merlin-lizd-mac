@@ -27,8 +27,7 @@ final class TerminalSession: ObservableObject, Identifiable,
     private var command: CommandSpec?
     private var currentDirectory: String?
     private let attachmentService: AttachmentTransferService
-    private let portForwardingService: SSHLocalForwardingService
-    private let portForwardingOwner = UUID()
+    private let forwardedLinks: ForwardedLinksModel
     private var linkTask: Task<Void, Never>?
     private var savePanel: NSSavePanel?
 
@@ -41,14 +40,14 @@ final class TerminalSession: ObservableObject, Identifiable,
         command: CommandSpec,
         attachmentModel: TerminalAttachmentModel,
         service: AttachmentTransferService,
-        portForwardingService: SSHLocalForwardingService,
+        forwardedLinks: ForwardedLinksModel,
         currentDirectory: String? = nil
     ) {
         self.id = id
         self.command = command
         self.attachmentModel = attachmentModel
         attachmentService = service
-        self.portForwardingService = portForwardingService
+        self.forwardedLinks = forwardedLinks
         self.currentDirectory = currentDirectory
         terminalView = AttachmentTerminalView(frame: .zero)
         terminalView.processDelegate = self
@@ -116,7 +115,6 @@ final class TerminalSession: ObservableObject, Identifiable,
             TerminalProcessReaper.reap(processID: processID)
         }
         terminalView.processDelegate = nil
-        releasePortForwards()
     }
 
     func dismissLinkTransferMessage() {
@@ -213,8 +211,7 @@ final class TerminalSession: ObservableObject, Identifiable,
         linkTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let localURL = try await portForwardingService.acquire(
-                    owner: portForwardingOwner,
+                let localURL = try await forwardedLinks.open(
                     destination: destination,
                     endpoint: endpoint
                 )
@@ -238,12 +235,6 @@ final class TerminalSession: ObservableObject, Identifiable,
                 linkTransferMessage = error.localizedDescription
             }
         }
-    }
-
-    private func releasePortForwards() {
-        let service = portForwardingService
-        let owner = portForwardingOwner
-        Task { await service.release(owner: owner) }
     }
 
     private func presentSavePanel(for remotePath: String, context: AttachmentContext) {
@@ -360,7 +351,6 @@ final class TerminalSession: ObservableObject, Identifiable,
             }
             self.didReportExit = true
             self.state = .exited(exitCode)
-            self.releasePortForwards()
         }
     }
 }

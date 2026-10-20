@@ -139,7 +139,7 @@ struct SSHLocalForwardingServiceTests {
         #expect(listener.recordedPorts() == [8080])
     }
 
-    @Test("replaces a cached route when its control master is gone")
+    @Test("repairs a cached route on the same port when its control master is gone")
     func replacesStaleRoute() async throws {
         let transport = RecordingForwardingTransport(masterRunning: false)
         let allocator = ScriptedPortAllocator([8080, 49153])
@@ -157,8 +157,9 @@ struct SSHLocalForwardingServiceTests {
             endpoint: endpoint
         )
 
-        #expect(replacement.absoluteString == "http://localhost:49153/")
-        #expect(await transport.recordedOpenCalls().map(\.localPort) == [8080, 49153])
+        #expect(replacement.absoluteString == "http://localhost:8080/")
+        #expect(await transport.recordedOpenCalls().map(\.localPort) == [8080, 8080])
+        #expect(allocator.recordedPreferredPorts() == [8080])
         #expect(await transport.recordedCancelCalls().map(\.localPort) == [8080])
     }
 
@@ -364,6 +365,161 @@ struct SSHLocalForwardingServiceTests {
             .open(5051),
         ])
         await service.release(owner: secondOwner)
+    }
+
+    @Test("saved links restore their remembered local port without allocating another")
+    func restoresRememberedPort() async throws {
+        let transport = RecordingForwardingTransport()
+        let allocator = ScriptedPortAllocator([])
+        let service = makeService(transport: transport, allocator: allocator)
+        let endpoint = try #require(LoopbackURL("http://localhost:8080/view?q=1#mesh"))
+        let owner = UUID()
+
+        let result = try await service.acquire(
+            owner: owner, destination: "cluster", endpoint: endpoint, localPort: 49170
+        )
+
+        #expect(result.absoluteString == "http://localhost:49170/view?q=1#mesh")
+        #expect(allocator.recordedPreferredPorts().isEmpty)
+        #expect(await transport.recordedOpenCalls().map(\.localPort) == [49170])
+        await service.release(owner: owner)
+        #expect(await transport.recordedCancelCalls().map(\.localPort) == [49170])
+    }
+
+    @Test("remembered ports reject invalid and browser-restricted values")
+    func rejectsInvalidRememberedPorts() async throws {
+        let transport = RecordingForwardingTransport()
+        let allocator = ScriptedPortAllocator([])
+        let service = makeService(transport: transport, allocator: allocator)
+        let endpoint = try #require(LoopbackURL("http://localhost:8080/"))
+        for port in [-1, 0, 65_536, 6000] {
+            await #expect(throws: SSHLocalForwardingError.invalidLocalPort(port)) {
+                try await service.acquire(
+                    owner: UUID(), destination: "cluster", endpoint: endpoint, localPort: port
+                )
+            }
+        }
+        #expect(await transport.recordedOpenCalls().isEmpty)
+        #expect(allocator.recordedPreferredPorts().isEmpty)
+    }
+
+    @Test("a busy remembered port fails instead of silently moving the browser address")
+    func rememberedPortCollision() async throws {
+        let transport = RecordingForwardingTransport(openSteps: [.portUnavailable])
+        let allocator = ScriptedPortAllocator([49199])
+        let service = makeService(transport: transport, allocator: allocator)
+        let endpoint = try #require(LoopbackURL("http://localhost:8080/"))
+        await #expect(throws: SSHLocalForwardingError.localPortUnavailable(49171)) {
+            try await service.acquire(
+                owner: UUID(), destination: "cluster", endpoint: endpoint, localPort: 49171
+            )
+        }
+        #expect(await transport.recordedOpenCalls().map(\.localPort) == [49171])
+        #expect(allocator.recordedPreferredPorts().isEmpty)
+        await service.shutdown()
+        #expect(await transport.recordedCancelCalls().isEmpty)
+    }
+
+    @Test("failed repair retains the assigned port and existing owner for a later shared retry")
+    func failedRepairPreservesDesiredRoute() async throws {
+        let transport = RecordingForwardingTransport(openSteps: [.succeed, .portUnavailable, .succeed])
+        let allocator = ScriptedPortAllocator([49172, 49199])
+        // After failed repair a listener may belong to a different process. It
+        // must not be mistaken for this route even with a live SSH master.
+        let probe = ScriptedListenerProbe([false, true])
+        let service = makeService(transport: transport, allocator: allocator, listenerProbe: probe)
+        let endpoint = try #require(LoopbackURL("http://localhost:8080/"))
+        let firstOwner = UUID()
+        let secondOwner = UUID()
+        let original = try await service.acquire(
+            owner: firstOwner, destination: "cluster", endpoint: endpoint
+        )
+        await #expect(throws: SSHLocalForwardingError.localPortUnavailable(49172)) {
+            try await service.acquire(owner: firstOwner, destination: "cluster", endpoint: endpoint)
+        }
+        let recovered = try await service.acquire(
+            owner: secondOwner, destination: "cluster", endpoint: endpoint
+        )
+        #expect(recovered == original)
+        #expect(await transport.recordedOpenCalls().map(\.localPort) == [49172, 49172, 49172])
+        #expect(allocator.recordedPreferredPorts() == [8080])
+        #expect(probe.recordedPorts() == [49172])
+        await service.release(owner: secondOwner)
+        #expect(await transport.recordedCancelCalls().count == 1)
+        await service.release(owner: firstOwner)
+        #expect(await transport.recordedCancelCalls().map(\.localPort) == [49172, 49172])
+    }
+
+    @Test("conflicting concurrent remembered ports cannot replace another owner's route")
+    func conflictingRememberedPorts() async throws {
+        let transport = RecordingForwardingTransport(pausesFirstOpen: true)
+        let allocator = ScriptedPortAllocator([])
+        let service = makeService(transport: transport, allocator: allocator)
+        let endpoint = try #require(LoopbackURL("http://localhost:8080/"))
+        let owner = UUID()
+        let first = Task {
+            try await service.acquire(
+                owner: owner, destination: "cluster", endpoint: endpoint, localPort: 49173
+            )
+        }
+        await transport.waitUntilOpenCallCount(1)
+        let conflict = Task {
+            try await service.acquire(
+                owner: UUID(), destination: "cluster", endpoint: endpoint, localPort: 49174
+            )
+        }
+        for _ in 0..<10 { await Task.yield() }
+        await transport.resumeFirstOpen()
+        #expect(try await first.value.port == 49173)
+        await #expect(throws: SSHLocalForwardingError.localPortUnavailable(49174)) {
+            try await conflict.value
+        }
+        #expect(await transport.recordedOpenCalls().map(\.localPort) == [49173])
+        #expect(await transport.recordedCancelCalls().isEmpty)
+        await service.release(owner: owner)
+        #expect(await transport.recordedCancelCalls().map(\.localPort) == [49173])
+    }
+
+    @Test("closing the owner during repair cleans up a successfully reopened route")
+    func releaseDuringRepair() async throws {
+        let transport = RecordingForwardingTransport(masterRunning: false, pausesFirstCancel: true)
+        let allocator = ScriptedPortAllocator([49175])
+        let service = makeService(transport: transport, allocator: allocator)
+        let endpoint = try #require(LoopbackURL("http://localhost:8080/"))
+        let owner = UUID()
+        _ = try await service.acquire(owner: owner, destination: "cluster", endpoint: endpoint)
+        let repair = Task {
+            try await service.acquire(owner: owner, destination: "cluster", endpoint: endpoint)
+        }
+        await transport.waitUntilCancelCallCount(1)
+        await service.release(owner: owner)
+        await transport.resumeFirstCancel()
+        await #expect(throws: CancellationError.self) { try await repair.value }
+        #expect(await transport.recordedOpenCalls().map(\.localPort) == [49175, 49175])
+        #expect(await transport.recordedCancelCalls().map(\.localPort) == [49175, 49175])
+    }
+
+    @Test("shutdown after failed repair clears desired routes without recreating listeners")
+    func shutdownAfterFailedRepair() async throws {
+        let transport = RecordingForwardingTransport(
+            openSteps: [.succeed, .fail], masterRunning: false
+        )
+        let allocator = ScriptedPortAllocator([49176])
+        let service = makeService(transport: transport, allocator: allocator)
+        let endpoint = try #require(LoopbackURL("http://localhost:8080/"))
+        let owner = UUID()
+        _ = try await service.acquire(owner: owner, destination: "cluster", endpoint: endpoint)
+        await #expect(throws: SSHLocalForwardingError.unableToOpenForward) {
+            try await service.acquire(owner: owner, destination: "cluster", endpoint: endpoint)
+        }
+        await service.shutdown()
+        await #expect(throws: SSHLocalForwardingError.shuttingDown) {
+            try await service.acquire(
+                owner: owner, destination: "cluster", endpoint: endpoint, localPort: 49176
+            )
+        }
+        #expect(await transport.recordedOpenCalls().map(\.localPort) == [49176, 49176])
+        #expect(await transport.recordedCancelCalls().map(\.localPort) == [49176, 49176])
     }
 
     private func makeService(
