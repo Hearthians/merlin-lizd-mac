@@ -94,6 +94,44 @@ struct SSHConnectionDiagnosticsTests {
         #expect(await fixture.runner.remainingSteps() == 0)
     }
 
+    @Test("a queue DNS failure after a successful job refresh stays actionable")
+    func queueDNSFailureAfterJobsSucceed() async throws {
+        let message = "ssh: Could not resolve hostname hpc3login.hpc.hkust-gz.edu.cn: nodename nor servname provided, or not known"
+        let fixture = makeFixture([
+            .success(.check),
+            .success(.remote),
+            .success(.check),
+            .failure(.remote, message),
+            .success(.check),
+            .failure(.remote, message),
+        ])
+        defer { fixture.removeDirectory() }
+        let hpc3 = HKUSTSlurmCluster.hpc3.defaultProfile()
+
+        #expect(try await fixture.service.listJobs(on: hpc3).isEmpty)
+        do {
+            _ = try await fixture.service.queueResources(on: hpc3)
+            Issue.record("Expected the queue hostname lookup failure")
+        } catch let error as SlurmServiceError {
+            #expect(error == .connectionFailed(message: message))
+            #expect(error.connectionFailureSummary?.contains("DNS") == true)
+            #expect(error.connectionFailureSummary?.contains("HostName") == true)
+            #expect(error.localizedDescription.contains("hpc3login.hpc.hkust-gz.edu.cn"))
+        }
+        #expect(await fixture.runner.remainingSteps() == 0)
+    }
+
+    @Test("DNS summaries distinguish transient name resolution from authentication")
+    func dnsFailureSummary() {
+        let transient = SlurmServiceError.connectionFailed(
+            message: "ssh: temporary failure in name resolution"
+        )
+        #expect(transient.connectionFailureSummary?.contains("DNS") == true)
+        #expect(transient.connectionFailureSummary?.contains("认证") == false)
+        let denied = SlurmServiceError.connectionFailed(message: "Permission denied (publickey).")
+        #expect(denied.connectionFailureSummary?.contains("认证") == true)
+    }
+
     @Test("cancelling a queue read propagates cancellation without retrying")
     func queryCancellationIsNotTransportFailure() async throws {
         let fixture = makeFixture([

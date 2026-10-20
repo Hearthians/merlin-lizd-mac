@@ -43,6 +43,10 @@ public enum SlurmServiceError: Error, Equatable, LocalizedError, Sendable {
         if message.contains("Permission denied") {
             return "SSH 认证未通过。请打开登录 Shell 完成登录后重试。"
         }
+        if message.localizedCaseInsensitiveContains("Could not resolve hostname")
+            || message.localizedCaseInsensitiveContains("Temporary failure in name resolution") {
+            return "无法解析 SSH 登录主机名。请检查当前网络或 DNS，并核对 SSH 配置中的 HostName。"
+        }
         return "无法连接登录节点。请查看连接详情，或打开登录 Shell 检查。"
     }
 }

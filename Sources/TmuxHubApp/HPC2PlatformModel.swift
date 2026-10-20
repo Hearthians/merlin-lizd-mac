@@ -389,8 +389,9 @@ final class HPC2PlatformModel: ObservableObject {
     ) async {
         guard !Task.isCancelled, profile == requestedProfile, !isRefreshingMonitoring else { return }
         let date = now()
+        let queueRetryInterval = queueMonitoringError == nil ? queueMonitoringInterval : freshnessInterval
         let refreshQueues = force || lastQueueMonitoringAttempt.map {
-            date.timeIntervalSince($0) >= queueMonitoringInterval
+            date.timeIntervalSince($0) >= queueRetryInterval
         } ?? true
         let refreshUtilization = force || lastUtilizationAttempt.map {
             date.timeIntervalSince($0) >= utilizationInterval

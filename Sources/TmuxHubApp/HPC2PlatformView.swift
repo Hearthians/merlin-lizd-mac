@@ -137,8 +137,13 @@ struct HPC2PlatformView: View {
             }
         case let .ready(date):
             HStack(spacing: 8) {
-                StatusPill(label: "已连接", color: .green, symbol: "checkmark.circle.fill")
-                Text("更新于 \(date.formatted(date: .omitted, time: .standard))")
+                let hasPartialFailure = model.queueMonitoringError != nil || model.historyError != nil
+                StatusPill(
+                    label: hasPartialFailure ? "部分数据不可用" : "已连接",
+                    color: hasPartialFailure ? .orange : .green,
+                    symbol: hasPartialFailure ? "exclamationmark.circle.fill" : "checkmark.circle.fill"
+                )
+                Text("任务更新于 \(date.formatted(date: .omitted, time: .standard))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if model.isRefreshing { ProgressView().controlSize(.small) }
