@@ -29,6 +29,9 @@ macOS 钥匙串，作为密钥认证失败后的回退。
 - 拖入文件、粘贴 Finder 文件或 ⌘V 截图，传输完成后把可访问路径插入当前终端。
 - 附件栏提供缩略图、状态、取消、重试、复制路径和手动插入；始终不自动按 Enter。
 
+Codex completion/approval notifications, shared read status across Macs,
+and reconnect behavior are documented in [Codex notifications](Docs/codex-notifications.md).
+
 ## 添加 SSH 主机
 
 点击主机库的「添加 SSH 主机」、侧边栏的 **+**，或按 **⌘⇧N** 打开添加窗口。

@@ -123,6 +123,7 @@ private struct AttachmentDropOverlay: View {
 
 struct TerminalTabBar: View {
     @ObservedObject var terminals: TerminalTabsModel
+    @ObservedObject var notifications: CodexNotificationsModel
     let hosts: [SSHHost]
     let onRefresh: () -> Void
 
@@ -257,6 +258,10 @@ struct TerminalTabBar: View {
                     Text(tab.title)
                         .lineLimit(1)
                         .frame(maxWidth: 210)
+                    if !unreadEntries(for: tab).isEmpty {
+                        Circle().fill(Color.accentColor).frame(width: 6, height: 6)
+                            .accessibilityLabel("有未读 Codex 通知")
+                    }
                 }
                 .font(.caption)
                 .foregroundStyle(selected ? .primary : .secondary)
@@ -349,6 +354,19 @@ struct TerminalTabBar: View {
                 .frame(width: 24, height: 24)
         }
         .help("新建终端")
+    }
+
+    private func unreadEntries(for tab: TerminalTabRecord) -> [CodexNotificationEntry] {
+        notifications.entries.filter { entry in
+            guard !entry.isRead, !entry.isResolved, !notifications.isMuted(entry: entry),
+                entry.destination == tab.target.sshDestination else { return false }
+            if let route = tab.notificationRoute {
+                return (try? CodexNotificationRoute(event: entry.event))?.isSameSession(as: route) == true
+            }
+            // Name-only matching is a hint for ordinary tabs; clicking one must
+            // not acknowledge an event without a verified server identity.
+            return entry.event.tmuxSession != nil && entry.event.tmuxSession == tab.sessionName
+        }
     }
 
     private func closeTab(_ tab: TerminalTabRecord) {

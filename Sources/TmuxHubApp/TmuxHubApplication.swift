@@ -27,6 +27,12 @@ struct TmuxHubApplication: App {
                 }
         )
         _terminals = StateObject(wrappedValue: terminals)
+        runtime.codexNotifications.onOpen = { [weak terminals, weak model] entry in
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            NSApplication.shared.windows.first(where: { $0.canBecomeMain })?.makeKeyAndOrderFront(nil)
+            model?.selection = .notifications
+            terminals?.openCodexNotification(entry)
+        }
         _hpc2 = StateObject(wrappedValue: HPC2PlatformModel(
             service: runtime.slurmService
         ))
@@ -40,7 +46,8 @@ struct TmuxHubApplication: App {
             TmuxHubRootView(
                 model: model, terminals: terminals,
                 hpc2: hpc2, hpc3: hpc3, hpc4: hpc4,
-                mesh: mesh, forwardedLinks: runtime.forwardedLinks
+                mesh: mesh, forwardedLinks: runtime.forwardedLinks,
+                notifications: runtime.codexNotifications
             )
                 .frame(minWidth: 900, minHeight: 600)
         }

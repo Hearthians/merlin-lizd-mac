@@ -10,6 +10,7 @@ struct TmuxHubRootView: View {
     @ObservedObject var hpc4: HPC2PlatformModel
     @ObservedObject var mesh: NetworkMeshModel
     @ObservedObject var forwardedLinks: ForwardedLinksModel
+    @ObservedObject var notifications: CodexNotificationsModel
     var propertiesReader = SSHHostPropertiesReader()
     @State private var sessionBrowserTarget: TerminalTarget?
     @State private var herdrBrowserTarget: TerminalTarget?
@@ -37,6 +38,7 @@ struct TmuxHubRootView: View {
                 SidebarView(
                     model: model,
                     terminals: terminals,
+                    notifications: notifications,
                     platforms: [hpc2.profile, hpc3.profile, hpc4.profile],
                     onAddHost: { showsAddSSHHost = true },
                     onShowProperties: showProperties,
@@ -55,6 +57,7 @@ struct TmuxHubRootView: View {
                         }
                         TerminalTabBar(
                             terminals: terminals,
+                            notifications: notifications,
                             hosts: model.quickAccessHosts,
                             onRefresh: refresh
                         )
@@ -83,6 +86,14 @@ struct TmuxHubRootView: View {
             .ignoresSafeArea(.container, edges: .top)
         }
         .toolbar(removing: .sidebarToggle)
+        .alert("无法打开通知对应的终端", isPresented: Binding(
+            get: { terminals.notificationOpenError != nil },
+            set: { if !$0 { terminals.notificationOpenError = nil } }
+        )) {
+            Button("好", role: .cancel) { terminals.notificationOpenError = nil }
+        } message: {
+            Text(terminals.notificationOpenError ?? "")
+        }
         .ignoresSafeArea(.container, edges: .top)
         .sheet(isPresented: Binding(
             get: { fileBrowserDestination != nil },
@@ -237,6 +248,8 @@ struct TmuxHubRootView: View {
             Task { await mesh.refresh(sshHosts: model.hosts) }
         } else if model.selection == .portForwarding {
             Task { await forwardedLinks.refreshAll() }
+        } else if model.selection == .notifications {
+            Task { await notifications.refreshAll() }
         } else if case let .platform(id) = model.selection,
             let platform = platformModel(for: id) {
             Task { await platform.refresh(force: true) }
@@ -265,6 +278,8 @@ struct TmuxHubRootView: View {
             )
         case .portForwarding:
             ForwardedLinksView(model: forwardedLinks)
+        case .notifications:
+            CodexNotificationsView(model: notifications, hosts: model.hosts)
         case .local:
             LocalTerminalLandingView(
                 terminals: terminals,

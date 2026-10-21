@@ -7,6 +7,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     @Published private(set) var tabs: [TerminalTabRecord]
     @Published private(set) var tmuxConfigurationStates: [TerminalTarget: TmuxConfigurationState] = [:]
     @Published private(set) var vimPasteConfigurationStates: [TerminalTarget: VimPasteConfigurationState] = [:]
+    @Published var notificationOpenError: String?
     @Published var selectedTabID: String? {
         didSet {
             if oldValue != selectedTabID {
@@ -20,6 +21,8 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
 
     private var sessions: [String: TerminalSession] = [:]
     private var attachments: [String: TerminalAttachmentModel] = [:]
+    private var notificationOpenTask: Task<Void, Never>?
+    private var notificationOpenToken: UUID?
     private let defaults: UserDefaults
     private let managedTerminalCommands: ManagedTerminalCommandBuilder
     private let runtime: HubRuntime
@@ -89,6 +92,44 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
 
     func openLocalShell() {
         open(title: "本机", target: .local, sessionName: nil)
+    }
+
+    func openCodexNotification(_ entry: CodexNotificationEntry) {
+        notificationOpenTask?.cancel()
+        let token = UUID()
+        notificationOpenToken = token
+        notificationOpenTask = Task { [weak self] in
+            await self?.performOpenCodexNotification(entry, token: token)
+        }
+    }
+
+    private func performOpenCodexNotification(_ entry: CodexNotificationEntry, token: UUID) async {
+        do {
+            let route = try CodexNotificationRoute(event: entry.event)
+            let target = entry.destination.map { TerminalTarget.ssh(destination: $0) } ?? .local
+            try await CodexNotificationRouting.focus(route: route, target: target,
+                sshMasterPool: runtime.sshMasterPool)
+            try Task.checkCancellation()
+            guard notificationOpenToken == token else { return }
+            if let index = tabs.firstIndex(where: {
+                $0.target == target && $0.notificationRoute?.isSameSession(as: route) == true
+            }) {
+                tabs[index].notificationRoute = route
+                attachments[tabs[index].id]?.notificationRoute = route
+                // The live tmux client may have switched sessions since the
+                // previous click. Reattach this client to the verified route.
+                reconnect(tabs[index].id)
+                persist()
+            } else {
+                open(title: "\(entry.destination ?? "本机") · \(entry.event.tmuxSession ?? "Codex")",
+                    target: target, sessionName: entry.event.tmuxSession,
+                    tmuxLaunchMode: .attachOnly, notificationRoute: route)
+            }
+        } catch {
+            if !Task.isCancelled, notificationOpenToken == token {
+                notificationOpenError = error.localizedDescription
+            }
+        }
     }
 
     func openLocalTmux(sessionName: String? = nil) {
@@ -329,7 +370,8 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
             let attachmentModel = attachments[id] ?? TerminalAttachmentModel(
                 target: tab.target, sessionName: tab.sessionName,
                 service: runtime.attachmentService, defaults: defaults,
-                herdrReference: tab.herdrReference
+                herdrReference: tab.herdrReference,
+                notificationRoute: tab.notificationRoute
             )
             attachments[id] = attachmentModel
             let session = TerminalSession(
@@ -510,6 +552,8 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     }
 
     func cancelAllAttachments() {
+        notificationOpenTask?.cancel()
+        notificationOpenToken = nil
         for model in attachments.values { model.cancelAll() }
     }
 
@@ -521,7 +565,8 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         sessionName: String?,
         tmuxIdentity: TmuxSessionIdentity? = nil,
         herdrReference: HerdrTerminalReference? = nil,
-        tmuxLaunchMode: TmuxSessionLaunchMode = .createOrAttach
+        tmuxLaunchMode: TmuxSessionLaunchMode = .createOrAttach,
+        notificationRoute: CodexNotificationRoute? = nil
     ) {
         let id = UUID().uuidString
         tabs.append(TerminalTabRecord(
@@ -531,7 +576,8 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
             sessionName: sessionName,
             tmuxIdentity: tmuxIdentity,
             herdrReference: herdrReference,
-            tmuxLaunchMode: tmuxLaunchMode
+            tmuxLaunchMode: tmuxLaunchMode,
+            notificationRoute: notificationRoute
         ))
         selectedTabID = id
         _ = session(for: id)
@@ -545,6 +591,13 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     }
 
     private func command(for tab: TerminalTabRecord) throws -> CommandSpec {
+        if let route = tab.notificationRoute {
+            let command = try CodexNotificationRouting.command(route: route, target: tab.target, attach: true)
+            if let destination = tab.target.sshDestination {
+                return try runtime.sshMasterPool.managedCommand(command, alias: destination)
+            }
+            return command
+        }
         if let reference = tab.herdrReference {
             let command = try HerdrCommands.attach(target: tab.target, reference: reference)
             if let destination = tab.target.sshDestination {
@@ -642,6 +695,10 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     }
 
     private static func isValidRestoredTab(_ tab: TerminalTabRecord) -> Bool {
+        if let route = tab.notificationRoute {
+            return route.isValid && tab.herdrReference == nil && tab.tmuxLaunchMode == .attachOnly
+                && (tab.target.sshDestination.map(IdentifierValidator.isSSHDestination) ?? true)
+        }
         if let reference = tab.herdrReference {
             guard tab.sessionName == nil, tab.tmuxIdentity == nil,
                 tab.tmuxLaunchMode == .createOrAttach,
@@ -661,6 +718,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     private static func normalizedRestoredTab(_ tab: TerminalTabRecord) -> TerminalTabRecord? {
         guard isValidRestoredTab(tab) else { return nil }
         var restored = tab
+        if tab.notificationRoute != nil { return restored }
         restored.sessionName = tab.sessionName.flatMap(
             IdentifierValidator.normalizedTmuxSessionName
         )

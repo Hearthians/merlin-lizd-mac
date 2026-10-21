@@ -14,6 +14,7 @@ final class HubRuntime {
     let sshMasterPool: SSHMasterPool
     let sshLocalForwardingService: SSHLocalForwardingService
     let forwardedLinks: ForwardedLinksModel
+    let codexNotifications: CodexNotificationsModel
     let tmuxDiscovery: TmuxSessionDiscovery
     let tmuxController: TmuxSessionController
     let attachmentService: AttachmentTransferService
@@ -40,6 +41,7 @@ final class HubRuntime {
             }
         )
         sshMasterPool = pool
+        codexNotifications = CodexNotificationsModel(service: CodexNotificationService(sshMasterPool: pool))
         let forwarding = SSHLocalForwardingService(sshMasterPool: pool)
         sshLocalForwardingService = forwarding
         forwardedLinks = ForwardedLinksModel(service: forwarding)
@@ -114,6 +116,7 @@ final class HubRuntime {
     func shutdown() async {
         guard !isShuttingDown else { return }
         isShuttingDown = true
+        await codexNotifications.shutdown()
         await forwardedLinks.shutdown()
         await sshLocalForwardingService.shutdown()
         await sshMasterPool.shutdown()

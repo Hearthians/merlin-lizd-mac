@@ -149,7 +149,8 @@ final class TerminalSession: ObservableObject, Identifiable,
                     target: attachmentModel.target,
                     sessionName: attachmentModel.sessionName,
                     localDirectory: localWorkingDirectory(),
-                    herdrReference: attachmentModel.herdrReference
+                    herdrReference: attachmentModel.herdrReference,
+                    notificationRoute: attachmentModel.notificationRoute
                 )
                 let resolvedPath: String
                 if browseInSFTP {

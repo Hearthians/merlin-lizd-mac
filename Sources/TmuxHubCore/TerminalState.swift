@@ -23,6 +23,7 @@ public struct TerminalTabRecord: Codable, Equatable, Hashable, Identifiable, Sen
     public var tmuxIdentity: TmuxSessionIdentity?
     public var herdrReference: HerdrTerminalReference?
     public var tmuxLaunchMode: TmuxSessionLaunchMode
+    public var notificationRoute: CodexNotificationRoute?
 
     public var allowsTmuxLifecycleMutation: Bool {
         tmuxLaunchMode == .createOrAttach
@@ -35,7 +36,8 @@ public struct TerminalTabRecord: Codable, Equatable, Hashable, Identifiable, Sen
         sessionName: String?,
         tmuxIdentity: TmuxSessionIdentity? = nil,
         herdrReference: HerdrTerminalReference? = nil,
-        tmuxLaunchMode: TmuxSessionLaunchMode = .createOrAttach
+        tmuxLaunchMode: TmuxSessionLaunchMode = .createOrAttach,
+        notificationRoute: CodexNotificationRoute? = nil
     ) {
         self.id = id
         self.title = title
@@ -44,6 +46,7 @@ public struct TerminalTabRecord: Codable, Equatable, Hashable, Identifiable, Sen
         self.tmuxIdentity = tmuxIdentity
         self.herdrReference = herdrReference
         self.tmuxLaunchMode = tmuxLaunchMode
+        self.notificationRoute = notificationRoute
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -54,6 +57,7 @@ public struct TerminalTabRecord: Codable, Equatable, Hashable, Identifiable, Sen
         case tmuxIdentity
         case herdrReference
         case tmuxLaunchMode
+        case notificationRoute
     }
 
     public init(from decoder: Decoder) throws {
@@ -74,6 +78,7 @@ public struct TerminalTabRecord: Codable, Equatable, Hashable, Identifiable, Sen
             TmuxSessionLaunchMode.self,
             forKey: .tmuxLaunchMode
         ) ?? .createOrAttach
+        notificationRoute = try container.decodeIfPresent(CodexNotificationRoute.self, forKey: .notificationRoute)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -85,6 +90,7 @@ public struct TerminalTabRecord: Codable, Equatable, Hashable, Identifiable, Sen
         try container.encodeIfPresent(tmuxIdentity, forKey: .tmuxIdentity)
         try container.encodeIfPresent(herdrReference, forKey: .herdrReference)
         try container.encode(tmuxLaunchMode, forKey: .tmuxLaunchMode)
+        try container.encodeIfPresent(notificationRoute, forKey: .notificationRoute)
     }
 }
 

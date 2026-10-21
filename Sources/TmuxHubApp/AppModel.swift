@@ -5,6 +5,7 @@ enum SidebarSelection: Hashable {
     case overview
     case mesh
     case portForwarding
+    case notifications
     case local
     case platform(String)
     case host(String)

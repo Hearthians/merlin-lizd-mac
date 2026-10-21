@@ -44,10 +44,24 @@ final class TerminalAttachmentModel: ObservableObject {
     let target: TerminalTarget
     var sessionName: String?
     let herdrReference: HerdrTerminalReference?
+    var notificationRoute: CodexNotificationRoute? {
+        didSet {
+            guard notificationRoute != oldValue else { return }
+            noteInteraction()
+            let nextKey = Self.directoryPreferenceKey(
+                target: target, sessionName: sessionName, herdrReference: herdrReference,
+                notificationRoute: notificationRoute
+            )
+            if nextKey != directoryKey {
+                directoryKey = nextKey
+                directoryOverride = defaults.string(forKey: nextKey) ?? ""
+            }
+        }
+    }
 
     private let service: AttachmentTransferService
     private let defaults: UserDefaults
-    private let directoryKey: String
+    private var directoryKey: String
     private var revision: UInt64 = 0
     private var worker: Task<Void, Never>?
     private var workingID: UUID?
@@ -60,19 +74,25 @@ final class TerminalAttachmentModel: ObservableObject {
     private var insertText: (String) -> Void = { _ in }
     private var localDirectory: () -> String = { FileManager.default.homeDirectoryForCurrentUser.path }
 
-    init(target: TerminalTarget, sessionName: String?, service: AttachmentTransferService, defaults: UserDefaults = .standard, herdrReference: HerdrTerminalReference? = nil) {
+    init(target: TerminalTarget, sessionName: String?, service: AttachmentTransferService, defaults: UserDefaults = .standard, herdrReference: HerdrTerminalReference? = nil, notificationRoute: CodexNotificationRoute? = nil) {
         self.target = target
         self.sessionName = sessionName
         self.herdrReference = herdrReference
+        self.notificationRoute = notificationRoute
         self.service = service
         self.defaults = defaults
-        directoryKey = Self.directoryPreferenceKey(target: target, sessionName: sessionName, herdrReference: herdrReference)
+        directoryKey = Self.directoryPreferenceKey(target: target, sessionName: sessionName, herdrReference: herdrReference, notificationRoute: notificationRoute)
         directoryOverride = defaults.string(forKey: directoryKey) ?? ""
     }
 
-    private static func directoryPreferenceKey(target: TerminalTarget, sessionName: String?, herdrReference: HerdrTerminalReference? = nil) -> String {
+    private static func directoryPreferenceKey(target: TerminalTarget, sessionName: String?, herdrReference: HerdrTerminalReference? = nil, notificationRoute: CodexNotificationRoute? = nil) -> String {
         let label: String
-        if let herdrReference {
+        if let route = notificationRoute {
+            let identity = ["codex-notification", target.sshDestination.map { "ssh:\($0)" } ?? "local",
+                            route.hostname, route.socket, route.sessionID,
+                            String(route.sessionCreated), String(route.serverPID)]
+            label = identity.map { "\($0.utf8.count):\($0)" }.joined()
+        } else if let herdrReference {
             // Keep tmux keys unchanged; each Herdr terminal has its own override,
             // even when another workspace currently has keyboard focus.
             label = "\(target.sshDestination ?? "local")/herdr/\(herdrReference.sessionName ?? "default")/\(herdrReference.terminalID)"
@@ -275,7 +295,7 @@ final class TerminalAttachmentModel: ObservableObject {
     private func process(_ item: TerminalAttachment) async {
         do {
             update(item.id) { $0.phase = .preparing }
-            let context = try await service.context(target: target, sessionName: sessionName, localDirectory: localDirectory(), herdrReference: herdrReference)
+            let context = try await service.context(target: target, sessionName: sessionName, localDirectory: localDirectory(), herdrReference: herdrReference, notificationRoute: notificationRoute)
             try Task.checkCancellation()
             update(item.id) { $0.phase = .uploading }
             let path = try await service.transfer(
@@ -289,7 +309,7 @@ final class TerminalAttachmentModel: ObservableObject {
             guard herdrReference == nil || context.herdrOccupantID != nil else { return }
             // A pane/window switch, shell/agent change, or cwd change during
             // upload leaves the result ready for explicit insertion instead.
-            let current = try? await service.context(target: target, sessionName: sessionName, localDirectory: localDirectory(), herdrReference: herdrReference)
+            let current = try? await service.context(target: target, sessionName: sessionName, localDirectory: localDirectory(), herdrReference: herdrReference, notificationRoute: notificationRoute)
             guard current == context, item.revision == revision, canInsert(), canAutoInsert(), !Task.isCancelled else { return }
             insert(item.id)
         } catch is CancellationError {

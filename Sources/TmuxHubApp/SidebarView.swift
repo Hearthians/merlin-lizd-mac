@@ -5,6 +5,7 @@ import SwiftUI
 struct SidebarView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var terminals: TerminalTabsModel
+    @ObservedObject var notifications: CodexNotificationsModel
     let platforms: [SlurmPlatformProfile]
     let onAddHost: () -> Void
     let onShowProperties: (SidebarSelection) -> Void
@@ -46,6 +47,22 @@ struct SidebarView: View {
                     tint: .teal,
                     selection: .portForwarding
                 )
+                HStack {
+                    sidebarRow(
+                        title: "Codex 通知",
+                        symbol: "bell",
+                        tint: .indigo,
+                        selection: .notifications
+                    )
+                    if notifications.unreadCount > 0 {
+                        Text("\(notifications.unreadCount)")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Color.accentColor, in: Capsule())
+                    }
+                }
+                .tag(SidebarSelection.notifications)
                 HStack {
                     sidebarRow(
                         title: "本机",
