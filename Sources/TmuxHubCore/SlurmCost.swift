@@ -4,15 +4,22 @@ public struct SlurmCostTierRates: Codable, Hashable, Sendable {
     public var cpuPerCoreHour: Double
     public var a800PerGPUHour: Double
     public var otherPerGPUHour: Double
+    /// Missing from older saved tariffs. An unknown NPU price must not become zero.
+    public var npuPerCardHour: Double?
 
-    public init(cpuPerCoreHour: Double, a800PerGPUHour: Double, otherPerGPUHour: Double) {
+    public init(
+        cpuPerCoreHour: Double, a800PerGPUHour: Double, otherPerGPUHour: Double,
+        npuPerCardHour: Double? = nil
+    ) {
         self.cpuPerCoreHour = cpuPerCoreHour
         self.a800PerGPUHour = a800PerGPUHour
         self.otherPerGPUHour = otherPerGPUHour
+        self.npuPerCardHour = npuPerCardHour
     }
 
     public var isValid: Bool {
         [cpuPerCoreHour, a800PerGPUHour, otherPerGPUHour].allSatisfy { $0.isFinite && $0 >= 0 }
+            && (npuPerCardHour.map { $0.isFinite && $0 >= 0 } ?? true)
     }
 }
 
@@ -22,20 +29,25 @@ public struct SlurmCostConfiguration: Codable, Hashable, Sendable {
     public var high: SlurmCostTierRates
     /// Missing in legacy saved configurations, which were always HPC2 tariffs.
     public var cluster: HKUSTSlurmCluster?
+    /// Scheduler NPU resource units per physical card. Kept explicit because
+    /// 910C cards expose two chips and a cluster may schedule either unit.
+    public var npuUnitsPerCard: Double?
     public var effectiveCluster: HKUSTSlurmCluster { cluster ?? .hpc2 }
-    public var isPricingAvailable: Bool { effectiveCluster != .hpc4 }
+    public var isPricingAvailable: Bool { true }
     public var currencyCode: String { "CNY" }
 
     public init(
         low: SlurmCostTierRates,
         medium: SlurmCostTierRates,
         high: SlurmCostTierRates,
-        cluster: HKUSTSlurmCluster? = nil
+        cluster: HKUSTSlurmCluster? = nil,
+        npuUnitsPerCard: Double? = nil
     ) {
         self.low = low
         self.medium = medium
         self.high = high
         self.cluster = cluster
+        self.npuUnitsPerCard = npuUnitsPerCard
     }
 
     /// HKUST(GZ) HPC price reference, verified 2026-10-13. GPU prices exclude CPU and storage.
@@ -45,8 +57,8 @@ public struct SlurmCostConfiguration: Codable, Hashable, Sendable {
         high: .init(cpuPerCoreHour: 0.06, a800PerGPUHour: 4.00, otherPerGPUHour: 1.50)
     )
 
-    /// Published phase III ACD rates, effective 2025-09-01. No separate CPU
-    /// charge is listed in that schedule; these rates apply only to ACD queues.
+    /// ACD rates from the user-provided HPC price reference (revision 83).
+    /// No separate phase III CPU charge is listed; these rates apply only to ACD queues.
     public static let hkustHPC3 = SlurmCostConfiguration(
         low: .init(cpuPerCoreHour: 0, a800PerGPUHour: 0, otherPerGPUHour: 2.40),
         medium: .init(cpuPerCoreHour: 0, a800PerGPUHour: 0, otherPerGPUHour: 3.75),
@@ -54,23 +66,47 @@ public struct SlurmCostConfiguration: Codable, Hashable, Sendable {
         cluster: .hpc3
     )
 
-    /// No verified phase IV tariff. Zero placeholders never produce an estimate.
+    /// ARM CPU and 910C rates from the user-provided HPC price reference (revision 83).
+    /// The NPU price is per physical card, not per scheduler device or chip.
+    /// Official HPC4 hardware has eight 910C cards per NPU node; Slurm reports
+    /// sixteen NPU resources. The corresponding factor of two remains configurable.
     public static let hkustHPC4 = SlurmCostConfiguration(
-        low: .init(cpuPerCoreHour: 0, a800PerGPUHour: 0, otherPerGPUHour: 0),
-        medium: .init(cpuPerCoreHour: 0, a800PerGPUHour: 0, otherPerGPUHour: 0),
-        high: .init(cpuPerCoreHour: 0, a800PerGPUHour: 0, otherPerGPUHour: 0),
-        cluster: .hpc4
+        low: .init(cpuPerCoreHour: 0.01, a800PerGPUHour: 0, otherPerGPUHour: 0, npuPerCardHour: 0.84),
+        medium: .init(cpuPerCoreHour: 0.02, a800PerGPUHour: 0, otherPerGPUHour: 0, npuPerCardHour: 1.30),
+        high: .init(cpuPerCoreHour: 0.03, a800PerGPUHour: 0, otherPerGPUHour: 0, npuPerCardHour: 2.10),
+        cluster: .hpc4,
+        npuUnitsPerCard: 2
     )
 
-    public var isValid: Bool { low.isValid && medium.isValid && high.isValid }
+    /// Replace only the old unpriced HPC4 placeholder. Explicit custom tariffs,
+    /// including a new zero-price NPU tariff, must survive application updates.
+    public var migratedToCurrentDefaults: SlurmCostConfiguration {
+        guard effectiveCluster == .hpc4, npuUnitsPerCard == nil else { return self }
+        let tiers: [SlurmCostTierRates] = [low, medium, high]
+        for tier in tiers {
+            guard tier.cpuPerCoreHour == 0, tier.a800PerGPUHour == 0,
+                tier.otherPerGPUHour == 0, tier.npuPerCardHour == nil
+            else { return self }
+        }
+        return .hkustHPC4
+    }
+
+    public var isValid: Bool {
+        low.isValid && medium.isValid && high.isValid
+            && (npuUnitsPerCard.map { $0.isFinite && $0 > 0 } ?? true)
+    }
 }
 
 public struct SlurmCostEstimate: Hashable, Sendable {
     public let amount: Double
     public let gpuAmount: Double
+    public let npuAmount: Double
     public let cpuAmount: Double
     public let hourlyCost: Double
     public let gpuCount: Int
+    /// The scheduler's allocated NPU resource units, which need not be physical cards.
+    public let npuCount: Int
+    public let npuCardCount: Double
     public let cpuCount: Int
     public let elapsedSeconds: TimeInterval
     public let tariffLabel: String
@@ -85,40 +121,47 @@ public enum SlurmCostEstimator {
         allocatedGPU: Int?,
         elapsedSeconds: TimeInterval?,
         configuration: SlurmCostConfiguration = .hkustHPC2,
-        allocatedResources: String? = nil
+        allocatedResources: String? = nil,
+        allocatedNPU: Int? = nil
     ) -> SlurmCostEstimate? {
         guard configuration.isValid, configuration.isPricingAvailable,
             let elapsedSeconds, elapsedSeconds.isFinite, elapsedSeconds >= 0,
             allocatedCPU.map({ $0 >= 0 }) ?? true,
             allocatedGPU.map({ $0 >= 0 }) ?? true,
+            allocatedNPU.map({ $0 >= 0 }) ?? true,
             let tariff = tariff(for: partition, cluster: configuration.effectiveCluster)
         else { return nil }
 
-        if let allocatedResources, allocatedResources.split(separator: ",").contains(where: {
-            let key = $0.split(separator: "=", maxSplits: 1).first?.lowercased() ?? ""
-            return key == "gres/npu" || key.hasPrefix("gres/npu:")
-        }) { return nil }
-
-        // The published HPC2 debug exception is free compute, even without allocation details.
+        // Preserve the HPC2 debug exception without extending it to unknown NPU resources.
         if tariff.tier == .free {
+            guard (allocatedNPU ?? 0) == 0,
+                !containsNPUResource(allocatedResources ?? "")
+            else { return nil }
             return SlurmCostEstimate(
-                amount: 0, gpuAmount: 0, cpuAmount: 0, hourlyCost: 0,
-                gpuCount: allocatedGPU ?? 0, cpuCount: allocatedCPU ?? 0,
+                amount: 0, gpuAmount: 0, npuAmount: 0, cpuAmount: 0, hourlyCost: 0,
+                gpuCount: allocatedGPU ?? 0, npuCount: 0, npuCardCount: 0,
+                cpuCount: allocatedCPU ?? 0,
                 elapsedSeconds: elapsedSeconds, tariffLabel: "调试队列 · 计算免费"
             )
         }
 
         var cpuCount = allocatedCPU
         var gpuCount = allocatedGPU
+        var npuCount = allocatedNPU ?? (tariff.npu ? nil : 0)
         if let allocatedResources {
-            guard let counts = resources(allocatedResources, gpu: tariff.gpu),
+            guard let counts = resources(allocatedResources, tariff: tariff),
                 cpuCount.map({ $0 == counts.cpu }) ?? true,
-                gpuCount.map({ $0 == counts.gpu }) ?? true
+                gpuCount.map({ $0 == counts.gpu }) ?? true,
+                allocatedNPU.map({ $0 == counts.npu }) ?? true
             else { return nil }
             cpuCount = counts.cpu
             gpuCount = counts.gpu
+            npuCount = counts.npu
         }
-        guard let cpuCount, let gpuCount, tariff.gpu != nil || gpuCount == 0 else { return nil }
+        guard let cpuCount, let gpuCount, let npuCount,
+            tariff.gpu != nil || gpuCount == 0,
+            tariff.npu || npuCount == 0
+        else { return nil }
 
         let rates: SlurmCostTierRates
         let label: String
@@ -130,18 +173,33 @@ public enum SlurmCostEstimator {
         }
         let gpuRate = tariff.gpu == .a800 ? rates.a800PerGPUHour : rates.otherPerGPUHour
         let gpuHourly = Double(gpuCount) * gpuRate
+        let npuCards: Double
+        let npuHourly: Double
+        if npuCount > 0 {
+            guard let rate = rates.npuPerCardHour,
+                let unitsPerCard = configuration.npuUnitsPerCard
+            else { return nil }
+            npuCards = Double(npuCount) / unitsPerCard
+            npuHourly = npuCards * rate
+        } else {
+            npuCards = 0
+            npuHourly = 0
+        }
         let cpuHourly = configuration.effectiveCluster == .hpc3
             ? 0 : Double(cpuCount) * rates.cpuPerCoreHour
         let hours = elapsedSeconds / 3_600
         let gpuAmount = gpuHourly * hours
+        let npuAmount = npuHourly * hours
         let cpuAmount = cpuHourly * hours
-        let amount = gpuAmount + cpuAmount
-        let hourlyCost = gpuHourly + cpuHourly
-        guard [gpuAmount, cpuAmount, amount, hourlyCost].allSatisfy({ $0.isFinite && $0 >= 0 })
+        let amount = gpuAmount + npuAmount + cpuAmount
+        let hourlyCost = gpuHourly + npuHourly + cpuHourly
+        guard [npuCards, gpuAmount, npuAmount, cpuAmount, amount, hourlyCost].allSatisfy({ $0.isFinite && $0 >= 0 })
         else { return nil }
         return SlurmCostEstimate(
-            amount: amount, gpuAmount: gpuAmount, cpuAmount: cpuAmount, hourlyCost: hourlyCost,
-            gpuCount: gpuCount, cpuCount: cpuCount, elapsedSeconds: elapsedSeconds, tariffLabel: label
+            amount: amount, gpuAmount: gpuAmount, npuAmount: npuAmount, cpuAmount: cpuAmount,
+            hourlyCost: hourlyCost, gpuCount: gpuCount, npuCount: npuCount,
+            npuCardCount: npuCards, cpuCount: cpuCount,
+            elapsedSeconds: elapsedSeconds, tariffLabel: label
         )
     }
 
@@ -159,7 +217,11 @@ public enum SlurmCostEstimator {
 
     private enum Tier { case free, low, medium, high }
     private enum GPU { case a800, a40, a30, ascend, acd }
-    private struct Tariff { let tier: Tier; let gpu: GPU? }
+    private struct Tariff {
+        let tier: Tier
+        let gpu: GPU?
+        var npu: Bool = false
+    }
 
     private static func tariff(for partition: String, cluster: HKUSTSlurmCluster) -> Tariff? {
         switch cluster {
@@ -170,7 +232,16 @@ public enum SlurmCostEstimator {
             case "emergency_acd": return Tariff(tier: .high, gpu: .acd)
             default: return nil
             }
-        case .hpc4: return nil
+        case .hpc4:
+            switch partition {
+            case "a128m512u": return Tariff(tier: .low, gpu: nil)
+            case "a128m512ue": return Tariff(tier: .medium, gpu: nil)
+            case "emergency": return Tariff(tier: .high, gpu: nil)
+            case "a320m2tn910cu": return Tariff(tier: .low, gpu: nil, npu: true)
+            case "a320m2tn910cue": return Tariff(tier: .medium, gpu: nil, npu: true)
+            case "emergency_a320m2tn910c": return Tariff(tier: .high, gpu: nil, npu: true)
+            default: return nil
+            }
         case .hpc2: break
         }
         switch partition {
@@ -191,7 +262,7 @@ public enum SlurmCostEstimator {
         }
     }
 
-    private static func resources(_ value: String, gpu expectedGPU: GPU?) -> (cpu: Int, gpu: Int)? {
+    private static func resources(_ value: String, tariff: Tariff) -> (cpu: Int, gpu: Int, npu: Int)? {
         guard !value.isEmpty, value.utf8.count <= 65_536 else { return nil }
         var fields: [String: String] = [:]
         for item in value.split(separator: ",", omittingEmptySubsequences: false) {
@@ -201,28 +272,49 @@ public enum SlurmCostEstimator {
             guard fields.updateValue(String(pair[1]), forKey: key) == nil else { return nil }
         }
         guard let rawCPU = fields["cpu"], let cpu = count(rawCPU) else { return nil }
-        // Slices and shared GPU resources have separate pricing, not full-card pricing.
+        // Slices and shared accelerators are not full-card allocations.
         guard !fields.keys.contains(where: {
             let key = $0.lowercased()
             return key.contains("mig") || key == "gres/mps" || key == "gres/shard"
-                || key == "gres/npu" || key.hasPrefix("gres/npu:")
         }) else { return nil }
 
-        let typed = fields.filter { $0.key.hasPrefix("gres/gpu:") }
+        guard let gpu = acceleratorCount(fields, resource: "gpu", acceptsType: { type in
+            guard let expected = tariff.gpu else { return false }
+            return gpuType(type) == expected
+        }), let npu = acceleratorCount(fields, resource: "npu", acceptsType: { type in
+            tariff.npu && ["910c", "ascend910c"].contains(type.lowercased())
+        }), tariff.gpu != nil || gpu == 0, tariff.npu || npu == 0
+        else { return nil }
+        return (cpu, gpu, npu)
+    }
+
+    /// Aggregate and typed GRES describe the same resources; never add both.
+    private static func acceleratorCount(
+        _ fields: [String: String], resource: String, acceptsType: (String) -> Bool
+    ) -> Int? {
+        let key = "gres/\(resource)"
+        let prefix = key + ":"
+        let typed = fields.filter { $0.key.hasPrefix(prefix) }
         var typedCount = 0
         for (key, value) in typed {
-            guard let expectedGPU, gpuType(String(key.dropFirst("gres/gpu:".count))) == expectedGPU,
-                let current = count(value)
+            guard acceptsType(String(key.dropFirst(prefix.count))), let current = count(value)
             else { return nil }
             let sum = typedCount.addingReportingOverflow(current)
             guard !sum.overflow else { return nil }
             typedCount = sum.partialValue
         }
-        if let rawGPU = fields["gres/gpu"] {
-            guard let gpu = count(rawGPU), typed.isEmpty || typedCount == gpu else { return nil }
-            return (cpu, gpu)
+        if let raw = fields[key] {
+            guard let total = count(raw), typed.isEmpty || typedCount == total else { return nil }
+            return total
         }
-        return (cpu, typedCount)
+        return typedCount
+    }
+
+    private static func containsNPUResource(_ value: String) -> Bool {
+        value.split(separator: ",").contains {
+            let key = $0.split(separator: "=", maxSplits: 1).first?.lowercased() ?? ""
+            return key == "gres/npu" || key.hasPrefix("gres/npu:")
+        }
     }
 
     private static func gpuType(_ value: String) -> GPU? {

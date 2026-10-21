@@ -38,7 +38,7 @@ struct HPC2PlatformView: View {
                     Text("HPC3 使用 2025-09-01 起公布的 ACD 卡时参考价；未另加 HPC2 的 CPU 费。可按当前账单调整单价。")
                         .font(.caption).foregroundStyle(.secondary)
                 } else if model.cluster == .hpc4 {
-                    Text("HPC4 计费标准尚未确认，费用暂不估算；缺失价格不按零费用处理。")
+                    Text("HPC4 按 ARM CPU 核时与 910C NPU 物理卡时估算，支持低、中、高优先级。NPU 资源单位按计费标准中的比例折算，可查看和修改。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 if selectedList == .current {

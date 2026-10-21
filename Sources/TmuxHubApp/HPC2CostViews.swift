@@ -18,11 +18,21 @@ struct HPC2JobCostView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-                Text("GPU \(HPC2CostFormat.money(estimate.gpuAmount)) + CPU \(HPC2CostFormat.money(estimate.cpuAmount)) · \(estimate.tariffLabel)")
-                    .foregroundStyle(.secondary)
+                if estimate.npuCount > 0 {
+                    Text("NPU \(HPC2CostFormat.money(estimate.npuAmount)) + ARM CPU \(HPC2CostFormat.money(estimate.cpuAmount)) · \(estimate.tariffLabel)")
+                        .foregroundStyle(.secondary)
+                    Text("\(estimate.npuCount) 个 NPU 资源单位 → \(estimate.npuCardCount.formatted()) 张 910C 计费卡")
+                        .foregroundStyle(.secondary)
+                } else if estimate.gpuCount > 0 {
+                    Text("GPU \(HPC2CostFormat.money(estimate.gpuAmount)) + CPU \(HPC2CostFormat.money(estimate.cpuAmount)) · \(estimate.tariffLabel)")
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("CPU \(HPC2CostFormat.money(estimate.cpuAmount)) · \(estimate.tariffLabel)")
+                        .foregroundStyle(.secondary)
+                }
             }
             .font(.caption.monospacedDigit())
-            .help("按当前平台计费标准、已分配资源和 Slurm 已运行时长估算，不按 GPU 利用率折扣；以平台账单为准。")
+            .help("按当前平台计费标准、已分配资源和 Slurm 已运行时长估算，不按 GPU / NPU 利用率折扣；以平台账单为准。")
         } else {
             Text(isPending
                  ? "排队中 · 暂未计入当前费用估计，已有运行记录可在历史中查看"
@@ -71,6 +81,7 @@ struct HPC2CostSummaryView: View {
 struct HPC2CostRatesSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var fields: [String]
+    @State private var npuUnitsPerCard: String
     @State private var error: String?
     private let cluster: HKUSTSlurmCluster
     let onSave: (SlurmCostConfiguration) throws -> Void
@@ -80,6 +91,7 @@ struct HPC2CostRatesSheet: View {
         onSave: @escaping (SlurmCostConfiguration) throws -> Void
     ) {
         _fields = State(initialValue: Self.fields(for: configuration))
+        _npuUnitsPerCard = State(initialValue: String(configuration.npuUnitsPerCard ?? 2))
         cluster = configuration.effectiveCluster
         self.onSave = onSave
     }
@@ -88,16 +100,20 @@ struct HPC2CostRatesSheet: View {
         let values = fields.compactMap {
             Double($0.trimmingCharacters(in: .whitespacesAndNewlines))
         }
-        guard values.count == 9 else { return nil }
+        guard values.count == 12 else { return nil }
         func tier(_ start: Int) -> SlurmCostTierRates {
             SlurmCostTierRates(
                 cpuPerCoreHour: cluster == .hpc3 ? 0 : values[start],
-                a800PerGPUHour: cluster == .hpc3 ? 0 : values[start + 1],
-                otherPerGPUHour: values[start + 2]
+                a800PerGPUHour: cluster == .hpc2 ? values[start + 1] : 0,
+                otherPerGPUHour: cluster == .hpc4 ? 0 : values[start + 2],
+                npuPerCardHour: cluster == .hpc4 ? values[start + 3] : nil
             )
         }
+        let unitsPerCard = Double(npuUnitsPerCard.trimmingCharacters(in: .whitespacesAndNewlines))
+        if cluster == .hpc4, unitsPerCard == nil { return nil }
         let configuration = SlurmCostConfiguration(
-            low: tier(0), medium: tier(3), high: tier(6), cluster: cluster
+            low: tier(0), medium: tier(4), high: tier(8), cluster: cluster,
+            npuUnitsPerCard: cluster == .hpc4 ? unitsPerCard : nil
         )
         return configuration.isValid ? configuration : nil
     }
@@ -107,6 +123,8 @@ struct HPC2CostRatesSheet: View {
             Text("费用估计 · 计费标准").font(.title2.bold())
             Text(cluster == .hpc3
                  ? "人民币（CNY） · ACD GPU 按卡时；不足一小时按秒折算，不另加 CPU 费用。"
+                 : cluster == .hpc4
+                 ? "人民币（CNY） · 910C NPU 按物理卡时，ARM CPU 按核时；不足一小时按秒折算。"
                  : "人民币（CNY） · GPU 按卡时，CPU 按核时；不足一小时按秒折算。")
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -115,6 +133,9 @@ struct HPC2CostRatesSheet: View {
                     Text("优先级")
                     if cluster == .hpc3 {
                         Text("ACD GPU / 卡时")
+                    } else if cluster == .hpc4 {
+                        Text("ARM CPU / 核时")
+                        Text("910C NPU / 卡时")
                     } else {
                         Text("CPU / 核时")
                         Text("A800 / 卡时")
@@ -124,12 +145,24 @@ struct HPC2CostRatesSheet: View {
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.secondary)
                 rateRow("低", offset: 0)
-                rateRow("中", offset: 3)
-                rateRow("高", offset: 6)
+                rateRow("中", offset: 4)
+                rateRow("高", offset: 8)
             }
             .textFieldStyle(.roundedBorder)
+            if cluster == .hpc4 {
+                HStack {
+                    Text("每张 910C 对应的 NPU 资源单位")
+                    TextField("2", text: $npuUnitsPerCard)
+                        .frame(width: 90)
+                        .textFieldStyle(.roundedBorder)
+                        .accessibilityLabel("每张 910C 对应的 NPU 资源单位")
+                }
+                .font(.callout)
+            }
             Text(cluster == .hpc3
                  ? "参考三期公开定价（2025-09-01 起生效），仅估算 ACD 低、中、高优先级队列；未列单独 CPU 加价。debug、未知队列及 MIG 暂不估算。修改单价会重新计算当前和历史任务，不会修改集群设置。"
+                 : cluster == .hpc4
+                 ? "按当前队列优先级推定低、中、高计价档位。默认 2 个 NPU 资源单位折算 1 张 910C（16 单位为 8 张卡），可按集群实际配置调整。NPU 任务暂按卡时费另加已分配 CPU 核时费估算；文档未说明是否包含 CPU，实际账单可能不同。未知队列及未确认资源暂不估算。修改后重新计算当前和历史任务，以平台账单为准。"
                  : "按已确认的 HPC2 队列匹配优先级；debug 计算免费。未知队列及 MIG 暂不估算。修改单价会重新计算当前和历史任务的估计金额，不会修改集群设置。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -138,20 +171,25 @@ struct HPC2CostRatesSheet: View {
                     Link("三期官方定价 · 2025-09-01", destination: URL(string: "https://docs.hpc.hkust-gz.edu.cn/docs/charges/prices-phaseIII/")!)
                     Link("官方队列说明", destination: URL(string: "https://docs.hpc.hkust-gz.edu.cn/docs/hpc3/slurm/queue/")!)
                 } else {
-                    Link("价格速查 · 2026-10-13", destination: URL(string: "https://mcnj47nsbq2m.feishu.cn/wiki/Rhr9wjK8FiK15DkjA33cruc5nWg")!)
-                    Link("官方队列说明", destination: URL(string: "https://docs.hpc.hkust-gz.edu.cn/docs/hpc12/slurm/queue/")!)
+                    Link("价格速查", destination: URL(string: "https://mcnj47nsbq2m.feishu.cn/wiki/Rhr9wjK8FiK15DkjA33cruc5nWg")!)
+                    if cluster == .hpc4 {
+                        Link("910C 资源单位说明", destination: URL(string: "https://docs.hpc.hkust-gz.edu.cn/docs/hpc4/domestic/quickstart-submit-ai-job/")!)
+                    } else {
+                        Link("官方队列说明", destination: URL(string: "https://docs.hpc.hkust-gz.edu.cn/docs/hpc12/slurm/queue/")!)
+                    }
                 }
             }
             .font(.caption)
             if let error {
                 Text(error).font(.caption).foregroundStyle(.red)
             } else if configuration == nil {
-                Text("请输入有效的非负单价，小数点使用「.」。")
+                Text(cluster == .hpc4 ? "请输入有效的非负单价和大于零的 NPU 折算比例，小数点使用「.」。" : "请输入有效的非负单价，小数点使用「.」。")
                     .font(.caption).foregroundStyle(.red)
             }
             HStack {
                 Button("恢复参考单价") {
                     fields = Self.fields(for: cluster.defaultCostConfiguration)
+                    npuUnitsPerCard = String(cluster.defaultCostConfiguration.npuUnitsPerCard ?? 2)
                     error = nil
                 }
                 Spacer()
@@ -179,6 +217,11 @@ struct HPC2CostRatesSheet: View {
             if cluster == .hpc3 {
                 TextField("ACD GPU", text: $fields[offset + 2])
                     .accessibilityLabel("\(title)优先级 ACD GPU 每卡小时单价")
+            } else if cluster == .hpc4 {
+                TextField("ARM CPU", text: $fields[offset])
+                    .accessibilityLabel("\(title)优先级 ARM CPU 每核小时单价")
+                TextField("910C NPU", text: $fields[offset + 3])
+                    .accessibilityLabel("\(title)优先级 910C NPU 每卡小时单价")
             } else {
                 TextField("CPU", text: $fields[offset])
                     .accessibilityLabel("\(title)优先级 CPU 每核小时单价")
@@ -193,6 +236,7 @@ struct HPC2CostRatesSheet: View {
     private static func fields(for configuration: SlurmCostConfiguration) -> [String] {
         [configuration.low, configuration.medium, configuration.high].flatMap {
             [$0.cpuPerCoreHour, $0.a800PerGPUHour, $0.otherPerGPUHour].map { String($0) }
+                + [configuration.effectiveCluster == .hpc4 ? $0.npuPerCardHour.map { String($0) } ?? "" : "0"]
         }
     }
 }

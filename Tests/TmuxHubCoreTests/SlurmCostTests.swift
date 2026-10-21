@@ -232,6 +232,210 @@ struct SlurmCostTests {
         #expect(abs(estimate.amount - 11.28) < 0.000_001)
     }
 
+    @Test("HPC4 queues apply ARM CPU and 910C priority tariffs with physical-card conversion")
+    func hpc4Tariffs() throws {
+        let cases: [(String, String, Double, Double)] = [
+            ("a128m512u", "a320m2tn910cu", 0.01, 0.84),
+            ("a128m512ue", "a320m2tn910cue", 0.02, 1.30),
+            ("emergency", "emergency_a320m2tn910c", 0.03, 2.10),
+        ]
+        for (cpuPartition, npuPartition, cpuRate, npuRate) in cases {
+            let cpu = try #require(SlurmCostEstimator.estimate(
+                partition: cpuPartition, allocatedCPU: 32, allocatedGPU: 0,
+                elapsedSeconds: 3_600, configuration: .hkustHPC4, allocatedNPU: 0
+            ))
+            #expect(abs(cpu.amount - 32 * cpuRate) < 0.000_001)
+            #expect(cpu.npuAmount == 0)
+            for resources in [
+                "cpu=32,gres/npu=16",
+                "cpu=32,gres/npu=16,gres/npu:910c=16",
+                "cpu=32,gres/npu:ascend910c=16",
+            ] {
+                let npu = try #require(SlurmCostEstimator.estimate(
+                    partition: npuPartition, allocatedCPU: 32, allocatedGPU: 0,
+                    elapsedSeconds: 3_600, configuration: .hkustHPC4,
+                    allocatedResources: resources, allocatedNPU: 16
+                ))
+                #expect(npu.npuCount == 16)
+                #expect(npu.npuCardCount == 8)
+                #expect(npu.gpuCount == 0)
+                #expect(npu.gpuAmount == 0)
+                #expect(abs(npu.npuAmount - 8 * npuRate) < 0.000_001)
+                #expect(abs(npu.cpuAmount - 32 * cpuRate) < 0.000_001)
+                #expect(abs(npu.amount - (8 * npuRate + 32 * cpuRate)) < 0.000_001)
+            }
+        }
+    }
+
+    @Test("NPU history uses total allocation and exact elapsed time without counting nodes again")
+    func hpc4History() throws {
+        for nodes in [1, 4] {
+            let result = try #require(SlurmCostEstimator.estimate(
+                history: history(
+                    partition: "a320m2tn910cu",
+                    resources: "cpu=32,node=4,gres/npu=16,gres/npu:910c=16",
+                    state: .cancelled, elapsed: "00:30:00", nodes: nodes
+                ),
+                configuration: .hkustHPC4
+            ))
+            #expect(result.npuCardCount == 8)
+            #expect(abs(result.amount - 3.52) < 0.000_001)
+        }
+        let partialCard = try #require(SlurmCostEstimator.estimate(
+            partition: "a320m2tn910cu", allocatedCPU: 0, allocatedGPU: 0,
+            elapsedSeconds: 1_800, configuration: .hkustHPC4, allocatedNPU: 1
+        ))
+        #expect(partialCard.npuCardCount == 0.5)
+        #expect(abs(partialCard.amount - 0.21) < 0.000_001)
+    }
+
+    @Test("NPU resource mismatches and mixed accelerator allocations never become partial charges")
+    func invalidNPUResources() {
+        for resources in [
+            "cpu=32,gres/npu=16,gres/npu:910c=8",
+            "cpu=32,gres/npu=16,gres/npu:910b=16",
+            "cpu=32,gres/npu=16,gres/npu:unknown=16",
+            "cpu=32,gres/npu=-2",
+            "cpu=32,gres/npu=1.5",
+            "cpu=32,gres/npu=16,gres/gpu=1",
+            "cpu=32,gres/npu=16,gres/shard=2",
+            "cpu=32,gres/npu=16,gres/mig=1",
+            "cpu=32,gres/npu=16,gres/npu=16",
+            "cpu=32,gres/npu=9999999999999999999999999999",
+            "gres/npu=16",
+        ] {
+            #expect(SlurmCostEstimator.estimate(
+                partition: "a320m2tn910cu", allocatedCPU: nil, allocatedGPU: nil,
+                elapsedSeconds: 3_600, configuration: .hkustHPC4,
+                allocatedResources: resources
+            ) == nil)
+        }
+        #expect(SlurmCostEstimator.estimate(
+            partition: "a320m2tn910cu", allocatedCPU: 32, allocatedGPU: 0,
+            elapsedSeconds: 3_600, configuration: .hkustHPC4,
+            allocatedResources: "cpu=32,gres/npu=16", allocatedNPU: 8
+        ) == nil)
+        #expect(SlurmCostEstimator.estimate(
+            partition: "a320m2tn910cu", allocatedCPU: 32, allocatedGPU: 0,
+            elapsedSeconds: 3_600, configuration: .hkustHPC4
+        ) == nil)
+        #expect(SlurmCostEstimator.estimate(
+            partition: "a128m512u", allocatedCPU: 32, allocatedGPU: 0,
+            elapsedSeconds: 3_600, configuration: .hkustHPC4, allocatedNPU: 2
+        ) == nil)
+        for cluster in [HKUSTSlurmCluster.hpc2, .hpc3] {
+            #expect(SlurmCostEstimator.estimate(
+                partition: cluster == .hpc2 ? "i64m1tga800u" : "acd_u",
+                allocatedCPU: 32, allocatedGPU: 4, elapsedSeconds: 3_600,
+                configuration: cluster.defaultCostConfiguration, allocatedNPU: 2
+            ) == nil)
+        }
+    }
+
+    @Test("live NPU allocation keeps GPU and NPU resource counts separate for billing")
+    func liveNPUAllocation() throws {
+        let jobID = try #require(SlurmJobID(rawValue: "123"))
+        let raw = "cpu=32,mem=128G,node=1,gres/npu=16,gres/npu:910c=16"
+        let allocation = try #require(SlurmMonitoringParser.allocations(
+            "JobId=123 UserId=user(1) JobState=RUNNING NumCPUs=32 RunTime=01:00:00 AllocTRES=\(raw)"
+        )[jobID])
+        #expect(allocation.allocatedGPU == 0)
+        #expect(allocation.allocatedNPU == 16)
+        let result = try #require(SlurmCostEstimator.estimate(
+            partition: "a320m2tn910cu",
+            allocatedCPU: allocation.allocatedCPU, allocatedGPU: allocation.allocatedGPU,
+            elapsedSeconds: allocation.elapsedSeconds, configuration: .hkustHPC4,
+            allocatedResources: allocation.allocatedResources,
+            allocatedNPU: allocation.allocatedNPU
+        ))
+        #expect(abs(result.amount - 7.04) < 0.000_001)
+    }
+
+    @Test("only the legacy zero HPC4 placeholder migrates to the newly published defaults")
+    func tariffMigration() throws {
+        let legacy = """
+        {"cluster":"hpc4",
+         "low":{"cpuPerCoreHour":0,"a800PerGPUHour":0,"otherPerGPUHour":0},
+         "medium":{"cpuPerCoreHour":0,"a800PerGPUHour":0,"otherPerGPUHour":0},
+         "high":{"cpuPerCoreHour":0,"a800PerGPUHour":0,"otherPerGPUHour":0}}
+        """
+        let decoded = try JSONDecoder().decode(SlurmCostConfiguration.self, from: Data(legacy.utf8))
+        #expect(decoded.low.npuPerCardHour == nil)
+        #expect(decoded.npuUnitsPerCard == nil)
+        #expect(decoded.migratedToCurrentDefaults == .hkustHPC4)
+        #expect(decoded.migratedToCurrentDefaults.migratedToCurrentDefaults == .hkustHPC4)
+        var explicitZero = decoded
+        explicitZero.low.npuPerCardHour = 0
+        explicitZero.medium.npuPerCardHour = 0
+        explicitZero.high.npuPerCardHour = 0
+        #expect(explicitZero.migratedToCurrentDefaults == explicitZero)
+        var custom = decoded
+        custom.low.cpuPerCoreHour = 0.012
+        #expect(custom.migratedToCurrentDefaults == custom)
+        var customMapping = decoded
+        customMapping.npuUnitsPerCard = 1
+        #expect(customMapping.migratedToCurrentDefaults == customMapping)
+        for cluster in [HKUSTSlurmCluster.hpc2, .hpc3] {
+            var other = decoded
+            other.cluster = cluster
+            #expect(other.migratedToCurrentDefaults == other)
+        }
+        #expect(try JSONDecoder().decode(
+            SlurmCostConfiguration.self, from: JSONEncoder().encode(SlurmCostConfiguration.hkustHPC4)
+        ) == .hkustHPC4)
+    }
+
+    @Test("custom NPU price and resource-to-card conversion persist and reject invalid values")
+    func npuConfiguration() throws {
+        var custom = SlurmCostConfiguration.hkustHPC4
+        custom.low.npuPerCardHour = 2
+        custom.npuUnitsPerCard = 1
+        #expect(try JSONDecoder().decode(
+            SlurmCostConfiguration.self, from: JSONEncoder().encode(custom)
+        ) == custom)
+        #expect(SlurmCostEstimator.estimate(
+            partition: "a320m2tn910cu", allocatedCPU: 0, allocatedGPU: 0,
+            elapsedSeconds: 3_600, configuration: custom, allocatedNPU: 16
+        )?.npuAmount == 32)
+        for invalid in [-1.0, .infinity, -.infinity, .nan] {
+            var invalidRate = custom
+            invalidRate.low.npuPerCardHour = invalid
+            #expect(!invalidRate.isValid)
+            #expect(SlurmCostEstimator.estimate(
+                partition: "a320m2tn910cu", allocatedCPU: 0, allocatedGPU: 0,
+                elapsedSeconds: 3_600, configuration: invalidRate, allocatedNPU: 16
+            ) == nil)
+        }
+        for invalid in [0.0, -1, .infinity, -.infinity, .nan] {
+            var invalidMapping = custom
+            invalidMapping.npuUnitsPerCard = invalid
+            #expect(!invalidMapping.isValid)
+        }
+        for missingRate in [true, false] {
+            var unknown = custom
+            if missingRate { unknown.low.npuPerCardHour = nil }
+            else { unknown.npuUnitsPerCard = nil }
+            #expect(SlurmCostEstimator.estimate(
+                partition: "a320m2tn910cu", allocatedCPU: 32, allocatedGPU: 0,
+                elapsedSeconds: 3_600, configuration: unknown, allocatedNPU: 16
+            ) == nil)
+            #expect(SlurmCostEstimator.estimate(
+                partition: "a128m512u", allocatedCPU: 32, allocatedGPU: 0,
+                elapsedSeconds: 3_600, configuration: unknown, allocatedNPU: 0
+            )?.amount == 0.32)
+        }
+        var overflow = custom
+        overflow.npuUnitsPerCard = .leastNonzeroMagnitude
+        #expect(SlurmCostEstimator.estimate(
+            partition: "a320m2tn910cu", allocatedCPU: 0, allocatedGPU: 0,
+            elapsedSeconds: 3_600, configuration: overflow, allocatedNPU: 16
+        ) == nil)
+        #expect(SlurmCostEstimator.estimate(
+            partition: "a320m2tn910cu", allocatedCPU: 0, allocatedGPU: 0,
+            elapsedSeconds: 3_600, configuration: custom, allocatedNPU: -1
+        ) == nil)
+    }
+
     private func history(
         partition: String = "i64m1tga800u",
         resources: String = "cpu=32,mem=256G,gres/gpu=4,gres/gpu:a800=4",

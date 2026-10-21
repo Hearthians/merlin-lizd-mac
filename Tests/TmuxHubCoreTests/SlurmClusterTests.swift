@@ -161,10 +161,10 @@ struct SlurmClusterTests {
         }
     }
 
-    @Test("unpriced phase IV and NPU allocations never appear free or CPU-only priced")
+    @Test("unknown phase IV queues and NPU allocations on other clusters remain unpriced")
     func unpricedAccelerators() {
-        #expect(!SlurmCostConfiguration.hkustHPC4.isPricingAvailable)
-        for partition in ["debug", "a128m512u", "a128m512ue", "emergency", "a320m2tn910cu"] {
+        #expect(SlurmCostConfiguration.hkustHPC4.isPricingAvailable)
+        for partition in ["debug", "unknown", "i64m1tga800u", "acd_u", "a320m2tn910cu"] {
             #expect(SlurmCostEstimator.estimate(
                 partition: partition, allocatedCPU: 32, allocatedGPU: 0,
                 elapsedSeconds: 3_600, configuration: .hkustHPC4

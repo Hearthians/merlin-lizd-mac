@@ -147,9 +147,15 @@ final class HPC2PlatformModel: ObservableObject {
             SlurmCostConfiguration.self,
             from: defaults.data(forKey: costConfigurationKey)
         )
-        costConfiguration = decodedCosts.flatMap {
+        let restoredCosts = decodedCosts.flatMap {
             $0.isValid && $0.effectiveCluster == cluster ? $0 : nil
         } ?? cluster.defaultCostConfiguration
+        let migratedCosts = restoredCosts.migratedToCurrentDefaults
+        costConfiguration = migratedCosts
+        if migratedCosts != restoredCosts,
+            let data = try? JSONEncoder().encode(migratedCosts) {
+            defaults.set(data, forKey: costConfigurationKey)
+        }
 
         let decodedRuns: [HPC2ManagedRunRecord] = Self.decode(
             [HPC2ManagedRunRecord].self,
@@ -184,7 +190,8 @@ final class HPC2PlatformModel: ObservableObject {
             allocatedGPU: allocation.allocatedGPU,
             elapsedSeconds: allocation.elapsedSeconds,
             configuration: costConfiguration,
-            allocatedResources: allocation.allocatedResources
+            allocatedResources: allocation.allocatedResources,
+            allocatedNPU: allocation.allocatedNPU
         )
     }
 

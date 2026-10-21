@@ -140,11 +140,11 @@ HPC2 / HPC3 默认请求 1 个 GPU，HPC4 默认仅请求 CPU。
   CPU 队列以及 `a320m2tn910cu` / `a320m2tn910cue` / `emergency_a320m2tn910c` NPU 队列。
   分区和资源数量以实时 Slurm 返回为准，不能用较早文档中的 HPC4 `hpc` 分区替代。
   GPU / NPU 分别显示总量、已分配和未分配数量；仅 GPU 队列显示按单节点统计的 4 / 8 卡空位，
-  NPU 不换算为物理卡数。共享节点的队列不可相加。
+  队列监控中的 NPU 数量保留资源单位，费用估计另行折算为物理卡数。共享节点的队列不可相加。
   空位不代表可立即启动，仍受 CPU、内存、优先级、配额和节点状态限制。
 - 当前任务显示 GPU / NPU / CPU / 内存分配；支持的 GPU 运行任务可通过已有作业内的短暂监控 step
   读取各节点所分配 GPU 的利用率、显存和功率，最多同时采样 3 个任务，不申请新的作业资源。
-  HPC4 NPU 数量按 Slurm 报告的资源单位显示，不换算为物理卡数；NPU 实时利用率、显存和功率暂未接入。
+  HPC4 任务资源中的 NPU 数量按 Slurm 报告的资源单位显示，费用明细同时显示折算后的物理卡数；NPU 实时利用率、显存和功率暂未接入。
   CPU 按当前活动 step 的累计 CPU 时间 / 作业运行时长 / 已分配核数估算，已结束 step 可能未计入；
   内存为 Slurm 记录的单个 task 的 RSS 峰值（可能包含子进程）。
   不支持、超时或无权限的指标显示「—」及原因；队列读取失败时保留旧数据并标明采样时间。
@@ -160,12 +160,22 @@ HPC2 / HPC3 默认请求 1 个 GPU，HPC4 默认仅请求 CPU。
   2025 年 9 月 1 日启用的 ACD 低 / 中 / 高档分别为 2.40 / 3.75 / 6.00 元每 GPU 小时，
   不附加 HPC2 的 CPU 费用；队列档位参考[HPC3 队列说明](https://docs.hpc.hkust-gz.edu.cn/docs/hpc3/slurm/queue/)。
   参考价可调整，实际结算以平台账单为准；MIG 等不能确认计价单位的资源不估算。
-  HPC4 尚无经确认的默认费率，显示费用不可估算，不套用 HPC2 / HPC3 价格，也不视为免费。
+  HPC4 采用[价格速查](https://mcnj47nsbq2m.feishu.cn/wiki/Rhr9wjK8FiK15DkjA33cruc5nWg)（2026-10-21 核对）：
+  ARM CPU 低 / 中 / 高档为 0.01 / 0.02 / 0.03 元每核小时，910C NPU 为 0.84 / 1.30 / 2.10 元每物理卡小时。
+  已知 CPU 队列 `a128m512u` / `a128m512ue` / `emergency` 与 NPU 队列
+  `a320m2tn910cu` / `a320m2tn910cue` / `emergency_a320m2tn910c`，
+  按实测调度优先级 100 / 200 / 300 推定低 / 中 / 高计价档位；未知队列和 debug 不推定免费。
+  NPU 分配数按默认 2 个资源单位折算 1 张 910C 卡，16 单位按 8 卡计价；
+  依据为[官方每节点 8 卡规格](https://itdid.hkust-gz.edu.cn/cn/detail-968)、实际节点 `gres/npu:16`
+  及[官方资源单位说明](https://docs.hpc.hkust-gz.edu.cn/docs/hpc4/domestic/quickstart-submit-ai-job/)。
+  「计费标准」可查看和修改三档单价及 NPU 折算比例；旧版未配置的 HPC4 零占位费率自动迁移，已保存的自定义费率保留。
+  NPU 任务暂按 NPU 卡时费另加已分配 ARM CPU 核时费估算；价目未说明 NPU 费用是否包含 CPU，页面明确标注这一假设，实际结算以账单为准。
+  仅估算 Slurm 计算费用，不包含存储、包机租赁或 AIStudio 容器费用。
 
 当前平台页可创建、连接和取消 TmuxHub 交互任务，并只读监控其他方式提交的普通任务。
 GPU 实时采样暂不覆盖数组或异构任务。容器开发中心、镜像管理和 `sbatch` 提交尚未纳入。
 HPC4 AIStudio 的 NPU 容器与 Slurm 作业是不同入口，参见[官方容器开发说明](https://docs.hpc.hkust-gz.edu.cn/docs/hpc4/domestic/quickstart-submit-ai-job/)；
-其中 NPU 芯片数量和物理卡数量并不相同，页面保持集群原始资源计数。
+其中 NPU 芯片数量和物理卡数量并不相同；资源监控保持集群原始计数，费用估计使用可配置的卡数折算比例。
 
 ## Herdr 工作区
 
