@@ -268,6 +268,37 @@ public enum CodexNotificationBridge {
         except (OSError, ValueError, subprocess.SubprocessError, UnicodeError):
             return {}
 
+    def desktop_context(payload, codex_home=None):
+        # The hook's transcript identifies the originating desktop chat even when
+        # session_id names a transient engine. Inspect only its metadata header.
+        path = payload.get('transcript_path')
+        if not isinstance(path, str) or not os.path.isabs(path):
+            return {}
+        codex_home = os.path.realpath(os.path.expanduser(codex_home or os.environ.get('CODEX_HOME') or '~/.codex'))
+        canonical = os.path.realpath(path)
+        roots = [os.path.join(codex_home, name) for name in ('sessions', 'archived_sessions')]
+        if not any(canonical.startswith(root + os.sep) for root in roots):
+            return {}
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+            with os.fdopen(fd, 'rb') as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                    return {}
+                header = stream.readline(262145)
+            if len(header) > 262144 or not header.endswith(b'\n'):
+                return {}
+            record = json.loads(header)
+            metadata = record.get('payload', {})
+            if record.get('type') != 'session_meta' or metadata.get('originator') not in ('Codex Desktop', 'codex_work_desktop'):
+                return {}
+            identifier = str(uuid.UUID(metadata['id']))
+            if not re.fullmatch(r'rollout-[0-9T-]+-' + re.escape(identifier) + r'(?:_[0-9a-f-]{36})?\.jsonl', os.path.basename(canonical), re.I):
+                return {}
+            return {'desktopThreadID': identifier}
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return {}
+
     def emit():
         raw = sys.stdin.buffer.read(MAX_INPUT + 1)
         if len(raw) > MAX_INPUT:
@@ -289,6 +320,7 @@ public enum CodexNotificationBridge {
                  'turnID': clean(payload.get('turn_id')), 'cwd': cwd, 'hostname': hostname,
                  'timestamp': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')}
         event.update(tmux_context())
+        event.update(desktop_context(payload))
         with locked():
             current = state()
             current['latestSequence'] += 1

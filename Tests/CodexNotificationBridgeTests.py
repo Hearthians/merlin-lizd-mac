@@ -155,7 +155,58 @@ def main():
         except (ValueError, json.JSONDecodeError):
             pass
         assert hooks.read_bytes() == b'{malformed'
-        print('PASS: concurrent events/shared receipts, independent cursors, privacy, retention, idempotent setup, malformed-config preservation')
+        # tmux routing is bound to the actual server, socket and originating pane.
+        actual_os, actual_run = scope['os'], scope['subprocess'].run
+        requested = []
+        fields = ['research session', '$3', '123456', '4321', '@7', '%5', '/tmp/tmux-test/default']
+        def tmux_result(argv, **kwargs):
+            requested.append((argv, kwargs))
+            return SimpleNamespace(stdout=('\t'.join(fields) + '\n').encode())
+        try:
+            scope['os'] = SimpleNamespace(environ={'TMUX': '/tmp/tmux-test/default,4321,0', 'TMUX_PANE': '%5'})
+            scope['subprocess'].run = tmux_result
+            tmux_metadata = scope['tmux_context']()
+            assert tmux_metadata == {'tmuxSession': 'research session', 'tmuxSessionID': '$3',
+                                     'tmuxSessionCreated': 123456, 'tmuxServerPID': 4321,
+                                     'tmuxWindow': '@7', 'tmuxPane': '%5', 'tmuxSocket': '/tmp/tmux-test/default'}
+            assert requested[-1][0][:6] == ['tmux', '-S', '/tmp/tmux-test/default', 'display-message', '-p', '-t']
+            assert requested[-1][0][6] == '%5' and requested[-1][1]['timeout'] == 0.8
+            assert 'shell' not in requested[-1][1]
+            for position, invalid_value in [(5, '%6'), (6, '/tmp/another-server/default'),
+                                            (1, '$3;bad'), (4, '%7'), (2, '-1'), (3, '0')]:
+                previous = fields[position]
+                fields[position] = invalid_value
+                assert scope['tmux_context']() == {}, (position, invalid_value)
+                fields[position] = previous
+            scope['os'] = SimpleNamespace(environ={'TMUX': '/tmp/tmux-test/default,4321,0', 'TMUX_PANE': '%5;bad'})
+            before = len(requested)
+            assert scope['tmux_context']() == {} and len(requested) == before
+        finally:
+            scope['os'], scope['subprocess'].run = actual_os, actual_run
+
+        # Desktop hook sessions may use an engine ID different from the chat ID.
+        desktop_id = str(uuid.uuid4())
+        transcript = codex_directory / 'sessions' / '2026' / '10' / '22' / f'rollout-2026-10-22T10-00-00-{desktop_id}.jsonl'
+        transcript.parent.mkdir(parents=True)
+        metadata = {'type': 'session_meta', 'payload': {'id': desktop_id, 'originator': 'Codex Desktop'}}
+        transcript.write_text(json.dumps(metadata) + '\nsecret transcript never copied\n')
+        payload = {'session_id': str(uuid.uuid4()), 'transcript_path': str(transcript)}
+        context = scope['desktop_context'](payload, str(codex_directory))
+        assert context == {'desktopThreadID': desktop_id}
+        assert 'secret' not in json.dumps(context) and 'transcript_path' not in context
+        # A bare environment ID, matching cwd, or non-desktop header is insufficient.
+        assert scope['desktop_context']({'session_id': desktop_id}, str(codex_directory)) == {}
+        metadata['payload']['originator'] = 'codex_vscode'
+        transcript.write_text(json.dumps(metadata) + '\n')
+        assert scope['desktop_context'](payload, str(codex_directory)) == {}
+        metadata['payload']['originator'] = 'Codex Desktop'
+        metadata['payload']['id'] = str(uuid.uuid4())
+        transcript.write_text(json.dumps(metadata) + '\n')
+        assert scope['desktop_context'](payload, str(codex_directory)) == {}
+        assert scope['desktop_context']({'transcript_path': str(hooks)}, str(codex_directory)) == {}
+        transcript.write_bytes(b'x' * 262145 + b'\n')
+        assert scope['desktop_context'](payload, str(codex_directory)) == {}
+        print('PASS: concurrent events/shared receipts, independent cursors, privacy, retention, idempotent setup, malformed-config preservation, verified desktop routing')
 
 
 if __name__ == '__main__':

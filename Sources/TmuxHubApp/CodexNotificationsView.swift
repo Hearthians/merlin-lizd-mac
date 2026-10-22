@@ -365,7 +365,7 @@ struct CodexNotificationsView: View {
 
     @ViewBuilder
     private func entryButtons(_ entry: CodexNotificationEntry, muted: Bool) -> some View {
-        Button("打开终端", systemImage: "terminal") { model.open(entry: entry) }
+        Button("返回会话", systemImage: "arrow.up.forward.app") { model.open(entry: entry) }
         if !entry.isRead {
             Button("标为已读", systemImage: "checkmark") { model.markRead(id: entry.id) }
                 .help("已读状态会同步到其他设备。")

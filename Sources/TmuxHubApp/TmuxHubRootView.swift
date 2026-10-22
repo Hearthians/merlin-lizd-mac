@@ -86,7 +86,7 @@ struct TmuxHubRootView: View {
             .ignoresSafeArea(.container, edges: .top)
         }
         .toolbar(removing: .sidebarToggle)
-        .alert("无法打开通知对应的终端", isPresented: Binding(
+        .alert("无法返回通知对应的会话", isPresented: Binding(
             get: { terminals.notificationOpenError != nil },
             set: { if !$0 { terminals.notificationOpenError = nil } }
         )) {

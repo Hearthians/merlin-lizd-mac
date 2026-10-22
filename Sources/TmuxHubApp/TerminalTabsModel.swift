@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import TmuxHubCore
 import SwiftUI
@@ -15,7 +16,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
             }
             persist()
             guard let selectedTab else { return }
-            prepareForUse(selectedTab.target)
+            prepareForUse(selectedTab.target, notificationRoute: selectedTab.notificationRoute)
         }
     }
 
@@ -95,6 +96,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     }
 
     func openCodexNotification(_ entry: CodexNotificationEntry) {
+        notificationOpenError = nil
         notificationOpenTask?.cancel()
         let token = UUID()
         notificationOpenToken = token
@@ -105,9 +107,20 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
 
     private func performOpenCodexNotification(_ entry: CodexNotificationEntry, token: UUID) async {
         do {
-            let route = try CodexNotificationRoute(event: entry.event)
+            if entry.destination == nil,
+                let url = await CodexDesktopNotificationResolver.resolve(event: entry.event) {
+                try Task.checkCancellation()
+                guard notificationOpenToken == token else { return }
+                guard NSWorkspace.shared.open(url) else {
+                    throw NotificationSessionOpenError.desktopUnavailable
+                }
+                return
+            }
+            guard let originalRoute = try? CodexNotificationRoute(event: entry.event) else {
+                throw NotificationSessionOpenError.missingRoute
+            }
             let target = entry.destination.map { TerminalTarget.ssh(destination: $0) } ?? .local
-            try await CodexNotificationRouting.focus(route: route, target: target,
+            let route = try await CodexNotificationRouting.resolveAndFocus(route: originalRoute, target: target,
                 sshMasterPool: runtime.sshMasterPool)
             try Task.checkCancellation()
             guard notificationOpenToken == token else { return }
@@ -366,7 +379,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
             // Restored tabs do not pass through selectedTabID's didSet during
             // initialization, so start their password-aware master preparation
             // here without delaying construction of the interactive terminal.
-            prepareForUse(tab.target)
+            prepareForUse(tab.target, notificationRoute: tab.notificationRoute)
             let attachmentModel = attachments[id] ?? TerminalAttachmentModel(
                 target: tab.target, sessionName: tab.sessionName,
                 service: runtime.attachmentService, defaults: defaults,
@@ -584,19 +597,29 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         persist()
     }
 
-    private func prepareForUse(_ target: TerminalTarget) {
-        runtime.prepare(target) { [weak self] destination in
-            self?.noteHostUse(destination)
+    private func prepareForUse(_ target: TerminalTarget, notificationRoute: CodexNotificationRoute? = nil) {
+        if let notificationRoute, let destination = target.sshDestination {
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    try await CodexNotificationRouting.prepare(route: notificationRoute, target: target,
+                        sshMasterPool: runtime.sshMasterPool)
+                    noteHostUse(destination)
+                } catch {
+                    // The interactive terminal displays its own connection failure.
+                }
+            }
+        } else {
+            runtime.prepare(target) { [weak self] destination in
+                self?.noteHostUse(destination)
+            }
         }
     }
 
     private func command(for tab: TerminalTabRecord) throws -> CommandSpec {
         if let route = tab.notificationRoute {
-            let command = try CodexNotificationRouting.command(route: route, target: tab.target, attach: true)
-            if let destination = tab.target.sshDestination {
-                return try runtime.sshMasterPool.managedCommand(command, alias: destination)
-            }
-            return command
+            return try CodexNotificationRouting.managedAttachCommand(route: route, target: tab.target,
+                sshMasterPool: runtime.sshMasterPool)
         }
         if let reference = tab.herdrReference {
             let command = try HerdrCommands.attach(target: tab.target, reference: reference)
@@ -730,6 +753,20 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
 
     private static func isPlatformManagedTmuxSessionName(_ sessionName: String?) -> Bool {
         sessionName?.hasPrefix("tmuxhub-slurm-") == true
+    }
+}
+
+private enum NotificationSessionOpenError: LocalizedError {
+    case desktopUnavailable
+    case missingRoute
+
+    var errorDescription: String? {
+        switch self {
+        case .desktopUnavailable:
+            "无法打开 Codex 桌面应用。请确认已安装 Codex，并能打开对应对话。"
+        case .missingRoute:
+            "这条通知没有记录可验证的原会话位置。请更新此来源的通知配置；新通知会记录 Codex 对话或 tmux 终端位置。旧通知若缺少这些信息，无法安全自动返回。"
+        }
     }
 }
 

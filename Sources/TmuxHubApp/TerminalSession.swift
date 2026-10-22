@@ -168,6 +168,11 @@ final class TerminalSession: ObservableObject, Identifiable,
                     NSWorkspace.shared.open(URL(fileURLWithPath: resolvedPath))
                 case let .ssh(alias):
                     if browseInSFTP {
+                        guard context.sshEndpoint == nil else {
+                            throw NSError(domain: "TmuxHub.SFTPDownloader", code: 2, userInfo: [
+                                NSLocalizedDescriptionKey: "此会话连接到指定登录节点，外部 SFTP Downloader 暂不支持该连接。请直接点击文件链接下载。"
+                            ])
+                        }
                         let url = try SFTPDownloaderLink.url(host: alias, path: resolvedPath)
                         guard let application = NSWorkspace.shared.urlForApplication(
                             withBundleIdentifier: "local.sftp-downloader"
@@ -214,7 +219,8 @@ final class TerminalSession: ObservableObject, Identifiable,
             do {
                 let localURL = try await forwardedLinks.open(
                     destination: destination,
-                    endpoint: endpoint
+                    endpoint: endpoint,
+                    sshEndpoint: attachmentModel.notificationRoute?.sshEndpoint
                 )
                 try Task.checkCancellation()
                 guard state == .running else {

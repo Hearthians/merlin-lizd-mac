@@ -63,6 +63,11 @@ public final class SSHMasterPool: @unchecked Sendable {
     private let passwordProvider: SSHPasswordProvider
     private let retryBoundaryHook: (@Sendable () async -> Void)?
     private let retryInvalidationHook: (@Sendable () async -> Void)?
+    private let directory: URL
+    private let maxConcurrentPreparations: Int
+    private let endpointPoolLock = NSLock()
+    private var endpointPools: [CodexNotificationSSHEndpoint: SSHMasterPool] = [:]
+    private var endpointPoolsShuttingDown = false
 
     public convenience init(
         maxConcurrentPreparations: Int = 4,
@@ -110,10 +115,13 @@ public final class SSHMasterPool: @unchecked Sendable {
         maxConcurrentPreparations: Int,
         passwordProvider: @escaping SSHPasswordProvider,
         retryBoundaryHook: (@Sendable () async -> Void)?,
-        retryInvalidationHook: (@Sendable () async -> Void)?
+        retryInvalidationHook: (@Sendable () async -> Void)?,
+        endpoint: CodexNotificationSSHEndpoint? = nil
     ) {
         precondition(maxConcurrentPreparations > 0)
-        commands = SSHMasterCommands(directory: directory)
+        self.directory = directory
+        self.maxConcurrentPreparations = maxConcurrentPreparations
+        commands = SSHMasterCommands(directory: directory, endpoint: endpoint)
         managedOwnership = SSHManagedOwnershipRegistry(directory: directory)
         self.runner = runner
         self.passwordProvider = passwordProvider
@@ -126,6 +134,25 @@ public final class SSHMasterPool: @unchecked Sendable {
             maxConcurrentPreparations: maxConcurrentPreparations,
             passwordProvider: passwordProvider
         )
+    }
+
+    /// A cluster alias may land on a different login node on each connection.
+    /// Keep credentials and SSH configuration tied to that alias while giving
+    /// the verified node its own control socket and lifetime.
+    func pinned(to endpoint: CodexNotificationSSHEndpoint) throws -> SSHMasterPool {
+        guard endpoint.isValid else { throw SSHMasterCommandError.invalidDestination }
+        return try endpointPoolLock.withLock {
+            guard !endpointPoolsShuttingDown else { throw SSHMasterPoolError.shuttingDown }
+            if let existing = endpointPools[endpoint] { return existing }
+            let pool = SSHMasterPool(
+                directory: directory, runner: runner,
+                maxConcurrentPreparations: maxConcurrentPreparations,
+                passwordProvider: passwordProvider,
+                retryBoundaryHook: nil, retryInvalidationHook: nil, endpoint: endpoint
+            )
+            endpointPools[endpoint] = pool
+            return pool
+        }
     }
 
     public func prepare(
@@ -323,6 +350,7 @@ public final class SSHMasterPool: @unchecked Sendable {
 
     public func shutdown() async {
         managedOwnership.beginShutdown()
+        endpointPoolLock.withLock { endpointPoolsShuttingDown = true }
         let task = await shutdownCoordinator.task { [weak self] in
             await self?.performShutdown()
         }
@@ -330,6 +358,8 @@ public final class SSHMasterPool: @unchecked Sendable {
     }
 
     private func performShutdown() async {
+        let children = endpointPoolLock.withLock { Array(endpointPools.values) }
+        for child in children { await child.shutdown() }
         let tasks = await state.beginShutdown()
         for task in tasks {
             _ = await task.value

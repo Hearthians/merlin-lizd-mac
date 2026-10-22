@@ -5,6 +5,7 @@ import TmuxHubCore
 struct ForwardedLinkRecord: Codable, Identifiable, Equatable {
     var id: UUID
     var destination: String
+    var sshEndpoint: CodexNotificationSSHEndpoint? = nil
     var originalURL: String
     var localPort: Int?
     var enabled: Bool
@@ -115,11 +116,14 @@ final class ForwardedLinksModel: ObservableObject {
         if let data = defaults.data(forKey: storageKey),
            let saved = try? JSONDecoder().decode([ForwardedLinkRecord].self, from: data) {
             var ids = Set<UUID>()
-            let validRecords = saved.filter {
-                ids.insert($0.id).inserted
-                    && Self.isValidDestination($0.destination)
-                    && LoopbackURL($0.originalURL) != nil
-                    && ($0.localPort.map { (1...65_535).contains($0) } ?? true)
+            let validRecords = saved.filter { record in
+                ids.insert(record.id).inserted
+                    && Self.isValidDestination(record.destination)
+                    && (record.sshEndpoint.map { endpoint in
+                        endpoint.isValid && endpoint.destination == record.destination
+                    } ?? true)
+                    && LoopbackURL(record.originalURL) != nil
+                    && (record.localPort.map { (1...65_535).contains($0) } ?? true)
             }
             if validRecords.count > 100 {
                 records = Array(validRecords.sorted { $0.lastUsed > $1.lastUsed }.prefix(100))
@@ -160,12 +164,16 @@ final class ForwardedLinksModel: ObservableObject {
         }
     }
 
-    func open(destination: String, endpoint: LoopbackURL) async throws -> URL {
+    func open(destination: String, endpoint: LoopbackURL,
+              sshEndpoint: CodexNotificationSSHEndpoint? = nil) async throws -> URL {
         guard !isShuttingDown else { throw ForwardedLinksError.shuttingDown }
-        guard Self.isValidDestination(destination) else { throw ForwardedLinksError.invalidLink }
+        guard Self.isValidDestination(destination),
+            sshEndpoint.map({ $0.isValid && $0.destination == destination }) ?? true
+        else { throw ForwardedLinksError.invalidLink }
         let id: UUID
         if let index = records.firstIndex(where: {
-            $0.destination == destination && $0.originalURL == endpoint.originalLink
+            $0.destination == destination && $0.sshEndpoint == sshEndpoint
+                && $0.originalURL == endpoint.originalLink
         }) {
             id = records[index].id
             records[index].enabled = true
@@ -176,6 +184,7 @@ final class ForwardedLinksModel: ObservableObject {
             records.append(ForwardedLinkRecord(
                 id: id,
                 destination: destination,
+                sshEndpoint: sshEndpoint,
                 originalURL: endpoint.originalLink,
                 localPort: nil,
                 enabled: true,
@@ -355,7 +364,8 @@ final class ForwardedLinksModel: ObservableObject {
                 owner: id,
                 destination: record.destination,
                 endpoint: endpoint,
-                localPort: record.localPort
+                localPort: record.localPort,
+                sshEndpoint: record.sshEndpoint
             )
             try Task.checkCancellation()
             guard !isShuttingDown, operations[id]?.token == token,
@@ -409,7 +419,8 @@ final class ForwardedLinksModel: ObservableObject {
 
     private func routeIdentity(_ record: ForwardedLinkRecord) -> String? {
         guard let endpoint = LoopbackURL(record.originalURL) else { return nil }
-        return "\(record.destination)\u{0}\(endpoint.remoteHost.lowercased())\u{0}\(endpoint.remotePort)"
+        let sshIdentity = record.sshEndpoint.map { "\($0.address)\u{0}\($0.hostKeyAlias)" } ?? ""
+        return "\(record.destination)\u{0}\(sshIdentity)\u{0}\(endpoint.remoteHost.lowercased())\u{0}\(endpoint.remotePort)"
     }
 
     private func persist() {

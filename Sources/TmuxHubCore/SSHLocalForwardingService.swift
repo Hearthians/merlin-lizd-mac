@@ -42,6 +42,8 @@ public enum SSHLocalForwardingError: Error, Equatable, LocalizedError, Sendable 
 }
 
 protocol SSHLocalForwardingTransport: Sendable {
+    func connection(for endpoint: CodexNotificationSSHEndpoint?) throws -> any SSHLocalForwardingTransport
+
     func openLocalForward(
         alias: String,
         localPort: Int,
@@ -59,7 +61,18 @@ protocol SSHLocalForwardingTransport: Sendable {
     func isMasterRunning(alias: String) async -> Bool
 }
 
-extension SSHMasterPool: SSHLocalForwardingTransport {}
+extension SSHLocalForwardingTransport {
+    func connection(for endpoint: CodexNotificationSSHEndpoint?) throws -> any SSHLocalForwardingTransport {
+        guard endpoint == nil else { throw SSHLocalForwardingError.unableToOpenForward }
+        return self
+    }
+}
+
+extension SSHMasterPool: SSHLocalForwardingTransport {
+    func connection(for endpoint: CodexNotificationSSHEndpoint?) throws -> any SSHLocalForwardingTransport {
+        try endpoint.map { try pinned(to: $0) } ?? self
+    }
+}
 
 protocol SSHLocalPortAllocating: Sendable {
     func availablePort(
@@ -81,6 +94,7 @@ protocol SSHLocalListenerProbing: Sendable {
 public actor SSHLocalForwardingService {
     private struct RouteKey: Hashable, Sendable {
         let destination: String
+        let sshEndpoint: CodexNotificationSSHEndpoint?
         let remoteHost: String
         let remotePort: Int
     }
@@ -142,7 +156,8 @@ public actor SSHLocalForwardingService {
         owner: UUID,
         destination: String,
         endpoint: LoopbackURL,
-        localPort requestedLocalPort: Int? = nil
+        localPort requestedLocalPort: Int? = nil,
+        sshEndpoint: CodexNotificationSSHEndpoint? = nil
     ) async throws -> URL {
         guard !isShuttingDown else {
             throw SSHLocalForwardingError.shuttingDown
@@ -152,9 +167,15 @@ public actor SSHLocalForwardingService {
             !(1...65_535).contains(requestedLocalPort) || browserRestrictedPorts.contains(requestedLocalPort) {
             throw SSHLocalForwardingError.invalidLocalPort(requestedLocalPort)
         }
+        if let sshEndpoint {
+            guard sshEndpoint.isValid, sshEndpoint.destination == destination else {
+                throw SSHLocalForwardingError.unableToOpenForward
+            }
+        }
         let remoteHost = try canonicalRemoteHost(endpoint.remoteHost)
         let key = RouteKey(
             destination: destination,
+            sshEndpoint: sshEndpoint,
             remoteHost: remoteHost,
             remotePort: endpoint.remotePort
         )
@@ -308,8 +329,9 @@ public actor SSHLocalForwardingService {
         let listenerProbe = self.listenerProbe
         let maximumOpenAttempts = self.maximumOpenAttempts
         return Task.detached {
+            let connection = try transport.connection(for: key.sshEndpoint)
             if let existingRoute, existingRoute.isEstablished {
-                let masterIsRunning = await transport.isMasterRunning(
+                let masterIsRunning = await connection.isMasterRunning(
                     alias: key.destination
                 )
                 if masterIsRunning,
@@ -322,7 +344,7 @@ public actor SSHLocalForwardingService {
 
             return try await Self.establishRoute(
                 key: key,
-                transport: transport,
+                transport: connection,
                 portAllocator: portAllocator,
                 maximumOpenAttempts: maximumOpenAttempts,
                 requestedLocalPort: existingRoute?.localPort ?? requestedLocalPort
@@ -466,6 +488,7 @@ public actor SSHLocalForwardingService {
         _ route: Route,
         using transport: any SSHLocalForwardingTransport
     ) async {
+        guard let transport = try? transport.connection(for: route.key.sshEndpoint) else { return }
         await transport.cancelLocalForward(
             alias: route.key.destination,
             localPort: route.localPort,

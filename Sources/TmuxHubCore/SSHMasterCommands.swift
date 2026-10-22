@@ -16,17 +16,23 @@ struct SSHMasterCommands: Sendable {
     private static let maximumControlPathBytes = 71
 
     private let directory: URL
+    private let endpoint: CodexNotificationSSHEndpoint?
 
-    init(directory: URL) {
+    init(directory: URL, endpoint: CodexNotificationSSHEndpoint? = nil) {
         self.directory = directory
+        self.endpoint = endpoint
     }
 
     func socketPath(alias: String) throws -> String {
         guard IdentifierValidator.isSSHDestination(alias) else {
             throw SSHMasterCommandError.invalidDestination
         }
+        if let endpoint, !endpoint.isValid || endpoint.destination != alias {
+            throw SSHMasterCommandError.invalidDestination
+        }
 
-        let digest = SHA256.hash(data: Data(alias.utf8))
+        let identity = endpoint.map { alias + "\0" + $0.address + "\0" + $0.hostKeyAlias } ?? alias
+        let digest = SHA256.hash(data: Data(identity.utf8))
         let hash = digest.prefix(12).map { byte in
             String(format: "%02x", byte)
         }.joined()
@@ -45,7 +51,7 @@ struct SSHMasterCommands: Sendable {
         authentication: SSHPasswordAuthentication? = nil
     ) throws -> CommandSpec {
         let path = try socketPath(alias: alias)
-        var arguments = ["-MNf"]
+        var arguments = (endpoint?.sshOptions ?? []) + ["-MNf"]
         arguments.append(contentsOf: authentication == nil
             ? ["-o", "BatchMode=yes"]
             : authenticationOptions(authentication))
@@ -104,7 +110,7 @@ struct SSHMasterCommands: Sendable {
         let path = try socketPath(alias: alias)
         // Batch transfers must use the prepared master. If it disappears,
         // fail instead of opening an unprompted second authentication flow.
-        return CommandSpec(executable: "/usr/bin/sftp", arguments: [
+        return CommandSpec(executable: "/usr/bin/sftp", arguments: (endpoint?.sshOptions ?? []) + [
             "-q", "-b", batchFile.path,
             "-o", "BatchMode=yes", "-o", "ControlMaster=no",
             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
@@ -127,7 +133,7 @@ struct SSHMasterCommands: Sendable {
         }
 
         let path = try socketPath(alias: alias)
-        var arguments = removingBatchModeOption(
+        var arguments = (endpoint?.sshOptions ?? []) + removingBatchModeOption(
             from: command.arguments,
             when: authentication != nil
         )

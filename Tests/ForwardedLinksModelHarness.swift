@@ -9,6 +9,7 @@ struct ForwardedLinksModelHarness {
     @MainActor
     static func main() async throws {
         try await restoredLinksKeepTheirFullAddress()
+        try await pinnedNodesPersistAndRemainSeparate()
         try await refreshRepairsTheOriginalPort()
         try await temporaryRepairFailureKeepsTheSavedAddress()
         try await stoppingSharedRoutesPersistsTheDisabledState()
@@ -17,7 +18,7 @@ struct ForwardedLinksModelHarness {
         try await removeDuringOpenDoesNotResurrect()
         try await shutdownDuringOpenDoesNotResurrect()
         try await malformedPreferencesAreIgnored()
-        print("Forwarded links model: 9 lifecycle checks passed.")
+        print("Forwarded links model: 10 lifecycle checks passed.")
     }
 
     @MainActor
@@ -60,6 +61,27 @@ struct ForwardedLinksModelHarness {
             try expect(reopened == first, "Reopening must preserve the saved URL.")
             await restored.shutdown()
             await nextService.shutdown()
+        }
+    }
+
+    @MainActor
+    private static func pinnedNodesPersistAndRemainSeparate() async throws {
+        try await withFixture(ports: [49_181, 49_182, 49_183]) { fixture in
+            let endpoint = try endpoint("http://localhost:8765/view")
+            let firstPin = CodexNotificationSSHEndpoint(destination: "hpc4",
+                address: "10.120.81.43", hostKeyAlias: "hpc4login.hpc.hkust-gz.edu.cn")
+            let secondPin = CodexNotificationSSHEndpoint(destination: "hpc4",
+                address: "10.120.81.41", hostKeyAlias: "hpc4login.hpc.hkust-gz.edu.cn")
+            _ = try await fixture.model.open(destination: "hpc4", endpoint: endpoint, sshEndpoint: firstPin)
+            _ = try await fixture.model.open(destination: "hpc4", endpoint: endpoint, sshEndpoint: secondPin)
+            _ = try await fixture.model.open(destination: "hpc4", endpoint: endpoint)
+            try expect(fixture.model.records.count == 3, "The same link on distinct login nodes must have separate saved records.")
+            let first = try require(fixture.model.records.first(where: { $0.sshEndpoint == firstPin }), "Pinned record missing.")
+            await fixture.model.stop(id: first.id)
+            try expect(fixture.model.records.filter(\.enabled).count == 2, "Stopping one pinned node must not stop another node or the original alias.")
+            let restored = ForwardedLinksModel(service: fixture.service, defaults: fixture.defaults, autoStart: false)
+            try expect(restored.records == fixture.model.records, "Pinned node identities must survive app restart.")
+            await restored.shutdown()
         }
     }
 
@@ -387,6 +409,12 @@ private actor HarnessTransport: SSHLocalForwardingTransport {
 
     init(pauseFirstOpen: Bool = false) {
         self.pauseFirstOpen = pauseFirstOpen
+    }
+
+    nonisolated func connection(for endpoint: CodexNotificationSSHEndpoint?) throws -> any SSHLocalForwardingTransport {
+        // Node separation and transport selection are covered by the core suite;
+        // this harness verifies persisted model identities and stop grouping.
+        self
     }
 
     func openLocalForward(alias: String, localPort: Int, remoteHost: String, remotePort: Int) async throws {

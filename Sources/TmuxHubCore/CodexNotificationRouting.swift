@@ -1,5 +1,45 @@
 import Foundation
 
+/// A private cluster address resolved through its configured, authenticated
+/// login alias. Host keys remain checked against the configured cluster host.
+public struct CodexNotificationSSHEndpoint: Codable, Hashable, Sendable {
+    public let destination: String
+    public let address: String
+    public let hostKeyAlias: String
+
+    public var isValid: Bool {
+        guard IdentifierValidator.isSSHDestination(destination),
+            Self.cluster(hostKeyAlias) != nil else { return false }
+        let pieces = address.split(separator: ".", omittingEmptySubsequences: false)
+        guard pieces.count == 4 else { return false }
+        let numbers = pieces.compactMap { piece -> Int? in
+            guard let number = Int(piece), (0...255).contains(number), String(number) == piece else { return nil }
+            return number
+        }
+        guard numbers.count == 4 else { return false }
+        return numbers[0] == 10 || (numbers[0] == 172 && (16...31).contains(numbers[1]))
+            || (numbers[0] == 192 && numbers[1] == 168)
+    }
+
+    static func cluster(_ hostname: String) -> String? {
+        ["hpc2", "hpc3", "hpc4"].first { hostname.lowercased() == "\($0)login.hpc.hkust-gz.edu.cn" }
+    }
+
+    static func matches(loginHostname: String, configuredHostname: String) -> Bool {
+        guard let cluster = cluster(configuredHostname) else { return false }
+        let prefix = cluster + "-login-"
+        let hostname = loginHostname.lowercased()
+        guard hostname.hasPrefix(prefix) else { return false }
+        let number = hostname.dropFirst(prefix.count)
+        return !number.isEmpty && number.count <= 3 && number.allSatisfy { $0.isASCII && $0.isNumber }
+    }
+
+    var sshOptions: [String] {
+        ["-o", "HostName=\(address)", "-o", "HostKeyAlias=\(hostKeyAlias)",
+         "-o", "StrictHostKeyChecking=yes"]
+    }
+}
+
 /// A notification refers to one existing tmux server/pane, never a command to run.
 public struct CodexNotificationRoute: Codable, Hashable, Sendable {
     public let hostname: String
@@ -8,6 +48,7 @@ public struct CodexNotificationRoute: Codable, Hashable, Sendable {
     public let sessionCreated: Int
     public let serverPID: Int
     public let pane: String
+    public private(set) var sshEndpoint: CodexNotificationSSHEndpoint?
 
     public init(event: CodexNotificationEvent) throws {
         guard let socket = event.tmuxSocket,
@@ -33,12 +74,20 @@ public struct CodexNotificationRoute: Codable, Hashable, Sendable {
             && pane.first == "%" && !pane.dropFirst().isEmpty
             && pane.dropFirst().allSatisfy({ $0.isASCII && $0.isNumber })
             && sessionCreated > 0 && serverPID > 0
+            && (sshEndpoint.map { $0.isValid && CodexNotificationSSHEndpoint.matches(
+                loginHostname: hostname, configuredHostname: $0.hostKeyAlias) } ?? true)
     }
 
     public func isSameSession(as other: Self) -> Bool {
         hostname == other.hostname && socket == other.socket
             && sessionID == other.sessionID && sessionCreated == other.sessionCreated
             && serverPID == other.serverPID
+    }
+
+    func pinned(to endpoint: CodexNotificationSSHEndpoint) -> Self {
+        var copy = self
+        copy.sshEndpoint = endpoint
+        return copy
     }
 }
 
@@ -52,19 +101,136 @@ public enum CodexNotificationRoutingError: LocalizedError {
 }
 
 public enum CodexNotificationRouting {
+    public static func prepare(
+        route: CodexNotificationRoute, target: TerminalTarget, sshMasterPool: SSHMasterPool
+    ) async throws {
+        let pool = try connectionPool(route: route, target: target, sshMasterPool: sshMasterPool)
+        guard let destination = target.sshDestination else { return }
+        guard await pool.prepare(alias: destination, priority: .foreground) == .ready else {
+            throw CodexNotificationRoutingError.commandFailed
+        }
+    }
+
+    public static func managedAttachCommand(
+        route: CodexNotificationRoute, target: TerminalTarget, sshMasterPool: SSHMasterPool
+    ) throws -> CommandSpec {
+        let command = try command(route: route, target: target, attach: true)
+        guard let destination = target.sshDestination else { return command }
+        return try connectionPool(route: route, target: target, sshMasterPool: sshMasterPool)
+            .managedCommand(command, alias: destination)
+    }
+
+    /// Shared cluster home directories contain notifications from every login
+    /// node, while the SSH entry point may send this connection to another one.
+    public static func resolveAndFocus(
+        route: CodexNotificationRoute, target: TerminalTarget, sshMasterPool: SSHMasterPool
+    ) async throws -> CodexNotificationRoute {
+        try await resolveAndFocus(route: route, target: target, sshMasterPool: sshMasterPool,
+            propertiesReader: SSHHostPropertiesReader())
+    }
+
+    static func resolveAndFocus(
+        route: CodexNotificationRoute, target: TerminalTarget, sshMasterPool: SSHMasterPool,
+        propertiesReader: SSHHostPropertiesReader
+    ) async throws -> CodexNotificationRoute {
+        let output = try await runFocus(route: route, target: target, sshMasterPool: sshMasterPool)
+        guard output.exitCode == 0 || output.exitCode == 21 else {
+            throw CodexNotificationRoutingError.commandFailed
+        }
+        guard route.sshEndpoint == nil, let destination = target.sshDestination else {
+            guard output.exitCode == 0 else { throw CodexNotificationRoutingError.commandFailed }
+            return route
+        }
+        let properties: SSHHostProperties
+        do { properties = try await propertiesReader.load(destination: destination) }
+        catch is CancellationError { throw CancellationError() }
+        catch {
+            // A successful ordinary SSH route does not depend on configuration
+            // introspection; only cluster node recovery needs this information.
+            if output.exitCode == 0 { return route }
+            throw error
+        }
+        guard CodexNotificationSSHEndpoint.matches(
+            loginHostname: route.hostname, configuredHostname: properties.hostname
+        ) else {
+            if output.exitCode == 0 { return route }
+            throw CodexNotificationRoutingError.unavailable
+        }
+        // Pin recognized cluster nodes even when the current alias master is
+        // already on the right node: its replacement may land elsewhere later.
+        let resolver = try resolutionCommand(hostname: route.hostname, destination: destination)
+        let resolution = BoundedAsyncOperationRunner(maxConcurrentOperations: 1, timeout: .seconds(15))
+        let resolved = try await resolution.run {
+            try await sshMasterPool.run(resolver, alias: destination, replay: .readOnly)
+        }
+        let endpoints = try parseEndpoints(resolved, destination: destination, configuredHostname: properties.hostname)
+        for endpoint in endpoints {
+            try Task.checkCancellation()
+            let candidate = route.pinned(to: endpoint)
+            do {
+                let result = try await runFocus(route: candidate, target: target, sshMasterPool: sshMasterPool)
+                if result.exitCode == 0 { return candidate }
+            } catch is CancellationError { throw CancellationError() }
+            catch { continue }
+        }
+        throw CodexNotificationRoutingError.commandFailed
+    }
+
     public static func focus(
         route: CodexNotificationRoute, target: TerminalTarget, sshMasterPool: SSHMasterPool
     ) async throws {
+        let output = try await runFocus(route: route, target: target, sshMasterPool: sshMasterPool)
+        guard output.exitCode == 0 else { throw CodexNotificationRoutingError.commandFailed }
+    }
+
+    private static func runFocus(
+        route: CodexNotificationRoute, target: TerminalTarget, sshMasterPool: SSHMasterPool
+    ) async throws -> InventoryProcessOutput {
         let command = try command(route: route, target: target, attach: false)
+        let pool = try connectionPool(route: route, target: target, sshMasterPool: sshMasterPool)
         let runner = BoundedAsyncOperationRunner(maxConcurrentOperations: 1, timeout: .seconds(20))
-        let output = try await runner.run {
+        return try await runner.run {
             if let destination = target.sshDestination {
-                return try await sshMasterPool.run(command, alias: destination, replay: .never)
+                return try await pool.run(command, alias: destination, replay: .never)
             }
             return try await TimedInventoryProcessRunner(timeout: .seconds(15),
                 underlying: FoundationInventoryProcessRunner()).run(command)
         }
-        guard output.exitCode == 0 else { throw CodexNotificationRoutingError.commandFailed }
+    }
+
+    static func connectionPool(
+        route: CodexNotificationRoute, target: TerminalTarget, sshMasterPool: SSHMasterPool
+    ) throws -> SSHMasterPool {
+        guard route.isValid else { throw CodexNotificationRoutingError.unavailable }
+        guard let endpoint = route.sshEndpoint else { return sshMasterPool }
+        guard endpoint.destination == target.sshDestination else { throw CodexNotificationRoutingError.unavailable }
+        return try sshMasterPool.pinned(to: endpoint)
+    }
+
+    static func resolutionCommand(hostname: String, destination: String) throws -> CommandSpec {
+        guard IdentifierValidator.isSSHDestination(destination),
+            hostname.utf8.count <= 255,
+            hostname.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == ".") })
+        else { throw CodexNotificationRoutingError.unavailable }
+        let script = "import json,socket,sys; print(json.dumps(sorted({v[4][0] for v in socket.getaddrinfo(sys.argv[1],22,socket.AF_INET,socket.SOCK_STREAM)})[:4]))"
+        return CommandSpec(executable: "/usr/bin/ssh", arguments: [
+            "-nT", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", destination,
+            ["python3", "-c", script, hostname].map(quote).joined(separator: " "),
+        ])
+    }
+
+    static func parseEndpoints(
+        _ output: InventoryProcessOutput, destination: String, configuredHostname: String
+    ) throws -> [CodexNotificationSSHEndpoint] {
+        guard output.exitCode == 0, output.stdout.utf8.count <= 1_024,
+            let data = output.stdout.data(using: .utf8),
+            let addresses = try? JSONDecoder().decode([String].self, from: data),
+            (1...4).contains(addresses.count) else { throw CodexNotificationRoutingError.unavailable }
+        let endpoints = addresses.map { CodexNotificationSSHEndpoint(
+            destination: destination, address: $0, hostKeyAlias: configuredHostname
+        ) }
+        guard endpoints.allSatisfy(\.isValid) else { throw CodexNotificationRoutingError.unavailable }
+        return endpoints
     }
 
     public static func command(
@@ -85,7 +251,9 @@ public enum CodexNotificationRouting {
     private static func command(
         route: CodexNotificationRoute, target: TerminalTarget, mode: String
     ) throws -> CommandSpec {
-        guard route.isValid else { throw CodexNotificationRoutingError.unavailable }
+        guard route.isValid,
+            route.sshEndpoint == nil || route.sshEndpoint?.destination == target.sshDestination
+        else { throw CodexNotificationRoutingError.unavailable }
         let data = try JSONEncoder().encode(route)
         guard let payload = String(data: data, encoding: .utf8) else {
             throw CodexNotificationRoutingError.unavailable
@@ -117,7 +285,8 @@ import json, os, shutil, socket, subprocess, sys
 try:
     route = json.loads(sys.argv[1])
     if socket.gethostname() != route['hostname']:
-        raise ValueError('host changed')
+        print('通知来自另一台登录节点。', file=sys.stderr)
+        sys.exit(21)
     tmux = shutil.which('tmux')
     if not tmux:
         raise ValueError('tmux unavailable')

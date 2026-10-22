@@ -188,6 +188,57 @@ struct SSHLocalForwardingServiceTests {
         #expect(calls.map(\.remotePort) == [8080, 8080])
     }
 
+    @Test("keeps the original alias's pinned login nodes isolated through reuse and cleanup")
+    func pinnedLoginNodesArePartOfRouteIdentity() async throws {
+        let base = RecordingForwardingTransport()
+        let firstNode = RecordingForwardingTransport()
+        let secondNode = RecordingForwardingTransport()
+        let firstEndpoint = CodexNotificationSSHEndpoint(destination: "hpc4",
+            address: "10.120.81.43", hostKeyAlias: "hpc4login.hpc.hkust-gz.edu.cn")
+        let secondEndpoint = CodexNotificationSSHEndpoint(destination: "hpc4",
+            address: "10.120.81.41", hostKeyAlias: "hpc4login.hpc.hkust-gz.edu.cn")
+        let transport = EndpointSelectingTransport(base: base,
+            connections: [firstEndpoint: firstNode, secondEndpoint: secondNode])
+        let service = SSHLocalForwardingService(transport: transport,
+            portAllocator: ScriptedPortAllocator([8080, 49154, 49155]),
+            listenerProbe: ScriptedListenerProbe([true]))
+        let endpoint = try #require(LoopbackURL("http://localhost:8080/view"))
+        let firstOwner = UUID()
+        let first = try await service.acquire(owner: firstOwner, destination: "hpc4",
+            endpoint: endpoint, sshEndpoint: firstEndpoint)
+        let second = try await service.acquire(owner: UUID(), destination: "hpc4",
+            endpoint: endpoint, sshEndpoint: secondEndpoint)
+        let unpinned = try await service.acquire(owner: UUID(), destination: "hpc4", endpoint: endpoint)
+        let reused = try await service.acquire(owner: firstOwner, destination: "hpc4",
+            endpoint: endpoint, sshEndpoint: firstEndpoint)
+        #expect(Set([first.port, second.port, unpinned.port]).count == 3)
+        #expect(reused == first)
+        #expect(await firstNode.recordedOpenCalls().count == 1)
+        #expect(await secondNode.recordedOpenCalls().count == 1)
+        #expect(await base.recordedOpenCalls().count == 1)
+        #expect(await firstNode.recordedMasterChecks() == ["hpc4"])
+        await service.release(owner: firstOwner)
+        #expect(await firstNode.recordedCancelCalls().count == 1)
+        #expect(await secondNode.recordedCancelCalls().isEmpty)
+        #expect(await base.recordedCancelCalls().isEmpty)
+        await service.shutdown()
+        #expect(await secondNode.recordedCancelCalls().count == 1)
+        #expect(await base.recordedCancelCalls().count == 1)
+    }
+
+    @Test("rejects a pinned endpoint belonging to a different SSH alias")
+    func pinnedEndpointMustMatchDestination() async throws {
+        let transport = RecordingForwardingTransport()
+        let service = makeService(transport: transport, allocator: ScriptedPortAllocator([8080]))
+        let pin = CodexNotificationSSHEndpoint(destination: "hpc4",
+            address: "10.120.81.43", hostKeyAlias: "hpc4login.hpc.hkust-gz.edu.cn")
+        await #expect(throws: SSHLocalForwardingError.self) {
+            _ = try await service.acquire(owner: UUID(), destination: "another-host",
+                endpoint: try #require(LoopbackURL("http://localhost:8080/")), sshEndpoint: pin)
+        }
+        #expect(await transport.recordedOpenCalls().isEmpty)
+    }
+
     @Test("does not retry an unrelated SSH failure and exposes a localized error")
     func genericTransportFailure() async throws {
         let transport = RecordingForwardingTransport(openSteps: [.fail])
@@ -546,6 +597,31 @@ private enum ForwardEvent: Equatable, Sendable {
     case open(Int)
     case cancelStarted(Int)
     case cancelFinished(Int)
+}
+
+private struct EndpointSelectingTransport: SSHLocalForwardingTransport {
+    let base: RecordingForwardingTransport
+    let connections: [CodexNotificationSSHEndpoint: RecordingForwardingTransport]
+
+    func connection(for endpoint: CodexNotificationSSHEndpoint?) throws -> any SSHLocalForwardingTransport {
+        guard let endpoint else { return base }
+        guard let connection = connections[endpoint] else {
+            throw SSHLocalForwardingError.unableToOpenForward
+        }
+        return connection
+    }
+
+    func openLocalForward(alias: String, localPort: Int, remoteHost: String, remotePort: Int) async throws {
+        try await base.openLocalForward(alias: alias, localPort: localPort, remoteHost: remoteHost, remotePort: remotePort)
+    }
+
+    func cancelLocalForward(alias: String, localPort: Int, remoteHost: String, remotePort: Int) async {
+        await base.cancelLocalForward(alias: alias, localPort: localPort, remoteHost: remoteHost, remotePort: remotePort)
+    }
+
+    func isMasterRunning(alias: String) async -> Bool {
+        await base.isMasterRunning(alias: alias)
+    }
 }
 
 private actor RecordingForwardingTransport: SSHLocalForwardingTransport {

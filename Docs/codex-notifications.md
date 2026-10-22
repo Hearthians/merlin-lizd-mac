@@ -49,20 +49,34 @@ transcripts, or assistant output. Files live under
 permissions. SSH uses the existing TmuxHub connection pool; no incoming network
 port or third-party notification service is needed.
 
-## Returning to a terminal
+## Returning to a session
 
-Opening a notification checks the original hostname, tmux socket, server PID,
-session creation time, and pane ID before focusing the pane and attaching.
+Choose **返回会话** to return to the original Codex chat or terminal. Local
+Codex desktop notifications open the matching chat in the desktop app after
+checking its local session metadata. The recorder retains the desktop chat ID
+when the hook supplies a verifiable transcript path; it does not retain the
+transcript contents. After updating TmuxHub, run **配置并启用** again on existing
+sources to update their recorder while preserving hooks, history, and read state.
+Older notifications can be recovered when their session metadata still identifies
+the original chat. Missing metadata is reported explicitly; a directory alone
+is never used to guess which chat to open.
+
+For tmux, opening a notification checks the original hostname, socket, server
+PID, session creation time, and pane ID before focusing and attaching.
 It does not create a replacement tmux session if the original is gone. A tab
 previously opened from that session's notifications is reused; otherwise an
 attach-only tab is opened. Closing this tab only disconnects it.
 
-Automatic return requires Codex to run inside tmux on the selected host.
-Events from plain shells can still appear in history, but have no tmux pane to
-open. If a cluster shares the same home directory across login and compute
-nodes, events may be visible through the login host while their tmux server
-exists on another node. TmuxHub reports that the original terminal is
-unavailable rather than attaching to a different machine's pane.
+HKUST HPC login aliases can connect to a different login node each time. For a
+notification from a recognized login node of the configured HPC cluster,
+TmuxHub resolves that node through the trusted cluster connection and pins the
+return connection to it. The connection retains the original SSH settings and
+credentials, uses a separate connection pool, and still verifies the host key
+and exact tmux identity. Reconnects and file operations retain that node route.
+
+Plain shells without tmux and notifications from unsupported compute-node
+routes may still have no return destination. An unavailable original session
+is reported without opening a different machine's pane.
 
 Official interface: [Codex hooks](https://learn.chatgpt.com/docs/hooks).
 

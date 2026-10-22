@@ -68,12 +68,14 @@ public struct AttachmentContext: Equatable, Sendable {
     public let workingDirectory: String
     public let herdrReference: HerdrTerminalReference?
     public let herdrOccupantID: String?
+    public let sshEndpoint: CodexNotificationSSHEndpoint?
 
     public init(
         target: TerminalTarget, sessionName: String?, paneID: String?,
         processName: String?, workingDirectory: String,
         herdrReference: HerdrTerminalReference? = nil,
-        herdrOccupantID: String? = nil
+        herdrOccupantID: String? = nil,
+        sshEndpoint: CodexNotificationSSHEndpoint? = nil
     ) {
         self.target = target
         self.sessionName = sessionName
@@ -82,6 +84,7 @@ public struct AttachmentContext: Equatable, Sendable {
         self.workingDirectory = workingDirectory
         self.herdrReference = herdrReference
         self.herdrOccupantID = herdrOccupantID
+        self.sshEndpoint = sshEndpoint
     }
 }
 
@@ -143,7 +146,8 @@ public enum AttachmentPaths {
     }
 
     static func parseContext(
-        _ output: String, target: TerminalTarget, sessionName: String
+        _ output: String, target: TerminalTarget, sessionName: String,
+        sshEndpoint: CodexNotificationSSHEndpoint? = nil
     ) throws -> AttachmentContext {
         let line = output.hasSuffix("\n") ? String(output.dropLast()) : output
         let fields = line.split(separator: "\t", omittingEmptySubsequences: false)
@@ -154,7 +158,7 @@ public enum AttachmentPaths {
         try validate(directory)
         return AttachmentContext(
             target: target, sessionName: sessionName, paneID: String(fields[0]),
-            processName: String(fields[1]), workingDirectory: directory
+            processName: String(fields[1]), workingDirectory: directory, sshEndpoint: sshEndpoint
         )
     }
 
@@ -304,7 +308,11 @@ public actor AttachmentTransferService {
             let command = try CodexNotificationRouting.contextCommand(route: notificationRoute, target: target)
             let output: InventoryProcessOutput
             if let destination = target.sshDestination {
-                do { output = try await pool.run(command, alias: destination, replay: .readOnly) }
+                do {
+                    let connection = try CodexNotificationRouting.connectionPool(
+                        route: notificationRoute, target: target, sshMasterPool: pool)
+                    output = try await connection.run(command, alias: destination, replay: .readOnly)
+                }
                 catch is CancellationError { throw CancellationError() }
                 catch { throw AttachmentError.connectionFailed }
             } else {
@@ -312,7 +320,8 @@ public actor AttachmentTransferService {
             }
             guard output.exitCode == 0 else { throw AttachmentError.contextUnavailable }
             return try AttachmentPaths.parseContext(
-                output.stdout, target: target, sessionName: notificationRoute.sessionID
+                output.stdout, target: target, sessionName: notificationRoute.sessionID,
+                sshEndpoint: notificationRoute.sshEndpoint
             )
         }
         if let herdrReference {
@@ -400,7 +409,7 @@ public actor AttachmentTransferService {
         let batchURL = staging.appendingPathComponent("transfer.batch")
         try Data(batch.text.utf8).write(to: batchURL)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: batchURL.path)
-        let pool = pool
+        let pool = try connectionPool(for: context)
         do {
             let output = try await limit.run {
                 try await pool.transfer(batchFile: batchURL, alias: destination)
@@ -411,6 +420,14 @@ public actor AttachmentTransferService {
         } catch is CancellationError { throw CancellationError() }
         catch let error as AttachmentError { throw error }
         catch { throw AttachmentError.transferFailed }
+    }
+
+    private func connectionPool(for context: AttachmentContext) throws -> SSHMasterPool {
+        guard let endpoint = context.sshEndpoint else { return pool }
+        guard endpoint.destination == context.target.sshDestination else {
+            throw AttachmentError.contextUnavailable
+        }
+        return try pool.pinned(to: endpoint)
     }
 
     public func download(
@@ -467,7 +484,7 @@ public actor AttachmentTransferService {
             throw AttachmentError.localSaveFailed(destination.path)
         }
 
-        let pool = pool
+        let pool = try connectionPool(for: context)
         let output: InventoryProcessOutput
         do {
             output = try await limit.runWithoutTimeout {
@@ -564,7 +581,7 @@ public actor AttachmentTransferService {
             ])
             let output: InventoryProcessOutput
             do {
-                output = try await pool.run(command, alias: alias, replay: .readOnly)
+                output = try await connectionPool(for: context).run(command, alias: alias, replay: .readOnly)
             } catch is CancellationError {
                 throw CancellationError()
             } catch {

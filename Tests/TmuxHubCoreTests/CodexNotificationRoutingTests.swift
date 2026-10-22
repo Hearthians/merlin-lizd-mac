@@ -74,7 +74,7 @@ struct CodexNotificationRoutingTests {
                 environment: ["PATH": directory.path + ":/usr/bin:/bin"]))
             let commands = (try? String(contentsOf: calls, encoding: .utf8)) ?? ""
             #expect(!commands.contains("select-pane") && !commands.contains("select-window") && !commands.contains("attach-session"))
-            #expect(output.exitCode == (succeeds ? 0 : 1))
+            #expect(output.exitCode == (succeeds ? 0 : (hostname != host ? 21 : 1)))
             if succeeds {
                 let context = try AttachmentPaths.parseContext(output.stdout, target: .local, sessionName: route.sessionID)
                 #expect(context.paneID == "%9")
@@ -116,7 +116,134 @@ struct CodexNotificationRoutingTests {
                 environment: ["PATH": directory.path + ":/usr/bin:/bin"]))
             let lines = (try? String(contentsOf: calls, encoding: .utf8))?.split(separator: "\n").count ?? 0
             #expect(lines == expectedCalls)
-            #expect(output.exitCode == (expectedCalls == 3 ? 0 : 1))
+            #expect(output.exitCode == (expectedCalls == 3 ? 0 : (hostname != host ? 21 : 1)))
         }
     }
+
+    @Test("matching and mismatched cluster connections both persist an isolated verified node", arguments: [Int32(0), 21])
+    func loginNodeRecovery(initialExit: Int32) async throws {
+        let directory = URL(fileURLWithPath: "/tmp/th-route-\(UUID().uuidString.prefix(8))")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let runner = LoginNodeRouteRunner(initialExit: initialExit)
+        let pool = SSHMasterPool(testDirectory: directory, runner: runner, passwordProvider: { alias in
+            alias == "my-cluster" ? SSHPasswordAuthentication(password: "fixture", askPassExecutable: "/test/askpass") : nil
+        })
+        let target = TerminalTarget.ssh(destination: "my-cluster")
+        let original = try CodexNotificationRoute(event: event(hostname: "HPC4-Login-3"))
+        let route = try await CodexNotificationRouting.resolveAndFocus(
+            route: original, target: target, sshMasterPool: pool,
+            propertiesReader: SSHHostPropertiesReader(runner: runner))
+        let endpoint = try #require(route.sshEndpoint)
+        #expect(endpoint.address == "10.120.81.43")
+        #expect(endpoint.hostKeyAlias == "hpc4login.hpc.hkust-gz.edu.cn")
+        #expect(endpoint.destination == "my-cluster")
+        #expect(route.isSameSession(as: original))
+        let restored = try JSONDecoder().decode(CodexNotificationRoute.self, from: JSONEncoder().encode(route))
+        #expect(restored == route)
+
+        let attach = try CodexNotificationRouting.managedAttachCommand(
+            route: restored, target: target, sshMasterPool: pool)
+        #expect(attach.arguments.contains("HostName=10.120.81.43"))
+        #expect(attach.arguments.contains("HostKeyAlias=hpc4login.hpc.hkust-gz.edu.cn"))
+        #expect(attach.arguments.contains("StrictHostKeyChecking=yes"))
+        #expect(attach.arguments.contains("my-cluster"))
+        #expect(!attach.arguments.contains("-F"))
+        let ordinary = try SSHMasterCommands(directory: directory).socketPath(alias: "my-cluster")
+        #expect(!attach.arguments.contains("ControlPath=\(ordinary)"))
+        let different = CodexNotificationSSHEndpoint(destination: "my-cluster", address: "10.120.81.41",
+            hostKeyAlias: endpoint.hostKeyAlias)
+        let otherSocket = try SSHMasterCommands(directory: directory, endpoint: different).socketPath(alias: "my-cluster")
+        #expect(!attach.arguments.contains("ControlPath=\(otherSocket)"))
+
+        let service = AttachmentTransferService(sshMasterPool: pool)
+        let context = try await service.context(target: target, sessionName: "training", localDirectory: "/",
+            notificationRoute: restored)
+        #expect(context.sshEndpoint == endpoint)
+        #expect(context.workingDirectory == "/work/node-three")
+        let commands = await runner.commands()
+        let pinnedPreparation = try #require(commands.first {
+            $0.arguments.contains("-MNf") && $0.arguments.contains("HostName=10.120.81.43")
+        })
+        #expect(pinnedPreparation.environment["TMUXHUB_SSH_PASSWORD"] == "fixture")
+        #expect(pinnedPreparation.arguments.firstIndex(of: "StrictHostKeyChecking=yes")!
+            < pinnedPreparation.arguments.firstIndex(of: "StrictHostKeyChecking=accept-new")!)
+        #expect(commands.contains { $0.arguments.last?.hasSuffix("'context'") == true
+            && $0.arguments.contains("HostName=10.120.81.43") })
+        await pool.shutdown()
+        #expect(throws: SSHMasterPoolError.shuttingDown) { try pool.pinned(to: endpoint) }
+    }
+
+    @Test("node discovery never treats an arbitrary event hostname or public address as a destination")
+    func boundedNodeDiscovery() throws {
+        #expect(CodexNotificationSSHEndpoint.matches(loginHostname: "HPC4-Login-3",
+            configuredHostname: "hpc4login.hpc.hkust-gz.edu.cn"))
+        for name in ["evil.example", "HPC3-Login-3", "HPC4-Login-3.evil.example", "HPC4-Login-3;echo"] {
+            #expect(!CodexNotificationSSHEndpoint.matches(loginHostname: name,
+                configuredHostname: "hpc4login.hpc.hkust-gz.edu.cn"))
+        }
+        for address in ["203.0.113.1", "127.0.0.1", "10.1.2.3 -oProxyCommand=bad", "010.1.2.3"] {
+            #expect(throws: CodexNotificationRoutingError.self) {
+                try CodexNotificationRouting.parseEndpoints(
+                    InventoryProcessOutput(stdout: "[\"\(address)\"]", stderr: "", exitCode: 0),
+                    destination: "hpc4", configuredHostname: "hpc4login.hpc.hkust-gz.edu.cn")
+            }
+        }
+        let route = try CodexNotificationRoute(event: event(hostname: "HPC4-Login-3"))
+        let endpoint = CodexNotificationSSHEndpoint(destination: "hpc4", address: "10.120.81.43",
+            hostKeyAlias: "hpc4login.hpc.hkust-gz.edu.cn")
+        #expect(throws: CodexNotificationRoutingError.self) {
+            try CodexNotificationRouting.command(route: route.pinned(to: endpoint),
+                target: .ssh(destination: "other"), attach: true)
+        }
+        let data = try JSONEncoder().encode(route)
+        #expect(try JSONDecoder().decode(CodexNotificationRoute.self, from: data).sshEndpoint == nil)
+    }
+
+    @Test("correct node still rejects a stale server instead of falling back to its session name")
+    func recoveredNodeStillChecksIdentity() async throws {
+        let directory = URL(fileURLWithPath: "/tmp/th-stale-\(UUID().uuidString.prefix(8))")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let runner = LoginNodeRouteRunner(pinnedExit: 1)
+        let pool = SSHMasterPool(testDirectory: directory, runner: runner)
+        let route = try CodexNotificationRoute(event: event(hostname: "HPC4-Login-3"))
+        await #expect(throws: CodexNotificationRoutingError.self) {
+            try await CodexNotificationRouting.resolveAndFocus(route: route,
+                target: .ssh(destination: "hpc4"), sshMasterPool: pool,
+                propertiesReader: SSHHostPropertiesReader(runner: runner))
+        }
+        let commands = await runner.commands()
+        #expect(!commands.contains { $0.arguments.last?.hasSuffix("'attach'") == true })
+        await pool.shutdown()
+    }
+}
+
+private actor LoginNodeRouteRunner: InventoryProcessRunning {
+    private var history: [CommandSpec] = []
+    private let pinnedExit: Int32
+    private let initialExit: Int32
+    init(pinnedExit: Int32 = 0, initialExit: Int32 = 21) {
+        self.pinnedExit = pinnedExit
+        self.initialExit = initialExit
+    }
+
+    func run(_ command: CommandSpec) async throws -> InventoryProcessOutput {
+        history.append(command)
+        if command.arguments.contains("-G") {
+            return InventoryProcessOutput(stdout: "hostname hpc4login.hpc.hkust-gz.edu.cn\nuser testuser\nport 2222\nproxyjump configured-jump\n",
+                stderr: "", exitCode: 0)
+        }
+        if command.arguments.contains("check") { return InventoryProcessOutput(stdout: "", stderr: "", exitCode: 255) }
+        if command.arguments.last?.contains("socket.getaddrinfo") == true {
+            return InventoryProcessOutput(stdout: "[\"10.120.81.43\"]", stderr: "", exitCode: 0)
+        }
+        if command.arguments.last?.hasSuffix("'focus'") == true {
+            return InventoryProcessOutput(stdout: "", stderr: "",
+                exitCode: command.arguments.contains("HostName=10.120.81.43") ? pinnedExit : initialExit)
+        }
+        if command.arguments.last?.hasSuffix("'context'") == true {
+            return InventoryProcessOutput(stdout: "%3\tcodex\t/work/node-three\n", stderr: "", exitCode: 0)
+        }
+        return InventoryProcessOutput(stdout: "", stderr: "", exitCode: 0)
+    }
+    func commands() -> [CommandSpec] { history }
 }

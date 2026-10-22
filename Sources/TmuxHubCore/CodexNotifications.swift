@@ -14,6 +14,8 @@ public struct CodexNotificationEvent: Codable, Sendable, Identifiable, Equatable
     public let kind: CodexNotificationKind
     public let sessionID: String
     public let turnID: String?
+    /// Stable desktop chat identity, distinct from transient hook/engine session IDs.
+    public let desktopThreadID: String?
     public let cwd: String
     public let hostname: String
     public let sequence: Int
@@ -32,13 +34,15 @@ public struct CodexNotificationEvent: Codable, Sendable, Identifiable, Equatable
         sequence: Int, timestamp: Date, tmuxSession: String? = nil,
         tmuxSessionID: String? = nil, tmuxSessionCreated: Int? = nil,
         tmuxServerPID: Int? = nil, tmuxWindow: String? = nil,
-        tmuxPane: String? = nil, tmuxSocket: String? = nil
+        tmuxPane: String? = nil, tmuxSocket: String? = nil,
+        desktopThreadID: String? = nil
     ) {
         self.id = id
         self.sourceID = sourceID
         self.kind = kind
         self.sessionID = sessionID
         self.turnID = turnID
+        self.desktopThreadID = desktopThreadID
         self.cwd = cwd
         self.hostname = hostname
         self.sequence = sequence
@@ -53,7 +57,7 @@ public struct CodexNotificationEvent: Codable, Sendable, Identifiable, Equatable
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, sourceID, kind, sessionID, turnID, cwd, hostname, sequence, timestamp
+        case id, sourceID, kind, sessionID, turnID, desktopThreadID, cwd, hostname, sequence, timestamp
         case tmuxSession, tmuxSessionID, tmuxSessionCreated, tmuxServerPID
         case tmuxWindow, tmuxPane, tmuxSocket
     }
@@ -65,6 +69,7 @@ public struct CodexNotificationEvent: Codable, Sendable, Identifiable, Equatable
         kind = try values.decode(CodexNotificationKind.self, forKey: .kind)
         sessionID = try values.decode(String.self, forKey: .sessionID)
         turnID = try values.decodeIfPresent(String.self, forKey: .turnID)
+        desktopThreadID = try values.decodeIfPresent(String.self, forKey: .desktopThreadID)
         cwd = try values.decode(String.self, forKey: .cwd)
         hostname = try values.decode(String.self, forKey: .hostname)
         sequence = try values.decode(Int.self, forKey: .sequence)
@@ -96,6 +101,7 @@ public struct CodexNotificationEvent: Codable, Sendable, Identifiable, Equatable
         try values.encode(kind, forKey: .kind)
         try values.encode(sessionID, forKey: .sessionID)
         try values.encodeIfPresent(turnID, forKey: .turnID)
+        try values.encodeIfPresent(desktopThreadID, forKey: .desktopThreadID)
         try values.encode(cwd, forKey: .cwd)
         try values.encode(hostname, forKey: .hostname)
         try values.encode(sequence, forKey: .sequence)
@@ -167,6 +173,9 @@ public struct CodexNotificationFeed: Codable, Sendable, Equatable {
                 validHostname(event.hostname)
             else { throw CodexNotificationError.invalidResponse }
             if let turnID = event.turnID, !validText(turnID, limit: 256) {
+                throw CodexNotificationError.invalidResponse
+            }
+            if let threadID = event.desktopThreadID, UUID(uuidString: threadID) == nil {
                 throw CodexNotificationError.invalidResponse
             }
             let metadata: [String?] = [event.tmuxSession, event.tmuxSessionID, event.tmuxWindow, event.tmuxPane, event.tmuxSocket]

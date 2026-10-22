@@ -29,6 +29,7 @@ let package = Package(
                 "CodexNotificationService.swift",
                 "CodexNotificationBridge.swift",
                 "CodexNotificationRouting.swift",
+                "CodexDesktopNotificationResolver.swift",
                 "RemoteFiles.swift",
                 "SFTPDownloaderLink.swift",
                 "ExternalTerminalLauncher.swift",
