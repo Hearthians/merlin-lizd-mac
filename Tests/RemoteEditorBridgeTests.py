@@ -135,6 +135,7 @@ def main():
                                     env=environment, check=True, stdout=subprocess.PIPE, text=True)
             assert result.stdout.strip() == 'original-function', result.stdout
 
+        default_installation_tests(source, shell, temporary)
         terminal_picker_test(source, root, temporary)
         tmux = shutil.which('tmux')
         if tmux:
@@ -143,6 +144,135 @@ def main():
             print('SKIP: live multi-client test (tmux unavailable)')
     print('Remote editor bridge checks passed.')
 
+
+
+def default_installation_tests(source, shell, temporary):
+    # Bash login shells use the first available profile, which need not source .bashrc.
+    for selected in ('.bash_profile', '.bash_login', '.profile', None):
+        home = Path(temporary) / ('login-' + (selected or 'new').lstrip('.'))
+        home.mkdir()
+        root = home / '.local/share/tmuxhub/remote-editor'
+        scope = scope_for(source, root)
+        names = ['.bash_profile', '.bash_login', '.profile']
+        if selected:
+            for name in names[names.index(selected):]:
+                (home / name).write_text('export EXISTING_PROFILE=preserved\n')
+        scope['install'](source.encode(), shell.encode(), str(home))
+        effective = home / (selected or '.profile')
+        assert scope['SOURCE_LINE'] in effective.read_text(), effective
+        if selected:
+            for name in names[names.index(selected) + 1:]:
+                assert (home / name).read_text() == 'export EXISTING_PROFILE=preserved\n'
+        environment = {key: value for key, value in os.environ.items()
+                       if key not in ('TMUX', 'TMUX_PANE', 'BASH_ENV', 'ENV', 'ZDOTDIR')}
+        environment['HOME'] = str(home)
+        loaded = subprocess.run(['/bin/bash', '--norc', '--login', '-c', 'type code; type tmuxhub-code'],
+                                env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, check=True)
+        assert 'code is a function' in loaded.stdout, loaded
+        # Simulate a non-Bash/non-Zsh reader of the common .profile file.
+        if effective.name == '.profile':
+            loaded = subprocess.run(['/bin/sh', '-c',
+                                     'unset BASH_VERSION ZSH_VERSION; . "$HOME/.profile"; '
+                                     'if command -v _tmuxhub_editor_code >/dev/null 2>&1; then exit 17; fi; printf safe'],
+                                    env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, check=True)
+            assert loaded.stdout == 'safe', loaded
+
+        installed = [root / 'bridge.py', root / 'shell.sh', home / '.bashrc', home / '.zshrc', effective]
+        before = {path: (path.stat().st_ino, path.stat().st_mtime_ns, path.read_bytes()) for path in installed}
+        backups = sorted(str(path) for path in home.glob('.*.tmuxhub-editor-backup-*'))
+        assert scope['install'](source.encode(), shell.encode(), str(home)) == []
+        assert before == {path: (path.stat().st_ino, path.stat().st_mtime_ns, path.read_bytes()) for path in installed}
+        assert backups == sorted(str(path) for path in home.glob('.*.tmuxhub-editor-backup-*'))
+
+    # Failed/no-tty registration must never mutate remote startup files.
+    home = Path(temporary) / 'no-tty-home'
+    home.mkdir()
+    (home / '.bashrc').write_text('export DO_NOT_CHANGE=1\n')
+    bootstrap_source = Path(temporary) / 'bootstrap-source.py'
+    bootstrap_source.write_text(source)
+    result = subprocess.run([
+        sys.executable, str(bootstrap_source), 'bootstrap',
+        base64.b64encode(source.encode()).decode(), base64.b64encode(shell.encode()).decode(),
+        str(uuid.uuid4()), 'Mac without a terminal', str(os.getpid()),
+    ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env={**os.environ, 'HOME': str(home)}, start_new_session=True)
+    assert result.returncode != 0
+    assert (home / '.bashrc').read_text() == 'export DO_NOT_CHANGE=1\n'
+    assert not (home / '.profile').exists()
+    assert not (home / '.local/share/tmuxhub/remote-editor').exists()
+
+    # Repeated auto-setup upgrades the prior unguarded marker rather than duplicating it.
+    home = Path(temporary) / 'legacy-startup'
+    home.mkdir()
+    root = home / '.local/share/tmuxhub/remote-editor'
+    legacy = '[ ! -r "$HOME/.local/share/tmuxhub/remote-editor/shell.sh" ] || . "$HOME/.local/share/tmuxhub/remote-editor/shell.sh" # TmuxHub remote editor'
+    (home / '.bashrc').write_text('export BEFORE=1\n' + legacy + '\nexport AFTER=2\n')
+    scope = scope_for(source, root)
+    scope['install'](source.encode(), shell.encode(), str(home))
+    updated = (home / '.bashrc').read_text()
+    assert updated.count('# TmuxHub remote editor') == 1
+    assert scope['SOURCE_LINE'] in updated
+    assert 'export BEFORE=1\n' in updated and 'export AFTER=2\n' in updated
+
+    # Devices may reconnect to a shared home at once; only one edits the startup files.
+    home = Path(temporary) / 'concurrent-startup'
+    home.mkdir()
+    (home / '.bashrc').write_text('export ORIGINAL=preserved\n')
+    root = home / '.local/share/tmuxhub/remote-editor'
+    source_file = Path(temporary) / 'installer-source.py'
+    source_file.write_text(source)
+    worker = (
+        "import base64; s={'__name__':'test'}; "
+        "exec(compile(open(%r).read(),%r,'exec'),s); s['ROOT']=%r; "
+        "s['install'](open(%r,'rb').read(),base64.b64decode(%r),%r)"
+    ) % (str(source_file), str(source_file), str(root), str(source_file),
+         base64.b64encode(shell.encode()).decode(), str(home))
+    processes = [subprocess.Popen([sys.executable, '-c', worker],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(6)]
+    for process in processes:
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 0, (stdout, stderr)
+    scope = scope_for(source, root)
+    assert (home / '.bashrc').read_text().count(scope['SOURCE_LINE']) == 1
+    assert len(list(home.glob('.bashrc.tmuxhub-editor-backup-*'))) == 1
+    assert (root / 'bridge.py').read_bytes() == source.encode()
+    assert (root / 'shell.sh').read_bytes() == shell.encode()
+
+    # Unsafe existing helper files cannot hang automatic setup before SSH attaches.
+    fifo = root / 'fifo-helper'
+    os.mkfifo(fifo, 0o600)
+    reject_fifo = (
+        "s={'__name__':'test'}; exec(compile(open(%r).read(),%r,'exec'),s); "
+        "s['write_if_changed'](%r,b'new helper')"
+    ) % (str(source_file), str(source_file), str(fifo))
+    result = subprocess.run([sys.executable, '-c', reject_fifo], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, timeout=2)
+    assert result.returncode != 0
+    assert stat.S_ISFIFO(fifo.stat().st_mode)
+
+    # A busy installer has a bounded wait. Advance its private clock to avoid a slow test.
+    descriptor = os.open(root / 'install.lock', os.O_RDWR)
+    original_time = scope['time']
+    class FastClock:
+        value = 0
+        @classmethod
+        def monotonic(cls):
+            cls.value += 10
+            return cls.value
+        @staticmethod
+        def sleep(seconds):
+            pass
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        scope['time'] = FastClock
+        expect_failure(lambda: scope['install'](source.encode(), shell.encode(), str(home)))
+    finally:
+        scope['time'] = original_time
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+    print('PASS: automatic setup covers login shells, idempotence, concurrent devices and bounded locking.')
 
 
 def terminal_picker_test(source, root, temporary):

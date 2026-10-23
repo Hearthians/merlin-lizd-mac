@@ -10,13 +10,17 @@ public enum RemoteEditorBridge {
         guard UUID(uuidString: token) != nil,
             command.executable == "/usr/bin/ssh", let original = command.arguments.last,
             !original.isEmpty else { throw CommandValidationError.invalidSSHDestination }
-        let bootstrap = "import base64;exec(compile(base64.b64decode(" + shellPythonLiteral(Data(helperSource.utf8).base64EncodedString()) + "),'tmuxhub-remote-editor','exec'))"
-        let registration = ["python3", "-c", bootstrap, "register", token, deviceName]
+        let source = Data(helperSource.utf8).base64EncodedString()
+        let shell = Data(shellIntegrationContents.utf8).base64EncodedString()
+        let bootstrap = "import base64;exec(compile(base64.b64decode(" + shellPythonLiteral(source) + "),'tmuxhub-remote-editor','exec'))"
+        let registration = ["python3", "-c", bootstrap, "bootstrap", source, shell, token, deviceName]
             .map(shellQuote).joined(separator: " ")
         var arguments = command.arguments
-        // Registration is optional: an unavailable Python or unwritable home must
-        // never prevent the user's SSH/tmux session from opening.
-        let script = registration + " \"$$\" >/dev/null 2>&1; " + original
+        // Install on the actual connection before new tmux shells start. A setup
+        // failure must still launch the user's original SSH/tmux command.
+        let script = registration + " \"$$\" >/dev/null 2>&1"
+            + " || printf '%s\\r\\n' 'TmuxHub: automatic code setup failed; Python 3 and a writable home are required. Retry from host settings.' >&2; "
+            + original
         // The SSH login shell may be fish/csh. Keep POSIX syntax inside /bin/sh.
         arguments[arguments.count - 1] = "exec /bin/sh -c " + shellQuote(script)
         return CommandSpec(executable: command.executable, arguments: arguments, environment: command.environment)
@@ -73,6 +77,7 @@ public enum RemoteEditorBridge {
     public static let helperSource = #"""
     # TmuxHub remote editor bridge v1
     import base64
+    import fcntl
     import io
     import json
     import os
@@ -91,7 +96,8 @@ public enum RemoteEditorBridge {
     MAX_PAYLOAD = 16384
     TOKEN = re.compile(r'^[A-Za-z0-9_-]{16,128}$')
     MARKER = '# TmuxHub remote editor bridge v1'
-    SOURCE_LINE = '[ ! -r "$HOME/.local/share/tmuxhub/remote-editor/shell.sh" ] || . "$HOME/.local/share/tmuxhub/remote-editor/shell.sh" # TmuxHub remote editor'
+    LEGACY_SOURCE_LINE = '[ ! -r "$HOME/.local/share/tmuxhub/remote-editor/shell.sh" ] || . "$HOME/.local/share/tmuxhub/remote-editor/shell.sh" # TmuxHub remote editor'
+    SOURCE_LINE = 'if [ -n "${BASH_VERSION-}${ZSH_VERSION-}" ] && [ -r "$HOME/.local/share/tmuxhub/remote-editor/shell.sh" ]; then . "$HOME/.local/share/tmuxhub/remote-editor/shell.sh"; fi # TmuxHub remote editor'
 
 
     def private_dir(path):
@@ -346,16 +352,57 @@ public enum RemoteEditorBridge {
         return 0
 
 
+    def write_if_changed(path, contents):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, 'O_NOFOLLOW', 0))
+        except FileNotFoundError:
+            return atomic_write(path, contents)
+        with os.fdopen(fd, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                raise ValueError('Unsafe remote editor file: ' + path)
+            if info.st_size == len(contents) and stream.read(len(contents) + 1) == contents:
+                return
+        atomic_write(path, contents)
+
+
     def install(source, shell_source, home=None):
         if not source.startswith(MARKER.encode()) or len(source) > 100000 or len(shell_source) > 20000:
             raise ValueError('Invalid remote editor installation')
-        home = os.path.abspath(home or os.path.expanduser('~'))
         private_dir(ROOT)
+        # Simultaneous attaches, including devices sharing an HPC home, must not
+        # race when appending startup hooks. Never delay a terminal indefinitely.
+        lock = os.open(os.path.join(ROOT, 'install.lock'),
+                       os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+        try:
+            info = os.fstat(lock)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+                raise ValueError('Unsafe remote editor setup lock')
+            deadline = time.monotonic() + 3
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise ValueError('Remote editor setup is busy; reconnect to retry')
+                    time.sleep(0.05)
+            return install_locked(source, shell_source, home)
+        finally:
+            os.close(lock)
+
+
+    def install_locked(source, shell_source, home=None):
+        home = os.path.abspath(home or os.path.expanduser('~'))
         private_dir(os.path.join(ROOT, 'clients'))
-        atomic_write(os.path.join(ROOT, 'bridge.py'), source)
-        atomic_write(os.path.join(ROOT, 'shell.sh'), shell_source)
+        write_if_changed(os.path.join(ROOT, 'bridge.py'), source)
+        write_if_changed(os.path.join(ROOT, 'shell.sh'), shell_source)
+        # tmux normally starts a login shell. Bash reads only the first existing
+        # login file, so do not introduce a .bash_profile that shadows .profile.
+        login = next((name for name in ('.bash_profile', '.bash_login', '.profile')
+                      if os.path.lexists(os.path.join(home, name))), '.profile')
         changed = []
-        for filename in ('.bashrc', '.zshrc'):
+        for filename in ('.bashrc', '.zshrc', login):
             path = os.path.join(home, filename)
             # Honor owned dotfile symlinks (for example a dotfiles checkout).
             target = os.path.realpath(path)
@@ -372,22 +419,32 @@ public enum RemoteEditorBridge {
                 raise ValueError('Broken shell configuration symlink: ' + path)
             else:
                 previous, mode = b'', 0o600
-            if SOURCE_LINE.encode() in previous.splitlines():
+            lines = previous.splitlines()
+            if SOURCE_LINE.encode() in lines and LEGACY_SOURCE_LINE.encode() not in lines:
                 continue
+            managed = (SOURCE_LINE.encode(), LEGACY_SOURCE_LINE.encode())
+            preserved = b''.join(line for line in previous.splitlines(keepends=True)
+                                 if line.rstrip(b'\r\n') not in managed)
+            updated = preserved + (b'\n' if preserved and not preserved.endswith(b'\n') else b'') + SOURCE_LINE.encode() + b'\n'
             if os.path.exists(target):
                 backup = target + '.tmuxhub-editor-backup-' + uuid.uuid4().hex[:8]
                 atomic_write(backup, previous, mode)
-            updated = previous + (b'\n' if previous and not previous.endswith(b'\n') else b'') + SOURCE_LINE.encode() + b'\n'
             atomic_write(target, updated, mode)
             changed.append(filename)
         print('TMUXHUB_REMOTE_EDITOR_INSTALLED_V1')
-        print('Open a new Bash/Zsh shell, or run: . ~/.local/share/tmuxhub/remote-editor/shell.sh')
+        print('New Bash/Zsh shells are ready. Existing shells: . ~/.local/share/tmuxhub/remote-editor/shell.sh')
         return changed
 
 
     def main():
         try:
             action = sys.argv[1]
+            if action == 'bootstrap' and len(sys.argv) == 7:
+                # Check the live tty before installing anything (also protects
+                # noninteractive invocations from touching shell startup files).
+                register(sys.argv[4], sys.argv[5], int(sys.argv[6]))
+                install(base64.b64decode(sys.argv[2], validate=True), base64.b64decode(sys.argv[3], validate=True))
+                return 0
             if action == 'register' and len(sys.argv) == 5:
                 register(sys.argv[2], sys.argv[3], int(sys.argv[4]))
                 return 0

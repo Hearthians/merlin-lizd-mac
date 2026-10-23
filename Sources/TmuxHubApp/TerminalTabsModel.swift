@@ -101,7 +101,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         defer { remoteEditorInstalling.remove(destination) }
         do {
             try await RemoteEditorInstallation.install(destination: destination, pool: runtime.sshMasterPool)
-            remoteEditorMessages[destination] = "已启用。重新连接标签页后，新 shell 可直接使用 code .；已有 shell 请加载下面的配置。"
+            remoteEditorMessages[destination] = "配置已修复。新 shell 可直接使用 code .；已有 shell 请加载下面的配置。"
         } catch {
             remoteEditorMessages[destination] = error.localizedDescription
         }

@@ -224,13 +224,16 @@ HPC4 AIStudio 的 NPU 容器与 Slurm 作业是不同入口，参见[官方容�
 
 ## 在本机 VS Code 打开远端目录
 
-在 SSH 主机详情的「本机 VS Code」中点击「启用 code 命令」，然后重新连接标签页。
+默认启用：每次 SSH 连接会自动检查并安装或更新远端 `code` 联动，在 tmux 启动前完成。
 远端需要 Python 3，本机需要 Visual Studio Code 和 Remote - SSH 扩展。
-新 Bash/Zsh 会自动加载；已打开的 shell 请执行一次：
+新 Bash/Zsh（含 Bash 登录 shell）直接可用；更新前已运行的 shell 请执行一次：
 
 ```sh
 source ~/.local/share/tmuxhub/remote-editor/shell.sh
 ```
+
+自动配置失败不会阻止终端连接，可在 SSH 主机详情的「本机 VS Code」中点击「修复 code 配置」重试。
+重复连接不重复追加配置或生成备份；多设备同时连接时，安装过程会串行完成。
 
 之后可在远端终端执行 `code .`、`code /path/to/project` 或 `code path/to/file.py`。
 相对路径按远端当前目录解析，文件保留在服务器；文件夹名里的点、空格和中文会保留。
