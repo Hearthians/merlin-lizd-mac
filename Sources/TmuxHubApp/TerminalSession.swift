@@ -30,6 +30,7 @@ final class TerminalSession: ObservableObject, Identifiable,
     private let forwardedLinks: ForwardedLinksModel
     private var linkTask: Task<Void, Never>?
     private var savePanel: NSSavePanel?
+    private var remoteEditor: RemoteEditorController?
 
     @Published private(set) var state: State = .idle
     private(set) var hasStarted = false
@@ -58,6 +59,24 @@ final class TerminalSession: ObservableObject, Identifiable,
         terminalView.inputChanged = { [weak attachmentModel] in attachmentModel?.noteInteraction() }
         terminalView.openLink = { [weak self] link, _ in self?.open(link: link) }
         terminalView.browseFile = { [weak self] link, _ in self?.open(link: link, browseInSFTP: true) }
+        if let destination = attachmentModel.target.sshDestination {
+            let editor = RemoteEditorController(destination: destination,
+                endpoint: attachmentModel.notificationRoute?.sshEndpoint)
+            do {
+                self.command = try editor.wrap(command)
+                remoteEditor = editor
+                editor.showMessage = { [weak self] message in self?.linkTransferMessage = message }
+                terminalView.getTerminal().registerOscHandler(code: RemoteEditorBridge.oscCode) { [weak editor] bytes in
+                    guard bytes.count <= 24_000 else { return }
+                    let payload = String(decoding: bytes, as: UTF8.self)
+                    Task { @MainActor [weak editor] in editor?.receive(payload) }
+                }
+            } catch {
+                // The editor integration must never prevent a terminal connection.
+                linkTransferMessage = "本机 VS Code 联动不可用；终端连接不受影响。"
+            }
+        }
+
         attachmentModel.bind(
             canInsert: { [weak self] in
                 guard let self else { return false }
@@ -102,6 +121,7 @@ final class TerminalSession: ObservableObject, Identifiable,
     func close() {
         guard state != .closed else { return }
         command = nil
+        remoteEditor?.close()
         attachmentModel.noteInteraction()
         linkTask?.cancel()
         linkTask = nil
@@ -357,6 +377,7 @@ final class TerminalSession: ObservableObject, Identifiable,
                 return
             }
             self.didReportExit = true
+            self.remoteEditor?.close()
             self.state = .exited(exitCode)
         }
     }

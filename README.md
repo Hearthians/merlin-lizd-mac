@@ -222,6 +222,28 @@ HPC4 AIStudio 的 NPU 容器与 Slurm 作业是不同入口，参见[官方容�
 容器或权限受限的工作区中，请把附件目录设为它能访问的挂载路径。
 附件目录不会自动加入 `.gitignore`；可按需忽略 `.tmuxhub/attachments/`。
 
+## 在本机 VS Code 打开远端目录
+
+在 SSH 主机详情的「本机 VS Code」中点击「启用 code 命令」，然后重新连接标签页。
+远端需要 Python 3，本机需要 Visual Studio Code 和 Remote - SSH 扩展。
+新 Bash/Zsh 会自动加载；已打开的 shell 请执行一次：
+
+```sh
+source ~/.local/share/tmuxhub/remote-editor/shell.sh
+```
+
+之后可在远端终端执行 `code .`、`code /path/to/project` 或 `code path/to/file.py`。
+相对路径按远端当前目录解析，文件保留在服务器；文件夹名里的点、空格和中文会保留。
+已有名为 `code` 的别名/函数不会被覆盖，此时可用 `tmuxhub-code .`。
+在普通 SSH、非 TmuxHub tmux 客户端或 VS Code 集成终端中，仍交给原来的 `code` 命令。
+本功能接受单个文件/目录路径，暂不代理 `--wait`、扩展管理等其他 VS Code CLI 参数。
+
+只有一个符合条件的 TmuxHub 客户端时自动打开；多个设备同时连接该会话时，终端会让你
+按设备名称选择目标，不会同时在其他设备打开。关闭或断开的客户端不会接收请求。
+HPC2/3/4 登录节点会固定到当前实际节点，保留原 SSH 身份、跳板和主机密钥校验；
+所需专用条目保存在 `~/.ssh/tmuxhub-code/`，并加入一个受限的 SSH Include。
+计算节点上的嵌套 SSH 尚不支持，需返回登录节点或使用直接配置的 SSH 主机。
+
 ## 打开终端链接
 
 SSH 终端中的 `http://localhost:<端口>/...`、`127.0.0.1`、`0.0.0.0` 和 `[::1]`

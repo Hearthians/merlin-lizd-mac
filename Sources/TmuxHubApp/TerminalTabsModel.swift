@@ -8,6 +8,8 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     @Published private(set) var tabs: [TerminalTabRecord]
     @Published private(set) var tmuxConfigurationStates: [TerminalTarget: TmuxConfigurationState] = [:]
     @Published private(set) var vimPasteConfigurationStates: [TerminalTarget: VimPasteConfigurationState] = [:]
+    @Published private(set) var remoteEditorInstalling: Set<String> = []
+    @Published private(set) var remoteEditorMessages: [String: String] = [:]
     @Published var notificationOpenError: String?
     @Published var selectedTabID: String? {
         didSet {
@@ -88,6 +90,20 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
             )
         } catch {
             vimPasteConfigurationStates[target] = .failed(error.localizedDescription)
+        }
+    }
+
+    func installRemoteEditor(on destination: String) async {
+        guard IdentifierValidator.isSSHDestination(destination),
+            !remoteEditorInstalling.contains(destination) else { return }
+        remoteEditorInstalling.insert(destination)
+        remoteEditorMessages[destination] = nil
+        defer { remoteEditorInstalling.remove(destination) }
+        do {
+            try await RemoteEditorInstallation.install(destination: destination, pool: runtime.sshMasterPool)
+            remoteEditorMessages[destination] = "已启用。重新连接标签页后，新 shell 可直接使用 code .；已有 shell 请加载下面的配置。"
+        } catch {
+            remoteEditorMessages[destination] = error.localizedDescription
         }
     }
 

@@ -282,6 +282,8 @@ struct SSHHostDetailView: View {
                     terminals: terminals
                 )
 
+                RemoteEditorConfigurationCard(destination: host.destination, terminals: terminals)
+
                 SurfaceCard("连接行为") {
                     Label(
                         "tmux 与 Herdr 标签均可恢复；关闭标签只断开连接，不终止远程任务。",
