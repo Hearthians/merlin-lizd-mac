@@ -180,9 +180,10 @@ public enum RemoteEditorBridge {
         socket_path, separator, rest = socket_path.rpartition(',')
         if not separator or not socket_path.startswith('/') or '\0' in socket_path:
             raise ValueError('A tmux pane is required')
+        # HPC login nodes may still use Python 3.6 (before the text keyword alias).
         completed = subprocess.run(['tmux', '-S', socket_path] + arguments,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   timeout=5, check=True, text=True)
+                                   timeout=5, check=True, universal_newlines=True)
         if len(completed.stdout) > 1024 * 1024:
             raise ValueError('Too many tmux clients')
         return completed.stdout
@@ -206,7 +207,7 @@ public enum RemoteEditorBridge {
                 else:
                     parent = subprocess.run(['ps', '-o', 'ppid=', '-p', str(pid)],
                                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                            text=True, timeout=1, check=True).stdout.strip()
+                                            universal_newlines=True, timeout=1, check=True).stdout.strip()
                 if not parent.isdigit():
                     return False
                 pid = int(parent)

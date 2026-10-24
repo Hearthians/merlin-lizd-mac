@@ -135,6 +135,7 @@ def main():
                                     env=environment, check=True, stdout=subprocess.PIPE, text=True)
             assert result.stdout.strip() == 'original-function', result.stdout
 
+        python36_subprocess_test(source, temporary)
         default_installation_tests(source, shell, temporary)
         terminal_picker_test(source, root, temporary)
         tmux = shutil.which('tmux')
@@ -144,6 +145,54 @@ def main():
             print('SKIP: live multi-client test (tmux unavailable)')
     print('Remote editor bridge checks passed.')
 
+
+
+def python36_subprocess_test(source, temporary):
+    # A modern local interpreter accepts text=True, but Python 3.6 on HPC does not.
+    # Enforce its supported kwargs while still launching real subprocesses, so
+    # both tmux output decoding and the /proc-less parent lookup are exercised.
+    fake_tmux = Path(temporary) / 'tmux-output-fixture'
+    fake_tmux.write_text("#!/bin/sh\nprintf '%s\\r\\n' '%1\t$0'\n")
+    fake_tmux.chmod(0o700)
+    arguments = ['list-panes', '-a', '-F', '#{pane_id}\t#{session_id}']
+
+    class Python36Subprocess:
+        PIPE = subprocess.PIPE
+        DEVNULL = subprocess.DEVNULL
+        SubprocessError = subprocess.SubprocessError
+
+        def __init__(self):
+            self.calls = []
+
+        def run(self, command, *, stdout=None, stderr=None, timeout=None,
+                check=False, universal_newlines=False):
+            self.calls.append(command)
+            if command[0] == 'tmux':
+                assert command == ['tmux', '-S', '/isolated/tmux.sock'] + arguments
+                command = [str(fake_tmux)] + command[1:]
+            return subprocess.run(command, stdout=stdout, stderr=stderr, timeout=timeout,
+                                  check=check, universal_newlines=universal_newlines)
+
+    class WithoutProc:
+        environ = {'TMUX': '/isolated/tmux.sock,456,0'}
+
+        class path:
+            @staticmethod
+            def exists(value):
+                assert value.startswith('/proc/'), value
+                return False
+
+    scope = scope_for(source, Path(temporary) / 'python36-bridge')
+    compatible = Python36Subprocess()
+    scope['subprocess'] = compatible
+    scope['os'] = WithoutProc
+    assert scope['tmux_output'](arguments) == '%1\t$0\n'
+    assert scope['process_descends_from'](os.getpid(), os.getppid()) is True
+    assert compatible.calls == [
+        ['tmux', '-S', '/isolated/tmux.sock'] + arguments,
+        ['ps', '-o', 'ppid=', '-p', str(os.getpid())],
+    ], compatible.calls
+    print('PASS: Python 3.6 subprocess arguments, decoded tmux output and real ps fallback.')
 
 
 def default_installation_tests(source, shell, temporary):
