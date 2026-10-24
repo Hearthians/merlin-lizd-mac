@@ -136,6 +136,38 @@ struct RemoteEditorDestinationTests {
         }
     }
 
+    @Test("observed HPC login names resolve to the exact SSH node for VS Code")
+    func observedLoginNodeResolution() async throws {
+        let home = temporaryHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        for (cluster, hostname, address) in [
+            ("hpc2", "mgmt-5", "10.120.19.110"),
+            ("hpc3", "ACD-Login-3", "10.120.48.33"),
+            ("hpc4", "HPC4-Login-1", "10.120.81.40"),
+        ] {
+            let configured = "\(cluster)login.hpc.hkust-gz.edu.cn"
+            let runner = StaticEditorConfigurationRunner(output: resolved.replacingOccurrences(
+                of: "hpc4login.hpc.hkust-gz.edu.cn", with: configured))
+            let endpoint = CodexNotificationSSHEndpoint(destination: cluster,
+                address: address, hostKeyAlias: configured)
+            for pinned in [nil, endpoint] as [CodexNotificationSSHEndpoint?] {
+                let destination = try await RemoteEditorService.resolve(sshDestination: cluster,
+                    absolutePath: "/data/user/tester/work/TRELLIS.2", kind: .folder,
+                    hostname: hostname, serverAddress: address, pinnedEndpoint: pinned,
+                    runner: runner, homeDirectory: home)
+                #expect(destination.sshDestination.hasPrefix("tmuxhub-code-"))
+                let output = try await FoundationInventoryProcessRunner().run(CommandSpec(
+                    executable: "/usr/bin/ssh", arguments: ["-G", "-T", "-F",
+                        home.appendingPathComponent(".ssh/config").path, destination.sshDestination]))
+                #expect(output.exitCode == 0)
+                let properties = try SSHHostPropertiesReader.parse(output.stdout,
+                    destination: destination.sshDestination)
+                #expect(properties.hostname == address)
+                #expect(output.stdout.contains("hostkeyalias \(configured)\n"))
+            }
+        }
+    }
+
     private var endpoint: CodexNotificationSSHEndpoint {
         CodexNotificationSSHEndpoint(destination: "hpc4", address: "10.120.81.43", hostKeyAlias: "hpc4login.hpc.hkust-gz.edu.cn")
     }

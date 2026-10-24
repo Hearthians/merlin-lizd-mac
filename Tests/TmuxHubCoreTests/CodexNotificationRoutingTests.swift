@@ -199,6 +199,31 @@ struct CodexNotificationRoutingTests {
         #expect(try JSONDecoder().decode(CodexNotificationRoute.self, from: data).sshEndpoint == nil)
     }
 
+    @Test("observed HPC login names match only their configured cluster")
+    func observedLoginHostnames() {
+        let nodes = [
+            ("hpc2", "mgmt-5"), ("hpc2", "HPC2-Login-1"),
+            ("hpc3", "ACD-Login-3"), ("hpc3", "HPC3-Login-1"),
+            ("hpc4", "HPC4-Login-1"), ("hpc4", "HPC4-Login-3"),
+        ]
+        for cluster in ["hpc2", "hpc3", "hpc4"] {
+            let configured = "\(cluster)login.hpc.hkust-gz.edu.cn"
+            for (owner, hostname) in nodes {
+                #expect(CodexNotificationSSHEndpoint.matches(loginHostname: hostname,
+                    configuredHostname: configured) == (owner == cluster))
+                #expect(CodexNotificationSSHEndpoint.matches(loginHostname: hostname.uppercased(),
+                    configuredHostname: configured.uppercased()) == (owner == cluster))
+            }
+            for name in ["mgmt-", "ACD-Login-", "ACD-Login-3.evil.example", "mgmt-5;echo",
+                         "ACD-Login-1234", "mgmt-５", "gpu1-31"] {
+                #expect(!CodexNotificationSSHEndpoint.matches(loginHostname: name,
+                    configuredHostname: configured))
+            }
+        }
+        #expect(!CodexNotificationSSHEndpoint.matches(loginHostname: "ACD-Login-3",
+            configuredHostname: "hpc3login.hpc.hkust-gz.edu.cn.evil.example"))
+    }
+
     @Test("correct node still rejects a stale server instead of falling back to its session name")
     func recoveredNodeStillChecksIdentity() async throws {
         let directory = URL(fileURLWithPath: "/tmp/th-stale-\(UUID().uuidString.prefix(8))")

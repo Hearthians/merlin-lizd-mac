@@ -27,11 +27,17 @@ public struct CodexNotificationSSHEndpoint: Codable, Hashable, Sendable {
 
     static func matches(loginHostname: String, configuredHostname: String) -> Bool {
         guard let cluster = cluster(configuredHostname) else { return false }
-        let prefix = cluster + "-login-"
+        // HPC2 and HPC3 report their internal node names instead of the public
+        // cluster name. Keep these aliases scoped to their configured cluster.
+        var prefixes = [cluster + "-login-"]
+        if cluster == "hpc2" { prefixes.append("mgmt-") }
+        if cluster == "hpc3" { prefixes.append("acd-login-") }
         let hostname = loginHostname.lowercased()
-        guard hostname.hasPrefix(prefix) else { return false }
-        let number = hostname.dropFirst(prefix.count)
-        return !number.isEmpty && number.count <= 3 && number.allSatisfy { $0.isASCII && $0.isNumber }
+        return prefixes.contains { prefix in
+            guard hostname.hasPrefix(prefix) else { return false }
+            let number = hostname.dropFirst(prefix.count)
+            return !number.isEmpty && number.count <= 3 && number.allSatisfy { $0.isASCII && $0.isNumber }
+        }
     }
 
     var sshOptions: [String] {
