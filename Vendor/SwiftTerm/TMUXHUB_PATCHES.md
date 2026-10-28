@@ -62,6 +62,13 @@ numeric versions and command flags are not treated as filenames.
 Actual terminal wraps preserve spaces between columns, so names on either
 side of a wrap are not combined into a nonexistent filename.
 
+Slash-separated relative folder paths also become implicit links without a
+filename extension, including colorized and parenthesized output. Lookup and
+heuristic hard-row joining use separate versions of the same pattern: folder
+recognition applies within a line or a real soft wrap, while hard-row joining
+keeps the original dotted-path requirement. Command-option fragments remain
+excluded from the broader relative-path lookup.
+
 Display changes refresh the pixel-snapped character dimensions when a view is
 attached to a window or its backing scale changes. The grid, cursor, and PTY
 dimensions are updated together and the full view is redrawn, preventing stale

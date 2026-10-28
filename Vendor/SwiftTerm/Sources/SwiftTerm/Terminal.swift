@@ -6191,7 +6191,11 @@ open class Terminal {
     // Ghostty-style URL/path pattern adapted for ICU regex.
     // Oniguruma uses a variable-length lookbehind in one branch; we keep
     // compatibility by applying an equivalent post-match suppression rule.
-    private static let ghosttyImplicitLinkRegex: NSRegularExpression? = {
+    private static let ghosttyImplicitLinkRegex = makeGhosttyImplicitLinkRegex(requireDottedRelativePath: false)
+    // Heuristic hard-row joins stay stricter than paths within a line or a true soft wrap.
+    private static let ghosttyImplicitSeamRegex = makeGhosttyImplicitLinkRegex(requireDottedRelativePath: true)
+
+    private static func makeGhosttyImplicitLinkRegex(requireDottedRelativePath: Bool) -> NSRegularExpression? {
         let urlSchemes = #"https?://|mailto:|ftp://|file:|ssh:|git://|ssh://|tel:|magnet:|ipfs://|ipns://|gemini://|gopher://|news:"#
         let ipv6URLPattern = #"(?:\[[:0-9a-fA-F]+(?:[:0-9a-fA-F]*)+\](?::[0-9]+)?)"#
         let schemeURLChars = #"[\w\-.~:/?#@!$&*+,;=%]"#
@@ -6238,9 +6242,16 @@ open class Terminal {
             noTrailingColon +
             trailingSpacesAtEOL
 
-        let regex = schemeURLBranch + "|" + rootedOrRelativePathBranch + "|" + bareRelativePathBranch
+        var regex = schemeURLBranch + "|" + rootedOrRelativePathBranch + "|" + bareRelativePathBranch
+        if !requireDottedRelativePath {
+            // Extend lookup only. Keep the original dotted branch and its boundaries.
+            let folderPathPrefix = #"(?<![\w.\/~:@$%+=-])[\w][\w\-.]*\/"#
+            let folderPathBranch = nonDottedPathLookahead + folderPathPrefix +
+                pathChars + "+" + dottedPathSpaceSegments + noTrailingColon + trailingSpacesAtEOL
+            regex += "|" + folderPathBranch
+        }
         return try? NSRegularExpression(pattern: regex, options: [])
-    }()
+    }
 
     // A basename with an extension can be resolved against the pane's working
     // directory just like a relative path. Accept arbitrary alphabetic
@@ -6468,7 +6479,7 @@ open class Terminal {
         in buffer: Buffer
     ) -> Bool
     {
-        guard let regex = Self.ghosttyImplicitLinkRegex else {
+        guard let regex = Self.ghosttyImplicitSeamRegex else {
             return false
         }
         guard upper >= 0, upper < buffer.lines.count, lower >= 0, lower < buffer.lines.count else {

@@ -19,6 +19,115 @@ struct TerminalLinkTests {
         #expect(link == "temp_output/r256/production-indexed/r256-run3/CelloFill/38.ply")
     }
 
+    @Test("recognizes the colored result directory in a Chinese status line")
+    func recognizesResultDirectory() {
+        let delegate = Delegate()
+        let terminal = Terminal(delegate: delegate)
+        terminal.resize(cols: 180, rows: 24)
+        let label = "hssd_thick_comparison_8"
+        let path = "temp_output/" + label
+        let prefix = "结果目录：" + label + " ("
+        // Each of the five Chinese prefix characters occupies two cells.
+        let firstColumn = 10 + label.count + 2
+        terminal.feed(text: prefix + "\u{1b}[32m" + path + "\u{1b}[0m)\r\n")
+
+        for column in firstColumn..<(firstColumn + path.count) {
+            #expect(terminal.link(
+                at: .screen(Position(col: column, row: 0)),
+                mode: .explicitAndImplicit
+            ) == path)
+        }
+        for column in [0, 10, firstColumn - 1, firstColumn + path.count] {
+            #expect(terminal.link(
+                at: .screen(Position(col: column, row: 0)),
+                mode: .explicitAndImplicit
+            ) == nil)
+        }
+    }
+
+    @Test("recognizes extensionless directories with relative and explicit prefixes", arguments: [
+        "outputs/run",
+        "outputs/run/",
+        "outputs/run-v2_8",
+        "./outputs/run",
+        "../outputs/run",
+        "~/outputs/run",
+        "/tmp/outputs/run",
+        ".cache/results",
+    ])
+    func recognizesExtensionlessDirectory(path: String) {
+        let delegate = Delegate()
+        let terminal = Terminal(delegate: delegate)
+        terminal.resize(cols: 180, rows: 24)
+        terminal.feed(text: path + "\r\n")
+        for column in 0..<path.count {
+            #expect(terminal.link(
+                at: .screen(Position(col: column, row: 0)),
+                mode: .explicitAndImplicit
+            ) == path)
+        }
+        #expect(terminal.link(
+            at: .screen(Position(col: path.count, row: 0)),
+            mode: .explicitAndImplicit
+        ) == nil)
+    }
+
+    @Test("keeps parenthesized directory links separate from surrounding prose")
+    func keepsDirectoryBoundaries() {
+        let delegate = Delegate()
+        let terminal = Terminal(delegate: delegate)
+        let path = "outputs/run"
+        let text = "result (" + path + ") next step"
+        terminal.feed(text: text + "\r\n")
+        for column in 0..<text.count {
+            let expected: String? = (8..<(8 + path.count)).contains(column) ? path : nil
+            #expect(terminal.link(
+                at: .screen(Position(col: column, row: 0)),
+                mode: .explicitAndImplicit
+            ) == expected)
+        }
+    }
+
+    @Test("recognizes colored extensionless directories across real terminal wraps")
+    func recognizesSoftWrappedDirectory() {
+        let delegate = Delegate()
+        let terminal = Terminal(delegate: delegate)
+        terminal.resize(cols: 12, rows: 24)
+        let path = "temp_output/hssd_thick_comparison_8/"
+        let text = "(" + path + ")"
+        terminal.feed(text: "\u{1b}[32m" + text + "\u{1b}[0m")
+
+        for offset in 0..<text.count {
+            let expected: String? = offset > 0 && offset <= path.count ? path : nil
+            #expect(terminal.link(
+                at: .screen(Position(col: offset % 12, row: offset / 12)),
+                mode: .explicitAndImplicit
+            ) == expected)
+        }
+    }
+
+    @Test("does not merge extensionless directories on separate hard rows")
+    func keepsDirectoryHardRowsSeparate() {
+        let delegate = Delegate()
+        let terminal = Terminal(delegate: delegate)
+        terminal.resize(cols: 12, rows: 24)
+        let paths = ["outputs/run", "other/run"]
+        terminal.feed(text: paths.joined(separator: "\r\n") + "\r\n")
+
+        for (row, path) in paths.enumerated() {
+            for column in 0..<path.count {
+                #expect(terminal.link(
+                    at: .screen(Position(col: column, row: row)),
+                    mode: .explicitAndImplicit
+                ) == path)
+            }
+            #expect(terminal.link(
+                at: .screen(Position(col: path.count, row: row)),
+                mode: .explicitAndImplicit
+            ) == nil)
+        }
+    }
+
     @Test("recognizes bare filenames in colored multi-column ls output")
     func recognizesColoredDirectoryListing() {
         let delegate = Delegate()
@@ -117,6 +226,7 @@ struct TerminalLinkTests {
 
     @Test("keeps complete URLs and paths ahead of their filename fragments", arguments: [
         "https://example.com/mesh.ply",
+        "https://localhost/outputs/run",
         "outputs/mesh.ply",
     ])
     func prefersCompleteLinks(text: String) {
@@ -131,8 +241,28 @@ struct TerminalLinkTests {
         }
     }
 
+    @Test("preserves dotted relative paths after option and label separators", arguments: [
+        "--output=outputs/mesh.ply",
+        "result:outputs/mesh.ply",
+    ])
+    func recognizesDottedPathAfterSeparator(text: String) {
+        let delegate = Delegate()
+        let terminal = Terminal(delegate: delegate)
+        let path = "outputs/mesh.ply"
+        let firstColumn = text.count - path.count
+        terminal.feed(text: text + "\r\n")
+        for column in 0..<text.count {
+            #expect(terminal.link(
+                at: .screen(Position(col: column, row: 0)),
+                mode: .explicitAndImplicit
+            ) == (column >= firstColumn ? path : nil))
+        }
+    }
+
     @Test("does not treat prose, versions, or dotted command options as filenames", arguments: [
         "ordinary prose and not-a-path",
+        "result directory hssd_thick_comparison_8 is ready",
+        "--output/folder --input/other",
         "version v1.2.3 and 1.2.3",
         "--output.log --format.ply --preview.png",
     ])

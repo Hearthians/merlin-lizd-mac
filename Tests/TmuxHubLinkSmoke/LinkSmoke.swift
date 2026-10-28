@@ -67,6 +67,14 @@ struct LinkSmoke {
             try await Task.sleep(nanoseconds: UInt64((NSEvent.doubleClickInterval + 0.05) * 1_000_000_000))
         }
 
+        func waitForBrowse() async throws {
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: .seconds(NSEvent.doubleClickInterval + 1))
+            while browsed.isEmpty && clock.now < deadline {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+        }
+
         precondition(view.link(at: event(.rightMouseDown))?.link == "outputs/result.png")
         for flags: NSEvent.ModifierFlags in [[], .command] {
             view.mouseDown(with: event(.leftMouseDown, flags: flags))
@@ -208,6 +216,26 @@ struct LinkSmoke {
         precondition(opened.map(\.0) == ["outputs/result.png"])
         precondition(recorder.sent.isEmpty, "File-download gestures must not leak mouse events to tmux")
         opened.removeAll()
+
+        let directoryPath = "temp_output/hssd_thick_comparison_8"
+        let directoryLabel = "hssd_thick_comparison_8"
+        let directoryPrefix = "结果目录：" + directoryLabel + " ("
+        let directoryColumn = 10 + directoryLabel.count + 2
+        resetTerminal(directoryPrefix + "\u{1b}[32m" + directoryPath + "\u{1b}[0m)\r\n", columns: 100)
+        precondition(view.link(at: event(.leftMouseDown, col: directoryColumn + 3))?.link == directoryPath,
+                     "The colored extensionless result directory must be detected")
+        view.mouseDown(with: event(.leftMouseDown, col: directoryColumn + 3))
+        view.mouseUp(with: event(.leftMouseUp, col: directoryColumn + 3))
+        precondition(opened.isEmpty && browsed.isEmpty,
+                     "A folder click must wait for the double-click interval without downloading")
+        try await waitForBrowse()
+        precondition(browsed.map(\.0) == [directoryPath] && opened.isEmpty,
+                     "Plain left-click must browse the detected folder instead of downloading it")
+        browsed.removeAll()
+        select(fromCol: directoryColumn, toCol: directoryColumn + directoryPath.count)
+        try await waitForSingleClick()
+        precondition(view.getSelection() == directoryPath && browsed.isEmpty && opened.isEmpty,
+                     "Dragging across a detected folder must preserve selection without browsing or downloading")
 
         let selectedPath = "outputs/selected.png"
         resetTerminal(selectedPath + "\r\noutputs/pointer.png\r\n")
@@ -372,7 +400,7 @@ struct LinkSmoke {
         view.mouseUp(with: event(.leftMouseUp, row: 3, col: 1, flags: .shift))
         precondition(view.getSelection() == json && recorder.sent.isEmpty,
                      "Shift bypass must retain the complete local selection without reporting mouse events")
-        print("Link UI smoke passed: left-click browsing, selection-first downloads, wrapped paths, URLs, OSC 8, and tmux mouse reporting.")
+        print("Link UI smoke passed: left-click file and folder browsing, selection-first downloads, wrapped paths, URLs, OSC 8, and tmux mouse reporting.")
     }
 }
 
