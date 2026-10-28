@@ -279,6 +279,10 @@ public actor TmuxSessionDiscovery {
             if output.exitCode != 0 {
                 if diagnostic.contains("no server running")
                     || diagnostic.contains("no sessions")
+                    || (
+                        diagnostic.contains("error connecting to")
+                            && diagnostic.contains("no such file or directory")
+                    )
                 {
                     return success(target: target, sessions: [], now: now())
                 }

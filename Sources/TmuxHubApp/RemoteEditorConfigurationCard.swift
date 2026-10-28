@@ -11,7 +11,7 @@ struct RemoteEditorConfigurationCard: View {
                 VStack(alignment: .leading, spacing: 5) {
                     Text("默认启用：在远端输入 code .，用本机 VS Code 打开当前目录。")
                         .font(.callout)
-                    Text("支持文件和绝对路径；文件保留在服务器。需要本机 VS Code 和 Remote - SSH。")
+                    Text("支持文件和绝对路径；文件保留在服务器。本机需安装 VS Code，Remote - SSH 自动配置。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 8)
@@ -35,6 +35,8 @@ struct RemoteEditorConfigurationCard: View {
                 }.buttonStyle(.borderless)
             }
             Text("多个设备同时连接时，终端会让你选择在哪台设备打开。")
+                .font(.caption).foregroundStyle(.secondary)
+            Text("每台电脑首次打开时自动准备 VS Code；远端扩展通过本机下载，服务器无需连接扩展市场。")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }

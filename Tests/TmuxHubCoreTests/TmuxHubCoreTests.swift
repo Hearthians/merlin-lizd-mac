@@ -419,6 +419,23 @@ struct TmuxSessionTests {
         #expect(snapshot.lastError == nil)
     }
 
+    @Test("discovery treats a missing remote tmux socket as an empty healthy result")
+    func handlesMissingRemoteSocket() async {
+        let runner = ScriptedRunner(outputs: [InventoryProcessOutput(
+            stdout: "",
+            stderr: "error connecting to /tmp//tmux-14461/default (No such file or directory)",
+            exitCode: 1
+        )])
+        let discovery = TmuxSessionDiscovery(
+            processRunner: runner,
+            localTmuxPath: "/usr/bin/tmux"
+        )
+        let snapshot = await discovery.refresh(target: .local)
+        #expect(snapshot.sessions.isEmpty)
+        #expect(snapshot.readiness == .ready)
+        #expect(snapshot.lastError == nil)
+    }
+
     @Test("discovery coalesces concurrent refreshes")
     func coalescesRefreshes() async {
         let runner = ScriptedRunner(outputs: [InventoryProcessOutput(

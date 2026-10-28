@@ -225,7 +225,7 @@ HPC4 AIStudio 的 NPU 容器与 Slurm 作业是不同入口，参见[官方容�
 ## 在本机 VS Code 打开远端目录
 
 默认启用：每次 SSH 连接会自动检查并安装或更新远端 `code` 联动，在 tmux 启动前完成。
-远端需要 Python 3，本机需要 Visual Studio Code 和 Remote - SSH 扩展。
+远端需要 Python 3.6+，本机只需安装正式版 Visual Studio Code；缺少 Remote - SSH 时会自动安装。
 新 Bash/Zsh（含 Bash 登录 shell）直接可用；更新前已运行的 shell 请执行一次：
 
 ```sh
@@ -234,6 +234,13 @@ source ~/.local/share/tmuxhub/remote-editor/shell.sh
 
 自动配置失败不会阻止终端连接，可在 SSH 主机详情的「本机 VS Code」中点击「修复 code 配置」重试。
 重复连接不重复追加配置或生成备份；多设备同时连接时，安装过程会串行完成。
+
+每台 Mac 收到 `code` 请求时都会自动准备本机 VS Code，无需复制上一台电脑的设置。
+TmuxHub 只更新 `remote.downloadExtensionsLocally: true` 和 `remote.SSH.localServerDownload: "always"`，
+保留 JSONC 注释、其他设置和已有默认扩展列表。关闭终端会取消尚未完成的准备。
+打开目录前会检查该实际节点上的默认扩展及依赖，缺失时按本机 VS Code 版本和远端架构，
+从微软官方服务下载并通过 SSH/SFTP 安装；服务器无需访问扩展市场。首次连接尚无安装组件时，
+也会自动准备匹配版本的组件，不启动或终止现有 VS Code 服务。后续请求复用已安装扩展和本机下载缓存。
 
 之后可在远端终端执行 `code .`、`code /path/to/project` 或 `code path/to/file.py`。
 相对路径按远端当前目录解析，文件保留在服务器；文件夹名里的点、空格和中文会保留。

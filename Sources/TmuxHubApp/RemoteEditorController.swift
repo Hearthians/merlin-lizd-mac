@@ -38,7 +38,7 @@ final class RemoteEditorController {
             do {
                 guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.microsoft.VSCode") else {
                     throw NSError(domain: "TmuxHub.RemoteEditor", code: 1, userInfo: [
-                        NSLocalizedDescriptionKey: "请先在本机安装 Visual Studio Code 和 Remote - SSH 扩展。"
+                        NSLocalizedDescriptionKey: "请先在本机安装 Visual Studio Code；Remote - SSH 会自动配置。"
                     ])
                 }
                 let cli = app.appendingPathComponent("Contents/Resources/app/bin/code").path
@@ -53,6 +53,11 @@ final class RemoteEditorController {
                     hostname: request.hostname, serverAddress: request.serverAddress,
                     pinnedEndpoint: endpoint
                 )
+                try Task.checkCancellation()
+                guard !closed else { return }
+                try await RemoteEditorPreparation.prepare(application: app, destination: remote) { [weak self] message in
+                    if let self, !self.closed { self.showMessage?(message) }
+                }
                 try Task.checkCancellation()
                 guard !closed else { return }
                 try await RemoteEditorLauncher.launch(executable: cli, destination: remote)
