@@ -5713,6 +5713,26 @@ open class Terminal {
     public func sendEvent (buttonFlags: Int, x: Int, y: Int) {
       sendEvent(buttonFlags: buttonFlags, x: x, y: y, pixelX: x, pixelY: y)
     }
+
+    /// Sends a button event while retaining the originating button on SGR
+    /// release sequences. Legacy encodings continue to use button 3 for release.
+    public func sendEvent (
+        buttonFlags: Int,
+        isRelease: Bool,
+        x: Int,
+        y: Int,
+        pixelX: Int,
+        pixelY: Int
+    ) {
+        sendEvent(
+            buttonFlags: buttonFlags,
+            releaseOverride: isRelease,
+            x: x,
+            y: y,
+            pixelX: pixelX,
+            pixelY: pixelY
+        )
+    }
     
     /**
      * Sends a mouse event for a specific button at the specific location
@@ -5722,27 +5742,46 @@ open class Terminal {
      */
     public func sendEvent (buttonFlags: Int, x: Int, y: Int, pixelX: Int, pixelY: Int)
     {
+        sendEvent(
+            buttonFlags: buttonFlags,
+            releaseOverride: nil,
+            x: x,
+            y: y,
+            pixelX: pixelX,
+            pixelY: pixelY
+        )
+    }
+
+    private func sendEvent (
+        buttonFlags: Int,
+        releaseOverride: Bool?,
+        x: Int,
+        y: Int,
+        pixelX: Int,
+        pixelY: Int
+    ) {
+        let inferredRelease = (buttonFlags & 3) == 3 && (buttonFlags & 32) == 0
+        let isRelease = releaseOverride ?? inferredRelease
+        let legacyButtonFlags = isRelease ? ((buttonFlags & ~3) | 3) : buttonFlags
         //print ("got \(mouseProtocol)")
         switch mouseProtocol {
         case .x10:
-            sendResponse(cc.CSI, "M", [UInt8(min(buttonFlags+32, 255)), UInt8(min(32 + x+1, 255)), UInt8(min(32+y+1, 255))])
+            sendResponse(cc.CSI, "M", [UInt8(min(legacyButtonFlags+32, 255)), UInt8(min(32 + x+1, 255)), UInt8(min(32+y+1, 255))])
         case .sgr:
-            let isRelease = (buttonFlags & 3) == 3 && (buttonFlags & 32) == 0
-            let bflags : Int = isRelease ? (buttonFlags & ~3) : buttonFlags
+            let bflags = releaseOverride == nil && isRelease ? (buttonFlags & ~3) : buttonFlags
             let m = isRelease ? "m" : "M"
             sendResponse(cc.CSI, "<\(bflags);\(x+1);\(y+1)\(m)")
         case .sgrPixel:
-            let isRelease = (buttonFlags & 3) == 3 && (buttonFlags & 32) == 0
-            let bflags : Int = isRelease ? (buttonFlags & ~3) : buttonFlags
+            let bflags = releaseOverride == nil && isRelease ? (buttonFlags & ~3) : buttonFlags
             let m = isRelease ? "m" : "M"
             print ("\(pixelX);\(pixelY)")
             sendResponse(cc.CSI, "<\(bflags);\(pixelX);\(pixelY)\(m)")
             
         case .urxvt:
-            sendResponse(cc.CSI, "\(buttonFlags+32);\(x+1);\(y+1)M");
+            sendResponse(cc.CSI, "\(legacyButtonFlags+32);\(x+1);\(y+1)M");
         case .utf8:
             var buffer: [UInt8] = [UInt8 (ascii: "M")]
-            encodeMouseUtf(data: &buffer, ch: buttonFlags+32)
+            encodeMouseUtf(data: &buffer, ch: legacyButtonFlags+32)
             encodeMouseUtf (data: &buffer, ch: x+33)
             encodeMouseUtf (data: &buffer, ch: y+33)
             sendResponse(cc.CSI, buffer)

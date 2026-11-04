@@ -4,6 +4,7 @@ public enum CodexNotificationKind: String, Codable, Sendable {
     case turnCompleted
     case approvalRequested
     case turnStarted
+    case herdrAgentStateChanged
 }
 
 /// Only routing metadata is retained. Prompts, tool arguments, transcripts and
@@ -27,6 +28,12 @@ public struct CodexNotificationEvent: Codable, Sendable, Identifiable, Equatable
     public let tmuxWindow: String?
     public let tmuxPane: String?
     public let tmuxSocket: String?
+    public let herdrSession: String?
+    public let herdrSocket: String?
+    public let herdrPane: String?
+    public let herdrWorkspace: String?
+    public let herdrAgent: String?
+    public let herdrStatus: String?
 
     public init(
         id: String, sourceID: String, kind: CodexNotificationKind,
@@ -35,7 +42,10 @@ public struct CodexNotificationEvent: Codable, Sendable, Identifiable, Equatable
         tmuxSessionID: String? = nil, tmuxSessionCreated: Int? = nil,
         tmuxServerPID: Int? = nil, tmuxWindow: String? = nil,
         tmuxPane: String? = nil, tmuxSocket: String? = nil,
-        desktopThreadID: String? = nil
+        desktopThreadID: String? = nil, herdrSession: String? = nil,
+        herdrSocket: String? = nil, herdrPane: String? = nil,
+        herdrWorkspace: String? = nil, herdrAgent: String? = nil,
+        herdrStatus: String? = nil
     ) {
         self.id = id
         self.sourceID = sourceID
@@ -54,12 +64,19 @@ public struct CodexNotificationEvent: Codable, Sendable, Identifiable, Equatable
         self.tmuxWindow = tmuxWindow
         self.tmuxPane = tmuxPane
         self.tmuxSocket = tmuxSocket
+        self.herdrSession = herdrSession
+        self.herdrSocket = herdrSocket
+        self.herdrPane = herdrPane
+        self.herdrWorkspace = herdrWorkspace
+        self.herdrAgent = herdrAgent
+        self.herdrStatus = herdrStatus
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, sourceID, kind, sessionID, turnID, desktopThreadID, cwd, hostname, sequence, timestamp
         case tmuxSession, tmuxSessionID, tmuxSessionCreated, tmuxServerPID
         case tmuxWindow, tmuxPane, tmuxSocket
+        case herdrSession, herdrSocket, herdrPane, herdrWorkspace, herdrAgent, herdrStatus
     }
 
     public init(from decoder: Decoder) throws {
@@ -92,6 +109,12 @@ public struct CodexNotificationEvent: Codable, Sendable, Identifiable, Equatable
         tmuxWindow = try values.decodeIfPresent(String.self, forKey: .tmuxWindow)
         tmuxPane = try values.decodeIfPresent(String.self, forKey: .tmuxPane)
         tmuxSocket = try values.decodeIfPresent(String.self, forKey: .tmuxSocket)
+        herdrSession = try values.decodeIfPresent(String.self, forKey: .herdrSession)
+        herdrSocket = try values.decodeIfPresent(String.self, forKey: .herdrSocket)
+        herdrPane = try values.decodeIfPresent(String.self, forKey: .herdrPane)
+        herdrWorkspace = try values.decodeIfPresent(String.self, forKey: .herdrWorkspace)
+        herdrAgent = try values.decodeIfPresent(String.self, forKey: .herdrAgent)
+        herdrStatus = try values.decodeIfPresent(String.self, forKey: .herdrStatus)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -115,6 +138,12 @@ public struct CodexNotificationEvent: Codable, Sendable, Identifiable, Equatable
         try values.encodeIfPresent(tmuxWindow, forKey: .tmuxWindow)
         try values.encodeIfPresent(tmuxPane, forKey: .tmuxPane)
         try values.encodeIfPresent(tmuxSocket, forKey: .tmuxSocket)
+        try values.encodeIfPresent(herdrSession, forKey: .herdrSession)
+        try values.encodeIfPresent(herdrSocket, forKey: .herdrSocket)
+        try values.encodeIfPresent(herdrPane, forKey: .herdrPane)
+        try values.encodeIfPresent(herdrWorkspace, forKey: .herdrWorkspace)
+        try values.encodeIfPresent(herdrAgent, forKey: .herdrAgent)
+        try values.encodeIfPresent(herdrStatus, forKey: .herdrStatus)
     }
 }
 
@@ -188,6 +217,30 @@ public struct CodexNotificationFeed: Codable, Sendable, Equatable {
             }
             if let created = event.tmuxSessionCreated, created < 0 { throw CodexNotificationError.invalidResponse }
             if let pid = event.tmuxServerPID, pid <= 0 { throw CodexNotificationError.invalidResponse }
+            let herdrMetadata = [event.herdrSession, event.herdrSocket, event.herdrPane,
+                                 event.herdrWorkspace, event.herdrAgent, event.herdrStatus]
+            for value in herdrMetadata.compactMap({ $0 }) where !validText(value, limit: 4_096) {
+                throw CodexNotificationError.invalidResponse
+            }
+            if event.kind == .herdrAgentStateChanged {
+                guard let socket = event.herdrSocket, socket.hasPrefix("/"),
+                    let pane = event.herdrPane, validHerdrIdentifier(pane),
+                    let status = event.herdrStatus,
+                    ["idle", "working", "blocked", "done", "unknown"].contains(status),
+                    event.desktopThreadID == nil,
+                    event.tmuxSession == nil, event.tmuxSessionID == nil,
+                    event.tmuxSessionCreated == nil, event.tmuxServerPID == nil,
+                    event.tmuxWindow == nil, event.tmuxPane == nil, event.tmuxSocket == nil
+                else { throw CodexNotificationError.invalidResponse }
+                if let session = event.herdrSession, !validHerdrSession(session) {
+                    throw CodexNotificationError.invalidResponse
+                }
+                if let workspace = event.herdrWorkspace, !validHerdrIdentifier(workspace) {
+                    throw CodexNotificationError.invalidResponse
+                }
+            } else if herdrMetadata.contains(where: { $0 != nil }) {
+                throw CodexNotificationError.invalidResponse
+            }
             previous = event.sequence
         }
         return feed
@@ -210,6 +263,22 @@ public struct CodexNotificationFeed: Codable, Sendable, Equatable {
     private static func validTmuxIdentifier(_ value: String, prefix: String) -> Bool {
         value.hasPrefix(prefix) && value.utf8.count > 1 && value.utf8.dropFirst().allSatisfy { (48...57).contains($0) }
     }
+
+    private static func validHerdrIdentifier(_ value: String) -> Bool {
+        guard let first = value.utf8.first, value.utf8.count <= 128,
+            isASCIIAlphaNumeric(first) else { return false }
+        return value.utf8.allSatisfy {
+            isASCIIAlphaNumeric($0) || $0 == 46 || $0 == 58 || $0 == 95 || $0 == 45
+        }
+    }
+
+    private static func validHerdrSession(_ value: String) -> Bool {
+        guard let first = value.utf8.first, value.utf8.count <= 64,
+            isASCIIAlphaNumeric(first) else { return false }
+        return value.utf8.allSatisfy {
+            isASCIIAlphaNumeric($0) || $0 == 46 || $0 == 95 || $0 == 45
+        }
+    }
 }
 
 public enum CodexNotificationError: Error, Equatable, LocalizedError, Sendable {
@@ -223,9 +292,9 @@ public enum CodexNotificationError: Error, Equatable, LocalizedError, Sendable {
         switch self {
         case .invalidDestination: "通知主机地址无效。"
         case .invalidCursor: "通知读取位置无效。"
-        case .notInstalled: "此主机尚未安装 Codex 通知桥接，请先启用通知并在 Codex 的 /hooks 中确认。"
+        case .notInstalled: "此主机尚未安装 TmuxHub 通知桥接，请先配置通知来源。"
         case .invalidResponse: "通知数据不完整，读取位置未更新。"
-        case let .commandFailed(message): "无法同步 Codex 通知：\(message)"
+        case let .commandFailed(message): "无法同步通知：\(message)"
         }
     }
 }

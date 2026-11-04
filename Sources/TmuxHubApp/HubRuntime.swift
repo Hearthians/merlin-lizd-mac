@@ -19,6 +19,7 @@ final class HubRuntime {
     let tmuxController: TmuxSessionController
     let attachmentService: AttachmentTransferService
     let herdrService: HerdrService
+    let herdrInstallationService: HerdrInstallationService
     let slurmService: SlurmService
     private let passwordStore: SSHPasswordStore
     private let askPassExecutable: String?
@@ -47,6 +48,7 @@ final class HubRuntime {
         forwardedLinks = ForwardedLinksModel(service: forwarding)
         let herdr = HerdrService(sshMasterPool: pool)
         herdrService = herdr
+        herdrInstallationService = HerdrInstallationService(sshMasterPool: pool)
         slurmService = SlurmService(sshMasterPool: pool)
         attachmentService = AttachmentTransferService(sshMasterPool: pool, herdrService: herdr)
         tmuxDiscovery = TmuxSessionDiscovery(

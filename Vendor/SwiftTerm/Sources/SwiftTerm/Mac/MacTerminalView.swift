@@ -1194,7 +1194,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     // We monitor the flags changed to enable URL previews on mouse-hover like iTerm
     // when the Command key is pressed.
     
-    public override func flagsChanged(with event: NSEvent) {
+    open override func flagsChanged(with event: NSEvent) {
         if event.modifierFlags.contains(.command){
             commandActive = true
             startTracking()
@@ -2466,7 +2466,20 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         let flags = event.modifierFlags
         let isReleaseEvent = overwriteRelease || [NSEvent.EventType.leftMouseUp, .otherMouseUp, .rightMouseUp].contains(event.type)
         
-        return terminal.encodeButton(button: event.buttonNumber, release: isReleaseEvent, shift: flags.contains(.shift), meta: flags.contains(.option), control: flags.contains(.control))
+        return terminal.encodeButton(button: terminalButtonNumber(for: event), release: isReleaseEvent, shift: flags.contains(.shift), meta: flags.contains(.option), control: flags.contains(.control))
+    }
+
+    /// AppKit uses 0=left, 1=right, 2=middle; xterm uses
+    /// 0=left, 1=middle, 2=right.
+    private func terminalButtonNumber(for event: NSEvent) -> Int {
+        switch event.type {
+        case .rightMouseDown, .rightMouseDragged, .rightMouseUp:
+            return 2
+        case .otherMouseDown, .otherMouseDragged, .otherMouseUp:
+            return event.buttonNumber == 2 ? 1 : event.buttonNumber
+        default:
+            return event.buttonNumber
+        }
     }
     
     func calculateMouseHit (with event: NSEvent) -> (grid: Position, pixels: Position)
@@ -2497,9 +2510,24 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     {
         let displayBuffer = terminal.displayBuffer
         let hit = calculateMouseHit(with: event)
-        let buttonFlags = encodeMouseEvent(with: event)
+        let flags = event.modifierFlags
+        let isRelease = [NSEvent.EventType.leftMouseUp, .otherMouseUp, .rightMouseUp].contains(event.type)
+        let buttonFlags = terminal.encodeButton(
+            button: terminalButtonNumber(for: event),
+            release: false,
+            shift: flags.contains(.shift),
+            meta: flags.contains(.option),
+            control: flags.contains(.control)
+        )
         let screenRow = max (0, min (displayBuffer.rows - 1, hit.grid.row - displayBuffer.yDisp))
-        terminal.sendEvent(buttonFlags: buttonFlags, x: hit.grid.col, y: screenRow, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
+        terminal.sendEvent(
+            buttonFlags: buttonFlags,
+            isRelease: isRelease,
+            x: hit.grid.col,
+            y: screenRow,
+            pixelX: hit.pixels.col,
+            pixelY: hit.pixels.row
+        )
     }
     
     private var autoScrollDelta = 0
@@ -2584,6 +2612,19 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
         setNeedsDisplay(bounds)
     }
+
+    /// AppKit dispatches secondary-button events through their own responder
+    /// methods, so they do not pass through `mouseDown`/`mouseUp`. Forward the
+    /// complete gesture when the terminal application has enabled mouse mode.
+    open override func rightMouseDown(with event: NSEvent) {
+        if allowMouseReporting && !shiftBypassesMouseReporting(for: event)
+            && terminal.mouseMode.sendButtonPress()
+        {
+            sharedMouseEvent(with: event)
+            return
+        }
+        super.rightMouseDown(with: event)
+    }
     
     func getPayload (for event: NSEvent) -> Any?
     {
@@ -2632,6 +2673,16 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         
         didSelectionDrag = false
     }
+
+    open override func rightMouseUp(with event: NSEvent) {
+        if allowMouseReporting && !shiftBypassesMouseReporting(for: event)
+            && terminal.mouseMode.sendButtonRelease()
+        {
+            sharedMouseEvent(with: event)
+            return
+        }
+        super.rightMouseUp(with: event)
+    }
     
     open override func mouseDragged(with event: NSEvent) {
         let displayBuffer = terminal.displayBuffer
@@ -2677,6 +2728,26 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             stopSelectionAutoScrollTimer()
         }
         setNeedsDisplay(bounds)
+    }
+
+    open override func rightMouseDragged(with event: NSEvent) {
+        guard allowMouseReporting, !shiftBypassesMouseReporting(for: event),
+              terminal.mouseMode.sendButtonTracking()
+        else {
+            super.rightMouseDragged(with: event)
+            return
+        }
+        let displayBuffer = terminal.displayBuffer
+        let hit = calculateMouseHit(with: event)
+        let flags = encodeMouseEvent(with: event)
+        let screenRow = max(0, min(displayBuffer.rows - 1, hit.grid.row - displayBuffer.yDisp))
+        terminal.sendMotion(
+            buttonFlags: flags,
+            x: hit.grid.col,
+            y: screenRow,
+            pixelX: hit.pixels.col,
+            pixelY: hit.pixels.row
+        )
     }
     
     func tryUrlFont () -> NSFont
@@ -2778,7 +2849,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         return calculateMouseHit(at: point).grid
     }
     
-    public override func mouseMoved(with event: NSEvent) {
+    open override func mouseMoved(with event: NSEvent) {
         if #available(macOS 26, *) {
             // On macOS 26 movement arrives via `acceptsMouseMovedEvents`, which delivers
             // to the first responder regardless of the pointer's location. Ignore moves

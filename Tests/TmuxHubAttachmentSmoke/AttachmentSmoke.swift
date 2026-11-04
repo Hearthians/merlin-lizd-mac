@@ -41,6 +41,28 @@ struct AttachmentSmoke {
         herdrModel.saveDirectory()
         let herdrRestored = TerminalAttachmentModel(target: remoteTarget, sessionName: nil, service: service, defaults: defaults, herdrReference: herdrReference)
         precondition(herdrRestored.directoryOverride == "/home/user/herdr-project")
+        let herdrSession = HerdrSessionReference()
+        TerminalAttachmentModel.migrateHerdrDirectoryOverride(
+            target: remoteTarget, from: herdrReference,
+            to: herdrSession, defaults: defaults
+        )
+        let herdrClient = TerminalAttachmentModel(
+            target: remoteTarget, sessionName: nil, service: service,
+            defaults: defaults, herdrSession: herdrSession
+        )
+        precondition(
+            herdrClient.directoryOverride == "/home/user/herdr-project",
+            "Legacy terminal tabs must preserve their directory after becoming a full Herdr client"
+        )
+        let namedHerdrClient = TerminalAttachmentModel(
+            target: remoteTarget, sessionName: nil, service: service,
+            defaults: defaults,
+            herdrSession: HerdrSessionReference(sessionName: "named")
+        )
+        precondition(
+            namedHerdrClient.directoryOverride.isEmpty,
+            "Independent Herdr server sessions must not share directory overrides"
+        )
         for reference in [HerdrTerminalReference(terminalID: "term_other"), HerdrTerminalReference(sessionName: "named", terminalID: "term_first")] {
             let other = TerminalAttachmentModel(target: remoteTarget, sessionName: nil, service: service, defaults: defaults, herdrReference: reference)
             precondition(other.directoryOverride.isEmpty, "Herdr terminals and servers must not share directory overrides")

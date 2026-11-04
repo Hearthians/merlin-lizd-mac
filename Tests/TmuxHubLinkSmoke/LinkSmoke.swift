@@ -80,10 +80,11 @@ struct LinkSmoke {
             view.mouseDown(with: event(.leftMouseDown, flags: flags))
             view.mouseUp(with: event(.leftMouseUp, flags: flags))
             precondition(opened.isEmpty, "Left-click must not download a file")
-            precondition(browsed.isEmpty, "Browsing must wait until the double-click interval ends")
+            precondition(browsed.isEmpty == flags.isEmpty,
+                         "Plain file clicks wait for double-click; Command-click browses immediately")
             try await waitForSingleClick()
-            precondition(browsed.map(\.0) == (flags.isEmpty ? ["outputs/result.png"] : []),
-                         "Only a plain left-click must browse the file")
+            precondition(browsed.map(\.0) == ["outputs/result.png"],
+                         "Plain and Command-left-click must both browse the file in shell output")
             browsed.removeAll()
         }
 
@@ -186,31 +187,77 @@ struct LinkSmoke {
 
         terminal.feed(text: "\u{1b}[?1000h\u{1b}[?1006h")
         recorder.sent.removeAll()
+        view.mouseMoved(with: event(.mouseMoved, row: 1))
+        precondition(view.link(at: event(.leftMouseDown, row: 1)) == nil,
+                     "TUI links must remain dormant without Command")
+        precondition(view.link(at: event(.leftMouseDown, row: 1, flags: .command))?.link
+                        == "https://example.com/reference",
+                     "Command must reveal the local link gesture inside a TUI")
         view.mouseDown(with: event(.leftMouseDown))
         view.mouseUp(with: event(.leftMouseUp))
         precondition(opened.isEmpty)
         try await waitForSingleClick()
-        precondition(browsed.map(\.0) == ["outputs/result.png"] && recorder.sent.isEmpty,
-                     "A file click must browse without leaking a mouse event to tmux")
-        browsed.removeAll()
+        precondition(browsed.isEmpty && recorder.sent.count == 2
+                        && recorder.sent[0].hasSuffix("M") && recorder.sent[1].hasSuffix("m"),
+                     "A mouse-aware terminal application must own clicks over detected file paths")
+        recorder.sent.removeAll()
         view.mouseDown(with: event(.leftMouseDown))
         _ = view.resignFirstResponder()
         view.mouseUp(with: event(.leftMouseUp))
-        precondition(browsed.isEmpty && recorder.sent.isEmpty,
-                     "Losing focus during a file click must cancel it without an unmatched mouse release")
+        precondition(browsed.isEmpty && recorder.sent.count == 2,
+                     "A mouse-aware application must retain a balanced click when focus changes")
+        recorder.sent.removeAll()
         _ = view.becomeFirstResponder()
         view.mouseDown(with: event(.leftMouseDown))
         view.mouseUp(with: event(.leftMouseUp))
         _ = view.resignFirstResponder()
         try await waitForSingleClick()
-        precondition(browsed.isEmpty && recorder.sent.isEmpty,
-                     "Losing focus during the double-click interval must cancel scheduled browsing")
+        precondition(browsed.isEmpty && recorder.sent.count == 2,
+                     "Mouse tracking must prevent delayed local browsing after focus changes")
+        recorder.sent.removeAll()
         _ = view.becomeFirstResponder()
         view.mouseDown(with: event(.leftMouseDown, col: 40))
         view.mouseUp(with: event(.leftMouseUp, col: 40))
         precondition(recorder.sent.count == 2 && recorder.sent[0].hasSuffix("M") && recorder.sent[1].hasSuffix("m"),
                      "Clicks outside file links must preserve the terminal's mouse press/release pair")
         recorder.sent.removeAll()
+        view.rightMouseDown(with: event(.rightMouseDown))
+        view.rightMouseUp(with: event(.rightMouseUp))
+        precondition(recorder.sent.count == 2
+                        && recorder.sent[0].contains("[<2;") && recorder.sent[0].hasSuffix("M")
+                        && recorder.sent[1].contains("[<2;") && recorder.sent[1].hasSuffix("m"),
+                     "Herdr must receive an SGR right-button press and right-button release: \(recorder.sent.debugDescription)")
+        recorder.sent.removeAll()
+        view.mouseDown(with: event(.leftMouseDown, row: 1))
+        view.mouseUp(with: event(.leftMouseUp, row: 1))
+        precondition(opened.isEmpty && recorder.sent.count == 2,
+                     "A mouse-aware application must also own clicks over ordinary URLs")
+        recorder.sent.removeAll()
+        view.mouseDown(with: event(.leftMouseDown, row: 1, flags: .command))
+        view.mouseUp(with: event(.leftMouseUp, row: 1, flags: .command))
+        precondition(opened.map(\.0) == ["https://example.com/reference"])
+        precondition(recorder.sent.isEmpty,
+                     "Command-click URL activation must not leak an unmatched press to the application")
+        opened.removeAll()
+        view.mouseDown(with: event(.leftMouseDown, flags: .command))
+        view.mouseUp(with: event(.leftMouseUp, flags: .command))
+        precondition(browsed.map(\.0) == ["outputs/result.png"] && recorder.sent.isEmpty,
+                     "Command-click must browse a path locally while a TUI owns plain clicks")
+        browsed.removeAll()
+        view.mouseDown(with: event(.leftMouseDown, row: 1, flags: .command))
+        view.mouseUp(with: event(.leftMouseUp, row: 1))
+        precondition(opened.isEmpty && recorder.sent.isEmpty,
+                     "Releasing Command must cancel locally without sending half a gesture to the TUI")
+        view.mouseDown(with: event(.leftMouseDown, row: 1))
+        view.mouseUp(with: event(.leftMouseUp, row: 1, flags: .command))
+        precondition(opened.isEmpty && recorder.sent.count == 2,
+                     "Adding Command after mouse-down must not steal a gesture already owned by the TUI")
+        recorder.sent.removeAll()
+        view.mouseDown(with: event(.leftMouseDown, row: 1, flags: .command))
+        view.mouseDragged(with: event(.leftMouseDragged, row: 1, col: 12, flags: .command))
+        view.mouseUp(with: event(.leftMouseUp, row: 1, col: 12, flags: .command))
+        precondition(opened.isEmpty && browsed.isEmpty && recorder.sent.isEmpty,
+                     "Dragging a local Command-click must cancel without leaking events")
         view.rightMouseDown(with: event(.rightMouseDown, flags: .command))
         view.rightMouseUp(with: event(.rightMouseUp, flags: .command))
         precondition(opened.map(\.0) == ["outputs/result.png"])
@@ -222,6 +269,7 @@ struct LinkSmoke {
         let directoryPrefix = "结果目录：" + directoryLabel + " ("
         let directoryColumn = 10 + directoryLabel.count + 2
         resetTerminal(directoryPrefix + "\u{1b}[32m" + directoryPath + "\u{1b}[0m)\r\n", columns: 100)
+        view.mouseMoved(with: event(.mouseMoved, col: directoryColumn + 3))
         precondition(view.link(at: event(.leftMouseDown, col: directoryColumn + 3))?.link == directoryPath,
                      "The colored extensionless result directory must be detected")
         view.mouseDown(with: event(.leftMouseDown, col: directoryColumn + 3))
@@ -320,6 +368,13 @@ struct LinkSmoke {
         resetTerminal(selectedPath + "\r\noutputs/pointer.png")
         terminal.feed(text: "\u{1b}[?1000h\u{1b}[?1006h")
         select(toCol: selectedPath.count, flags: .shift)
+        view.mouseDown(with: event(.leftMouseDown, row: 1, flags: .command))
+        view.mouseUp(with: event(.leftMouseUp, row: 1, flags: .command))
+        precondition(browsed.map(\.0) == [selectedPath] && opened.isEmpty,
+                     "Selected paths must override a different pointer path for Command-click browsing")
+        precondition(recorder.sent.isEmpty,
+                     "Selection-priority browsing must remain entirely local")
+        browsed.removeAll()
         commandRightClick(row: 1)
         precondition(opened.map(\.0) == [selectedPath])
         precondition(recorder.sent.isEmpty, "Selected-file gestures must not leak mouse events to tmux")
@@ -395,12 +450,21 @@ struct LinkSmoke {
         precondition(!view.selectionActive && recorder.sent.count == 3,
                      "Remote mouse tracking must not start a local selection")
         recorder.sent.removeAll()
+        view.rightMouseDown(with: event(.rightMouseDown, row: 0, col: 0))
+        view.rightMouseDragged(with: event(.rightMouseDragged, row: 2, col: 1))
+        view.rightMouseUp(with: event(.rightMouseUp, row: 2, col: 1))
+        precondition(recorder.sent.count == 3
+                        && recorder.sent[0].contains("[<2;")
+                        && recorder.sent[1].contains("[<34;")
+                        && recorder.sent[2].contains("[<2;") && recorder.sent[2].hasSuffix("m"),
+                     "Right-button tracking must preserve press, drag, and release")
+        recorder.sent.removeAll()
         view.mouseDown(with: event(.leftMouseDown, row: 0, col: 0, flags: .shift))
         view.mouseDragged(with: event(.leftMouseDragged, row: 3, col: 1, flags: .shift))
         view.mouseUp(with: event(.leftMouseUp, row: 3, col: 1, flags: .shift))
         precondition(view.getSelection() == json && recorder.sent.isEmpty,
                      "Shift bypass must retain the complete local selection without reporting mouse events")
-        print("Link UI smoke passed: left-click file and folder browsing, selection-first downloads, wrapped paths, URLs, OSC 8, and tmux mouse reporting.")
+        print("Link UI smoke passed: file browsing, selection-first downloads, wrapped paths, URLs, and native TUI mouse priority.")
     }
 }
 

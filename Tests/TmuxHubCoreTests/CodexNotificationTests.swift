@@ -25,6 +25,42 @@ struct CodexNotificationTests {
         ).timestamp == event.timestamp)
     }
 
+    @Test("Herdr status events retain safe routing metadata and reject mixed routes")
+    func herdrEventValidation() throws {
+        let event = herdr(sequence: 1, status: "blocked")
+        let feed = CodexNotificationFeed(
+            sourceID: sourceID, events: [event], latestSequence: 1, hasMore: false
+        )
+        let decoded = try CodexNotificationFeed.decode(encode(feed), after: 0, limit: 100)
+        #expect(decoded.events == [event])
+        #expect(try HerdrNotificationRoute(event: event).sessionReference == .init(
+            sessionName: "research.lab",
+            socketPath: "/home/user/.config/herdr/sessions/research.lab/herdr.sock"
+        ))
+        for status in ["", "finished", "blocked\nnext"] {
+            let invalid = CodexNotificationFeed(
+                sourceID: sourceID, events: [herdr(sequence: 1, status: status)],
+                latestSequence: 1, hasMore: false
+            )
+            #expect(throws: CodexNotificationError.invalidResponse) {
+                try CodexNotificationFeed.decode(encode(invalid), after: 0, limit: 100)
+            }
+        }
+        let mixed = CodexNotificationEvent(
+            id: event.id, sourceID: sourceID, kind: .herdrAgentStateChanged,
+            sessionID: event.sessionID, cwd: "", hostname: "host", sequence: 1,
+            timestamp: event.timestamp, tmuxSession: "wrong", herdrSession: event.herdrSession,
+            herdrSocket: event.herdrSocket, herdrPane: event.herdrPane,
+            herdrWorkspace: event.herdrWorkspace, herdrAgent: event.herdrAgent,
+            herdrStatus: event.herdrStatus
+        )
+        #expect(throws: CodexNotificationError.invalidResponse) {
+            try CodexNotificationFeed.decode(encode(.init(
+                sourceID: sourceID, events: [mixed], latestSequence: 1, hasMore: false
+            )), after: 0, limit: 100)
+        }
+    }
+
     @Test("feed pages preserve the global cursor and source reset signal")
     func feedPages() throws {
         let page = CodexNotificationFeed(sourceID: sourceID, events: [sample(sequence: 11)], latestSequence: 30, hasMore: true)
@@ -110,6 +146,9 @@ struct CodexNotificationTests {
         #expect(local.executable == "/usr/bin/env")
         #expect(local.arguments.first == "python3")
         #expect(!CodexNotificationBridge.helperSource.contains("dangerously-bypass"))
+        let herdr = try CodexNotificationBridge.installHerdrCommand(destination: "research@hpc3")
+        #expect(herdr.arguments.contains("research@hpc3"))
+        #expect(herdr.arguments.last?.contains("install-herdr") == true)
         for (source, ids) in [("invalid", [UUID().uuidString]), (sourceID, ["bad;command"]), (sourceID, (0..<101).map { _ in UUID().uuidString })] {
             #expect(throws: CodexNotificationError.invalidResponse) {
                 try CodexNotificationBridge.markReadCommand(destination: nil, sourceID: source, eventIDs: ids)
@@ -129,6 +168,17 @@ struct CodexNotificationTests {
         #expect(try await service.install(destination: "host") == "Review /hooks")
         #expect(try await service.read(destination: "host", after: 0) == feed)
         #expect(await runner.modes == ["host:never", "host:readOnly"])
+    }
+
+    @Test("Herdr setup is a non-replayed explicit mutation")
+    func herdrServiceRouting() async throws {
+        let receipt = "{\"sourceID\":\"\(sourceID)\",\"message\":\"Herdr ready\"}"
+        let runner = NotificationTestRunner(outputs: [
+            .init(stdout: receipt, stderr: "", exitCode: 0),
+        ])
+        let service = CodexNotificationService(remote: runner, local: runner)
+        #expect(try await service.installHerdr(destination: "host") == "Herdr ready")
+        #expect(await runner.modes == ["host:never"])
     }
 
     @Test("shared read acknowledgment uses idempotent replay and verifies source identity")
@@ -176,6 +226,18 @@ struct CodexNotificationTests {
             sequence: sequence, timestamp: Date(timeIntervalSince1970: 1_792_627_200),
             tmuxSession: "research session", tmuxSessionID: "$3", tmuxSessionCreated: 123,
             tmuxServerPID: 1234, tmuxWindow: "@2", tmuxPane: "%4", tmuxSocket: "/tmp/tmux-501/default"
+        )
+    }
+
+    private func herdr(sequence: Int, status: String) -> CodexNotificationEvent {
+        CodexNotificationEvent(
+            id: UUID().uuidString, sourceID: sourceID, kind: .herdrAgentStateChanged,
+            sessionID: "herdr:0123456789abcdef", cwd: "", hostname: "host",
+            sequence: sequence, timestamp: Date(timeIntervalSince1970: 1_792_627_200),
+            herdrSession: "research.lab",
+            herdrSocket: "/home/user/.config/herdr/sessions/research.lab/herdr.sock",
+            herdrPane: "w1:p2", herdrWorkspace: "w1", herdrAgent: "claude",
+            herdrStatus: status
         )
     }
 

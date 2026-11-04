@@ -8,6 +8,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     @Published private(set) var tabs: [TerminalTabRecord]
     @Published private(set) var tmuxConfigurationStates: [TerminalTarget: TmuxConfigurationState] = [:]
     @Published private(set) var vimPasteConfigurationStates: [TerminalTarget: VimPasteConfigurationState] = [:]
+    @Published private(set) var herdrInstallationStates: [TerminalTarget: HerdrInstallationState] = [:]
     @Published private(set) var remoteEditorInstalling: Set<String> = []
     @Published private(set) var remoteEditorMessages: [String: String] = [:]
     @Published var notificationOpenError: String?
@@ -30,7 +31,6 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
     private let managedTerminalCommands: ManagedTerminalCommandBuilder
     private let runtime: HubRuntime
     let tmuxSessionDiscovery: TmuxSessionDiscovery
-    var herdrService: HerdrService { runtime.herdrService }
     var remoteFileService: RemoteFileService { RemoteFileService(pool: runtime.sshMasterPool) }
     private let tmuxSessionController: TmuxSessionController
     private let externalTerminalLauncher = ExternalTerminalLauncher()
@@ -54,13 +54,32 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         if let encoded = defaults.string(forKey: persistenceKey),
             let restored = try? TerminalStateCodec.decode(encoded)
         {
-            let validTabs = restored.tabs.compactMap { tab -> TerminalTabRecord? in
-                guard let normalized = Self.normalizedRestoredTab(tab) else { return nil }
+            var validTabs: [TerminalTabRecord] = []
+            for tab in restored.tabs {
+                guard let normalized = Self.normalizedRestoredTab(tab) else { continue }
                 TerminalAttachmentModel.migrateDirectoryOverride(
                     target: tab.target, from: tab.sessionName,
                     to: normalized.sessionName, defaults: defaults
                 )
-                return normalized
+                if let terminal = tab.herdrReference,
+                    let session = normalized.herdrSession
+                {
+                    TerminalAttachmentModel.migrateHerdrDirectoryOverride(
+                        target: tab.target, from: terminal,
+                        to: session, defaults: defaults
+                    )
+                }
+                if let reference = normalized.herdrSession,
+                    let duplicate = validTabs.firstIndex(where: {
+                        $0.target == normalized.target && $0.herdrSession == reference
+                    })
+                {
+                    if normalized.id == restored.selectedTabID {
+                        validTabs[duplicate] = normalized
+                    }
+                } else {
+                    validTabs.append(normalized)
+                }
             }
             tabs = validTabs
             selectedTabID = validTabs.contains(where: {
@@ -70,6 +89,9 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         } else {
             tabs = []
             selectedTabID = nil
+        }
+        for target in Set(tabs.compactMap { $0.herdrSession == nil ? nil : $0.target }) {
+            ensureHerdrNotifications(for: target)
         }
     }
 
@@ -123,6 +145,15 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
 
     private func performOpenCodexNotification(_ entry: CodexNotificationEntry, token: UUID) async {
         do {
+            if entry.event.kind == .herdrAgentStateChanged {
+                let route = try HerdrNotificationRoute(event: entry.event)
+                let target = entry.destination.map { TerminalTarget.ssh(destination: $0) } ?? .local
+                try await runtime.herdrService.focus(target: target, route: route)
+                try Task.checkCancellation()
+                guard notificationOpenToken == token else { return }
+                openHerdr(target: target, reference: route.sessionReference)
+                return
+            }
             if entry.destination == nil,
                 let url = await CodexDesktopNotificationResolver.resolve(event: entry.event) {
                 try Task.checkCancellation()
@@ -221,6 +252,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         let target = TerminalTarget.ssh(destination: destination)
         if let existing = tabs.last(where: {
             $0.target == target
+                && $0.herdrSession == nil
                 && $0.herdrReference == nil
                 && allowsTmuxLifecycleMutation($0)
         }) {
@@ -233,18 +265,30 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         openSSH(destination, sessionName: stableName)
     }
 
-    func openHerdr(_ pane: HerdrPaneRecord, target: TerminalTarget, workspaceLabel: String) {
+    func openHerdr(
+        target: TerminalTarget,
+        reference: HerdrSessionReference = .init()
+    ) {
+        guard reference.isValid else { return }
+        ensureHerdrNotifications(for: target)
         if let existing = tabs.first(where: {
-            $0.target == target && $0.herdrReference == pane.reference
+            guard $0.target == target, let session = $0.herdrSession else { return false }
+            return session == reference
         }) {
             select(existing.id)
             return
         }
         let host = target.sshDestination ?? "本机"
+        let suffix = reference.sessionName.map { " · \($0)" } ?? ""
         open(
-            title: "\(host) · \(workspaceLabel) · \(pane.agent ?? pane.label)",
-            target: target, sessionName: nil, herdrReference: pane.reference
+            title: "\(host) · Herdr\(suffix)",
+            target: target, sessionName: nil, herdrSession: reference
         )
+    }
+
+    private func ensureHerdrNotifications(for target: TerminalTarget) {
+        let notifications = runtime.codexNotifications
+        Task { await notifications.ensureHerdr(destination: target.sshDestination) }
     }
 
     func hasSavedPassword(for destination: String) async throws -> Bool {
@@ -277,6 +321,20 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
             )
         } catch {
             tmuxConfigurationStates[target] = .failed(error.localizedDescription)
+        }
+    }
+
+    func installHerdr(on target: TerminalTarget) async {
+        guard herdrInstallationStates[target] != .installing else { return }
+        herdrInstallationStates[target] = .installing
+        do {
+            let result = try await runtime.herdrInstallationService.install(on: target)
+            herdrInstallationStates[target] = .installed(result)
+            if let destination = target.sshDestination { noteHostUse(destination) }
+        } catch is CancellationError {
+            herdrInstallationStates[target] = nil
+        } catch {
+            herdrInstallationStates[target] = .failed(error.localizedDescription)
         }
     }
 
@@ -399,6 +457,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
             let attachmentModel = attachments[id] ?? TerminalAttachmentModel(
                 target: tab.target, sessionName: tab.sessionName,
                 service: runtime.attachmentService, defaults: defaults,
+                herdrSession: tab.herdrSession,
                 herdrReference: tab.herdrReference,
                 notificationRoute: tab.notificationRoute
             )
@@ -593,6 +652,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         target: TerminalTarget,
         sessionName: String?,
         tmuxIdentity: TmuxSessionIdentity? = nil,
+        herdrSession: HerdrSessionReference? = nil,
         herdrReference: HerdrTerminalReference? = nil,
         tmuxLaunchMode: TmuxSessionLaunchMode = .createOrAttach,
         notificationRoute: CodexNotificationRoute? = nil
@@ -604,6 +664,7 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
             target: target,
             sessionName: sessionName,
             tmuxIdentity: tmuxIdentity,
+            herdrSession: herdrSession,
             herdrReference: herdrReference,
             tmuxLaunchMode: tmuxLaunchMode,
             notificationRoute: notificationRoute
@@ -636,6 +697,16 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         if let route = tab.notificationRoute {
             return try CodexNotificationRouting.managedAttachCommand(route: route, target: tab.target,
                 sshMasterPool: runtime.sshMasterPool)
+        }
+        if let reference = tab.herdrSession {
+            let command = try HerdrCommands.client(
+                target: tab.target,
+                reference: reference
+            )
+            if let destination = tab.target.sshDestination {
+                return try runtime.sshMasterPool.managedCommand(command, alias: destination)
+            }
+            return command
         }
         if let reference = tab.herdrReference {
             let command = try HerdrCommands.attach(target: tab.target, reference: reference)
@@ -735,8 +806,15 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
 
     private static func isValidRestoredTab(_ tab: TerminalTabRecord) -> Bool {
         if let route = tab.notificationRoute {
-            return route.isValid && tab.herdrReference == nil && tab.tmuxLaunchMode == .attachOnly
+            return route.isValid && tab.herdrSession == nil
+                && tab.herdrReference == nil && tab.tmuxLaunchMode == .attachOnly
                 && (tab.target.sshDestination.map(IdentifierValidator.isSSHDestination) ?? true)
+        }
+        if let reference = tab.herdrSession {
+            guard tab.sessionName == nil, tab.tmuxIdentity == nil,
+                tab.herdrReference == nil, tab.tmuxLaunchMode == .createOrAttach,
+                reference.isValid else { return false }
+            return tab.target.sshDestination.map(IdentifierValidator.isSSHDestination) ?? true
         }
         if let reference = tab.herdrReference {
             guard tab.sessionName == nil, tab.tmuxIdentity == nil,
@@ -758,6 +836,17 @@ final class TerminalTabsModel: ObservableObject, TerminalTabTmuxStateStoring {
         guard isValidRestoredTab(tab) else { return nil }
         var restored = tab
         if tab.notificationRoute != nil { return restored }
+        if let terminal = restored.herdrReference {
+            restored.herdrSession = HerdrSessionReference(
+                sessionName: terminal.sessionName
+            )
+            restored.herdrReference = nil
+            restored.sessionName = nil
+            restored.tmuxIdentity = nil
+            restored.tmuxLaunchMode = .createOrAttach
+            return restored
+        }
+        if restored.herdrSession != nil { return restored }
         restored.sessionName = tab.sessionName.flatMap(
             IdentifierValidator.normalizedTmuxSessionName
         )
@@ -781,7 +870,7 @@ private enum NotificationSessionOpenError: LocalizedError {
         case .desktopUnavailable:
             "无法打开 Codex 桌面应用。请确认已安装 Codex，并能打开对应对话。"
         case .missingRoute:
-            "这条通知没有记录可验证的原会话位置。请更新此来源的通知配置；新通知会记录 Codex 对话或 tmux 终端位置。旧通知若缺少这些信息，无法安全自动返回。"
+            "这条通知没有记录可验证的原会话位置。请更新此来源的通知配置；新通知会记录 Codex、tmux 或 Herdr 的原会话位置。旧通知若缺少这些信息，无法安全自动返回。"
         }
     }
 }
@@ -795,6 +884,12 @@ enum TmuxConfigurationState: Equatable {
 enum VimPasteConfigurationState: Equatable {
     case applying
     case applied(VimPasteConfigurationResult)
+    case failed(String)
+}
+
+enum HerdrInstallationState: Equatable {
+    case installing
+    case installed(HerdrInstallationResult)
     case failed(String)
 }
 

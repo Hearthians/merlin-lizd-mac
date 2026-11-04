@@ -300,11 +300,14 @@ public actor AttachmentTransferService {
 
     public func context(
         target: TerminalTarget, sessionName: String?, localDirectory: String,
+        herdrSession: HerdrSessionReference? = nil,
         herdrReference: HerdrTerminalReference? = nil,
         notificationRoute: CodexNotificationRoute? = nil
     ) async throws -> AttachmentContext {
         if let notificationRoute {
-            guard herdrReference == nil else { throw AttachmentError.contextUnavailable }
+            guard herdrSession == nil, herdrReference == nil else {
+                throw AttachmentError.contextUnavailable
+            }
             let command = try CodexNotificationRouting.contextCommand(route: notificationRoute, target: target)
             let output: InventoryProcessOutput
             if let destination = target.sshDestination {
@@ -322,6 +325,25 @@ public actor AttachmentTransferService {
             return try AttachmentPaths.parseContext(
                 output.stdout, target: target, sessionName: notificationRoute.sessionID,
                 sshEndpoint: notificationRoute.sshEndpoint
+            )
+        }
+        if let herdrSession {
+            guard sessionName == nil, herdrReference == nil else {
+                throw AttachmentError.contextUnavailable
+            }
+            let pane = try await herdr.focusedPane(
+                target: target,
+                reference: herdrSession
+            )
+            guard let directory = pane.workingDirectory else {
+                throw AttachmentError.contextUnavailable
+            }
+            try AttachmentPaths.validate(directory)
+            return AttachmentContext(
+                target: target, sessionName: nil, paneID: pane.paneID,
+                processName: pane.agent, workingDirectory: directory,
+                herdrReference: pane.reference,
+                herdrOccupantID: pane.occupantID
             )
         }
         if let herdrReference {

@@ -1,6 +1,6 @@
-# Codex notifications
+# Agent notifications (Codex and Herdr)
 
-Open **Codex 通知** in the sidebar. Select the local machine or an SSH host and
+Open **Agent 通知** in the sidebar. Select the local machine or an SSH host and
 choose **配置并启用**. This installs a small Python 3 recorder on the machine where
 Codex runs, and merges its `Stop`, `PermissionRequest`, and `UserPromptSubmit`
 hooks into the user-level Codex `hooks.json`. Existing hooks are retained and a
@@ -12,6 +12,14 @@ Codex's `/hooks` command, then start a new session. Installation does not bypass
 Codex's trust review or change any approval decision. If hooks are disabled,
 run `codex features enable hooks` on that machine. The page distinguishes a
 successful connection from actually receiving the first event.
+
+Opening a full Herdr client automatically links the same private recorder as a
+Herdr `pane.agent_status_changed` plugin. A blocked agent creates an actionable
+alert; a completed agent creates a completion alert. Returning to work, becoming
+idle, or another non-actionable state resolves the previous alert without adding
+noise to the history. This does not change Herdr's `ui.toast` setting or replace
+Herdr's own in-client status UI. Reopen Herdr after updating TmuxHub to refresh
+the linked recorder.
 
 Choose **开启系统通知** separately on each Mac to request macOS notification
 permission. Notification history and unread indicators work without that
@@ -43,11 +51,13 @@ for a system alert. The local history retains
 the latest 300 entries. Pausing or removing a source affects only that device.
 
 The feed stores event IDs, time, host, working directory, Codex session/turn IDs,
-and tmux routing metadata. It does not store prompts, tool arguments,
-transcripts, or assistant output. Files live under
+tmux routing metadata, and (for Herdr) the exact socket, pane, workspace, agent
+label, and status. It does not store prompts, tool arguments, transcripts,
+terminal contents, or assistant output. Files live under
 `~/.local/share/tmuxhub/codex-notifications/`, with private directory/file
 permissions. SSH uses the existing TmuxHub connection pool; no incoming network
-port or third-party notification service is needed.
+port or third-party notification service is needed. The legacy directory name is
+retained so existing histories and read receipts keep working.
 
 ## Returning to a session
 
@@ -78,7 +88,13 @@ Plain shells without tmux and notifications from unsupported compute-node
 routes may still have no return destination. An unavailable original session
 is reported without opening a different machine's pane.
 
-Official interface: [Codex hooks](https://learn.chatgpt.com/docs/hooks).
+For Herdr, opening a notification uses the recorded socket and pane rather than
+guessing from a workspace name. TmuxHub asks Herdr to focus that pane, then
+reuses or opens the matching full-client tab. If that server or pane no longer
+exists, Herdr reports the failure instead of opening an unrelated session.
+
+Official interfaces: [Codex hooks](https://learn.chatgpt.com/docs/hooks) and
+[Herdr plugins](https://herdr.dev/docs/plugins/).
 
 ## Development checks
 

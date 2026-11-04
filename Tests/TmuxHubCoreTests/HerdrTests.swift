@@ -2,14 +2,15 @@ import Foundation
 import Testing
 @testable import TmuxHubCore
 
-@Suite("Herdr discovery and stable terminal binding")
+@Suite("Herdr client and focused-pane integration")
 struct HerdrTests {
     private static let sessions = #"{"sessions":[{"default":true,"name":"default","running":true},{"default":false,"name":"research.lab","running":true},{"default":false,"name":"stopped","running":false}]}"#
 
     private func snapshot(
         terminalID: String = "term_123", paneID: String = "w1:p1", workspaceID: String = "w1",
         cwd: String? = "/home/user/project", foregroundCwd: String? = "/home/user/project/subdirectory",
-        agentSession: [String: String]? = nil
+        agentSession: [String: String]? = nil,
+        focusedPaneID: String? = "w9:p9"
     ) throws -> String {
         var pane: [String: Any] = [
             "terminal_id": terminalID, "pane_id": paneID, "workspace_id": workspaceID,
@@ -19,13 +20,12 @@ struct HerdrTests {
         if let cwd { pane["cwd"] = cwd }
         if let foregroundCwd { pane["foreground_cwd"] = foregroundCwd }
         if let agentSession { pane["agent_session"] = agentSession }
-        let object: [String: Any] = [
-            "result": ["snapshot": [
-                "focused_pane_id": "w9:p9",
-                "workspaces": [["workspace_id": workspaceID, "label": "Research"]],
-                "panes": [pane],
-            ]]
+        var snapshot: [String: Any] = [
+            "workspaces": [["workspace_id": workspaceID, "label": "Research"]],
+            "panes": [pane],
         ]
+        if let focusedPaneID { snapshot["focused_pane_id"] = focusedPaneID }
+        let object: [String: Any] = ["result": ["snapshot": snapshot]]
         return String(decoding: try JSONSerialization.data(withJSONObject: object), as: UTF8.self)
     }
 
@@ -132,8 +132,51 @@ struct HerdrTests {
         }
         for name in ["--session", "research'lab", "$(false)", "one\ntwo"] {
             #expect(!HerdrTerminalReference(sessionName: name, terminalID: "term_123").isValid)
+            #expect(!HerdrSessionReference(sessionName: name).isValid)
+            #expect(throws: HerdrError.invalidIdentifier) {
+                try HerdrCommands.client(
+                    target: .ssh(destination: "cis-lab"),
+                    reference: .init(sessionName: name)
+                )
+            }
+        }
+        for socket in ["relative/herdr.sock", "/tmp/herdr\nnext.sock", "/tmp/herdr\u{1b}.sock"] {
+            #expect(!HerdrSessionReference(socketPath: socket).isValid)
         }
         #expect(HerdrTerminalReference(sessionName: "research.lab", terminalID: "term_123").isValid)
+    }
+
+    @Test("notification routes focus the exact Herdr socket without shell interpolation")
+    func notificationRoute() async throws {
+        let event = CodexNotificationEvent(
+            id: UUID().uuidString, sourceID: UUID().uuidString,
+            kind: .herdrAgentStateChanged, sessionID: "herdr:route", cwd: "",
+            hostname: "host", sequence: 1, timestamp: Date(),
+            herdrSession: "research.lab",
+            herdrSocket: "/home/user/.config/herdr/sessions/research.lab/herdr.sock",
+            herdrPane: "w1:p2", herdrWorkspace: "w1", herdrAgent: "codex",
+            herdrStatus: "blocked"
+        )
+        let route = try HerdrNotificationRoute(event: event)
+        let remote = try HerdrCommands.focus(target: .ssh(destination: "cis-lab"), route: route)
+        #expect(remote.arguments.contains("-nT"))
+        #expect(remote.arguments.last?.contains("HERDR_SOCKET_PATH") == true)
+        #expect(remote.arguments.last?.contains("agent") == true)
+        #expect(remote.arguments.last?.contains("focus") == true)
+        #expect(remote.arguments.last?.contains("w1:p2") == true)
+        let snapshot = try HerdrCommands.snapshot(
+            target: .ssh(destination: "cis-lab"), reference: route.sessionReference
+        )
+        #expect(snapshot.arguments.last?.contains("HERDR_SOCKET_PATH") == true)
+        #expect(snapshot.arguments.last?.contains(route.socketPath) == true)
+
+        let runner = HerdrFixtureRunner(outputs: [
+            .init(stdout: "{}", stderr: "", exitCode: 0),
+        ])
+        let service = HerdrService(processRunner: runner)
+        try await service.focus(target: .ssh(destination: "cis-lab"), route: route)
+        let command = try #require(await runner.commands().first)
+        #expect(command == remote)
     }
 
     @Test("remote attach uses official terminal attach without takeover or lifecycle changes")
@@ -159,6 +202,23 @@ struct HerdrTests {
             try HerdrCommands.attach(
                 target: .ssh(destination: "-oProxyCommand=bad"), reference: .init(terminalID: "term_123")
             )
+        }
+    }
+
+    @Test("full client attach leaves workspace and pane management to Herdr")
+    func clientCommand() throws {
+        let remote = try HerdrCommands.client(
+            target: .ssh(destination: "cis-lab"),
+            reference: .init(sessionName: "research.lab")
+        )
+        #expect(remote.executable == "/usr/bin/ssh")
+        #expect(remote.arguments.first == "-tt")
+        #expect(remote.arguments[remote.arguments.count - 2] == "cis-lab")
+        let script = remote.arguments.last!
+        #expect(script.contains("--session"))
+        #expect(script.contains("research.lab"))
+        for prohibited in ["terminal attach", "--takeover", "tmux", "server stop"] {
+            #expect(!script.contains(prohibited))
         }
     }
 
@@ -225,26 +285,31 @@ struct HerdrTests {
         }
     }
 
-    @Test("legacy tab state remains readable and Herdr references round trip")
+    @Test("legacy tab state remains readable and Herdr client sessions round trip")
     func persistenceCompatibility() throws {
         let legacy = #"{"selectedTabID":"old-tab","tabs":[{"id":"old-tab","title":"Existing terminal","target":{"ssh":{"destination":"cis-lab"}},"sessionName":"existing-session"}]}"#
         let decoded = try TerminalStateCodec.decode(legacy)
         #expect(decoded.tabs.count == 1)
+        #expect(decoded.tabs[0].herdrSession == nil)
         #expect(decoded.tabs[0].herdrReference == nil)
         #expect(decoded.tabs[0].sessionName == "existing-session")
         #expect(decoded.tabs[0].target == .ssh(destination: "cis-lab"))
 
         let state = TerminalState(selectedTabID: "named", tabs: [
             .init(id: "default", title: "Research", target: .ssh(destination: "cis-lab"),
-                  sessionName: nil, herdrReference: .init(terminalID: "term_default")),
+                  sessionName: nil, herdrSession: .init()),
             .init(id: "named", title: "Review", target: .ssh(destination: "cis-lab"),
-                  sessionName: nil, herdrReference: .init(sessionName: "research.lab", terminalID: "term_named")),
+                  sessionName: nil, herdrSession: .init(
+                    sessionName: "research.lab",
+                    socketPath: "/home/user/.config/herdr/sessions/research.lab/herdr.sock"
+                  )),
         ])
         let restored = try TerminalStateCodec.decode(TerminalStateCodec.encode(state))
         #expect(restored == state)
-        #expect(restored.tabs[0].herdrReference?.sessionName == nil)
-        #expect(restored.tabs[1].herdrReference?.sessionName == "research.lab")
-        #expect(restored.tabs.allSatisfy { $0.herdrReference?.isValid == true })
+        #expect(restored.tabs[0].herdrSession?.sessionName == nil)
+        #expect(restored.tabs[1].herdrSession?.sessionName == "research.lab")
+        #expect(restored.tabs[1].herdrSession?.socketPath == "/home/user/.config/herdr/sessions/research.lab/herdr.sock")
+        #expect(restored.tabs.allSatisfy { $0.herdrSession?.isValid == true })
     }
 
     @Test("attachment context uses the selected Herdr terminal and its foreground directory")
@@ -268,6 +333,61 @@ struct HerdrTests {
         #expect(commands.count == 1)
         #expect(!commands[0].arguments.last!.contains("tmux"))
         #expect(commands[0].arguments.last!.contains("research.lab"))
+    }
+
+    @Test("full Herdr client paste follows the currently focused pane")
+    func focusedClientAttachmentContext() async throws {
+        let fixture = try snapshot(
+            paneID: "w2:p9", workspaceID: "w2",
+            agentSession: [
+                "source": "herdr:codex", "agent": "codex",
+                "kind": "id", "value": "agent-session-1",
+            ],
+            focusedPaneID: "w2:p9"
+        )
+        let runner = HerdrFixtureRunner(outputs: [
+            .init(stdout: fixture, stderr: "", exitCode: 0)
+        ])
+        let service = AttachmentTransferService(
+            sshMasterPool: SSHMasterPool(),
+            herdrService: HerdrService(processRunner: runner)
+        )
+        let session = HerdrSessionReference(sessionName: "research.lab")
+        let context = try await service.context(
+            target: .ssh(destination: "cis-lab"), sessionName: nil,
+            localDirectory: "/must-not-be-used", herdrSession: session
+        )
+        #expect(context.workingDirectory == "/home/user/project/subdirectory")
+        #expect(context.herdrReference == HerdrTerminalReference(
+            sessionName: "research.lab", terminalID: "term_123"
+        ))
+        #expect(context.paneID == "w2:p9")
+        #expect(context.herdrOccupantID != nil)
+        let commands = await runner.commands()
+        #expect(commands.count == 1)
+        #expect(commands[0].arguments.last!.contains("api"))
+        #expect(commands[0].arguments.last!.contains("snapshot"))
+        #expect(commands[0].arguments.last!.contains("research.lab"))
+    }
+
+    @Test("full Herdr client paste refuses a snapshot without a focused pane")
+    func focusedClientMissingPane() async throws {
+        let runner = HerdrFixtureRunner(outputs: [
+            .init(
+                stdout: try snapshot(focusedPaneID: nil),
+                stderr: "", exitCode: 0
+            )
+        ])
+        let service = AttachmentTransferService(
+            sshMasterPool: SSHMasterPool(),
+            herdrService: HerdrService(processRunner: runner)
+        )
+        await #expect(throws: HerdrError.terminalUnavailable) {
+            try await service.context(
+                target: .ssh(destination: "cis-lab"), sessionName: nil,
+                localDirectory: "/unused", herdrSession: .init()
+            )
+        }
     }
 
     @Test("stale Herdr attachment targets fail without falling back to another context")

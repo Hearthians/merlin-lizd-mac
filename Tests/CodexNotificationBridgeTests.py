@@ -70,6 +70,55 @@ def main():
             scope['subprocess'].run = real_run
             scope['shutil'].which = lambda _: None
 
+        # Herdr installs an idempotent plugin hook and records only bounded
+        # routing/status metadata in an independent durable feed.
+        original_root = scope['ROOT']
+        herdr_root = Path(temporary) / 'herdr-feed'
+        scope['ROOT'] = str(herdr_root)
+        actual_find_herdr = scope['find_herdr']
+        previous_environment = {}
+        try:
+            scope['find_herdr'] = lambda: '/test/herdr'
+            scope['subprocess'].run = lambda argv, **kwargs: SimpleNamespace(returncode=0, stdout=b'{}', stderr=b'')
+            herdr_receipt = scope['install_herdr'](source.encode())
+            assert 'Herdr Agent' in herdr_receipt['message']
+            manifest = (herdr_root / 'herdr-plugin' / 'herdr-plugin.toml').read_text()
+            assert 'pane.agent_status_changed' in manifest and 'herdr-event' in manifest
+            event_environment = {
+                'HERDR_SOCKET_PATH': '/tmp/config/herdr/sessions/research/herdr.sock',
+                'HERDR_PLUGIN_EVENT_JSON': json.dumps({
+                    'event': 'pane_agent_status_changed',
+                    'data': {'pane_id': 'w1:p2', 'workspace_id': 'w1',
+                             'agent_status': 'blocked', 'agent': 'claude',
+                             'display_agent': 'secret task summary',
+                             'title': 'secret terminal title'},
+                }),
+            }
+            previous_environment = {key: os.environ.get(key) for key in event_environment}
+            os.environ.update(event_environment)
+            scope['emit_herdr']()
+            recorded = scope['read_feed'](0, 100)['events']
+            assert len(recorded) == 1
+            assert recorded[0]['kind'] == 'herdrAgentStateChanged'
+            assert recorded[0]['herdrSession'] == 'research'
+            assert recorded[0]['herdrSocket'] == event_environment['HERDR_SOCKET_PATH']
+            assert recorded[0]['herdrPane'] == 'w1:p2'
+            assert recorded[0]['herdrWorkspace'] == 'w1'
+            assert recorded[0]['herdrAgent'] == 'claude'
+            assert recorded[0]['herdrStatus'] == 'blocked'
+            serialized = json.dumps(recorded[0])
+            assert 'HERDR_PLUGIN_EVENT_JSON' not in serialized
+            assert 'secret task summary' not in serialized and 'secret terminal title' not in serialized
+        finally:
+            scope['ROOT'] = original_root
+            scope['find_herdr'] = actual_find_herdr
+            scope['subprocess'].run = real_run
+            for key, value in previous_environment.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
         environment = {key: value for key, value in os.environ.items() if key not in ('TMUX', 'TMUX_PANE')}
         def send(index, event='Stop'):
             payload = {'hook_event_name': event, 'session_id': 'session-1', 'turn_id': f'turn-{index}',

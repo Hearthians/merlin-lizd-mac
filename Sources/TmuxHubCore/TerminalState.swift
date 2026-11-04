@@ -21,12 +21,14 @@ public struct TerminalTabRecord: Codable, Equatable, Hashable, Identifiable, Sen
     public let target: TerminalTarget
     public var sessionName: String?
     public var tmuxIdentity: TmuxSessionIdentity?
+    public var herdrSession: HerdrSessionReference?
     public var herdrReference: HerdrTerminalReference?
     public var tmuxLaunchMode: TmuxSessionLaunchMode
     public var notificationRoute: CodexNotificationRoute?
 
     public var allowsTmuxLifecycleMutation: Bool {
-        tmuxLaunchMode == .createOrAttach
+        herdrSession == nil && herdrReference == nil
+            && tmuxLaunchMode == .createOrAttach
     }
 
     public init(
@@ -35,6 +37,7 @@ public struct TerminalTabRecord: Codable, Equatable, Hashable, Identifiable, Sen
         target: TerminalTarget,
         sessionName: String?,
         tmuxIdentity: TmuxSessionIdentity? = nil,
+        herdrSession: HerdrSessionReference? = nil,
         herdrReference: HerdrTerminalReference? = nil,
         tmuxLaunchMode: TmuxSessionLaunchMode = .createOrAttach,
         notificationRoute: CodexNotificationRoute? = nil
@@ -44,6 +47,7 @@ public struct TerminalTabRecord: Codable, Equatable, Hashable, Identifiable, Sen
         self.target = target
         self.sessionName = sessionName
         self.tmuxIdentity = tmuxIdentity
+        self.herdrSession = herdrSession
         self.herdrReference = herdrReference
         self.tmuxLaunchMode = tmuxLaunchMode
         self.notificationRoute = notificationRoute
@@ -55,6 +59,7 @@ public struct TerminalTabRecord: Codable, Equatable, Hashable, Identifiable, Sen
         case target
         case sessionName
         case tmuxIdentity
+        case herdrSession
         case herdrReference
         case tmuxLaunchMode
         case notificationRoute
@@ -69,6 +74,10 @@ public struct TerminalTabRecord: Codable, Equatable, Hashable, Identifiable, Sen
         tmuxIdentity = try container.decodeIfPresent(
             TmuxSessionIdentity.self,
             forKey: .tmuxIdentity
+        )
+        herdrSession = try container.decodeIfPresent(
+            HerdrSessionReference.self,
+            forKey: .herdrSession
         )
         herdrReference = try container.decodeIfPresent(
             HerdrTerminalReference.self,
@@ -88,6 +97,7 @@ public struct TerminalTabRecord: Codable, Equatable, Hashable, Identifiable, Sen
         try container.encode(target, forKey: .target)
         try container.encodeIfPresent(sessionName, forKey: .sessionName)
         try container.encodeIfPresent(tmuxIdentity, forKey: .tmuxIdentity)
+        try container.encodeIfPresent(herdrSession, forKey: .herdrSession)
         try container.encodeIfPresent(herdrReference, forKey: .herdrReference)
         try container.encode(tmuxLaunchMode, forKey: .tmuxLaunchMode)
         try container.encodeIfPresent(notificationRoute, forKey: .notificationRoute)

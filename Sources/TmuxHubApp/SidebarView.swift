@@ -10,7 +10,7 @@ struct SidebarView: View {
     let onAddHost: () -> Void
     let onShowProperties: (SidebarSelection) -> Void
     let onBrowseSessions: (TerminalTarget) -> Void
-    let onBrowseHerdr: (TerminalTarget) -> Void
+    let onOpenHerdr: (TerminalTarget) -> Void
 
     @State private var searchText = ""
 
@@ -49,7 +49,7 @@ struct SidebarView: View {
                 )
                 HStack {
                     sidebarRow(
-                        title: "Codex 通知",
+                        title: "Agent 通知",
                         symbol: "bell",
                         tint: .indigo,
                         selection: .notifications
@@ -75,7 +75,7 @@ struct SidebarView: View {
                 }
                 .tag(SidebarSelection.local)
                 .contextMenu {
-                    Button("Herdr 工作区") { onBrowseHerdr(.local) }
+                    Button("打开 Herdr") { onOpenHerdr(.local) }
                     Button("查看 tmux 会话") { onBrowseSessions(.local) }
                     Button("登录 Shell") { terminals.openLocalShell() }
                 }
@@ -206,8 +206,8 @@ struct SidebarView: View {
             Button("连接或继续", systemImage: "terminal") {
                 terminals.openOrResumeSSH(host.destination)
             }
-            Button("Herdr 工作区") {
-                onBrowseHerdr(.ssh(destination: host.destination))
+            Button("打开 Herdr") {
+                onOpenHerdr(.ssh(destination: host.destination))
             }
             Button("查看 tmux 会话") {
                 onBrowseSessions(.ssh(destination: host.destination))
@@ -242,15 +242,15 @@ struct SidebarView: View {
 
     private func herdrButton(for target: TerminalTarget) -> some View {
         Button {
-            onBrowseHerdr(target)
+            onOpenHerdr(target)
         } label: {
             Image(systemName: "square.stack.3d.up")
                 .foregroundStyle(.secondary)
                 .frame(width: 24, height: 26)
         }
         .buttonStyle(.borderless)
-        .help("浏览 Herdr 工作区")
-        .accessibilityLabel("浏览 Herdr 工作区")
+        .help("打开 Herdr")
+        .accessibilityLabel("打开 Herdr")
     }
 
     private func hostSectionHeader(

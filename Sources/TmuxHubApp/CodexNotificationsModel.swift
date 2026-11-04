@@ -5,11 +5,18 @@ import TmuxHubCore
 
 protocol CodexNotificationClient: Sendable {
     func install(destination: String?) async throws -> String
+    func installHerdr(destination: String?) async throws -> String
     func read(destination: String?, after: Int, limit: Int) async throws -> CodexNotificationFeed
     func markRead(destination: String?, sourceID: String, eventIDs: [String]) async throws
 }
 
 extension CodexNotificationService: CodexNotificationClient {}
+
+extension CodexNotificationClient {
+    func installHerdr(destination: String?) async throws -> String {
+        try await install(destination: destination)
+    }
+}
 
 struct CodexNotificationSource: Codable, Identifiable, Equatable {
     var id: UUID
@@ -36,12 +43,21 @@ struct CodexNotificationEntry: Codable, Identifiable, Equatable {
         case .turnCompleted: "Codex 已完成"
         case .approvalRequested: "Codex 需要确认"
         case .turnStarted: "Codex 已继续"
+        case .herdrAgentStateChanged:
+            event.herdrStatus == "blocked" ? "Herdr Agent 需要处理" : "Herdr Agent 已完成"
         }
     }
     var message: String {
-        event.kind == .approvalRequested
-            ? "有一项操作等待确认。点击返回对应会话。"
-            : "任务已完成。点击返回对应会话。"
+        switch event.kind {
+        case .approvalRequested:
+            "有一项操作等待确认。点击返回对应会话。"
+        case .herdrAgentStateChanged where event.herdrStatus == "blocked":
+            "Agent 正在等待输入或确认。点击返回对应 Herdr pane。"
+        case .herdrAgentStateChanged:
+            "Agent 任务已完成。点击返回对应 Herdr pane。"
+        default:
+            "任务已完成。点击返回对应会话。"
+        }
     }
     static func key(_ source: String, _ value: String) -> String {
         // Length prefix avoids collisions even when an upstream identifier contains punctuation.
@@ -112,7 +128,8 @@ final class CodexNativeNotifications: NSObject, CodexNotificationDelivering, UNU
         }
         let content = UNMutableNotificationContent()
         content.title = entry.title
-        content.subtitle = [entry.sourceLabel, entry.event.tmuxSession].compactMap { $0 }.joined(separator: " · ")
+        content.subtitle = [entry.sourceLabel, entry.event.herdrAgent,
+                            entry.event.tmuxSession].compactMap { $0 }.joined(separator: " · ")
         content.body = entry.message
         content.sound = .default
         content.threadIdentifier = entry.sessionKey
@@ -225,6 +242,8 @@ final class CodexNotificationsModel: ObservableObject {
     private var periodicTask: Task<Void, Never>?
     private var deliveryTask: Task<Void, Never>?
     private var receiptTasks: [String: Task<Void, Never>] = [:]
+    private var herdrSetupTasks: [String: Task<Void, Never>] = [:]
+    private var herdrConfiguredDestinations = Set<String>()
     private var wakeObserver: NSObjectProtocol?
     private var shuttingDown = false
     private var pendingOpenID: String?
@@ -253,6 +272,8 @@ final class CodexNotificationsModel: ObservableObject {
         restored.entries = Array(restored.entries.filter {
             $0.id == CodexNotificationEntry.key($0.event.sourceID, $0.event.id)
                 && $0.event.kind != .turnStarted && $0.event.sequence > 0
+                && ($0.event.kind != .herdrAgentStateChanged
+                    || ["blocked", "done"].contains($0.event.herdrStatus ?? ""))
                 && $0.event.timestamp.timeIntervalSince1970.isFinite
                 && $0.receivedAt.timeIntervalSince1970.isFinite
                 && Self.validDestination($0.destination) && entryIDs.insert($0.id).inserted
@@ -301,6 +322,54 @@ final class CodexNotificationsModel: ObservableObject {
         try commit(next)
         try await run(id: id, install: true)
         return id
+    }
+
+    /// Opening Herdr enables its durable event hook without touching Codex
+    /// hook trust. A source the user explicitly paused remains paused.
+    func ensureHerdr(destination: String?) async {
+        guard !shuttingDown else { return }
+        let destination = destination?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard Self.validDestination(destination) else { return }
+        let key = destination ?? ""
+        guard !herdrConfiguredDestinations.contains(key) else { return }
+        if let current = herdrSetupTasks[key] {
+            await current.value
+            return
+        }
+        let task = Task { @MainActor [weak self] in
+            guard let self, !self.shuttingDown else { return }
+            do {
+                var next = self.saved
+                let sourceID: UUID
+                if let source = next.sources.first(where: { $0.destination == destination }) {
+                    sourceID = source.id
+                } else {
+                    guard next.sources.count < 100 else { throw CodexNotificationsError.capacity }
+                    sourceID = UUID()
+                    next.sources.append(.init(id: sourceID, destination: destination,
+                                              sourceID: nil, enabled: true))
+                    try self.commit(next)
+                }
+                try await self.permits.acquire()
+                do {
+                    self.notice = try await self.service.installHerdr(destination: destination)
+                    await self.permits.release()
+                } catch {
+                    await self.permits.release()
+                    throw error
+                }
+                self.herdrConfiguredDestinations.insert(key)
+                if self.sources.first(where: { $0.id == sourceID })?.enabled == true {
+                    await self.refresh(id: sourceID)
+                }
+            } catch is CancellationError {
+            } catch {
+                self.notice = "Herdr 通知接入失败：\(Self.safeError(error))"
+            }
+        }
+        herdrSetupTasks[key] = task
+        await task.value
+        herdrSetupTasks.removeValue(forKey: key)
     }
 
     func setSourceEnabled(id: UUID, enabled: Bool) async {
@@ -435,7 +504,9 @@ final class CodexNotificationsModel: ObservableObject {
         shuttingDown = true
         startupTask?.cancel(); periodicTask?.cancel(); refreshTask?.1.cancel(); deliveryTask?.cancel()
         let pendingReceipts = Array(receiptTasks.values)
+        let pendingHerdrSetups = Array(herdrSetupTasks.values)
         for task in pendingReceipts { task.cancel() }
+        for task in pendingHerdrSetups { task.cancel() }
         if let wakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver) }
         wakeObserver = nil
         let pending = operations.values.map(\.task)
@@ -443,7 +514,10 @@ final class CodexNotificationsModel: ObservableObject {
         for task in pending { _ = await task.result }
         await deliveryTask?.value
         for task in pendingReceipts { await task.value }
+        for task in pendingHerdrSetups { await task.value }
         operations.removeAll(); busySourceIDs.removeAll(); isRefreshing = false
+        herdrSetupTasks.removeAll()
+        herdrConfiguredDestinations.removeAll()
     }
 
     private func run(id: UUID, install: Bool) async throws {
@@ -577,7 +651,20 @@ final class CodexNotificationsModel: ObservableObject {
                     removedNotifications.append(next.entries[index].id)
                 }
             }
-            if event.kind != .turnStarted {
+            if event.kind == .herdrAgentStateChanged,
+                !["blocked", "done"].contains(event.herdrStatus ?? "") {
+                for index in next.entries.indices where next.entries[index].sessionKey == sessionKey
+                    && next.entries[index].event.kind == .herdrAgentStateChanged
+                    && !next.entries[index].isResolved {
+                    next.entries[index].isResolved = true
+                    next.entries[index].notificationHandled = true
+                    removedNotifications.append(next.entries[index].id)
+                }
+            }
+            let isDisplayEvent = event.kind != .turnStarted
+                && (event.kind != .herdrAgentStateChanged
+                    || ["blocked", "done"].contains(event.herdrStatus ?? ""))
+            if isDisplayEvent {
                 let id = CodexNotificationEntry.key(event.sourceID, event.id)
                 if !next.entries.contains(where: { $0.id == id }) {
                     next.entries.append(.init(

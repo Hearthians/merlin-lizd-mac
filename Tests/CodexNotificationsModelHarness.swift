@@ -16,7 +16,8 @@ struct CodexNotificationsModelHarness {
         try await offlineReadReceiptSurvivesRestart()
         try await concurrentReadsUnionWithoutReadingFutureEvents()
         try await readReceiptsTryAnotherAlias()
-        print("Codex notifications model: 11 lifecycle checks passed.")
+        try await herdrLifecycleAndAutomaticSetup()
+        print("Agent notifications model: 12 lifecycle checks passed.")
     }
 
     @MainActor private static func baselineAliasesAndRestart() async throws {
@@ -266,9 +267,53 @@ struct CodexNotificationsModelHarness {
         }
     }
 
+    @MainActor private static func herdrLifecycleAndAutomaticSetup() async throws {
+        try await fixture { model, client, native, _ in
+            await model.ensureHerdr(destination: "hpc3")
+            await model.ensureHerdr(destination: "hpc3")
+            let installCount = await client.installCount
+            try expect(model.sources.count == 1 && installCount == 1,
+                       "Opening Herdr must add its source and configure the plugin once per launch.")
+            await model.enableSystemNotifications()
+            await client.set(events: [herdrEvent(1, status: "blocked")])
+            await model.refreshAll()
+            let blocked = try require(model.entries.first)
+            try expect(model.unreadCount == 1 && blocked.title.contains("需要处理")
+                       && native.active.contains(blocked.id),
+                       "A blocked Herdr agent must create one actionable alert.")
+            await client.set(events: [
+                herdrEvent(1, status: "blocked"),
+                herdrEvent(2, status: "working"),
+            ])
+            await model.refreshAll()
+            try expect(blocked.id == model.entries.first?.id && model.entries.first?.isResolved == true
+                       && native.active.isEmpty,
+                       "A continued Herdr agent must resolve its stale alert without adding a row.")
+            await client.set(events: [
+                herdrEvent(1, status: "blocked"), herdrEvent(2, status: "working"),
+                herdrEvent(3, status: "done"),
+            ])
+            await model.refreshAll()
+            try expect(model.entries.count == 2 && model.unreadCount == 1
+                       && model.entries.first?.event.herdrStatus == "done",
+                       "A later completed turn must create a fresh alert for the same pane.")
+        }
+    }
+
     private static func event(_ sequence: Int, kind: CodexNotificationKind = .turnCompleted, source: String = "remote-a") -> CodexNotificationEvent {
         .init(id: "event-\(sequence)", sourceID: source, kind: kind, sessionID: "codex-session", cwd: "/work", hostname: "host",
               sequence: sequence, timestamp: Date(timeIntervalSince1970: Double(sequence)), tmuxSession: "work", tmuxSessionID: "$1", tmuxPane: "%1")
+    }
+
+    private static func herdrEvent(_ sequence: Int, status: String) -> CodexNotificationEvent {
+        .init(
+            id: "herdr-event-\(sequence)", sourceID: "remote-a",
+            kind: .herdrAgentStateChanged, sessionID: "herdr:socket-pane", cwd: "",
+            hostname: "host", sequence: sequence,
+            timestamp: Date(timeIntervalSince1970: Double(sequence)),
+            herdrSocket: "/home/user/.config/herdr/herdr.sock", herdrPane: "w1:p1",
+            herdrWorkspace: "w1", herdrAgent: "codex", herdrStatus: status
+        )
     }
 
     @MainActor private static func fixture(_ work: @MainActor (CodexNotificationsModel, HarnessNotificationClient, HarnessNotifications, UserDefaults) async throws -> Void) async throws {

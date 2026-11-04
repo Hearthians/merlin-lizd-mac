@@ -61,8 +61,8 @@ struct CodexNotificationsView: View {
     private var heading: some View {
         HStack(alignment: .top, spacing: 16) {
             VStack(alignment: .leading, spacing: 6) {
-                Text("Codex 通知").font(.largeTitle.bold())
-                Text("接收任务完成和审批提醒，直接返回对应终端。")
+                Text("Agent 通知").font(.largeTitle.bold())
+                Text("接收 Codex 与 Herdr Agent 的完成、等待输入和审批提醒，直接返回对应会话。")
                     .foregroundStyle(.secondary)
                 Text("事件保留在运行 Codex 的主机上，已读状态在设备间同步；每台设备独立接收，静音和系统提醒仅影响本机。")
                     .font(.caption)
@@ -82,7 +82,7 @@ struct CodexNotificationsView: View {
     private var setupCard: some View {
         SurfaceCard("添加通知来源") {
             VStack(alignment: .leading, spacing: 12) {
-                Text("选择运行 Codex 的位置，再配置通知。")
+                Text("选择运行 Codex 或 Herdr 的位置，再配置通知。")
                     .foregroundStyle(.secondary)
                 Picker("运行位置", selection: $setupLocation) {
                     Text("本机").tag(SetupLocation.local)
@@ -120,7 +120,7 @@ struct CodexNotificationsView: View {
                     }
                 }
 
-                Text("配置后，请在该位置的 Codex 中打开 /hooks，审查并允许 TmuxHub 的 hooks，然后新建会话。收到首条通知后，才能确认事件上报正常。")
+                Text("Herdr 通知会自动接入；Codex 还需要在该位置打开 /hooks，审查并允许 TmuxHub 的 hooks，然后新建会话。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -299,11 +299,11 @@ struct CodexNotificationsView: View {
             SurfaceCard {
                 if visibleEntries.isEmpty {
                     ContentUnavailableView(
-                        showUnreadOnly ? "没有未读通知" : "还没有 Codex 通知",
+                        showUnreadOnly ? "没有未读通知" : "还没有 Agent 通知",
                         systemImage: showUnreadOnly ? "checkmark.circle" : "bell",
                         description: Text(showUnreadOnly
                             ? "已读记录仍可在「全部」中查看。"
-                            : "配置来源并完成 /hooks 审查后，新会话的任务完成和审批提醒会显示在这里。")
+                            : "打开 Herdr 或配置来源后，Agent 的任务完成、等待输入和审批提醒会显示在这里。")
                     )
                     .frame(maxWidth: .infinity, minHeight: 160)
                 } else {
@@ -330,7 +330,7 @@ struct CodexNotificationsView: View {
                     .accessibilityHidden(!model.isUnread(entry))
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        eventLabel(entry.event.kind)
+                        eventLabel(entry.event)
                             .font(.headline)
                         if entry.isResolved && entry.event.kind == .approvalRequested {
                             Text("已继续").font(.caption).foregroundStyle(.secondary)
@@ -377,18 +377,31 @@ struct CodexNotificationsView: View {
     }
 
     @ViewBuilder
-    private func eventLabel(_ kind: CodexNotificationKind) -> some View {
-        switch kind {
+    private func eventLabel(_ event: CodexNotificationEvent) -> some View {
+        switch event.kind {
         case .turnCompleted:
             Label("任务已完成", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
         case .approvalRequested:
             Label("需要审批", systemImage: "hand.raised.fill").foregroundStyle(.orange)
         case .turnStarted:
             Label("任务已继续", systemImage: "play.circle").foregroundStyle(.secondary)
+        case .herdrAgentStateChanged:
+            if event.herdrStatus == "blocked" {
+                Label("Herdr Agent 等待处理", systemImage: "exclamationmark.bubble.fill")
+                    .foregroundStyle(.orange)
+            } else {
+                Label("Herdr Agent 已完成", systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+            }
         }
     }
 
     private func sessionLabel(_ entry: CodexNotificationEntry) -> String {
+        if entry.event.kind == .herdrAgentStateChanged {
+            return [entry.event.herdrAgent, entry.event.herdrWorkspace, entry.event.herdrPane]
+                .compactMap { value in value.flatMap { $0.isEmpty ? nil : $0 } }
+                .joined(separator: " · ")
+        }
         if let session = entry.event.tmuxSession, !session.isEmpty { return session }
         return "Codex 会话 \(entry.event.sessionID.prefix(8))"
     }
@@ -425,7 +438,7 @@ struct CodexNotificationsView: View {
             do {
                 _ = try await model.setup(destination: destination)
                 setupFailed = false
-                setupNotice = "已写入通知配置。请在 Codex 的 /hooks 中审查并允许，然后新建会话；收到首条通知后即可确认生效。"
+                setupNotice = "已写入 Agent 通知配置。Herdr 已自动接入；请在 Codex 的 /hooks 中审查并允许，然后新建会话。"
             } catch is CancellationError {
             } catch {
                 setupFailed = true

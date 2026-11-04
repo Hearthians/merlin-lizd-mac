@@ -169,6 +169,7 @@ final class TerminalSession: ObservableObject, Identifiable,
                     target: attachmentModel.target,
                     sessionName: attachmentModel.sessionName,
                     localDirectory: localWorkingDirectory(),
+                    herdrSession: attachmentModel.herdrSession,
                     herdrReference: attachmentModel.herdrReference,
                     notificationRoute: attachmentModel.notificationRoute
                 )

@@ -17,9 +17,9 @@ macOS 钥匙串，作为密钥认证失败后的回退。
 - 快捷连接优先回到已有标签；首次连接使用稳定的默认 tmux 会话名，主动新建才生成新会话。
 - 浏览、创建、接入、重命名和批量终止本机或远端 tmux 会话。
 - 在主机详情或本机页面一键应用 tmux 快捷配置，自动备份并保留其他设置。
-- 浏览本机或远端 Herdr 工作区、Agent 和终端，直接打开所选终端。
+- 在本机或远端直接打开完整 Herdr 客户端，工作区、标签页和 Agent 由 Herdr 自己管理。
 - 远程终端由 tmux 或 Herdr 托管；关闭 App 标签只断开 SSH，远端任务继续运行。
-- SSH 断开后可以原地重连同一个 tmux 会话或 Herdr 终端。
+- SSH 断开后可以原地重连同一个 tmux 会话或 Herdr 客户端。
 - 使用 App 自己的 OpenSSH ControlMaster 复用连接，加快刷新与 tmux 操作。
 - 点击 SSH 终端里的远端 `localhost:<端口>` 网页链接时，自动建立本机端口转发并打开浏览器。
 - 每个主机可选密码回退；默认仍优先使用 SSH config、私钥和 SSH Agent。
@@ -29,8 +29,8 @@ macOS 钥匙串，作为密钥认证失败后的回退。
 - 拖入文件、粘贴 Finder 文件或 ⌘V 截图，传输完成后把可访问路径插入当前终端。
 - 附件栏提供缩略图、状态、取消、重试、复制路径和手动插入；始终不自动按 Enter。
 
-Codex completion/approval notifications, shared read status across Macs,
-and reconnect behavior are documented in [Codex notifications](Docs/codex-notifications.md).
+Codex 与 Herdr Agent 通知、跨 Mac 共享已读状态和重连行为详见
+[Agent 通知](Docs/codex-notifications.md)。
 
 ## 添加 SSH 主机
 
@@ -180,25 +180,32 @@ GPU 实时采样暂不覆盖数组或异构任务。容器开发中心、镜像�
 HPC4 AIStudio 的 NPU 容器与 Slurm 作业是不同入口，参见[官方容器开发说明](https://docs.hpc.hkust-gz.edu.cn/docs/hpc4/domestic/quickstart-submit-ai-job/)；
 其中 NPU 芯片数量和物理卡数量并不相同；资源监控保持集群原始计数，费用估计使用可配置的卡数折算比例。
 
-## Herdr 工作区
+## Herdr 客户端
 
-在侧边栏主机行点击 Herdr 图标，或在主机详情的「Herdr 工作区」中点击「浏览工作区」，即可按
-会话、工作区浏览现有终端。点击 Agent 或终端会直接打开对应的终端标签；已有标签
-会被选中。列表在打开时读取最新状态，也可手动刷新。
+在侧边栏主机行点击 Herdr 图标，或在主机详情点击「打开 Herdr」，会为这台主机打开一个
+完整 Herdr 客户端标签。TmuxHub 只负责本机或 SSH 连接、断线重连和文件联动；Herdr 自己
+管理会话、工作区、标签页、pane 和 Agent，不在 TmuxHub 中重复一套工作区浏览器。
 
-- 目标主机需要已安装并运行支持 `api snapshot` 和 `terminal attach` 的 Herdr；
-  已使用 Herdr 0.9.0 验证。本机和远程连接均可使用。
-- TmuxHub 使用 Herdr 官方直接连接命令，不需要再套一层 tmux。
-- 每个标签保存服务器会话名和稳定的 terminal ID。切换 Herdr 焦点或移动 pane
-  不会把附件传给另一个 Agent；原终端不存在时需要重新选择。
-- Herdr 未提供工作目录时仍可打开终端，但附件操作会提示目录不可用；未提供
-  Agent 会话标识时，上传结果会保留为「就绪」，由你点击插入。
-- 关闭标签只断开连接。也可按 Ctrl+B、再按 q 断开；输入 Ctrl+B 本身需连按两次。
-- Herdr 同一终端仅允许一个直接控制客户端。如果已有客户端占用，连接会显示错误；
-  请先断开原客户端，再重连。TmuxHub 不自动接管控制权。
-- 本版只接入现有工作区和终端；创建、停止工作区仍在 Herdr 中操作。
+- 主机详情和本机页面提供「安装 Herdr」。已有 Homebrew、mise、Nix 或直接安装版本时只验证
+  现有可执行文件，不改变安装方式；缺失时先把[官方稳定版安装程序](https://herdr.dev/docs/install/)
+  下载到私有临时目录并限制大小，再安装到 `~/.local/bin/herdr`，最后显示验证得到的版本和路径。
+  安装不使用 `sudo`，也不会停止已有 Herdr server 或 pane。
+- 目标主机需要安装支持 `api snapshot` 的 Herdr；已使用 Herdr 0.9.0 验证。本机和远程
+  连接均可使用。默认会话由 Herdr 自动启动或接入，不需要再套一层 tmux。
+- 同一主机和 Herdr 会话只打开一个 TmuxHub 标签。旧版按 terminal ID 保存的 Herdr 标签
+  会自动迁移并合并为对应服务器会话的客户端标签。
+- 文件粘贴、拖放附件和终端文件链接会在操作时读取 Herdr 当前聚焦 pane，优先使用
+  `foreground_cwd`，再回退到 pane 的工作目录。相对路径不会搜索其他工作区代替。
+- 上传完成前会再次核对 pane、目录和 Agent 会话标识；焦点或 Agent 已变化时，结果只保留为
+  「就绪」，由你确认后手动插入，避免粘贴到错误的 Agent。Herdr 未报告目录时终端仍可使用，
+  但文件操作会提示目录不可用。
+- 关闭 TmuxHub 标签只断开 Herdr 客户端，不停止 Herdr 服务器、pane 或 Agent。也可按
+  Ctrl+B、再按 q 让 Herdr 主动断开客户端。
+- 打开 Herdr 客户端时会自动链接 TmuxHub 的轻量通知插件：Agent 等待处理或完成时写入主机上的
+  持久通知流；点击通知会按原 Herdr socket 和 pane 返回。通知不保存 prompt、输出或终端内容，
+  并与其他设备共享已读状态；不会覆盖 Herdr 自己的 `ui.toast` 和客户端状态提示。
 
-参考：[Herdr 直接终端连接](https://herdr.dev/docs/cli-reference/#direct-terminal-attach)。
+参考：[Herdr 客户端与服务器](https://herdr.dev/docs/concepts/)。
 
 ## 给 agent CLI 添加附件
 
@@ -206,7 +213,7 @@ HPC4 AIStudio 的 NPU 容器与 Slurm 作业是不同入口，参见[官方容�
 使用终端底部的「添加文件」和「粘贴截图」按钮。
 
 - 远程会话：通过独立 SFTP 通道复用已认证的 SSH ControlMaster，上传到当前
-  tmux pane 或所选 Herdr 终端工作目录的 `.tmuxhub/attachments/<唯一 ID>/`。服务器须开启 SFTP。
+  tmux pane 或 Herdr 当前聚焦 pane 工作目录的 `.tmuxhub/attachments/<唯一 ID>/`。服务器须开启 SFTP。
 - 本机文件：直接引用原路径；剪贴板截图转为 PNG 并保存到上述附件目录。
 - 目录按钮可为会话指定一个已存在的绝对路径，作为 `.tmuxhub/attachments` 的父目录。
 - 文件完整上传后才插入路径。如果期间输入文字、切换标签、离开终端焦点，或检测到
@@ -303,7 +310,7 @@ SFTP Downloader 中打开对应的 SSH 主机与位置：目录直接进入，�
   打开 `~/Downloads/_tmuxhub_download/`，并通过现有 SSH ControlMaster 的独立 SFTP
   通道下载。
 - 本机标签中的文件路径直接使用默认 App 打开。
-- Herdr 标签始终按所选终端的实际工作目录解析文件；不存在时直接提示失败，
+- Herdr 标签始终按当前聚焦 pane 的实际工作目录解析文件；不存在时直接提示失败，
   不会搜索其他工作区代替。
 - 下载先写入所选目录中的唯一临时文件，成功后再替换最终文件；取消、失败或关闭标签
   会清理临时文件。选择已有文件时，macOS 保存面板会先要求确认覆盖。下载完成后

@@ -254,13 +254,15 @@ struct TerminalTabBar: View {
                 terminals.select(tab.id)
             } label: {
                 HStack(spacing: 6) {
-                    Image(systemName: tab.herdrReference != nil ? "square.stack.3d.up" : (tab.target == .local ? "macbook" : "server.rack"))
+                    Image(systemName: tab.herdrSession != nil || tab.herdrReference != nil
+                        ? "square.stack.3d.up"
+                        : (tab.target == .local ? "macbook" : "server.rack"))
                     Text(tab.title)
                         .lineLimit(1)
                         .frame(maxWidth: 210)
                     if !unreadEntries(for: tab).isEmpty {
                         Circle().fill(Color.accentColor).frame(width: 6, height: 6)
-                            .accessibilityLabel("有未读 Codex 通知")
+                            .accessibilityLabel("有未读 Agent 通知")
                     }
                 }
                 .font(.caption)
@@ -271,7 +273,13 @@ struct TerminalTabBar: View {
             .buttonStyle(.plain)
             .accessibilityLabel(tab.title)
             .accessibilityAddTraits(selected ? .isSelected : [])
-            .help(tab.herdrReference.map { "Herdr: \($0.terminalID)" } ?? tab.sessionName.map { "tmux: \($0)" } ?? "本机登录 shell")
+            .help(
+                tab.herdrSession.map { reference in
+                    reference.sessionName.map { "Herdr: \($0)" } ?? "Herdr"
+                } ?? tab.herdrReference.map { "Herdr: \($0.terminalID)" }
+                    ?? tab.sessionName.map { "tmux: \($0)" }
+                    ?? "本机登录 shell"
+            )
 
             if terminatingSessionID == tab.id {
                 ProgressView()
@@ -363,6 +371,11 @@ struct TerminalTabBar: View {
             if let route = tab.notificationRoute {
                 return (try? CodexNotificationRoute(event: entry.event))?.isSameSession(as: route) == true
             }
+            if let session = tab.herdrSession,
+                let route = try? HerdrNotificationRoute(event: entry.event) {
+                if let socket = session.socketPath { return socket == route.socketPath }
+                return session.sessionName == route.sessionName
+            }
             // Name-only matching is a hint for ordinary tabs; clicking one must
             // not acknowledge an event without a verified server identity.
             return entry.event.tmuxSession != nil && entry.event.tmuxSession == tab.sessionName
@@ -387,7 +400,9 @@ struct TerminalTabBar: View {
         if tab.sessionName != nil, terminals.allowsTmuxLifecycleMutation(tab) {
             return "关闭标签并断开连接；按住 Option 点击 × 可终止 tmux 会话"
         }
-        if tab.sessionName != nil || tab.herdrReference != nil {
+        if tab.sessionName != nil || tab.herdrSession != nil
+            || tab.herdrReference != nil
+        {
             return "关闭标签并断开连接；会话和任务会继续运行"
         }
         return tab.target == .local ? "关闭标签并结束本机 shell" : "关闭标签并断开连接"

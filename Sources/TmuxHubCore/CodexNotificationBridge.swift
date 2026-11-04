@@ -10,6 +10,12 @@ public enum CodexNotificationBridge {
         return try command(arguments: ["python3", "-c", bootstrap, "install", encoded], destination: destination)
     }
 
+    static func installHerdrCommand(destination: String?) throws -> CommandSpec {
+        let encoded = Data(helperSource.utf8).base64EncodedString()
+        let bootstrap = "import base64;exec(compile(base64.b64decode(\"\(encoded)\"),\"tmuxhub-notification-bridge\",\"exec\"))"
+        return try command(arguments: ["python3", "-c", bootstrap, "install-herdr", encoded], destination: destination)
+    }
+
     static func readCommand(destination: String?, after: Int, limit: Int) throws -> CommandSpec {
         guard after >= 0, (1...100).contains(limit) else { throw CodexNotificationError.invalidCursor }
         return try installedCommand(arguments: ["read", String(after), String(limit)], destination: destination)
@@ -63,6 +69,7 @@ public enum CodexNotificationBridge {
     import contextlib
     import datetime
     import fcntl
+    import hashlib
     import json
     import os
     import re
@@ -80,6 +87,7 @@ public enum CodexNotificationBridge {
     MAX_AGE = 30 * 86400
     MAX_INPUT = 2 * 1024 * 1024
     EVENT_NAMES = {'Stop': 'turnCompleted', 'PermissionRequest': 'approvalRequested', 'UserPromptSubmit': 'turnStarted'}
+    HERDR_STATUSES = {'idle', 'working', 'blocked', 'done', 'unknown'}
     MARKER = '# TmuxHub Codex notification bridge v1'
     ROOT = os.path.expanduser('~/.local/share/tmuxhub/codex-notifications')
     if globals().get('__file__') and os.path.basename(__file__) == 'bridge.py':
@@ -333,6 +341,64 @@ public enum CodexNotificationBridge {
             atomic_json(os.path.join(ROOT, 'events', name), event)
             prune()
 
+    def herdr_session(socket_path):
+        if os.path.basename(socket_path) != 'herdr.sock':
+            return None
+        parent = os.path.dirname(socket_path)
+        if os.path.basename(os.path.dirname(parent)) == 'sessions':
+            name = os.path.basename(parent)
+            if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', name):
+                return name
+        return None
+
+    def emit_herdr():
+        raw = os.environ.get('HERDR_PLUGIN_EVENT_JSON', '')
+        if not raw or len(raw.encode('utf-8')) > 65536:
+            return
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            return
+        data = payload.get('data', payload)
+        if not isinstance(data, dict):
+            return
+        pane = clean(data.get('pane_id'), 128)
+        status = clean(data.get('agent_status'), 32)
+        socket_path = clean(os.environ.get('HERDR_SOCKET_PATH'), 4096)
+        if (not pane or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}', pane)
+                or status not in HERDR_STATUSES or not socket_path or not os.path.isabs(socket_path)):
+            return
+        hostname = socket.gethostname()
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,255}', hostname):
+            return
+        workspace = clean(data.get('workspace_id'), 128)
+        if workspace and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}', workspace):
+            workspace = None
+        # Store the stable agent label only. display_agent/title may contain a
+        # user-authored task summary and are intentionally excluded.
+        agent = clean(data.get('agent'), 256)
+        session = herdr_session(socket_path)
+        identity = hashlib.sha256((socket_path + '\0' + pane).encode('utf-8')).hexdigest()
+        event = {
+            'id': str(uuid.uuid4()), 'kind': 'herdrAgentStateChanged',
+            'sessionID': 'herdr:' + identity, 'turnID': None, 'cwd': '',
+            'hostname': hostname,
+            'timestamp': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+            'herdrSocket': socket_path, 'herdrPane': pane,
+            'herdrWorkspace': workspace, 'herdrAgent': agent,
+            'herdrStatus': status,
+        }
+        if session:
+            event['herdrSession'] = session
+        with locked():
+            current = state()
+            current['latestSequence'] += 1
+            event['sourceID'] = current['sourceID']
+            event['sequence'] = current['latestSequence']
+            atomic_json(os.path.join(ROOT, 'state.json'), current)
+            name = '%020d-%s.json' % (event['sequence'], event['id'])
+            atomic_json(os.path.join(ROOT, 'events', name), event)
+            prune()
+
     def read_feed(after, limit):
         if after < 0 or not 1 <= limit <= 100:
             raise ValueError('invalid notification cursor')
@@ -415,7 +481,8 @@ public enum CodexNotificationBridge {
                     backup = hooks_path + '.tmuxhub-backup-' + str(uuid.uuid4())
                     atomic_bytes(backup, original)
                 atomic_bytes(hooks_path, rewritten)
-        note = '已安装通知桥接。请在此主机的 Codex 中打开 /hooks，审阅并信任新增通知钩子；必要时重新启动 Codex。'
+        herdr_note = install_herdr(source, required=False)['message']
+        note = '已安装通知桥接。请在此主机的 Codex 中打开 /hooks，审阅并信任新增通知钩子；必要时重新启动 Codex。' + herdr_note
         executable = shutil.which('codex')
         if executable:
             try:
@@ -431,6 +498,61 @@ public enum CodexNotificationBridge {
             note += ' 当前环境未找到 codex，请确认使用支持 hooks 的 CLI。'
         return {'sourceID': current['sourceID'], 'message': note}
 
+    def find_herdr():
+        candidates = [
+            os.path.expanduser('~/.local/bin/herdr'),
+            os.path.expanduser('~/.local/share/mise/shims/herdr'),
+            os.path.expanduser('~/.nix-profile/bin/herdr'),
+            '/opt/homebrew/bin/herdr', '/usr/local/bin/herdr', '/opt/local/bin/herdr',
+            '/run/current-system/sw/bin/herdr', '/nix/var/nix/profiles/default/bin/herdr',
+            '/usr/bin/herdr',
+        ]
+        located = shutil.which('herdr')
+        if located:
+            candidates.insert(0, located)
+        for candidate in candidates:
+            if os.path.isabs(candidate) and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        return None
+
+    def install_herdr(source, required=True):
+        helper_path = os.path.join(ROOT, 'bridge.py')
+        plugin_dir = os.path.join(ROOT, 'herdr-plugin')
+        manifest_path = os.path.join(plugin_dir, 'herdr-plugin.toml')
+        with locked(create=True):
+            if os.path.exists(helper_path):
+                previous = read_bytes(helper_path, MAX_INPUT)
+                if not previous.startswith(MARKER.encode()):
+                    raise ValueError('bridge path occupied by another file')
+            atomic_bytes(helper_path, source)
+            private_dir(plugin_dir)
+            manifest = (
+                'id = "tmuxhub.notifications"\n'
+                'name = "TmuxHub Notifications"\n'
+                'version = "1.0.0"\n'
+                'min_herdr_version = "0.7.0"\n'
+                'description = "Durable cross-device TmuxHub agent notifications"\n'
+                'platforms = ["linux", "macos"]\n\n'
+                '[[events]]\n'
+                'on = "pane.agent_status_changed"\n'
+                'command = [' + json.dumps(sys.executable) + ', ' + json.dumps(helper_path) + ', "herdr-event"]\n'
+            ).encode('utf-8')
+            atomic_bytes(manifest_path, manifest)
+            current = state(create=True)
+        herdr = find_herdr()
+        if not herdr:
+            if required:
+                raise FileNotFoundError('Herdr is not installed')
+            return {'sourceID': current['sourceID'], 'message': ' 未检测到 Herdr；以后从 TmuxHub 打开 Herdr 时会自动接入。'}
+        result = subprocess.run([herdr, 'plugin', 'link', plugin_dir], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, timeout=15)
+        if result.returncode != 0:
+            diagnostic = clean(result.stderr.decode('utf-8', errors='replace'), 1024) or 'Herdr plugin link failed'
+            if required:
+                raise ValueError(diagnostic)
+            return {'sourceID': current['sourceID'], 'message': ' Herdr 通知暂未接入；打开 Herdr 后可重试。'}
+        return {'sourceID': current['sourceID'], 'message': ' Herdr Agent 通知也已接入。'}
+
     if __name__ == '__main__':
         action = sys.argv[1] if len(sys.argv) > 1 else 'emit'
         if action == 'emit':
@@ -440,10 +562,17 @@ public enum CodexNotificationBridge {
                 pass
             # Notification failures must never approve, reject or block a tool.
             print('{}')
+        elif action == 'herdr-event':
+            try:
+                emit_herdr()
+            except Exception:
+                pass
         else:
             try:
                 if action == 'install':
                     result = install(base64.b64decode(sys.argv[2], validate=True))
+                elif action == 'install-herdr':
+                    result = install_herdr(base64.b64decode(sys.argv[2], validate=True))
                 elif action == 'read':
                     result = read_feed(int(sys.argv[2]), int(sys.argv[3]))
                 elif action == 'ack':

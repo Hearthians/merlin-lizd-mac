@@ -34,6 +34,20 @@ public actor CodexNotificationService {
         return receipt.message
     }
 
+    /// Installs only the durable feed and Herdr event hook. This path never
+    /// changes Codex hook configuration and is safe to run whenever a Herdr
+    /// client is opened.
+    public func installHerdr(destination: String?) async throws -> String {
+        let command = try CodexNotificationBridge.installHerdrCommand(destination: destination)
+        let output = try await run(command, destination: destination, replay: .never)
+        struct Receipt: Decodable { let sourceID: String; let message: String }
+        guard output.utf8.count <= 65_536, let data = output.data(using: .utf8),
+            let receipt = try? JSONDecoder().decode(Receipt.self, from: data),
+            UUID(uuidString: receipt.sourceID) != nil, receipt.message.utf8.count <= 8_192
+        else { throw CodexNotificationError.invalidResponse }
+        return receipt.message
+    }
+
     /// Non-destructive, paginated read. Every TmuxHub device owns its own
     /// persisted cursor and must detect sourceID changes before advancing it.
     public func read(destination: String?, after: Int, limit: Int = 100) async throws -> CodexNotificationFeed {

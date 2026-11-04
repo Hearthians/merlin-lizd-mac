@@ -1,5 +1,49 @@
 import Foundation
 
+/// A Herdr client attaches to one independently managed server session. The
+/// default session is represented by `nil`; named sessions keep their name.
+public struct HerdrSessionReference: Codable, Hashable, Sendable {
+    public let sessionName: String?
+    /// Exact API socket used by notification routing. It takes precedence over
+    /// the readable session name and keeps custom/named sessions unambiguous.
+    public let socketPath: String?
+
+    public init(sessionName: String? = nil, socketPath: String? = nil) {
+        self.sessionName = sessionName
+        self.socketPath = socketPath
+    }
+
+    public var isValid: Bool {
+        (sessionName.map { (try? HerdrCommands.validateSessionName($0)) != nil } ?? true)
+            && (socketPath.map { (try? HerdrCommands.validatePath($0)) != nil } ?? true)
+    }
+}
+
+public struct HerdrNotificationRoute: Codable, Hashable, Sendable {
+    public let sessionName: String?
+    public let socketPath: String
+    public let paneID: String
+
+    public init(event: CodexNotificationEvent) throws {
+        guard event.kind == .herdrAgentStateChanged,
+            let socketPath = event.herdrSocket,
+            let paneID = event.herdrPane
+        else { throw HerdrError.invalidIdentifier }
+        if let sessionName = event.herdrSession {
+            try HerdrCommands.validateSessionName(sessionName)
+        }
+        try HerdrCommands.validatePath(socketPath)
+        try HerdrCommands.validateID(paneID)
+        self.sessionName = event.herdrSession
+        self.socketPath = socketPath
+        self.paneID = paneID
+    }
+
+    public var sessionReference: HerdrSessionReference {
+        HerdrSessionReference(sessionName: sessionName, socketPath: socketPath)
+    }
+}
+
 /// A terminal survives workspace/pane moves. Pane IDs and agent names do not.
 public struct HerdrTerminalReference: Codable, Hashable, Sendable {
     public let sessionName: String?
@@ -38,6 +82,7 @@ public struct HerdrWorkspaceRecord: Equatable, Identifiable, Sendable {
 public struct HerdrSessionSnapshot: Equatable, Sendable {
     public let name: String
     public let sessionName: String?
+    public let focusedPaneID: String?
     public let workspaces: [HerdrWorkspaceRecord]
 }
 
@@ -68,6 +113,19 @@ public enum HerdrError: Error, Equatable, LocalizedError, Sendable {
 }
 
 public enum HerdrCommands {
+    public static func client(
+        target: TerminalTarget,
+        reference: HerdrSessionReference = .init()
+    ) throws -> CommandSpec {
+        guard reference.isValid else { throw HerdrError.invalidIdentifier }
+        return try command(
+            target: target,
+            arguments: sessionArguments(reference.sessionName),
+            socketPath: reference.socketPath,
+            interactive: true
+        )
+    }
+
     public static func attach(
         target: TerminalTarget,
         reference: HerdrTerminalReference
@@ -86,10 +144,27 @@ public enum HerdrCommands {
     }
 
     static func snapshot(target: TerminalTarget, sessionName: String?) throws -> CommandSpec {
-        if let sessionName { try validateSessionName(sessionName) }
-        return try command(
+        try snapshot(
             target: target,
-            arguments: sessionArguments(sessionName) + ["api", "snapshot"]
+            reference: HerdrSessionReference(sessionName: sessionName)
+        )
+    }
+
+    static func snapshot(
+        target: TerminalTarget, reference: HerdrSessionReference
+    ) throws -> CommandSpec {
+        guard reference.isValid else { throw HerdrError.invalidIdentifier }
+        return try command(
+            target: target, arguments: sessionArguments(reference.sessionName) + ["api", "snapshot"],
+            socketPath: reference.socketPath
+        )
+    }
+
+    static func focus(target: TerminalTarget, route: HerdrNotificationRoute) throws -> CommandSpec {
+        try command(
+            target: target,
+            arguments: ["agent", "focus", route.paneID],
+            socketPath: route.socketPath
         )
     }
 
@@ -130,17 +205,21 @@ public enum HerdrCommands {
     }
 
     private static func command(
-        target: TerminalTarget, arguments: [String], interactive: Bool = false
+        target: TerminalTarget, arguments: [String], socketPath: String? = nil,
+        interactive: Bool = false
     ) throws -> CommandSpec {
+        if let socketPath { try validatePath(socketPath) }
         switch target {
         case .local:
             guard let executable = LocalHerdrResolver.resolve() else {
                 throw HerdrError.notInstalled
             }
             // App launches from a Herdr pane must not inherit that pane's server.
+            var environment = ["-u", "HERDR_SESSION", "-u", "HERDR_SOCKET_PATH"]
+            if let socketPath { environment.append("HERDR_SOCKET_PATH=\(socketPath)") }
             return CommandSpec(
                 executable: "/usr/bin/env",
-                arguments: ["-u", "HERDR_SESSION", "-u", "HERDR_SOCKET_PATH", executable]
+                arguments: environment + [executable]
                     + arguments
             )
         case let .ssh(destination):
@@ -152,8 +231,9 @@ public enum HerdrCommands {
                 : ["-nT", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
             let script = """
                 unset HERDR_SESSION HERDR_SOCKET_PATH
+                \(socketPath.map { "export HERDR_SOCKET_PATH=" + shellQuote($0) } ?? ":")
                 herdr_binary=''
-                for herdr_candidate in "$HOME/.local/bin/herdr" /opt/homebrew/bin/herdr /usr/local/bin/herdr /usr/bin/herdr; do
+                for herdr_candidate in "$HOME/.local/bin/herdr" "$HOME/.local/share/mise/shims/herdr" "$HOME/.nix-profile/bin/herdr" /opt/homebrew/bin/herdr /usr/local/bin/herdr /opt/local/bin/herdr /run/current-system/sw/bin/herdr /nix/var/nix/profiles/default/bin/herdr /usr/bin/herdr; do
                     if [ -x "$herdr_candidate" ]; then herdr_binary="$herdr_candidate"; break; fi
                 done
                 if [ -z "$herdr_binary" ]; then herdr_binary=$(command -v herdr 2>/dev/null) || exit 127; fi
@@ -172,7 +252,17 @@ public enum HerdrCommands {
 enum LocalHerdrResolver {
     static func resolve() -> String? {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let paths = [home + "/.local/bin/herdr", "/opt/homebrew/bin/herdr", "/usr/local/bin/herdr", "/usr/bin/herdr"]
+        let paths = [
+            home + "/.local/bin/herdr",
+            home + "/.local/share/mise/shims/herdr",
+            home + "/.nix-profile/bin/herdr",
+            "/opt/homebrew/bin/herdr",
+            "/usr/local/bin/herdr",
+            "/opt/local/bin/herdr",
+            "/run/current-system/sw/bin/herdr",
+            "/nix/var/nix/profiles/default/bin/herdr",
+            "/usr/bin/herdr",
+        ]
             + (ProcessInfo.processInfo.environment["PATH"] ?? "")
                 .split(separator: ":").map { String($0) + "/herdr" }
         return paths.first {
@@ -256,8 +346,20 @@ enum HerdrParser {
             )
         }
         return HerdrSessionSnapshot(
-            name: sessionName ?? "default", sessionName: sessionName, workspaces: workspaces
+            name: sessionName ?? "default", sessionName: sessionName,
+            focusedPaneID: snapshot.focusedPaneID, workspaces: workspaces
         )
+    }
+
+    static func focusedPane(
+        in snapshot: HerdrSessionSnapshot
+    ) throws -> HerdrPaneRecord {
+        guard let paneID = snapshot.focusedPaneID,
+            let pane = snapshot.workspaces.lazy.flatMap(\.panes).first(where: {
+                $0.paneID == paneID
+            })
+        else { throw HerdrError.terminalUnavailable }
+        return pane
     }
 
     static func resolve(
@@ -321,8 +423,12 @@ enum HerdrParser {
     }
     private struct SnapshotResult: Decodable { let snapshot: SnapshotInfo }
     private struct SnapshotInfo: Decodable {
+        let focusedPaneID: String?
         let workspaces: [WorkspaceInfo]
         let panes: [PaneInfo]
+        enum CodingKeys: String, CodingKey {
+            case focusedPaneID = "focused_pane_id", workspaces, panes
+        }
     }
     private struct WorkspaceInfo: Decodable {
         let workspaceID: String
@@ -414,13 +520,42 @@ public actor HerdrService {
         )
     }
 
-    private func run(_ command: CommandSpec, target: TerminalTarget) async throws -> InventoryProcessOutput {
+    /// Resolve the pane currently focused by Herdr. This keeps paste and file
+    /// actions aligned with the full Herdr client instead of binding TmuxHub to
+    /// one terminal for the lifetime of a tab.
+    public func focusedPane(
+        target: TerminalTarget, reference: HerdrSessionReference
+    ) async throws -> HerdrPaneRecord {
+        guard reference.isValid else { throw HerdrError.invalidIdentifier }
+        let output = try await run(
+            HerdrCommands.snapshot(target: target, reference: reference),
+            target: target
+        )
+        return try HerdrParser.focusedPane(
+            in: HerdrParser.snapshot(output.stdout, sessionName: reference.sessionName)
+        )
+    }
+
+    public func focus(
+        target: TerminalTarget, route: HerdrNotificationRoute
+    ) async throws {
+        _ = try await run(
+            HerdrCommands.focus(target: target, route: route),
+            target: target,
+            replay: .never
+        )
+    }
+
+    private func run(
+        _ command: CommandSpec, target: TerminalTarget,
+        replay: SSHReplayPolicy = .readOnly
+    ) async throws -> InventoryProcessOutput {
         let pool = sshMasterPool
         let runner = processRunner
         return try await queryPolicy.run {
             let output: InventoryProcessOutput
             if let alias = target.sshDestination, let pool {
-                output = try await pool.run(command, alias: alias, replay: .readOnly)
+                output = try await pool.run(command, alias: alias, replay: replay)
             } else {
                 output = try await runner.run(command)
             }

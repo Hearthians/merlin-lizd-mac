@@ -200,7 +200,7 @@ struct SSHHostDetailView: View {
     let onConnect: () -> Void
     let onNewSession: () -> Void
     let onBrowseSessions: () -> Void
-    let onBrowseHerdr: () -> Void
+    let onOpenHerdr: () -> Void
     let hasSavedPassword: () async throws -> Bool
     let onSavePassword: (String) async throws -> Void
     let onAuthorizePassword: () async throws -> Void
@@ -261,21 +261,11 @@ struct SSHHostDetailView: View {
                     .controlSize(.large)
                 }
 
-                SurfaceCard {
-                    HStack(spacing: 16) {
-                        VStack(alignment: .leading, spacing: 5) {
-                            Label("Herdr 工作区", systemImage: "square.stack.3d.up")
-                                .font(.headline)
-                            Text("按工作区查看 Agent 和终端，选择后直接接入。")
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer(minLength: 8)
-                        Button("浏览工作区", action: onBrowseHerdr)
-                            .buttonStyle(.bordered)
-                            .controlSize(.large)
-                    }
-                }
+                HerdrConfigurationCard(
+                    target: .ssh(destination: host.destination),
+                    terminals: terminals,
+                    onOpen: onOpenHerdr
+                )
 
                 TmuxConfigurationCard(
                     target: .ssh(destination: host.destination),
@@ -448,7 +438,7 @@ struct LocalTerminalLandingView: View {
     let onOpenShell: () -> Void
     let onNewTmux: () -> Void
     let onBrowseSessions: () -> Void
-    let onBrowseHerdr: () -> Void
+    let onOpenHerdr: () -> Void
 
     var body: some View {
         VStack(spacing: 18) {
@@ -457,7 +447,7 @@ struct LocalTerminalLandingView: View {
                 .foregroundStyle(.tint)
             Text("本机终端")
                 .font(.title.bold())
-            Text("打开本机 Shell、管理 tmux 会话，或直接接入 Herdr 终端。")
+            Text("打开本机 Shell、管理 tmux 会话，或连接完整 Herdr 客户端。")
                 .foregroundStyle(.secondary)
             HStack {
                 Button("登录 Shell", systemImage: "terminal", action: onOpenShell)
@@ -466,14 +456,109 @@ struct LocalTerminalLandingView: View {
                     .buttonStyle(.borderedProminent)
                 Button("现有 tmux 会话", systemImage: "rectangle.stack", action: onBrowseSessions)
                     .buttonStyle(.bordered)
-                Button("Herdr 工作区", systemImage: "square.stack.3d.up", action: onBrowseHerdr)
-                    .buttonStyle(.bordered)
             }
             .controlSize(.large)
+            HerdrConfigurationCard(
+                target: .local,
+                terminals: terminals,
+                onOpen: onOpenHerdr
+            )
+            .frame(maxWidth: 720)
             TmuxConfigurationCard(target: .local, terminals: terminals)
                 .frame(maxWidth: 720)
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+struct HerdrConfigurationCard: View {
+    let target: TerminalTarget
+    @ObservedObject var terminals: TerminalTabsModel
+    let onOpen: () -> Void
+
+    private var state: HerdrInstallationState? {
+        terminals.herdrInstallationStates[target]
+    }
+
+    var body: some View {
+        SurfaceCard {
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .center, spacing: 16) {
+                    description
+                    Spacer(minLength: 8)
+                    actions
+                }
+                VStack(alignment: .leading, spacing: 12) {
+                    description
+                    actions
+                }
+            }
+
+            switch state {
+            case .installing:
+                Text("正在检查 Herdr；缺失时从官方稳定通道下载、安装并验证…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case let .installed(result):
+                Label("Herdr 已就绪：\(result.version)", systemImage: "checkmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+                Text("可执行文件：\(result.executablePath)")
+                    .font(.caption.monospaced())
+                    .textSelection(.enabled)
+            case let .failed(message):
+                Label(message, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+            case nil:
+                EmptyView()
+            }
+
+            HStack(spacing: 4) {
+                Text("安装仅写入当前用户目录，不使用 sudo。来源：")
+                Link("Herdr 官方安装程序", destination: URL(string: "https://herdr.dev/docs/install/")!)
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+    }
+
+    private var description: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Label("Herdr", systemImage: "square.stack.3d.up")
+                .font(.headline)
+            Text("连接完整 Herdr 客户端；工作区、标签页和 Agent 由 Herdr 管理。")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var actions: some View {
+        HStack(spacing: 8) {
+            Button {
+                let selectedTarget = target
+                Task { await terminals.installHerdr(on: selectedTarget) }
+            } label: {
+                HStack(spacing: 6) {
+                    if state == .installing {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: "arrow.down.circle")
+                    }
+                    Text(state == .installing ? "正在安装…" : "安装 Herdr")
+                }
+            }
+            .buttonStyle(.bordered)
+            .disabled(state == .installing)
+            .accessibilityIdentifier("install-herdr")
+            .help("在 \(target.sshDestination ?? "本机") 缺少 Herdr 时安装稳定版")
+
+            Button("打开 Herdr", action: onOpen)
+                .buttonStyle(.borderedProminent)
+                .disabled(state == .installing)
+        }
+        .controlSize(.large)
     }
 }

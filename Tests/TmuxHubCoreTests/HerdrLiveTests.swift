@@ -2,13 +2,13 @@ import Foundation
 import Testing
 @testable import TmuxHubCore
 
-@Suite("Optional live Herdr attachment integration")
+@Suite("Optional live Herdr client paste integration")
 struct HerdrLiveTests {
     @Test(
-        "bound Herdr terminal survives focus changes and drives exact SFTP paths",
+        "full Herdr client follows focus and drives exact SFTP paths",
         .enabled(if: ProcessInfo.processInfo.environment["TMUXHUB_LIVE_HERDR_HOST"] != nil)
     )
-    func boundTerminalTransfer() async throws {
+    func focusedPaneTransfer() async throws {
         let host = try #require(ProcessInfo.processInfo.environment["TMUXHUB_LIVE_HERDR_HOST"])
         try #require(IdentifierValidator.isSSHDestination(host))
         let target = TerminalTarget.ssh(destination: host)
@@ -79,26 +79,17 @@ struct HerdrLiveTests {
 
             let createdA = try await run(
                 named + " workspace create --cwd " + quote(originalDirectory)
-                    + " --label bound-a --no-focus"
+                    + " --label focused-a --focus"
             )
             try #require(createdA.exitCode == 0, "\(createdA.stderr)")
             let initial = try await namedSnapshot()
             let workspaceA = try #require(initial.workspaces.first)
             let paneA = try #require(workspaceA.panes.first)
             let reference = paneA.reference
-            let createdB = try await run(
-                named + " workspace create --cwd " + quote(otherDirectory)
-                    + " --label focused-b --focus"
-            )
-            try #require(createdB.exitCode == 0, "\(createdB.stderr)")
-
-            let sessions = try await herdr.discover(target: target)
-            let discovered = try #require(sessions.first { $0.sessionName == sessionName })
-            #expect(discovered.workspaces.count == 2)
-            #expect(discovered.workspaces.flatMap(\.panes).contains { $0.reference == reference })
+            let session = HerdrSessionReference(sessionName: sessionName)
             let context = try await attachments.context(
                 target: target, sessionName: nil, localDirectory: "/",
-                herdrReference: reference
+                herdrSession: session
             )
             #expect(context.workingDirectory == originalDirectory)
             #expect(context.herdrReference == reference)
@@ -117,6 +108,23 @@ struct HerdrLiveTests {
             try await attachments.download(remotePath: uploaded, context: context, destination: downloaded)
             #expect(try Data(contentsOf: downloaded) == payload)
 
+            let createdB = try await run(
+                named + " workspace create --cwd " + quote(otherDirectory)
+                    + " --label focused-b --focus"
+            )
+            try #require(createdB.exitCode == 0, "\(createdB.stderr)")
+            let otherContext = try await attachments.context(
+                target: target, sessionName: nil, localDirectory: "/",
+                herdrSession: session
+            )
+            #expect(otherContext.workingDirectory == otherDirectory)
+            #expect(otherContext.herdrReference != reference)
+
+            let refocused = try await run(
+                named + " workspace focus " + quote(workspaceA.id)
+            )
+            try #require(refocused.exitCode == 0, "\(refocused.stderr)")
+
             let changed = try await run(
                 named + " pane run " + quote(paneA.paneID) + " "
                     + quote("cd -- " + quote(movedDirectory))
@@ -126,7 +134,7 @@ struct HerdrLiveTests {
             for _ in 0..<30 {
                 updatedContext = try await attachments.context(
                     target: target, sessionName: nil, localDirectory: "/",
-                    herdrReference: reference
+                    herdrSession: session
                 )
                 if updatedContext.workingDirectory == movedDirectory { break }
                 try await Task.sleep(for: .milliseconds(100))
@@ -159,12 +167,12 @@ struct HerdrLiveTests {
 
             let closed = try await run(named + " workspace close " + quote(workspaceA.id))
             try #require(closed.exitCode == 0, "\(closed.stderr)")
-            await #expect(throws: HerdrError.terminalUnavailable) {
-                try await attachments.context(
-                    target: target, sessionName: nil, localDirectory: otherDirectory,
-                    herdrReference: reference
-                )
-            }
+            let fallbackContext = try await attachments.context(
+                target: target, sessionName: nil, localDirectory: otherDirectory,
+                herdrSession: session
+            )
+            #expect(fallbackContext.workingDirectory == otherDirectory)
+            #expect(fallbackContext.herdrReference != reference)
         } catch {
             _ = try? await run(cleanup)
             await pool.shutdown()
